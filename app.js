@@ -11,7 +11,11 @@ function postedMs(v){if(typeof v==="number")return v;const n=Date.parse(v);retur
 const CYCLE=56*864e5;
 CALLS.forEach(c=>{c._post0=c.postedAt;c._due0=c.dueAt});
 const ANCHOR=Math.min(...CALLS.flatMap(c=>[postedMs(c._post0),postedMs(c._due0)]));
-function applyCycle(){const k=Math.max(0,Math.floor((Date.now()-ANCHOR)/CYCLE));CALLS.forEach(c=>{c.postedAt=new Date(postedMs(c._post0)+k*CYCLE).toISOString();c.dueAt=new Date(postedMs(c._due0)+k*CYCLE).toISOString()});const prev=ls.get("pv_cycle",null);if(prev!==null&&prev!==k){const s=ls.get("pv_searches",[]);s.forEach(f=>{f.seenAt=Date.now()});ls.set("pv_searches",s)}if(prev!==k)ls.set("pv_cycle",k);return k}
+function targetCycle(){return Math.max(0,Math.floor((Date.now()-ANCHOR)/CYCLE))}
+function hasActiveClaim(){const now=Date.now();return Object.values(ls.get("pv_claims",{})).some(exp=>exp>now)}
+// A cycle change only rewrites seenAt. Filters (name, q, shot, city) stay as saved.
+function bumpSeen(){const s=ls.get("pv_searches",[]);s.forEach(f=>{f.seenAt=Date.now()});ls.set("pv_searches",s)}
+function applyCycle(){const target=targetCycle();const prev=ls.get("pv_cycle",null);const hold=hasActiveClaim()&&prev!==null;const k=hold?prev:target;CALLS.forEach(c=>{c.postedAt=new Date(postedMs(c._post0)+k*CYCLE).toISOString();c.dueAt=new Date(postedMs(c._due0)+k*CYCLE).toISOString()});if(!hold&&prev!==null&&prev!==target)bumpSeen();if(!hold&&prev!==target)ls.set("pv_cycle",target);return k}
 applyCycle();
 function board(){return posts().concat(CALLS)}
 const findCall=id=>board().find(x=>x.id===id);
@@ -35,7 +39,7 @@ function status(){if(!DEMO){$("#status").innerHTML="";return}const u=me();$("#st
 <div class="row"><button data-a="score">Add a 4.8 score</button><button data-a="acc">Add accepted file</button><button data-a="reset">Reset demo</button></div>`}
 function postedLabel(ts){const hrs=Math.max(0,Math.round((Date.now()-postedMs(ts))/36e5));if(hrs>=48){const d=Math.round(hrs/24);return LANG==="es"?`Publicado hace ${d} d`:`Posted ${d}d ago`}return LANG==="es"?`Publicado hace ${hrs} h`:`Posted ${hrs}h ago`}
 function dur(sec){sec=Number(sec)||0;if(sec<60)return sec+"s";const m=sec/60;return (Number.isInteger(m)?String(m):m.toFixed(1))+" "+t("min")}
-function render(){syncFilters();status();renderWork();renderProfile();renderBuyer();renderAlerts();badge();alertBadge();const q=$("#q").value.toLowerCase(),sh=$("#shot").value,ci=$("#city").value,so=$("#sort").value;
+function render(){applyCycle();syncFilters();status();renderWork();renderProfile();renderBuyer();renderAlerts();badge();alertBadge();const q=$("#q").value.toLowerCase(),sh=$("#shot").value,ci=$("#city").value,so=$("#sort").value;
 let L=board().filter(c=>matchCall(c,{q,shot:sh,city:ci}));
 const rank=c=>closed(c)?1:0;
 if(so==="pay")L=[...L].sort((a,b)=>rank(a)-rank(b)||b.pay-a.pay);else if(so==="due")L=[...L].sort((a,b)=>rank(a)-rank(b)||postedMs(a.dueAt)-postedMs(b.dueAt));else L=[...L].sort((a,b)=>rank(a)-rank(b)||postedMs(b.postedAt)-postedMs(a.postedAt));
@@ -56,7 +60,7 @@ if(a==="rel"){delete cl[id];ls.set("pv_claims",cl)}
 if(!DEMO&&["score","acc","reset"].includes(a))return;if(a==="score"){u.scores.push(4.8);ls.set("pv_user",u)}if(a==="acc"){u.accepted++;ls.set("pv_user",u)}
 if(a==="reset"){if(!confirm("Reset the demo? This erases your claims, scores and My Work history."))return;["pv_user","pv_claims","pv_subs"].forEach(k=>localStorage.removeItem(k))}render()});
 ["#q","#sort","#shot","#city"].forEach(s=>$(s).addEventListener("input",render));
-setInterval(()=>{let expired=false;document.querySelectorAll(".due").forEach(el=>{const left=+el.dataset.due-Date.now();if(left<=0){if(el.dataset.open==="1")expired=true;el.textContent=t("closed")}else el.textContent=dueText(left)});document.querySelectorAll(".timer").forEach(el=>{const left=+el.dataset.exp-Date.now();el.textContent=fmt(left);if(left>0&&Math.floor(left/1000)%300===0)$("#live").textContent=`${fmt(left)} left on your slot.`;if(left<=0){$("#live").textContent="Your slot timed out and was released.";const cl=claims();delete cl[el.dataset.id];ls.set("pv_claims",cl);expired=true}});if(expired)render()},1000);
+setInterval(()=>{let expired=false;const before=ls.get("pv_cycle",null);document.querySelectorAll(".due").forEach(el=>{const left=+el.dataset.due-Date.now();if(left<=0){if(el.dataset.open==="1")expired=true;el.textContent=t("closed")}else el.textContent=dueText(left)});document.querySelectorAll(".timer").forEach(el=>{const left=+el.dataset.exp-Date.now();el.textContent=fmt(left);if(left>0&&Math.floor(left/1000)%300===0)$("#live").textContent=`${fmt(left)} left on your slot.`;if(left<=0){$("#live").textContent="Your slot timed out and was released.";const cl=claims();delete cl[el.dataset.id];ls.set("pv_claims",cl);expired=true}});if(!expired)applyCycle();if(expired||ls.get("pv_cycle",null)!==before)render()},1000);
 $("#cf").addEventListener("submit",async e=>{e.preventDefault();const f=e.target,ticket="PV-"+Date.now().toString(36).toUpperCase().slice(-6);const fd=new FormData(f);fd.append("ticket",ticket);fd.append("_subject",`[${ticket}] ${fd.get("type")}`);
 const m=$("#cfmsg");m.textContent="Sending…";let sent=false;if(!CONTACT_ENDPOINT.includes("YOUR_FORM_ID")){try{const r=await fetch(CONTACT_ENDPOINT,{method:"POST",body:fd,headers:{Accept:"application/json"}});sent=r.ok}catch{}}
 m.innerHTML=sent?`Sent. Your ticket number is <b>${ticket}</b>.`:(CONTACT_ENDPOINT.includes("YOUR_FORM_ID")?`<b style="color:#e66">Not sent.</b> The contact form isn't connected yet, so nobody received this. For safety issues, please email <a href="mailto:${SUPPORT_EMAIL}">${SUPPORT_EMAIL}</a>.`:`<b style="color:#e66">Not sent.</b> Something went wrong, so nobody received this. Please try again.`);if(sent)f.reset()});
