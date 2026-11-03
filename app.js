@@ -7,6 +7,7 @@ const ls={get:(k,d)=>{try{return JSON.parse(localStorage.getItem(k))??d}catch{re
 let LANG=ls.get("pv_lang","en")==="es"?"es":"en";
 const posts=()=>ls.get("pv_posts",[]);
 function postedMs(v){if(typeof v==="number")return v;const n=Date.parse(v);return Number.isNaN(n)?0:n}
+(function migratePosts(){const all=posts();let ch=false;all.forEach(p=>{if(p.dueAt||p.dueH==null)return;const hours=Number(p.dueH);if(!Number.isFinite(hours))return;p.dueAt=new Date((postedMs(p.postedAt)||Date.now())+hours*36e5).toISOString();delete p.dueH;ch=true});if(ch)ls.set("pv_posts",all)})();
 function board(){return posts().concat(CALLS)}
 const findCall=id=>board().find(x=>x.id===id);
 const me=()=>ls.get("pv_user",{scores:[],accepted:0});
@@ -18,7 +19,8 @@ const taken=id=>{const c=findCall(id);return Math.min(c.slots,(c.taken||0)+(clai
 const size=mb=>mb<1000?mb+" MB":(mb/1000)+" GB";
 const $=s=>document.querySelector(s);
 function fmt(ms){ms=Math.max(0,ms);const m=Math.floor(ms/60000),s=Math.floor(ms/1000)%60;return m+":"+String(s).padStart(2,"0")}
-function due(h){const n=h>=48?Math.round(h/24):h,u=h>=48?(LANG==="es"?"d":"d"):(LANG==="es"?"h":"h");return LANG==="es"?`Vence en ${n} ${u}`:`Due in ${n}${u}`}
+function closed(c){return Date.now()>postedMs(c.dueAt)}
+function dueText(left){if(left<=0)return t("closed");const h=Math.floor(left/36e5),m=Math.floor(left%36e5/60000),s=Math.floor(left%60000/1000);if(h>=48){const d=Math.floor(h/24);return LANG==="es"?`Vence en ${d} d ${h%24} h`:`Due in ${d}d ${h%24}h`}return LANG==="es"?`Vence en ${h} h ${m} min ${s} s`:`Due in ${h}h ${m}m ${s}s`}
 function addOpt(sel,val){if(!val||[...sel.options].some(o=>o.value===val))return;sel.add(new Option(val,val))}
 function syncFilters(){const shot=$("#shot"),city=$("#city"),sv=shot.value,cv=city.value;board().forEach(c=>{c.tags.forEach(tag=>{if(!["Sound","Hands"].includes(tag))addOpt(shot,tag)});addOpt(city,c.city)});shot.value=sv;city.value=cv}
 const shots=[...new Set(board().flatMap(c=>c.tags))].filter(tag=>!["Sound","Hands"].includes(tag));
@@ -30,23 +32,25 @@ function postedLabel(ts){const hrs=Math.max(0,Math.round((Date.now()-postedMs(ts
 function dur(sec){sec=Number(sec)||0;if(sec<60)return sec+"s";const m=sec/60;return (Number.isInteger(m)?String(m):m.toFixed(1))+" "+t("min")}
 function render(){syncFilters();status();renderWork();renderProfile();renderBuyer();renderAlerts();badge();alertBadge();const q=$("#q").value.toLowerCase(),sh=$("#shot").value,ci=$("#city").value,so=$("#sort").value;
 let L=board().filter(c=>matchCall(c,{q,shot:sh,city:ci}));
-if(so==="pay")L=[...L].sort((a,b)=>b.pay-a.pay);else if(so==="due")L=[...L].sort((a,b)=>a.dueH-b.dueH);else L=[...L].sort((a,b)=>postedMs(b.postedAt)-postedMs(a.postedAt));
+const rank=c=>closed(c)?1:0;
+if(so==="pay")L=[...L].sort((a,b)=>rank(a)-rank(b)||b.pay-a.pay);else if(so==="due")L=[...L].sort((a,b)=>rank(a)-rank(b)||postedMs(a.dueAt)-postedMs(b.dueAt));else L=[...L].sort((a,b)=>rank(a)-rank(b)||postedMs(b.postedAt)-postedMs(a.postedAt));
 const cl=claims(),ok=qualifies();
-$("#list").innerHTML=L.map(c=>{const mine=cl[c.id];const locked=c.invite&&!ok;
-let act;if(locked)act=`<div class="note">🔒 Invite only. Opens after two recent scores at 4.5, or five accepted files. Upload is locked.</div>`;
+$("#list").innerHTML=L.map(c=>{const mine=cl[c.id];const locked=c.invite&&!ok;const over=closed(c);const left=postedMs(c.dueAt)-Date.now();
+let act;if(over)act=`<button class="pri" data-a="claim" data-id="${c.id}" disabled>${t("claim")}</button>`;
+else if(locked)act=`<div class="note">🔒 Invite only. Opens after two recent scores at 4.5, or five accepted files. Upload is locked.</div>`;
 else if(mine)act=`<span>${t("your_slot")} · <span class="timer" role="timer" data-exp="${mine}" data-id="${c.id}">${fmt(mine-Date.now())}</span> ${t("left")}</span><button data-a="rel" data-id="${c.id}">${t("release")}</button><button class="pri" data-a="up" data-id="${c.id}">${t("upload")}</button>`;
 else act=taken(c.id)>=c.slots?`<span class="mute">${t("full")}</span>`:`<button class="pri" data-a="claim" data-id="${c.id}">${t("claim")}</button>`;
 return `<article class="card"><div class="top"><div><div class="mute">${esc(c.city)} · ${c.you?esc(t("posted_by_you")):esc(c.buyer)}</div><h2 class="calltitle">${esc(c.title)}</h2></div><div class="pay">$${c.pay}</div></div>
 <p>${esc(c.desc)}</p>${c.night?`<div class="note">⚠️ Night shoot: stay somewhere public and well lit, don't trespass, and don't film anyone who objects. <a href="#safety">Safety tips</a></div>`:""}<div class="mute" style="font-size:13px">${t("file")}: ${dur(c.spec.minSec)} ${t("to")} ${dur(c.spec.maxSec)}, ${c.spec.orientation==="any"?t("orient_any"):c.spec.orientation}, ${t("up_to")} ${size(c.spec.maxMB)}</div><div class="mute" style="font-size:13px">${esc(c.license)}</div><div class="mute" style="font-size:13px">${esc(postedLabel(c.postedAt))}</div><div>${c.tags.map(tag=>`<span class="tag">${esc(tag)}</span>`).join("")}${c.invite?`<span class="tag inv">${esc(t("invite"))}</span>`:""}<span class="tag">${esc(t("funded"))}</span><span class="tag">${esc(c.gear)}</span>${c.decision?`<span class="tag">${esc(t("decision"))} ${esc(c.decision)}</span>`:""}</div>
-<div class="row mute" style="font-size:14px">★ ${esc(c.rating)} ${t("from")} ${esc(c.ratings)} · ${due(c.dueH)} · <b class="slots">${taken(c.id)} ${t("of")} ${c.slots}</b>${c.mount?" · "+esc(c.mount):""}</div><div class="row">${act}</div></article>`}).join("")||`<p class="mute">${t("no_match")}</p>`}
+<div class="row mute" style="font-size:14px">★ ${esc(c.rating)} ${t("from")} ${esc(c.ratings)} · <span class="due" data-due="${postedMs(c.dueAt)}" data-open="${over?0:1}">${dueText(left)}</span> · <b class="slots">${taken(c.id)} ${t("of")} ${c.slots}</b>${c.mount?" · "+esc(c.mount):""}</div><div class="row">${act}</div></article>`}).join("")||`<p class="mute">${t("no_match")}</p>`}
 document.addEventListener("click",e=>{const b=e.target.closest("[data-a]");if(!b)return;const a=b.dataset.a,id=b.dataset.id,cl=claims(),u=me();
-if(a==="claim"){const c=findCall(id);if(c.invite&&!qualifies())return;if(taken(id)>=c.slots){alert(t("full"));return}cl[id]=Date.now()+CLAIM_MS;ls.set("pv_claims",cl)}
+if(a==="claim"){const c=findCall(id);if(!c||closed(c))return;if(c.invite&&!qualifies())return;if(taken(id)>=c.slots){alert(t("full"));return}cl[id]=Date.now()+CLAIM_MS;ls.set("pv_claims",cl)}
 if(a==="up"){openUpload(findCall(id));return}
 if(a==="rel"){delete cl[id];ls.set("pv_claims",cl)}
 if(!DEMO&&["score","acc","reset"].includes(a))return;if(a==="score"){u.scores.push(4.8);ls.set("pv_user",u)}if(a==="acc"){u.accepted++;ls.set("pv_user",u)}
 if(a==="reset"){if(!confirm("Reset the demo? This erases your claims, scores and My Work history."))return;["pv_user","pv_claims","pv_subs"].forEach(k=>localStorage.removeItem(k))}render()});
 ["#q","#sort","#shot","#city"].forEach(s=>$(s).addEventListener("input",render));
-setInterval(()=>{let expired=false;document.querySelectorAll(".timer").forEach(el=>{const left=+el.dataset.exp-Date.now();el.textContent=fmt(left);if(left>0&&Math.floor(left/1000)%300===0)$("#live").textContent=`${fmt(left)} left on your slot.`;if(left<=0){$("#live").textContent="Your slot timed out and was released.";const cl=claims();delete cl[el.dataset.id];ls.set("pv_claims",cl);expired=true}});if(expired)render()},1000);
+setInterval(()=>{let expired=false;document.querySelectorAll(".due").forEach(el=>{const left=+el.dataset.due-Date.now();if(left<=0){if(el.dataset.open==="1")expired=true;el.textContent=t("closed")}else el.textContent=dueText(left)});document.querySelectorAll(".timer").forEach(el=>{const left=+el.dataset.exp-Date.now();el.textContent=fmt(left);if(left>0&&Math.floor(left/1000)%300===0)$("#live").textContent=`${fmt(left)} left on your slot.`;if(left<=0){$("#live").textContent="Your slot timed out and was released.";const cl=claims();delete cl[el.dataset.id];ls.set("pv_claims",cl);expired=true}});if(expired)render()},1000);
 $("#cf").addEventListener("submit",async e=>{e.preventDefault();const f=e.target,ticket="PV-"+Date.now().toString(36).toUpperCase().slice(-6);const fd=new FormData(f);fd.append("ticket",ticket);fd.append("_subject",`[${ticket}] ${fd.get("type")}`);
 const m=$("#cfmsg");m.textContent="Sending…";let sent=false;if(!CONTACT_ENDPOINT.includes("YOUR_FORM_ID")){try{const r=await fetch(CONTACT_ENDPOINT,{method:"POST",body:fd,headers:{Accept:"application/json"}});sent=r.ok}catch{}}
 m.innerHTML=sent?`Sent. Your ticket number is <b>${ticket}</b>.`:(CONTACT_ENDPOINT.includes("YOUR_FORM_ID")?`<b style="color:#e66">Not sent.</b> The contact form isn't connected yet, so nobody received this. For safety issues, please email <a href="mailto:${SUPPORT_EMAIL}">${SUPPORT_EMAIL}</a>.`:`<b style="color:#e66">Not sent.</b> Something went wrong, so nobody received this. Please try again.`);if(sent)f.reset()});
@@ -129,7 +133,7 @@ document.addEventListener("click",e=>{if(e.target.closest("[data-x=export]")){co
 const I18N={en:{
 how_title:"How it works",dismiss:"Dismiss",how_1:"Claim a slot",how_2:"Upload within 30 minutes",how_3:"Get paid after review",
 c_title:"Before you upload",c_lic:"I agree to the license on this call:",c_faces:"Everyone who can be recognized in this video agreed to be filmed, or their faces are out of frame or blurred.",c_own:"I shot this myself and I own it.",cancel:"Cancel",check:"Check and upload",
-posted_by_you:"Posted by you (demo)",claim:"Claim a slot",upload:"Upload file",release:"Release",full:"Full",funded:"Funded",invite:"Invite",your_slot:"Your slot",left:"left",file:"File",to:"to",min:"min",of:"of",from:"from",up_to:"up to",decision:"Decision in",no_match:"No calls match.",
+posted_by_you:"Posted by you (demo)",claim:"Claim a slot",upload:"Upload file",release:"Release",full:"Full",funded:"Funded",invite:"Invite",your_slot:"Your slot",left:"left",file:"File",to:"to",min:"min",of:"of",from:"from",up_to:"up to",decision:"Decision in",no_match:"No calls match.",closed:"Closed",f_due:"Due in",f_due_unit:"Unit",unit_h:"hours",unit_d:"days",post_bad_due:"Due in must be at least 1 hour.",
 nav_calls:"Calls",nav_alerts:"Alerts",nav_post:"Post",nav_profile:"Profile",nav_work:"My Work",nav_help:"Help",nav_contact:"Contact",calls_h:"Open calls",calls_sub:"Browse. Send a file. Get paid.",
 alerts_h:"Saved searches",search_name:"Name this search",search_ph:"Name this search",save_search:"Save search",delete:"Delete",no_searches:"No saved searches yet.",any:"Any text",any_shot:"Any shot",any_city:"Any city",need_name:"Name this search first.",saved:"Saved in this browser.",
 post_h:"Post a call",post_note:"Demo only. This call stays in this browser. Nothing is sent or paid.",f_title:"Title",f_pay:"Pay (USD, minimum $20)",f_city:"City",f_min:"Min seconds",f_max:"Max seconds",f_orient:"Orientation",f_mb:"Max MB",f_lic:"License",f_slots:"Slots",f_add:"Add to the board",orient_any:"Any",orient_v:"Vertical",orient_l:"Landscape",
@@ -140,7 +144,7 @@ buyer_banner:"🧪 Buyer-only demo. Without a sign-in, anyone with the demo link
 },es:{
 how_title:"Cómo funciona",dismiss:"Cerrar",how_1:"Reclama un cupo",how_2:"Sube el archivo en 30 minutos",how_3:"Te pagan después de la revisión",
 c_title:"Antes de subir",c_lic:"Acepto la licencia de este llamado:",c_faces:"Quien se pueda reconocer en este video aceptó ser filmado, o su cara está fuera de cuadro o borrosa.",c_own:"Lo grabé yo y es mío.",cancel:"Cancelar",check:"Revisar y subir",
-posted_by_you:"Publicado por ti (demo)",claim:"Reclama un cupo",upload:"Sube el archivo",release:"Liberar",full:"Lleno",funded:"Con fondos",invite:"Invitación",your_slot:"Tu cupo",left:"restantes",file:"Archivo",to:"a",min:"min",of:"de",from:"de",up_to:"hasta",decision:"Decisión en",no_match:"Ningún llamado coincide.",
+posted_by_you:"Publicado por ti (demo)",claim:"Reclama un cupo",upload:"Sube el archivo",release:"Liberar",full:"Lleno",funded:"Con fondos",invite:"Invitación",your_slot:"Tu cupo",left:"restantes",file:"Archivo",to:"a",min:"min",of:"de",from:"de",up_to:"hasta",decision:"Decisión en",no_match:"Ningún llamado coincide.",closed:"Cerrada",f_due:"Vence en",f_due_unit:"Unidad",unit_h:"horas",unit_d:"días",post_bad_due:"El plazo tiene que ser de al menos 1 hora.",
 nav_calls:"Llamados",nav_alerts:"Alertas",nav_post:"Publicar",nav_profile:"Perfil",nav_work:"Mi trabajo",nav_help:"Ayuda",nav_contact:"Contacto",calls_h:"Llamados abiertos",calls_sub:"Mira. Envía un archivo. Te pagan.",
 alerts_h:"Búsquedas guardadas",search_name:"Nombre de esta búsqueda",search_ph:"Nombre de esta búsqueda",save_search:"Guardar búsqueda",delete:"Borrar",no_searches:"Todavía no hay búsquedas guardadas.",any:"Cualquier texto",any_shot:"Cualquier plano",any_city:"Cualquier ciudad",need_name:"Primero ponle un nombre a la búsqueda.",saved:"Guardado en este navegador.",
 post_h:"Publicar un llamado",post_note:"Solo demo. Este llamado se queda en este navegador. No se envía ni se paga.",f_title:"Título",f_pay:"Pago (USD, mínimo $20)",f_city:"Ciudad",f_min:"Mínimo de segundos",f_max:"Máximo de segundos",f_orient:"Orientación",f_mb:"MB máx.",f_lic:"Licencia",f_slots:"Cupos",f_add:"Agregar al tablero",orient_any:"Cualquiera",orient_v:"Vertical",orient_l:"Horizontal",
@@ -161,8 +165,9 @@ if(location.hash==="#alerts"&&rows.some(r=>r.fresh.length)){s.forEach(f=>f.seenA
 $("#savesearch").addEventListener("click",()=>{const name=$("#savename").value.trim();const msg=$("#savemsg");if(!name){msg.textContent=t("need_name");return}const s=searches();s.unshift({id:"Q"+Date.now().toString(36),name,q:$("#q").value,shot:$("#shot").value,city:$("#city").value,seenAt:Date.now()});ls.set("pv_searches",s);$("#savename").value="";msg.textContent=t("saved");render()});
 document.addEventListener("click",e=>{const b=e.target.closest("[data-s=del]");if(!b)return;ls.set("pv_searches",searches().filter(f=>f.id!==b.dataset.id));render()});
 $("#postform").addEventListener("submit",e=>{e.preventDefault();const err=$("#posterr");err.textContent="";const title=$("#ptitle").value.trim(),pay=Number($("#ppay").value),city=$("#pcity").value.trim(),min=Number($("#pmin").value),max=Number($("#pmax").value),mb=Number($("#pmb").value),slots=Number($("#pslots").value),orientation=$("#porient").value,license=$("#plic").value.trim();
-if(!Number.isFinite(pay)||pay<20){err.textContent=t("post_bad_pay");return}if(!(max>min)||min<1||mb<1||!Number.isInteger(slots)||slots<1){err.textContent=t("post_bad_spec");return}
-const call={id:"p"+Date.now().toString(36),you:true,buyer:"You",title,desc:t("post_note"),license,tags:["Phone"],city,pay,mount:"",rating:"—",ratings:0,dueH:72,slots,gear:"Phone only",decision:"",invite:false,setting:"",spec:{minSec:min,maxSec:max,orientation,maxMB:mb},night:false,postedAt:Date.now()};
+const dueN=Number($("#pdue").value),dueMs=dueN*(($("#pdueu").value)==="d"?864e5:36e5);
+if(!Number.isFinite(pay)||pay<20){err.textContent=t("post_bad_pay");return}if(!(max>min)||min<1||mb<1||!Number.isInteger(slots)||slots<1){err.textContent=t("post_bad_spec");return}if(!Number.isFinite(dueN)||dueN<1||dueMs<36e5){err.textContent=t("post_bad_due");return}
+const call={id:"p"+Date.now().toString(36),you:true,buyer:"You",title,desc:t("post_note"),license,tags:["Phone"],city,pay,mount:"",rating:"—",ratings:0,dueAt:new Date(Date.now()+dueMs).toISOString(),slots,gear:"Phone only",decision:"",invite:false,setting:"",spec:{minSec:min,maxSec:max,orientation,maxMB:mb},night:false,postedAt:Date.now()};
 const all=posts();all.unshift(call);ls.set("pv_posts",all);e.target.reset();$("#live").textContent=t("post_ok");location.hash="calls";render()});
 document.addEventListener("submit",e=>{if(e.target.id!=="payform")return;e.preventDefault();const u=me(),kind=(new FormData(e.target).get("pkind")||"");const raw=$("#plast4").value.trim();const box=$("#payerr");
 if(kind!=="paypal"&&kind!=="bank"){box.textContent=t("pay_pick");return}

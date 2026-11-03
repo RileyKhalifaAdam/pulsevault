@@ -23,7 +23,7 @@ header{background:#121416;border-bottom:1px solid var(--line);z-index:5}
 .logo{font:600 20px Georgia,serif;color:var(--acc)}nav{display:flex;flex-wrap:wrap;gap:4px 14px}nav a{color:var(--mute);text-decoration:none}nav a:hover{color:var(--fg)}
 h1{font:600 28px Georgia,serif;margin:24px 0 4px}.mute{color:var(--mute)}
 .tools{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0;max-width:100%}.tools input,.tools select{flex:1 1 9em;min-width:0;max-width:100%}input,select,textarea,button{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px 12px;max-width:100%}
-button{cursor:pointer}.pri{background:var(--acc);color:#1a1300;border:0;font-weight:600}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin:12px 0}
+button{cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}.pri{background:var(--acc);color:#1a1300;border:0;font-weight:600}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin:12px 0}
 .top{display:flex;justify-content:space-between;gap:12px}.pay{font:600 24px Georgia,serif}.tag{display:inline-block;font-size:12px;border:1px solid var(--line);border-radius:99px;padding:2px 8px;margin:2px 4px 2px 0;color:var(--mute)}
 .inv{border-color:var(--acc);color:var(--acc)}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px}
 .note{background:#2a2410;border:1px solid #5a4a1a;color:#f0d48a;border-radius:10px;padding:8px 12px;font-size:14px}.note a{color:#ffe7a3}
@@ -66,6 +66,7 @@ dialog{background:var(--card);color:inherit;border:1px solid var(--line);border-
 <label><span data-i="f_mb">Max MB</span><input id="pmb" type="number" min="1" step="1" required></label></div>
 <label><span data-i="f_lic">License</span><input id="plic" required maxlength="120"></label>
 <label><span data-i="f_slots">Slots</span><input id="pslots" type="number" min="1" max="50" step="1" required></label>
+<div class="row"><label><span data-i="f_due">Due in</span><input id="pdue" type="number" min="1" step="1" value="3" required></label><label><span data-i="f_due_unit">Unit</span><select id="pdueu"><option value="h" data-i="unit_h">hours</option><option value="d" data-i="unit_d">days</option></select></label></div>
 <p id="posterr" role="alert" style="color:#e66"></p><button class="pri" type="submit" data-i="f_add">Add to the board</button></form></section>
 <section id="help" class="card"><h2>Help</h2><p>Claim a slot to reserve your place for 30 minutes, then upload your file. If the timer runs out, the slot is released automatically. Invite-only calls open after two recent scores of 4.5 or better, or five accepted files. Payouts go out by PayPal or bank after the buyer accepts.</p></section>
 <section id="profile" class="card"><h2>Your profile</h2><div id="prof"></div></section>
