@@ -1,0 +1,41 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>PulseVault</title><meta name="description" content="People post the video they need. You upload the file."><meta name="theme-color" content="#121416">
+<link rel="manifest" href="manifest.webmanifest"><link rel="icon" href="icon-192.png"><link rel="apple-touch-icon" href="icon-192.png">
+<style>
+:root{--bg:#121416;--card:#1b1e21;--line:#2a2e33;--fg:#eef0f2;--mute:#9aa1a9;--acc:#e8b04a;--ok:#5fc48a;--bad:#e06a5f}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+header{position:sticky;top:0;background:#121416ee;backdrop-filter:blur(8px);border-bottom:1px solid var(--line);z-index:5}
+.wrap{max-width:880px;margin:0 auto;padding:0 16px}.bar{display:flex;align-items:center;gap:16px;height:56px}
+.logo{font:600 20px Georgia,serif;color:var(--acc)}nav a{color:var(--mute);margin-left:14px;text-decoration:none}nav a:hover{color:var(--fg)}
+h1{font:600 28px Georgia,serif;margin:24px 0 4px}.mute{color:var(--mute)}
+.tools{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0}input,select,textarea,button{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px 12px}
+button{cursor:pointer}.pri{background:var(--acc);color:#1a1300;border:0;font-weight:600}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin:12px 0}
+.top{display:flex;justify-content:space-between;gap:12px}.pay{font:600 24px Georgia,serif}.tag{display:inline-block;font-size:12px;border:1px solid var(--line);border-radius:99px;padding:2px 8px;margin:2px 4px 2px 0;color:var(--mute)}
+.inv{border-color:var(--acc);color:var(--acc)}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px}
+.note{background:#2a2410;border:1px solid #5a4a1a;color:#f0d48a;border-radius:10px;padding:8px 12px;font-size:14px}
+.timer{font-variant-numeric:tabular-nums;color:var(--ok);font-weight:600}footer{border-top:1px solid var(--line);margin-top:40px;padding:24px 0;color:var(--mute)}
+footer a{color:var(--mute);margin-right:14px}.hide{display:none}.demo{font-size:13px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}dialog{background:var(--card);color:inherit;border:1px solid var(--line);border-radius:14px;max-width:440px}dialog label{display:block;margin:8px 0}</style></head><body>
+<header><div class="wrap bar"><span class="logo">PulseVault</span><nav><a href="#calls">Calls</a><a href="#profile">Profile</a><a href="#work" id="worknav">My Work</a><a href="#help">Help</a><a href="#contact">Contact</a></nav></div></header>
+<main class="wrap">
+<section id="calls"><h1>Open calls</h1><div class="mute">Browse. Send a file. Get paid.</div>
+<div class="card demo" id="status"></div>
+<div class="tools"><label for="q" class="sr">Search calls</label><input id="q" placeholder="Search calls"><label for="sort" class="sr">Sort by</label><select id="sort"><option value="new">Newest</option><option value="pay">Highest pay</option><option value="due">Due soon</option></select>
+<label for="shot" class="sr">Shot type</label><select id="shot"><option value="">All shots</option></select><label for="city" class="sr">City</label><select id="city"><option value="">All cities</option></select></div>
+<div id="list"></div></section>
+<section id="help" class="card"><h2>Help</h2><p>Claim a slot to reserve your place for 30 minutes, then upload your file. If the timer runs out, the slot is released automatically. Invite-only calls open after two recent scores of 4.5 or better, or five accepted files. Payouts go out by PayPal or bank after the buyer accepts.</p></section>
+<section id="profile" class="card"><h2>Your profile</h2><div id="prof"></div></section>
+<section id="work" class="card"><h2>My Work</h2><div class="note">⚠️ My Work is saved only in this browser for now. Clearing site data or switching phones erases it. <button data-x="export">Export my history</button></div><div id="worklist"></div></section>
+<section id="contact" class="card"><h2>Contact or report</h2>
+<form id="cf"><div class="row"><select name="type"><option>Question</option><option>Report a call</option><option>Payout issue</option><option>Safety</option></select><input name="email" type="email" required placeholder="Your email"></div>
+<div class="row"><textarea name="message" required rows="4" style="width:100%" placeholder="What happened?"></textarea></div><div class="row"><button class="pri">Send</button><span id="cfmsg" class="mute"></span></div></form></section>
+</main>
+<section class="wrap" id="review"><h2>Review files</h2><p>Buyers review each upload against the call's spec and score it from 1 to 5. Any score below 3 needs a reason, which you'll see in My Work.</p><p class="mute">Buyer view. In the real product only the buyer who posted a call sees its files.</p><div id="buyer"></div></section>
+<section class="wrap" id="payouts"><h2>Payouts</h2><p>Every call is funded before it opens. When a file is accepted, the call's pay plus any mount bonus is released to you on the timeline shown on the call.</p></section>
+<section class="wrap" id="safety"><h2>Safety</h2><p>Never trespass, travel somewhere unsafe, or film people who haven't agreed. Keep faces out of frame unless the call has a signed release. Report anything unsafe through Contact.</p></section>
+<section class="wrap" id="privacy"><h2>Privacy</h2><p>This demo stores your claims and scores only in this browser. Nothing is uploaded or shared.</p></section>
+<section class="wrap" id="terms"><h2>Terms</h2><p>Draft only: each call lists its license (for example, Commercial, non-exclusive, 1 year). You keep ownership of your footage, and the buyer gets the license stated on the call. Final terms need a lawyer's review before launch.</p></section>
+<div id="live" class="sr" aria-live="polite"></div>
+<dialog id="consent"><form method="dialog" id="cform"><h3>Before you upload</h3><p class="mute" id="cspec"></p><label><input type="checkbox" required> I agree to the license on this call: <b id="clic"></b>.</label><label><input type="checkbox" required> Everyone who can be recognized in this video agreed to be filmed, or their faces are out of frame or blurred.</label><label><input type="checkbox" required> I shot this myself and I own it.</label><input type="file" id="cfile" accept="video/*" required><p id="cerr" style="color:#e66"></p><div class="row"><button value="cancel" formnovalidate>Cancel</button><button class="pri" id="cgo" value="ok">Check and upload</button></div></form></dialog>
+<footer><div class="wrap"><a href="#review">Review files</a><a href="#payouts">Payouts</a><a href="#safety">Safety</a><a href="#privacy">Privacy</a><a href="#terms">Terms</a><a href="#help">Help</a><a href="#contact">Contact</a></div></footer>
+<script src="data.js"></script><script src="app.js"></script></body></html>
