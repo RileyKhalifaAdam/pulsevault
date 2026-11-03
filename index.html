@@ -28,18 +28,37 @@ button{cursor:pointer}.pri{background:var(--acc);color:#1a1300;border:0;font-wei
 .timer{font-variant-numeric:tabular-nums;color:var(--ok);font-weight:600}footer{border-top:1px solid var(--line);margin-top:40px;padding:24px 0;color:var(--mute)}
 footer .wrap{display:flex;flex-wrap:wrap;gap:8px 14px}footer a{color:var(--mute);text-decoration:none}.hide{display:none}.demo{font-size:13px}
 .howsteps{margin:8px 0 0;padding-left:1.2em}.howsteps li{margin:2px 0}
-.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}dialog{background:var(--card);color:inherit;border:1px solid var(--line);border-radius:14px;width:min(440px,calc(100% - 24px));max-width:calc(100% - 24px);max-height:calc(100dvh - 24px);overflow:auto;box-sizing:border-box}dialog label{display:block;margin:8px 0}dialog input[type=file]{max-width:100%}</style></head><body>
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+:focus-visible{outline:3px solid #ffe600;outline-offset:2px}
+button,nav a,.langbtn{min-height:44px}nav a{display:inline-flex;align-items:center}
+#postform label,#payform label{display:block;margin:8px 0}
+#postform input,#postform select,#payform input{width:100%;min-height:44px}
+#postform .spec{display:flex;flex-wrap:wrap;gap:8px}#postform .spec label{flex:1 1 140px;min-width:0}
+dialog{background:var(--card);color:inherit;border:1px solid var(--line);border-radius:14px;width:min(440px,calc(100% - 24px));max-width:calc(100% - 24px);max-height:calc(100dvh - 24px);overflow:auto;box-sizing:border-box}dialog label{display:block;margin:8px 0}dialog input[type=file]{max-width:100%}</style></head><body>
 <div class="topstick">
 <p class="demo-site">Demo site: no real jobs, uploads, or payments. Nothing here is sent or paid.</p>
 <div id="buyerflag"></div>
-<header><div class="wrap bar"><span class="logo">PulseVault</span><nav><a href="#calls">Calls</a><a href="#profile">Profile</a><a href="#work" id="worknav">My Work</a><a href="#help">Help</a><a href="#contact">Contact</a></nav></div></header>
+<header><div class="wrap bar"><span class="logo">PulseVault</span><nav><a href="#calls" data-i="nav_calls">Calls</a><a href="#alerts" id="alertsnav">Alerts</a><a href="#post" data-i="nav_post">Post</a><a href="#profile" data-i="nav_profile">Profile</a><a href="#work" id="worknav">My Work</a><a href="#help" data-i="nav_help">Help</a><a href="#contact" data-i="nav_contact">Contact</a></nav><button type="button" id="langbtn" class="langbtn" aria-pressed="false">ES</button></div></header>
 </div>
 <main class="wrap">
-<section id="calls"><div class="card how" id="how"><div class="top"><b id="howtitle">How it works</b><button type="button" id="howdismiss">Dismiss</button></div><ol class="howsteps" aria-labelledby="howtitle"><li>Claim a slot</li><li>Upload within 30 minutes</li><li>Get paid after review</li></ol></div><h1>Open calls</h1><div class="mute">Browse. Send a file. Get paid.</div>
+<section id="calls"><div class="card how" id="how"><div class="top"><b id="howtitle" data-i="how_title">How it works</b><button type="button" id="howdismiss" data-i="dismiss">Dismiss</button></div><ol class="howsteps" aria-labelledby="howtitle"><li data-i="how_1">Claim a slot</li><li data-i="how_2">Upload within 30 minutes</li><li data-i="how_3">Get paid after review</li></ol></div><h1 data-i="calls_h">Open calls</h1><div class="mute" data-i="calls_sub">Browse. Send a file. Get paid.</div>
 <div class="card demo" id="status"></div>
 <div class="tools"><label for="q" class="sr">Search calls</label><input id="q" placeholder="Search calls"><label for="sort" class="sr">Sort by</label><select id="sort"><option value="new">Newest</option><option value="pay">Highest pay</option><option value="due">Due soon</option></select>
 <label for="shot" class="sr">Shot type</label><select id="shot"><option value="">All shots</option></select><label for="city" class="sr">City</label><select id="city"><option value="">All cities</option></select></div>
+<div class="row" id="saverow"><label for="savename" class="sr" data-i="search_name">Name this search</label><input id="savename" maxlength="40" placeholder="Name this search"><button type="button" id="savesearch" data-i="save_search">Save search</button><span id="savemsg" class="mute" role="status"></span></div>
 <div id="list"></div></section>
+<section id="alerts" class="card"><h2 data-i="alerts_h">Saved searches</h2><div id="alertlist"></div></section>
+<section id="post" class="card"><h2 data-i="post_h">Post a call</h2><p class="note" data-i="post_note">Demo only. This call stays in this browser. Nothing is sent or paid.</p>
+<form id="postform" novalidate><label><span data-i="f_title">Title</span><input id="ptitle" required maxlength="80"></label>
+<label><span data-i="f_pay">Pay (USD, minimum $20)</span><input id="ppay" type="number" min="20" step="1" required></label>
+<label><span data-i="f_city">City</span><input id="pcity" required maxlength="60"></label>
+<div class="spec"><label><span data-i="f_min">Min seconds</span><input id="pmin" type="number" min="1" step="1" required></label>
+<label><span data-i="f_max">Max seconds</span><input id="pmax" type="number" min="1" step="1" required></label>
+<label><span data-i="f_orient">Orientation</span><select id="porient"><option value="any" data-i="orient_any">Any</option><option value="vertical" data-i="orient_v">Vertical</option><option value="landscape" data-i="orient_l">Landscape</option></select></label>
+<label><span data-i="f_mb">Max MB</span><input id="pmb" type="number" min="1" step="1" required></label></div>
+<label><span data-i="f_lic">License</span><input id="plic" required maxlength="120"></label>
+<label><span data-i="f_slots">Slots</span><input id="pslots" type="number" min="1" max="50" step="1" required></label>
+<p id="posterr" role="alert" style="color:#e66"></p><button class="pri" type="submit" data-i="f_add">Add to the board</button></form></section>
 <section id="help" class="card"><h2>Help</h2><p>Claim a slot to reserve your place for 30 minutes, then upload your file. If the timer runs out, the slot is released automatically. Invite-only calls open after two recent scores of 4.5 or better, or five accepted files. Payouts go out by PayPal or bank after the buyer accepts.</p></section>
 <section id="profile" class="card"><h2>Your profile</h2><div id="prof"></div></section>
 <section id="work" class="card"><h2>My Work</h2><div class="note">⚠️ My Work is saved only in this browser for now. Clearing site data or switching phones erases it. <button data-x="export">Export my history</button></div><div id="worklist"></div></section>
@@ -53,6 +72,6 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:8px 14px}footer a{color:var(--mute)
 <section class="wrap" id="privacy"><h2>Privacy</h2><p>This demo stores your claims and scores only in this browser. Nothing is uploaded or shared.</p></section>
 <section class="wrap" id="terms"><h2>Terms</h2><p>Draft only: each call lists its license (for example, Commercial, non-exclusive, 1 year). You keep ownership of your footage, and the buyer gets the license stated on the call. Final terms need a lawyer's review before launch.</p></section>
 <div id="live" class="sr" aria-live="polite"></div>
-<dialog id="consent"><form method="dialog" id="cform"><h3>Before you upload</h3><p class="mute" id="cspec"></p><label><input type="checkbox" required> I agree to the license on this call: <b id="clic"></b>.</label><label><input type="checkbox" required> Everyone who can be recognized in this video agreed to be filmed, or their faces are out of frame or blurred.</label><label><input type="checkbox" required> I shot this myself and I own it.</label><input type="file" id="cfile" accept="video/*" required><p id="cerr" style="color:#e66"></p><div class="row"><button value="cancel" formnovalidate>Cancel</button><button class="pri" id="cgo" value="ok">Check and upload</button></div></form></dialog>
+<dialog id="consent" aria-labelledby="consenttitle"><form method="dialog" id="cform"><h3 id="consenttitle" data-i="c_title">Before you upload</h3><p class="mute" id="cspec"></p><label><input type="checkbox" required> <span data-i="c_lic">I agree to the license on this call:</span> <b id="clic"></b></label><label><input type="checkbox" required> <span data-i="c_faces">Everyone who can be recognized in this video agreed to be filmed, or their faces are out of frame or blurred.</span></label><label><input type="checkbox" required> <span data-i="c_own">I shot this myself and I own it.</span></label><input type="file" id="cfile" accept="video/*" required><p id="cerr" role="alert" style="color:#e66"></p><div class="row"><button value="cancel" formnovalidate data-i="cancel">Cancel</button><button class="pri" id="cgo" value="ok" data-i="check">Check and upload</button></div></form></dialog>
 <footer><div class="wrap"><a href="#review">Review files</a><a href="#payouts">Payouts</a><a href="#safety">Safety</a><a href="#privacy">Privacy</a><a href="#terms">Terms</a><a href="#help">Help</a><a href="#contact">Contact</a></div></footer>
 <script src="data.js"></script><script src="app.js"></script></body></html>
