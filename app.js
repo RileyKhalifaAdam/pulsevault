@@ -42,6 +42,8 @@ $("#cf").addEventListener("submit",async e=>{e.preventDefault();const f=e.target
 const m=$("#cfmsg");m.textContent="Sending…";let sent=false;if(!CONTACT_ENDPOINT.includes("YOUR_FORM_ID")){try{const r=await fetch(CONTACT_ENDPOINT,{method:"POST",body:fd,headers:{Accept:"application/json"}});sent=r.ok}catch{}}
 m.innerHTML=sent?`Sent. Your ticket number is <b>${ticket}</b>.`:(CONTACT_ENDPOINT.includes("YOUR_FORM_ID")?`<b style="color:#e66">Not sent.</b> The contact form isn't connected yet, so nobody received this. For safety issues, please email <a href="mailto:${SUPPORT_EMAIL}">${SUPPORT_EMAIL}</a>.`:`<b style="color:#e66">Not sent.</b> Something went wrong, so nobody received this. Please try again.`);if(sent)f.reset()});
 if("serviceWorker" in navigator)navigator.serviceWorker.register("sw.js").catch(()=>{});
+if(ls.get("pv_how",false))$("#how").hidden=true;
+$("#howdismiss").addEventListener("click",()=>{ls.set("pv_how",true);$("#how").hidden=true});
 
 // ---- My Work: submission timeline, rejection reasons, appeals ----
 const REASONS={spec:"Doesn't match the call's spec",face:"Faces visible without a release",talk:"Talking or music in the audio",quality:"Too shaky or too dark"};

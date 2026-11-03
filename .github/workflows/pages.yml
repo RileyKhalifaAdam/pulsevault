@@ -30,7 +30,7 @@ jobs:
       - name: Collect site files
         run: |
           mkdir -p _site
-          cp index.html app.js data.js sw.js manifest.webmanifest icon-192.png icon-512.png .nojekyll _site/
+          cp index.html 404.html app.js data.js sw.js manifest.webmanifest icon-192.png icon-512.png .nojekyll _site/
 
       - name: Configure Pages
         uses: actions/configure-pages@v6
