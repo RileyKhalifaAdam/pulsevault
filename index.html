@@ -9,6 +9,7 @@
 <meta name="twitter:image" content="https://rileykhalifaadam.github.io/pulsevault/icon-512.png">
 <meta name="theme-color" content="#121416">
 <link rel="manifest" href="manifest.webmanifest"><link rel="icon" href="icon-192.png"><link rel="apple-touch-icon" href="icon-192.png">
+<script>document.documentElement.classList.toggle("demo",new URLSearchParams(location.search).has("demo"))</script>
 <style>
 :root{--bg:#121416;--card:#1b1e21;--line:#2a2e33;--fg:#eef0f2;--mute:#9aa1a9;--acc:#e8b04a;--ok:#5fc48a;--bad:#e06a5f}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -16,6 +17,7 @@
 .demo-site{position:sticky;top:0;z-index:30;margin:0;background:#ffe600;color:#111;font-weight:700;text-align:center;padding:10px 16px;border-bottom:3px solid #111}
 .buyer-only{position:sticky;top:0;z-index:29;background:#ff1a1a;color:#140000;font-weight:700;text-align:center;padding:10px 16px;border-bottom:3px solid #4a0000}
 #buyerflag:empty{display:none}
+html:not(.demo) #buyerflag{display:none}
 header{background:#121416;border-bottom:1px solid var(--line);z-index:5}
 .wrap{width:100%;max-width:880px;margin:0 auto;padding:0 16px}.bar{display:flex;align-items:center;gap:8px 14px;min-height:56px;height:auto;flex-wrap:wrap;padding:8px 0}
 .logo{font:600 20px Georgia,serif;color:var(--acc)}nav{display:flex;flex-wrap:wrap;gap:4px 14px}nav a{color:var(--mute);text-decoration:none}nav a:hover{color:var(--fg)}
@@ -24,7 +26,10 @@ h1{font:600 28px Georgia,serif;margin:24px 0 4px}.mute{color:var(--mute)}
 button{cursor:pointer}.pri{background:var(--acc);color:#1a1300;border:0;font-weight:600}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin:12px 0}
 .top{display:flex;justify-content:space-between;gap:12px}.pay{font:600 24px Georgia,serif}.tag{display:inline-block;font-size:12px;border:1px solid var(--line);border-radius:99px;padding:2px 8px;margin:2px 4px 2px 0;color:var(--mute)}
 .inv{border-color:var(--acc);color:var(--acc)}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px}
-.note{background:#2a2410;border:1px solid #5a4a1a;color:#f0d48a;border-radius:10px;padding:8px 12px;font-size:14px}
+.note{background:#2a2410;border:1px solid #5a4a1a;color:#f0d48a;border-radius:10px;padding:8px 12px;font-size:14px}.note a{color:#ffe7a3}
+.calltitle{font:600 20px Georgia,serif;margin:4px 0}
+.langnote{margin:0;padding:0 16px 8px;color:var(--mute);font-size:13px}
+@media (max-width:430px){#list{min-height:6020px}}
 .timer{font-variant-numeric:tabular-nums;color:var(--ok);font-weight:600}footer{border-top:1px solid var(--line);margin-top:40px;padding:24px 0;color:var(--mute)}
 footer .wrap{display:flex;flex-wrap:wrap;gap:8px 14px}footer a{color:var(--mute);text-decoration:none}.hide{display:none}.demo{font-size:13px}
 .howsteps{margin:8px 0 0;padding-left:1.2em}.howsteps li{margin:2px 0}
@@ -36,9 +41,12 @@ button,nav a,.langbtn{min-height:44px}nav a{display:inline-flex;align-items:cent
 #postform .spec{display:flex;flex-wrap:wrap;gap:8px}#postform .spec label{flex:1 1 140px;min-width:0}
 dialog{background:var(--card);color:inherit;border:1px solid var(--line);border-radius:14px;width:min(440px,calc(100% - 24px));max-width:calc(100% - 24px);max-height:calc(100dvh - 24px);overflow:auto;box-sizing:border-box}dialog label{display:block;margin:8px 0}dialog input[type=file]{max-width:100%}</style></head><body>
 <div class="topstick">
+<header>
 <p class="demo-site">Demo site: no real jobs, uploads, or payments. Nothing here is sent or paid.</p>
-<div id="buyerflag"></div>
-<header><div class="wrap bar"><span class="logo">PulseVault</span><nav><a href="#calls" data-i="nav_calls">Calls</a><a href="#alerts" id="alertsnav">Alerts</a><a href="#post" data-i="nav_post">Post</a><a href="#profile" data-i="nav_profile">Profile</a><a href="#work" id="worknav">My Work</a><a href="#help" data-i="nav_help">Help</a><a href="#contact" data-i="nav_contact">Contact</a></nav><button type="button" id="langbtn" class="langbtn" aria-pressed="false">ES</button></div></header>
+<div id="buyerflag"><div class="buyer-only" role="status" data-i="buyer_banner">🧪 Buyer-only demo. Without a sign-in, anyone with the demo link could score their own files. Not for real use.</div></div>
+<div class="wrap bar"><span class="logo">PulseVault</span><nav><a href="#calls" data-i="nav_calls">Calls</a><a href="#alerts" id="alertsnav">Alerts</a><a href="#post" data-i="nav_post">Post</a><a href="#profile" data-i="nav_profile">Profile</a><a href="#work" id="worknav">My Work</a><a href="#help" data-i="nav_help">Help</a><a href="#contact" data-i="nav_contact">Contact</a></nav><button type="button" id="langbtn" class="langbtn" aria-pressed="false">Interfaz en español</button></div>
+<p id="langnote" class="langnote">Interface only. Call descriptions stay in English.</p>
+</header>
 </div>
 <main class="wrap">
 <section id="calls"><div class="card how" id="how"><div class="top"><b id="howtitle" data-i="how_title">How it works</b><button type="button" id="howdismiss" data-i="dismiss">Dismiss</button></div><ol class="howsteps" aria-labelledby="howtitle"><li data-i="how_1">Claim a slot</li><li data-i="how_2">Upload within 30 minutes</li><li data-i="how_3">Get paid after review</li></ol></div><h1 data-i="calls_h">Open calls</h1><div class="mute" data-i="calls_sub">Browse. Send a file. Get paid.</div>
@@ -63,9 +71,8 @@ dialog{background:var(--card);color:inherit;border:1px solid var(--line);border-
 <section id="profile" class="card"><h2>Your profile</h2><div id="prof"></div></section>
 <section id="work" class="card"><h2>My Work</h2><div class="note">⚠️ My Work is saved only in this browser for now. Clearing site data or switching phones erases it. <button data-x="export">Export my history</button></div><div id="worklist"></div></section>
 <section id="contact" class="card"><h2>Contact or report</h2>
-<form id="cf"><div class="row"><select name="type"><option>Question</option><option>Report a call</option><option>Payout issue</option><option>Safety</option></select><input name="email" type="email" required placeholder="Your email"></div>
-<div class="row"><textarea name="message" required rows="4" style="width:100%" placeholder="What happened?"></textarea></div><div class="row"><button class="pri">Send</button><span id="cfmsg" class="mute"></span></div></form></section>
-</main>
+<form id="cf"><div class="row"><label for="ctype" class="sr">Topic</label><select id="ctype" name="type"><option>Question</option><option>Report a call</option><option>Payout issue</option><option>Safety</option></select><label for="cemail" class="sr">Your email</label><input id="cemail" name="email" type="email" required placeholder="Your email"></div>
+<div class="row"><label for="cmsg" class="sr">Message</label><textarea id="cmsg" name="message" required rows="4" style="width:100%" placeholder="What happened?"></textarea></div><div class="row"><button class="pri">Send</button><span id="cfmsg" class="mute"></span></div></form></section>
 <section class="wrap" id="review"><h2>Review files</h2><p>Buyers review each upload against the call's spec and score it from 1 to 5. Any score below 3 needs a reason, which you'll see in My Work.</p><p class="mute">Buyer view. In the real product only the buyer who posted a call sees its files.</p><div id="buyer"></div></section>
 <section class="wrap" id="payouts"><h2>Payouts</h2><p>Every call is funded before it opens. When a file is accepted, the call's pay plus any mount bonus is released to you on the timeline shown on the call.</p></section>
 <section class="wrap" id="safety"><h2>Safety</h2><p>Never trespass, travel somewhere unsafe, or film people who haven't agreed. Keep faces out of frame unless the call has a signed release. Report anything unsafe through Contact.</p></section>
@@ -73,5 +80,6 @@ dialog{background:var(--card);color:inherit;border:1px solid var(--line);border-
 <section class="wrap" id="terms"><h2>Terms</h2><p>Draft only: each call lists its license (for example, Commercial, non-exclusive, 1 year). You keep ownership of your footage, and the buyer gets the license stated on the call. Final terms need a lawyer's review before launch.</p></section>
 <div id="live" class="sr" aria-live="polite"></div>
 <dialog id="consent" aria-labelledby="consenttitle"><form method="dialog" id="cform"><h3 id="consenttitle" data-i="c_title">Before you upload</h3><p class="mute" id="cspec"></p><label><input type="checkbox" required> <span data-i="c_lic">I agree to the license on this call:</span> <b id="clic"></b></label><label><input type="checkbox" required> <span data-i="c_faces">Everyone who can be recognized in this video agreed to be filmed, or their faces are out of frame or blurred.</span></label><label><input type="checkbox" required> <span data-i="c_own">I shot this myself and I own it.</span></label><input type="file" id="cfile" accept="video/*" required><p id="cerr" role="alert" style="color:#e66"></p><div class="row"><button value="cancel" formnovalidate data-i="cancel">Cancel</button><button class="pri" id="cgo" value="ok" data-i="check">Check and upload</button></div></form></dialog>
+</main>
 <footer><div class="wrap"><a href="#review">Review files</a><a href="#payouts">Payouts</a><a href="#safety">Safety</a><a href="#privacy">Privacy</a><a href="#terms">Terms</a><a href="#help">Help</a><a href="#contact">Contact</a></div></footer>
 <script src="data.js"></script><script src="app.js"></script></body></html>
