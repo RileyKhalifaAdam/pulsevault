@@ -24,7 +24,8 @@ export const AFTERGLOW: SystemSpec = {
     kind: 'whiteDwarf',
     mass: 0.62 * SOLAR_MASS,
     temperature: 11800,
-    rings: { inner: 60, outer: 140, color: hex('#f2c9a0'), opacity: 0.5 },
+    // Dust survives outside ~30 radii (cooler than 1,500 K) and rock is torn apart inside ~129 radii.
+    rings: { inner: 60, outer: 124, color: hex('#f2c9a0'), opacity: 0.5 },
     description:
       'Afterglow is a white dwarf: 62 % of a solar mass crushed into a sphere hardly bigger than Wick, still white-hot at 11,800 K with nothing left to burn. ' +
       'A disc of silicate dust circles it inside the Roche limit, lit from within, where its tides are grinding an asteroid belt to powder.',
@@ -49,7 +50,7 @@ export const AFTERGLOW: SystemSpec = {
         cityLights: 0.08,
       },
       description:
-        'Keepsake was an ice world until its sun died and the habitable zone fell inward to meet it; now it is one warm ocean under a sky of hard blue, lit by a star that is a single blinding point. ' +
+        'Keepsake was an ice world in the outer dark until the upheaval of its sun\'s death threw it inward and tides rounded its orbit inside the new, narrow habitable zone; now it is one warm ocean under a sky of hard blue, lit by a star that is a single blinding point. ' +
         'It has perhaps a billion years before Afterglow cools and the sea freezes again.',
       surveyValue: 16000,
     },
@@ -58,6 +59,8 @@ export const AFTERGLOW: SystemSpec = {
       name: 'Token',
       cls: 'barren',
       mass: 0.08 * EARTH_MASS,
+      // Nickel-iron through and through: 7,200 kg/m^3, half again as dense as a rocky world of its mass.
+      radius: 2.512e6,
       orbit: { a: 0.11 * AU, e: 0.05, i: 2.4 * DEG, lan: 5.0 },
       atmosphere: null,
       visual: { palette: hexes('#26262a', '#4c4c52', '#7c7c82', '#b4b4b8'), roughness: 0.7, craters: 0.6 },
@@ -74,7 +77,7 @@ export const AFTERGLOW: SystemSpec = {
       axialTilt: 3 * DEG,
       visual: { palette: hexes('#c8bfae', '#a89c88', '#ddd6c6', '#8f8474', '#b9ae9a'), bands: 12, storms: 0.35 },
       description:
-        'Heirloom is the one giant that outlived its sun, a pale banded world that spiralled inward as the star shed half its mass. ' +
+        'Heirloom is the one giant that outlived its sun: a pale banded world flung inward from the cold when the dying star threw off two-thirds of its mass, then caught and circularised by tides. ' +
         'In white-dwarf light it has no colour at all, like a photograph of a planet.',
     },
     {

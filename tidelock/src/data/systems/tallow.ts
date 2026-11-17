@@ -150,7 +150,7 @@ export const TALLOW: SystemSpec = {
       atmosphere: null,
       visual: { palette: hexes('#5d7f96', '#93b8c9', '#c9e0e8', '#eef7f9'), roughness: 0.25, craters: 0.3, ice: 1 },
       description:
-        'Douter is the last world of the system, a frozen ball of water ice and nitrogen frost at ninety kelvin from which Tallow is only the brightest star. ' +
+        'Douter is the last world of the system, a frozen ball of water ice and carbon-dioxide frost at ninety kelvin, where Tallow is a small red coal that gives light and no warmth. ' +
         'A year and a half to go round, and no reason yet for anyone to stay.',
     },
   ],

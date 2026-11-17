@@ -21,8 +21,8 @@ void main() {
  * First bloom pass: HDR scene -> half resolution. 13-tap (Jimenez / COD:AW) downsample whose five 2x2
  * groups are combined with a Karis average (weights 1 / (1 + max channel)), so a single very bright
  * texel — a star point, a specular sparkle — cannot flare into a flickering blob ("firefly"). The
- * averaged colour then goes through a soft-knee bright pass keyed on the max channel, which keeps
- * saturated emitters (red dwarfs, amber strips) blooming in their own colour.
+ * averaged colour (already exposed) then goes through a soft-knee bright pass keyed on the max channel,
+ * which keeps saturated emitters (red dwarfs, amber strips) blooming in their own colour.
  * `uStep` is half a destination texel, i.e. one source texel of an ideal 2:1 chain; it is tied to the
  * bloom target, not the scene target, so the footprint does not change with dynamic resolution.
  */
@@ -32,6 +32,7 @@ uniform highp sampler2D tSrc;
 uniform vec2 uStep;
 uniform vec4 uCurve;   // threshold, threshold - knee, 2 * knee, 0.25 / knee
 uniform float uClamp;
+uniform float uExposure;
 in vec2 vUv;
 out vec4 outColor;
 
@@ -40,7 +41,8 @@ vec3 tap(float x, float y) {
   // A NaN or Inf from a scene shader would otherwise be smeared over the whole screen by the chain.
   float s = c.r + c.g + c.b;
   if (isnan(s) || isinf(s) || !(s >= 0.0)) c = vec3(0.0);
-  return min(max(c, vec3(0.0)), vec3(uClamp));
+  // Exposed values: what blooms is what ends up brighter than display white, at any exposure.
+  return min(max(c * uExposure, vec3(0.0)), vec3(uClamp));
 }
 float maxc(vec3 c) { return max(c.r, max(c.g, c.b)); }
 
@@ -147,9 +149,9 @@ vec3 filmGrain(vec3 srgb, vec2 fragCoord, vec4 grain) {
 // ---------------------------------------------------------------------------------------------- composite
 
 /**
- * Composite: scene (+ sharpen, chromatic aberration, screen-space effects) + bloom -> exposure ->
- * vignette -> AgX tone map -> look / split-tone grade -> sRGB -> dither (+ grain when this is the last
- * pass).
+ * Composite: scene (+ sharpen, chromatic aberration, screen-space effects) -> exposure -> + bloom ->
+ * vignette -> hue-preserving filmic tone map -> split-tone grade -> sRGB -> dither (+ grain when this is
+ * the last pass).
  *
  * Compile-time switches (set from the quality tier):
  *   FINAL      last pass (MSAA tiers): add film grain, alpha = 1. Otherwise alpha carries luma for FXAA.
@@ -167,7 +169,7 @@ uniform vec2 uSceneTexel;   // 1 / internal resolution
 uniform vec2 uBloomTexel;   // 1 / bloom level-0 resolution
 uniform vec2 uOutSize;      // output size, px
 uniform vec4 uTone;         // exposure (linear), bloom strength, contrast, saturation
-uniform vec4 uLens;         // vignette, aberration (output px at the long-axis edge), sharpen, time (s)
+uniform vec4 uLens;         // vignette, aberration (output px in the corners), sharpen, time (s)
 uniform vec3 uShadowTint;
 uniform vec3 uHighTint;
 uniform vec4 uFx;           // jump, damage, heat, flash
@@ -187,48 +189,40 @@ float vnoise(vec2 p) {
              mix(hash12(ip + vec2(0.0, 1.0)), hash12(ip + vec2(1.0, 1.0)), fp.x), fp.y);
 }
 
-// ---- AgX (Troy Sobotka), constants as in three.js / Filament (Rec.2020 working primaries).
-// Chosen over an ACES fit because it rolls saturated emitters off toward white along their own hue:
-// an ember-orange star stays orange in its halo instead of skewing yellow, blue does not turn purple.
-const mat3 SRGB_TO_REC2020 = mat3(
-  vec3(0.6274, 0.0691, 0.0164), vec3(0.3293, 0.9195, 0.0880), vec3(0.0433, 0.0113, 0.8956));
-const mat3 REC2020_TO_SRGB = mat3(
-  vec3(1.6605, -0.1246, -0.0182), vec3(-0.5876, 1.1329, -0.1006), vec3(-0.0728, -0.0083, 1.1187));
-const mat3 AGX_INSET = mat3(
-  vec3(0.856627153315983, 0.137318972929847, 0.11189821299995),
-  vec3(0.0951212405381588, 0.761241990602591, 0.0767994186031903),
-  vec3(0.0482516061458583, 0.101439036467562, 0.811302368396859));
-const mat3 AGX_OUTSET = mat3(
-  vec3(1.1271005818144368, -0.1413297634984383, -0.14132976349843826),
-  vec3(-0.11060664309660323, 1.157823702216272, -0.11060664309660294),
-  vec3(-0.016493938717834573, -0.016493938717834257, 1.2519364065950405));
-const float AGX_MIN_EV = -12.47393;
-const float AGX_MAX_EV = 4.026069;
-
-vec3 agxCurve(vec3 x) {
-  vec3 x2 = x * x;
-  vec3 x4 = x2 * x2;
-  return 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x - 0.00232;
+// ---- Display transform: a hue-preserving filmic curve.
+// A per-channel curve (ACES fit, AgX…) clips the channels of a bright saturated emitter one after the
+// other, so an ember-orange star slides through yellow to white and deep blue goes purple. Here the curve
+// is applied to one norm (the max channel) and the colour keeps its chromaticity; very bright values then
+// travel toward white along a straight line in Oklab's cone space, where hue is perceptually constant.
+// The scalar curve is the ACES RRT+ODT fit (S. Hill) at the exposure three.js uses, so neutral tones land
+// exactly where art tuned under ACESFilmicToneMapping expects them: 0.18 -> 0.21, 1.0 -> 0.76.
+float filmic(float x) {
+  x *= 1.0 / 0.6;
+  return clamp((x * (x + 0.0245786) - 0.000090537) / (x * (0.983729 * x + 0.4329510) + 0.238081), 0.0, 1.0);
 }
-
-// Symmetric power S-curve through 0, 0.5 and 1 (0.5 is where AgX puts 18 % grey).
-vec3 sCurve(vec3 x, float k) {
-  vec3 lo = 0.5 * pow(2.0 * x, vec3(k));
-  vec3 hi = 1.0 - 0.5 * pow(2.0 - 2.0 * x, vec3(k));
-  return mix(lo, hi, step(vec3(0.5), x));
-}
+const mat3 RGB_TO_LMS = mat3(
+  vec3(0.4122214708, 0.2119034982, 0.0883024619),
+  vec3(0.5363325363, 0.6806995451, 0.2817188376),
+  vec3(0.0514459929, 0.1073969566, 0.6299787005));
+const mat3 LMS_TO_RGB = mat3(
+  vec3(4.0767416621, -1.2684380046, -0.0041960863),
+  vec3(-3.3077115913, 2.6097574011, -0.7034186147),
+  vec3(0.2309699292, -0.3413193965, 1.7076147010));
+// How fast over-range colour whitens: 8 % at 8x display white, 32 % at 40x, 43 % at 64x. Slow enough
+// that a star disc at 40 is still clearly its own colour, fast enough that it reads as hot.
+const float WHITEN = 0.012;
 
 vec3 toneMap(vec3 c, float contrast, float saturation) {
-  c = AGX_INSET * (SRGB_TO_REC2020 * c);
-  c = clamp((log2(max(c, vec3(1e-10))) - AGX_MIN_EV) / (AGX_MAX_EV - AGX_MIN_EV), 0.0, 1.0);
-  c = clamp(agxCurve(c), 0.0, 1.0);
-  // look, in the log-encoded domain (as AgX looks are defined): contrast, then saturation
-  c = sCurve(c, contrast);
-  float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
-  c = l + (c - l) * saturation;
-  c = AGX_OUTSET * c;
-  c = pow(max(c, vec3(0.0)), vec3(2.2));
-  return clamp(REC2020_TO_SRGB * c, 0.0, 1.0);
+  float peak = max(maxc(c), 1e-6);
+  float p = 0.18 * pow(peak / 0.18, contrast);     // contrast pivots on mid grey, on the norm only
+  float m = filmic(p);
+  vec3 col = c * (m / peak);                       // same chromaticity, display range
+  vec3 lms = pow(max(RGB_TO_LMS * col, vec3(0.0)), vec3(1.0 / 3.0));
+  float L = dot(lms, vec3(0.2104542553, 0.7936177850, -0.0040720468));   // Oklab lightness
+  lms = L + (lms - L) * saturation;                // scales Oklab chroma at constant hue and lightness
+  float w = 1.0 - 1.0 / (1.0 + WHITEN * max(p - 1.0, 0.0));
+  lms = mix(lms, vec3(pow(m, 1.0 / 3.0)), w);      // toward white at the same peak
+  return clamp(LMS_TO_RGB * (lms * lms * lms), 0.0, 1.0);
 }
 
 vec3 linearToSrgb(vec3 c) {
@@ -250,6 +244,9 @@ void main() {
   float r2 = dot(pn, pn);
   // 0 at the centre, 1 at the edge midpoints, 2 in the corners (elliptical, follows the frame)
   float e2 = 4.0 * dot(d, d);
+  // lens coordinates: round, |pv| = 1 in the frame corners (the image circle of a real lens)
+  vec2 pv = d * uOutSize * (2.0 / length(uOutSize));
+  float rv2 = dot(pv, pv);
   float time = uLens.w;
 
   // ---- heat haze: refraction shimmer rising up the screen, stronger toward the frame edge
@@ -265,19 +262,20 @@ void main() {
   vec3 col;
   float jump = uFx.x;
   if (jump > 0.0) {
-    // Radial chromatic stretch: smear toward the centre with the spectrum laid along the streak.
+    // Radial stretch: every point streaks away from the vanishing point, longer toward the frame
+    // edge, with a restrained dispersion (blue leads, red trails) rather than a full rainbow.
     float jit = ign(gl_FragCoord.xy + uGrain.z * 5.588238);
-    float amount = jump * (0.06 + 0.34 * smoothstep(0.0, 1.2, r2));
+    float amount = jump * (0.05 + 0.3 * smoothstep(0.0, 1.2, r2));
     vec3 acc = vec3(0.0);
     vec3 wsum = vec3(0.0);
-    for (int i = 0; i < 10; i++) {
-      float t = (float(i) + jit) / 10.0;
-      vec3 w = spectrum(t);
+    for (int i = 0; i < 16; i++) {
+      float t = (float(i) + jit) / 16.0;
+      vec3 w = mix(vec3(1.0), spectrum(t) * 2.0, 0.45) * (1.0 - 0.6 * t);   // streaks fade along their length
       acc += w * sceneTap(0.5 + (uv - 0.5) * (1.0 - amount * t));
       wsum += w;
     }
     col = acc / wsum;
-    col *= 1.0 + jump * 0.8 * (1.0 - smoothstep(0.0, 0.5, r2));   // the tunnel mouth brightens
+    col *= 1.0 + jump * (1.5 * smoothstep(0.0, 1.2, r2) + 0.8 * (1.0 - smoothstep(0.0, 0.4, r2)));
   } else {
     col = sceneTap(uv);
 #ifdef SHARPEN
@@ -296,8 +294,10 @@ void main() {
 #endif
 #ifdef CHROMA
     if (uLens.y > 0.0) {
-      // Lateral chromatic aberration: red scales out, blue scales in, growing with r^2 — zero on axis.
-      vec2 off = pn * (r2 * uLens.y) / uOutSize;
+      // Lateral chromatic aberration: red scales out, blue scales in. It grows with r^5 — nothing over
+      // the middle of the frame, uLens.y output px in the very corners — and stays well under a pixel:
+      // any more and one-pixel HDR lines and star points split into coloured ghosts.
+      vec2 off = pv * (rv2 * rv2 * uLens.y) / uOutSize;
       col.r = sceneTap(uv - off).r;
       col.b = sceneTap(uv + off).b;
     }
@@ -315,16 +315,23 @@ void main() {
 #else
   vec3 bloom = texture(tBloom, uv).rgb;
 #endif
-  col += bloom * uTone.y;
+  // The bloom chain was built from exposed values (see the prefilter), the scene taps were not.
+  col = col * uTone.x + bloom * uTone.y;
 
-  // ---- exposure, natural (cos^4-like) vignette, scene-referred effect light
-  float vig = 1.0 / (1.0 + e2 * uLens.x);
-  col *= uTone.x * vig * vig;
+  // ---- natural (cos^4-like) vignette over the image circle, scene-referred effect light
+  float vig = 1.0 / (1.0 + rv2 * uLens.x);
+  col *= vig * vig;
   float flash = uFx.w;
-  col = col * (1.0 + 3.0 * flash) + vec3(flash * flash * 2.0);
+  col = col * (1.0 + 4.0 * flash) + vec3(flash * flash * 2.5 * (1.0 - 0.45 * rv2));
   if (heat > 0.0) {
-    float lick = vnoise(vec2(uv.x * 5.0, uv.y * 3.0 - time * 1.8)) * 0.6 + 0.4;
-    col += vec3(1.0, 0.34, 0.07) * (heat * heat * 1.4 * lick * smoothstep(0.45, 2.0, e2));
+    // Plasma sheath: ragged streamers flowing up the frame edges, hotter (whiter) where they are dense.
+    vec2 hq = vec2(vUv.x * uOutSize.x / uOutSize.y, vUv.y);
+    float s1 = vnoise(vec2(hq.x * 10.0, hq.y * 2.4 - time * 2.6));
+    float s2 = vnoise(vec2(hq.x * 27.0 + 7.1, hq.y * 5.5 - time * 4.4));
+    float streak = s1 * 0.65 + s2 * 0.35;
+    float sheath = smoothstep(0.85, 2.1, e2 + (streak - 0.5) * 1.1) * (0.25 + 1.5 * streak * streak);
+    float glow = heat * heat * sheath;
+    col += vec3(1.0, 0.33, 0.07) * (glow * 2.6) + vec3(1.0, 0.72, 0.42) * (glow * glow * 3.0);
   }
 
   // ---- display transform + grade
@@ -338,12 +345,13 @@ void main() {
   float dmg = uFx.y;
   if (dmg > 0.0) {
     float pulse = 0.82 + 0.18 * sin(time * 9.0);
-    float edge = smoothstep(0.25, 1.9, e2) * dmg * pulse;
+    float edge = smoothstep(0.55, 2.0, e2);
+    edge = edge * edge * dmg * pulse;
     float grey = dot(col, vec3(0.2126, 0.7152, 0.0722));
     col = mix(col, vec3(grey), 0.35 * dmg);
-    col = mix(col, col * vec3(1.0, 0.16, 0.12) + vec3(0.42, 0.012, 0.0), edge);
+    col = mix(col, col * vec3(1.0, 0.2, 0.15) + vec3(0.36, 0.008, 0.0), edge);
   }
-  col = mix(col, vec3(1.0), smoothstep(0.0, 1.0, flash));
+  col = mix(col, vec3(1.0), flash * flash * (3.0 - 2.0 * flash) * (1.0 - 0.3 * rv2 * (1.0 - flash)));
 
   vec3 srgb = linearToSrgb(clamp(col, 0.0, 1.0));
 #ifdef FINAL
@@ -366,7 +374,8 @@ void main() {
 /**
  * FXAA 3.11 (quality path, after Timothy Lottes) for the tiers without MSAA. Input is the sRGB-encoded
  * composite with luma in alpha; film grain is added here, after the filter, so it is not mistaken for
- * edges. The sub-pixel blend is kept low: a full-strength one eats one-pixel stars and dims thin lines.
+ * edges. The sub-pixel blend is moderate, reduced on one-pixel lines and almost off on isolated maxima:
+ * a full-strength one eats stars and dims thin lines.
  */
 export const FXAA_FRAG = /* glsl */ `
 precision highp float;
@@ -380,7 +389,7 @@ ${NOISE}
 
 #define EDGE_MIN 0.0312
 #define EDGE_REL 0.125
-#define SUBPIX 0.35
+#define SUBPIX 0.5
 #define SEARCH_STEPS 9
 
 float stepSize(int i) {
@@ -454,7 +463,13 @@ void main() {
     float lAll = (2.0 * (lNS + lWE) + lWc + lEc) / 12.0;
     float sub = clamp(abs(lAll - lM) / range, 0.0, 1.0);
     sub = (3.0 - 2.0 * sub) * sub * sub;
-    finalOff = max(finalOff, sub * sub * SUBPIX);
+    // A pixel that stands clear of all four neighbours is a star point, and one that stands clear of
+    // both neighbours across the edge is the spine of a one-pixel line. Neither is a stair-step: the
+    // sub-pixel low-pass would only dim them (a quarter-pixel blend with black halves a line's light).
+    float lone = lM - max(max(lN, lS), max(lE, lW));
+    float ridge = lM - max(l1, l2);
+    float keep = lone > 0.6 * range ? 0.15 : (ridge > 0.5 * range ? 0.4 : 1.0);
+    finalOff = max(finalOff, sub * sub * SUBPIX * keep);
 
     vec2 uvF = vUv;
     if (horz) uvF.y += finalOff * stepLen; else uvF.x += finalOff * stepLen;

@@ -893,8 +893,8 @@ hRough = clamp(hRough, 0.07, 1.0);
 // heat: aerobraking / radiators (uHeat) and engine-adjacent metal (uThrottle)
 float hHeatA = vFx.x * uHeat;
 float hHeatE = vFx.y * uThrottle;
-vec3 hEmis = vec3(1.0, 0.24, 0.035) * (hHeatA * hHeatA * 5.0 * (0.6 + 0.8 * hTone))
-           + vec3(1.0, 0.3, 0.06) * (hHeatE * hHeatE * 0.16 * (0.4 + hTone));
+vec3 hEmis = vec3(1.0, 0.24, 0.035) * (hHeatA * hHeatA * 3.0 * (0.5 + 0.9 * hTone) * (1.0 - 0.7 * hCav))
+           + mix(vec3(0.8, 0.06, 0.008), vec3(1.0, 0.42, 0.1), hHeatE) * (hHeatE * hHeatE * hHeatE * 0.9 * (0.55 + 0.9 * hTone));
 hEmis *= 1.0 - 0.6 * hScorch;
 diffuseColor.rgb = hAlbedo;
 `;
@@ -1000,19 +1000,27 @@ void main() {
     vec3 wcol = mix(col, col * vec3(0.8, 0.95, 1.25), step(0.82, fract(r * 3.7)));
     outc = wcol * I * lit * inner * pane * (0.5 + 0.5 * facing) * mix(1.0, 0.25 + 0.75 * sw, 1.0) + vec3(0.004) * pane;
   } else if (mode < 2.5) {
-    // engine bell interior: uv.y = 0 at the lip .. 1 at the injector
+    // engine bell interior: uv.y = 0 at the lip .. 1 at the injector. The wall is incandescent: nearly
+    // dark at the lip, saturated engine colour half-way down, white-hot at the throat (bloom does the rest).
     float d = clamp(vGUv.y, 0.0, 1.0);
     float thr = clamp(uThrottle, 0.0, 1.0) * (1.0 - 0.5 * uDamage);
-    float flick = 1.0 + 0.05 * sin(uTime * 61.0 + vGUv.x * 40.0) * thr;
+    float flick = 1.0 + 0.06 * sin(uTime * 61.0 + vGUv.x * 40.0) * thr;
     // regenerative-cooling channels along the wall and a few stiffening bands
-    float ribs = 0.9 + 0.1 * sin(vGUv.x * 6.2832 * 48.0);
-    float bands = 0.88 + 0.12 * smoothstep(0.35, 0.5, abs(fract(d * 7.0) - 0.5));
-    float wall = pow(d, 2.3);
-    float core = smoothstep(0.86, 1.0, d);
-    vec3 hot = mix(col, vec3(1.0, 0.97, 0.93), clamp(wall * 0.8 + core, 0.0, 1.0) * thr);
-    float k = thr * (0.016 + 0.42 * wall + 2.6 * core) * ribs * bands * flick;
-    vec3 idle = vec3(1.0, 0.3, 0.06) * (0.01 + 0.05 * wall * wall);
-    outc = hot * I * k + idle * (1.0 - thr);
+    float ribs = 0.82 + 0.18 * sin(vGUv.x * 6.2832 * 40.0);
+    float bands = 0.8 + 0.2 * smoothstep(0.3, 0.5, abs(fract(d * 6.0) - 0.5));
+    float d2 = d * d;
+    float wall = 0.3 * d * sqrt(d) + 0.8 * d2 * d2 * d;
+    float core = smoothstep(0.84, 1.0, d);
+    // saturated engine colour on the cooler outer wall, white-hot toward the throat
+    vec3 sat = col * col * sqrt(col);
+    sat /= max(max(sat.r, sat.g), max(sat.b, 1e-3));
+    vec3 hot = mix(sat, vec3(1.0, 0.96, 0.9), clamp(d2 * 1.15 + core, 0.0, 1.0));
+    float lip = smoothstep(0.0, 0.14, d);
+    float k = thr * (0.004 + lip * wall * mix(ribs * bands, 1.0, d) + 0.9 * core) * flick;
+    // seen along the axis the hot gas column adds to the wall glow
+    k *= 0.8 + 0.35 * facing;
+    vec3 idle = vec3(1.0, 0.3, 0.06) * (0.004 + 0.05 * d2 * d2);
+    outc = hot * I * k + idle * (1.0 - thr) + vec3(0.004, 0.0045, 0.005) * ribs;
   } else if (mode < 3.5) {
     float period = max(0.05, vSurf.z * 8.0);
     float ph = fract(uTime / period + vSurf.w);
@@ -1121,31 +1129,33 @@ export function createHullMaterials(opts: HullMaterialOptions): HullMaterials {
       .replace('#include <emissivemap_fragment>', 'totalEmissiveRadiance += hEmis;')
       .replace('#include <aomap_fragment>', HULL_FRAG_AO);
   };
-  hull.customProgramCacheKey = () => 'tidelock-hull-1';
+  hull.customProgramCacheKey = () => 'tidelock-hull-2';
 
   const glass = new THREE.MeshPhysicalMaterial({
-    color: new THREE.Color(0.03, 0.028, 0.03),
+    color: new THREE.Color(0.016, 0.022, 0.03),
     roughness: 0.035,
     metalness: 0,
     ior: 1.52,
     specularIntensity: 1,
-    envMapIntensity: 1.6,
+    envMapIntensity: 1.8,
     transparent: true,
-    opacity: 0.3,
+    opacity: 0.46,
     depthWrite: true,
   });
   glass.onBeforeCompile = (shader) => {
     shader.fragmentShader = shader.fragmentShader.replace(
       '#include <opaque_fragment>',
       /* glsl */ `
-      float gF = pow(1.0 - clamp(dot(normalize(vViewPosition), normal), 0.0, 1.0), 4.0);
+      float gF = pow(1.0 - clamp(dot(normalize(vViewPosition), normal), 0.0, 1.0), 3.0);
       float gS = max(max(totalSpecular.r, totalSpecular.g), totalSpecular.b);
+      // a faint cool sheen toward grazing angles so a canopy reads as glass even against black space
+      vec3 gRim = vec3(0.07, 0.1, 0.14) * gF;
       diffuseColor.a = clamp(opacity + 0.5 * gF + gS, 0.0, 1.0);
-      gl_FragColor = vec4(outgoingLight, diffuseColor.a);
+      gl_FragColor = vec4(outgoingLight + gRim, diffuseColor.a);
       `,
     );
   };
-  glass.customProgramCacheKey = () => 'tidelock-glass-1';
+  glass.customProgramCacheKey = () => 'tidelock-glass-2';
 
   const glow = new THREE.ShaderMaterial({
     uniforms: { uTime: U.uTime, uThrottle: U.uThrottle, uLightsOn: U.uLightsOn, uHeat: U.uHeat, uDamage: U.uDamage },

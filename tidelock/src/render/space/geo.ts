@@ -2169,6 +2169,24 @@ export class MeshBuilder {
 
   // ---------------------------------------------------------------- finishing
 
+  /** Vertices emitted so far in a channel (pair with remapEngineHeat() to post-process a part). */
+  vertexCount(ch = CH_HULL): number {
+    return this.bufs[ch].nv;
+  }
+
+  /**
+   * Rewrite the engine-heat mask of the hull vertices emitted since `from` as a function of their final
+   * (model-space) position, e.g. to grade a bell from a glowing throat to a cool lip. `cur` is the current
+   * mask 0..1; return the new one.
+   */
+  remapEngineHeat(from: number, fn: (x: number, y: number, z: number, cur: number) => number): void {
+    const B = this.bufs[CH_HULL];
+    for (let i = from; i < B.nv; i++) {
+      const cur = B.fx[i * 4 + 1] / 255;
+      B.fx[i * 4 + 1] = Math.round(255 * clamp01(fn(B.pos[i * 3], B.pos[i * 3 + 1], B.pos[i * 3 + 2], cur)));
+    }
+  }
+
   /** Triangles emitted so far in all channels. */
   get triangleCount(): number {
     let n = 0;

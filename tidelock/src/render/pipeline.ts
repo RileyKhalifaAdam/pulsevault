@@ -2,8 +2,8 @@
 //
 //   layers (far scene, near scene, …) ──► one half-float HDR target (4x MSAA on high/ultra)
 //     ──► bloom: Karis-averaged bright pass + 13-tap downsample chain, tent upsample chain (half res ↓)
-//     ──► composite: sharpen · chromatic aberration · effects · bloom · exposure · vignette · AgX ·
-//                    split-tone grade · sRGB · dither (· grain)
+//     ──► composite: sharpen · chromatic aberration · effects · exposure · bloom · vignette ·
+//                    hue-preserving filmic tone map · split-tone grade · sRGB · dither (· grain)
 //     ──► FXAA + grain (only on the tiers without MSAA) ──► canvas
 //
 // A lean chain of full-screen-triangle passes instead of EffectComposer: no ping-pong copies, no
@@ -49,24 +49,24 @@ type RGBTuple = readonly [number, number, number];
 
 /** Look controls; every field is optional and only the given ones change. */
 export interface GradeParams {
-  /** Tone-curve contrast around mid grey. 1 = AgX base curve. Default 1.1. */
+  /** Tone-curve contrast around mid grey. 1 = the ACES-fit base curve. Default 1. */
   contrast?: number;
-  /** 1 = neutral. Default 1.12. */
+  /** Oklab chroma scale, 1 = neutral. Default 1.04. */
   saturation?: number;
   /** Split-tone colours (linear RGB, only their chroma matters). Defaults: cool shadows, warm highlights. */
   shadowTint?: RGBTuple;
   highlightTint?: RGBTuple;
-  /** Split-tone strength 0..1. Default 0.5. */
+  /** Split-tone strength 0..1. Default 0.35. */
   split?: number;
-  /** Vignette strength 0..1 (0.14 ≈ −0.6 EV in the corners). Default 0.14. */
+  /** Vignette strength 0..1 over the image circle (0.2 ≈ −0.5 EV in the corners). Default 0.2. */
   vignette?: number;
-  /** Film grain amplitude in display units. Default 0.03. */
+  /** Film grain amplitude in display units. Default 0.025. */
   grain?: number;
-  /** Edge chromatic aberration in CSS px at the long-axis edge. Default 1. Ignored on `low`. */
+  /** Lateral chromatic aberration: red/blue shift in CSS px in the frame corners. Default 0.3. Off on `low`. */
   aberration?: number;
   /** Sharpen strength 0..1. Default 0.25. Only on `high` / `ultra`. */
   sharpen?: number;
-  /** Scene value (max channel) where bloom starts, and the width of its soft knee. Defaults 1.0 / 0.5. */
+  /** Exposed scene value (max channel) where bloom starts, and the width of its soft knee. Defaults 1.0 / 0.5. */
   bloomThreshold?: number;
   bloomKnee?: number;
   /** 0..1: how much of the bloom energy goes to the wide halo rather than the tight core. Default 0.65. */
@@ -120,8 +120,9 @@ export interface RenderPipeline {
   render(layers: readonly RenderLayer[], dt: number): void;
   resize(cssWidth: number, cssHeight: number, devicePixelRatio: number): void;
   setQuality(q: Quality): void;
-  /** Exposure in stops (EV). 0 = sun-lit white diffuse lands just under display white. */
+  /** Exposure in stops (EV). 0 = sun-lit white diffuse (1.0) lands just under display white (0.76 linear). */
   setExposure(ev: number): void;
+  /** Fraction of the light above the bloom threshold that is scattered into the halo. Default 0.12; 0 = off. */
   setBloom(strength: number): void;
   setGrade(params: GradeParams): void;
   /** Screen-space accents, amount 0..1 (0 = off): jump stretch, damage vignette, heat haze, white flash. */
@@ -258,6 +259,7 @@ class Pipeline implements RenderPipeline {
   private readonly uPreSrc: Uniform<THREE.Texture | null> = { value: null };
   private readonly uPreStep: Uniform<THREE.Vector2> = { value: new THREE.Vector2() };
   private readonly uCurve: Uniform<THREE.Vector4> = { value: new THREE.Vector4() };
+  private readonly uExposure: Uniform<number> = { value: 1 };
   private readonly uDownSrc: Uniform<THREE.Texture | null> = { value: null };
   private readonly uDownStep: Uniform<THREE.Vector2> = { value: new THREE.Vector2() };
   private readonly uUpSrc: Uniform<THREE.Texture | null> = { value: null };
@@ -268,8 +270,8 @@ class Pipeline implements RenderPipeline {
   private readonly uSceneTexel: Uniform<THREE.Vector2> = { value: new THREE.Vector2(1, 1) };
   private readonly uBloomTexel: Uniform<THREE.Vector2> = { value: new THREE.Vector2(1, 1) };
   private readonly uOutSize: Uniform<THREE.Vector2> = { value: new THREE.Vector2(1, 1) };
-  private readonly uTone: Uniform<THREE.Vector4> = { value: new THREE.Vector4(1, 0.7, 1.1, 1.12) };
-  private readonly uLens: Uniform<THREE.Vector4> = { value: new THREE.Vector4(0.14, 0, 0, 0) };
+  private readonly uTone: Uniform<THREE.Vector4> = { value: new THREE.Vector4(1, 0.12, 1, 1) };
+  private readonly uLens: Uniform<THREE.Vector4> = { value: new THREE.Vector4(0.2, 0, 0, 0) };
   private readonly uShadowTint: Uniform<THREE.Vector3> = { value: new THREE.Vector3(1, 1, 1) };
   private readonly uHighTint: Uniform<THREE.Vector3> = { value: new THREE.Vector3(1, 1, 1) };
   private readonly uFx: Uniform<THREE.Vector4> = { value: new THREE.Vector4(0, 0, 0, 0) };
@@ -279,16 +281,16 @@ class Pipeline implements RenderPipeline {
 
   // look state
   private exposureEv = 0;
-  private bloomStrength = 0.7;
+  private bloomStrength = 0.12;
   private readonly grade = {
-    contrast: 1.1,
-    saturation: 1.12,
+    contrast: 1.0,
+    saturation: 1.04,
     shadowTint: [0.82, 0.97, 1.2] as [number, number, number],
     highlightTint: [1.08, 1.0, 0.88] as [number, number, number],
-    split: 0.5,
-    vignette: 0.14,
-    grain: 0.03,
-    aberration: 1.0,
+    split: 0.35,
+    vignette: 0.2,
+    grain: 0.025,
+    aberration: 0.3,
     sharpen: 0.25,
     bloomThreshold: 1.0,
     bloomKnee: 0.5,
@@ -351,6 +353,7 @@ class Pipeline implements RenderPipeline {
       uStep: this.uPreStep,
       uCurve: this.uCurve,
       uClamp: { value: BLOOM_CLAMP },
+      uExposure: this.uExposure,
     });
     this.downMat = passMaterial(BLOOM_DOWN_FRAG, { tSrc: this.uDownSrc, uStep: this.uDownStep });
     this.upMat = passMaterial(
@@ -613,7 +616,7 @@ class Pipeline implements RenderPipeline {
 
   setExposure(ev: number): void {
     this.exposureEv = Number.isFinite(ev) ? ev : 0;
-    this.uTone.value.x = Math.pow(2, this.exposureEv);
+    this.uTone.value.x = this.uExposure.value = Math.pow(2, this.exposureEv);
   }
 
   setBloom(strength: number): void {
@@ -648,7 +651,8 @@ class Pipeline implements RenderPipeline {
 
   private applyGrade(): void {
     const g = this.grade;
-    this.uTone.value.set(Math.pow(2, this.exposureEv), this.bloomStrength, Math.max(0.5, g.contrast), Math.max(0, g.saturation));
+    this.uExposure.value = Math.pow(2, this.exposureEv);
+    this.uTone.value.set(this.uExposure.value, this.bloomStrength, Math.max(0.5, g.contrast), Math.max(0, g.saturation));
     const split = Math.min(1, Math.max(0, g.split));
     setTint(this.uShadowTint.value, g.shadowTint, split);
     setTint(this.uHighTint.value, g.highlightTint, split);
@@ -727,7 +731,7 @@ class Pipeline implements RenderPipeline {
     const g = this.grade;
     const lens = this.uLens.value;
     lens.x = g.vignette;
-    lens.y = g.aberration * 1.25 * this.outRatio;
+    lens.y = g.aberration * this.outRatio;
     // Sharpen harder the more the scene is being magnified.
     lens.z = g.sharpen > 0 ? g.sharpen + (1 - this.scale) * 0.9 : 0;
     lens.w = this.time;

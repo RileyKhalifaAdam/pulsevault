@@ -1,6 +1,7 @@
 // The map of the Ember Reach: where each of its 24 systems sits and what part it plays.
 //
-// The cluster is a flattened disc about 42 by 39 light-years. Its structure is authored, not rolled:
+// The cluster is a flattened disc about 42 by 38 light-years (45 between its two farthest stars).
+// Its structure is authored, not rolled:
 //
 //   * a dense, contested CORE of six systems around Tallow, the start;
 //   * three ARMS, one per great power, each joined to the core through a single gate system
@@ -163,7 +164,7 @@ export const GALAXY_SLOTS: readonly GalaxySlot[] = [
     role: '{name} is where the League grows its food: dusk orchards on a tide-locked world, worked by cooperatives older than the League itself.',
   },
   {
-    key: 'fl', pos: [8.2, 0.5, 23.6], region: 'frontier', power: null, star: 'brownDwarf', world: 'wild', tier: 0, stations: 0, security: 0.1,
+    key: 'fl', pos: [7.6, 0.5, 22.4], region: 'frontier', power: null, star: 'brownDwarf', world: 'wild', tier: 0, stations: 0, security: 0.1,
     role: '{name} sits at the dark end of the League arm with a family of frozen worlds that no one has landed on.',
   },
 

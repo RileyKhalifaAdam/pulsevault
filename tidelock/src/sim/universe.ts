@@ -105,6 +105,8 @@ const ATMOSPHERE_CUTOFF_DENSITY = 1e-7;
 const RING_ICE_DENSITY = 920;
 /** Density assumed for a rubble-pile moon when testing against the Roche limit, kg/m^3. */
 const RUBBLE_DENSITY = 2000;
+/** Brightest surface colour channel allowed in a body palette (linear). */
+const MAX_ALBEDO = 0.9;
 /** Maximum single hop for which the cluster is guaranteed connected, light-years. */
 export const MAX_GUARANTEED_JUMP_LY = 7;
 
@@ -323,17 +325,27 @@ const SURVEY_BASE: Record<BodyClass, number> = {
 
 const hexes = (...h: string[]): RGB[] => h.map(hexToLinear);
 
-/** Sky tints (day-side scattering colour, sunset colour) by kind of air. */
-const AIR = {
-  breathable: { color: hexToLinear('#6C9CF0'), sunsetColor: hexToLinear('#FF8A4A') },
-  dusty: { color: hexToLinear('#D9B27C'), sunsetColor: hexToLinear('#7FA6D9') },
-  thin: { color: hexToLinear('#C9A27E'), sunsetColor: hexToLinear('#6F93C9') },
-  vapour: { color: hexToLinear('#FF9A4D'), sunsetColor: hexToLinear('#FF5A2A') },
-  haze: { color: hexToLinear('#E0A050'), sunsetColor: hexToLinear('#B8642C') },
-  hydrogenWarm: { color: hexToLinear('#E8D8B8'), sunsetColor: hexToLinear('#F0B070') },
-  hydrogenHot: { color: hexToLinear('#86AEE6'), sunsetColor: hexToLinear('#E8C0A0') },
-  methane: { color: hexToLinear('#8FD8E8'), sunsetColor: hexToLinear('#D8F2F0') },
-} as const;
+interface SkyTint {
+  color: RGB;
+  sunsetColor: RGB;
+}
+const sky = (day: string, sunset: string): SkyTint => ({ color: hexToLinear(day), sunsetColor: hexToLinear(sunset) });
+
+/**
+ * Sky tints (day-side scattering colour, sunset colour) by kind of air; a world is dealt one of the
+ * alternatives. Rayleigh skies are blue with warm sunsets; dust-laden skies are tan with blue sunsets
+ * (forward scattering by fine dust), hazes take the colour of their aerosol.
+ */
+const AIR: Record<'breathable' | 'dusty' | 'thin' | 'vapour' | 'haze' | 'hydrogenWarm' | 'hydrogenHot' | 'methane', readonly SkyTint[]> = {
+  breathable: [sky('#6C9CF0', '#FF8A4A'), sky('#5FA6E6', '#FF9E5C'), sky('#7C8FEA', '#FF7462'), sky('#62B0D8', '#F6A24E')],
+  dusty: [sky('#D9B27C', '#7FA6D9'), sky('#E2C48E', '#8CB4DE'), sky('#CC9A78', '#7898D2'), sky('#D8BCA0', '#94A8D0')],
+  thin: [sky('#C9A27E', '#6F93C9'), sky('#B8A890', '#7C9CCC'), sky('#D0947A', '#6888C4')],
+  vapour: [sky('#FF9A4D', '#FF5A2A'), sky('#F2B45C', '#E8642C'), sky('#E88860', '#C8402C')],
+  haze: [sky('#E0A050', '#B8642C'), sky('#8098C0', '#C8D4EA'), sky('#D4B078', '#A0704C')],
+  hydrogenWarm: [sky('#E8D8B8', '#F0B070'), sky('#E0D0C0', '#E8A888'), sky('#DCDCC4', '#ECC078')],
+  hydrogenHot: [sky('#86AEE6', '#E8C0A0'), sky('#7098D8', '#D8B0B0')],
+  methane: [sky('#8FD8E8', '#D8F2F0'), sky('#84B8EC', '#D0E4F6'), sky('#98E0D0', '#E0F4E8')],
+};
 
 /** Class-default atmosphere for a body whose spec leaves it open. Deterministic in `rng`. */
 function defaultAtmosphere(cls: BodyClass, mass: number, eqTemp: number, rng: Rng): AtmosphereSpec | null {
@@ -341,28 +353,28 @@ function defaultAtmosphere(cls: BodyClass, mass: number, eqTemp: number, rng: Rn
     case 'terran':
     case 'eyeball': {
       const p = rng.range(0.7, 1.4) * 1e5;
-      return { pressure: p, molarMass: 0.02897, ...AIR.breathable, opacity: 0.55, greenhouse: 30 * Math.pow(p / 1e5, 0.4) };
+      return { pressure: p, molarMass: 0.02897, ...rng.pick(AIR.breathable), opacity: 0.55, greenhouse: 30 * Math.pow(p / 1e5, 0.4) };
     }
     case 'ocean': {
       const p = rng.range(0.9, 1.8) * 1e5;
-      return { pressure: p, molarMass: 0.0275, ...AIR.breathable, opacity: 0.65, greenhouse: 32 * Math.pow(p / 1e5, 0.4) };
+      return { pressure: p, molarMass: 0.0275, ...rng.pick(AIR.breathable), opacity: 0.65, greenhouse: 32 * Math.pow(p / 1e5, 0.4) };
     }
     case 'desert': {
       const p = rng.range(0.25, 1.6) * 1e5;
-      return { pressure: p, molarMass: 0.038, ...AIR.dusty, opacity: 0.45, greenhouse: 22 * Math.sqrt(p / 1e5) };
+      return { pressure: p, molarMass: 0.038, ...rng.pick(AIR.dusty), opacity: r3(0.3 + 0.2 * Math.min(1, p / 1e5)), greenhouse: 22 * Math.sqrt(p / 1e5) };
     }
     case 'rocky': {
       const p = rng.range(400, 4000);
-      return { pressure: p, molarMass: 0.0435, ...AIR.thin, opacity: 0.16, greenhouse: 4 };
+      return { pressure: p, molarMass: 0.0435, ...rng.pick(AIR.thin), opacity: r3(0.1 + p / 4e4), greenhouse: 4 };
     }
     case 'lava': {
       if (rng.chance(0.4)) return null;
-      return { pressure: rng.range(40, 400), molarMass: 0.05, ...AIR.vapour, opacity: 0.1, greenhouse: 0 };
+      return { pressure: rng.range(40, 400), molarMass: 0.05, ...rng.pick(AIR.vapour), opacity: 0.1, greenhouse: 0 };
     }
     case 'ice': {
       // Only large, cold ice worlds hold a dense nitrogen-methane haze; the rest are bare.
       if (mass >= 0.018 * EARTH_MASS && eqTemp < 110 && rng.chance(0.3)) {
-        return { pressure: rng.range(0.6, 1.5) * 1e5, molarMass: 0.028, ...AIR.haze, opacity: 0.9, greenhouse: 9 };
+        return { pressure: rng.range(0.6, 1.5) * 1e5, molarMass: 0.028, ...rng.pick(AIR.haze), opacity: r3(rng.range(0.7, 0.92)), greenhouse: 9 };
       }
       return null;
     }
@@ -370,12 +382,12 @@ function defaultAtmosphere(cls: BodyClass, mass: number, eqTemp: number, rng: Rn
       return {
         pressure: 1e5,
         molarMass: 0.0023,
-        ...(eqTemp > 330 ? AIR.hydrogenHot : AIR.hydrogenWarm),
+        ...rng.pick(eqTemp > 330 ? AIR.hydrogenHot : AIR.hydrogenWarm),
         opacity: 0.6,
         scoopable: true,
       };
     case 'iceGiant':
-      return { pressure: 1e5, molarMass: 0.0026, ...AIR.methane, opacity: 0.55, scoopable: true };
+      return { pressure: 1e5, molarMass: 0.0026, ...rng.pick(AIR.methane), opacity: 0.55, scoopable: true };
     default:
       return null;
   }
@@ -404,64 +416,93 @@ const PALETTES: Record<Exclude<BodyClass, 'star' | 'gasGiant'>, RGB[][]> = {
     hexes('#353230', '#67625c', '#948e84', '#c4bcae'),
     hexes('#2b2624', '#5a4c44', '#8a7566', '#b9a690'),
     hexes('#1e1f22', '#44464b', '#74777c', '#a9abad'),
+    hexes('#3a3020', '#6e5c38', '#a08a58', '#cdbd8c'), // sulphur-stained
+    hexes('#2e1c18', '#5c3428', '#8a5a48', '#b89480'), // iron-red regolith
+    hexes('#4a4a48', '#7e7c76', '#aeaba2', '#d6d2c8'), // pale anorthosite highlands
   ],
   rocky: [
     hexes('#43291e', '#74452f', '#a36a46', '#cc9c74'),
     hexes('#3a3028', '#6a5a48', '#9a8466', '#c8b592'),
     hexes('#33272a', '#5e4347', '#8c6660', '#b99a86'),
+    hexes('#2a2c30', '#4c5058', '#7c7870', '#b0a48c'), // slate basalt under ochre dust
+    hexes('#40321a', '#74592c', '#a8884a', '#d0b880'), // yellow ochre
+    hexes('#2c2e22', '#505238', '#807c58', '#b0a888'), // olive, sulphide-weathered
   ],
   desert: [
     hexes('#553c23', '#946635', '#c49557', '#e3cb9c'),
     hexes('#5c2f1e', '#9a5230', '#c98852', '#e8c79a'),
     hexes('#4d4530', '#857a50', '#b8ab78', '#e0d7ae'),
+    hexes('#5e3a34', '#9c6456', '#cc9c88', '#eedcd0'), // rose rock and white salt
+    hexes('#2a2422', '#5a4a40', '#a48c6c', '#dcc8a0'), // black basalt, pale dune seas
+    hexes('#4a1e14', '#883a22', '#b8643c', '#dca070'), // deep rust
   ],
   lava: [
     hexes('#0f0908', '#241410', '#402015', '#6e3519'),
     hexes('#0b0b0d', '#1e1a1c', '#3a2a26', '#5e3a2a'),
     hexes('#140c06', '#3b2a10', '#6e5318', '#a8862e'),
+    hexes('#0a0c10', '#181c24', '#2c2e38', '#4a4448'), // blue-black glass
+    hexes('#120806', '#2e120c', '#52200f', '#863c18'), // oxidised crust
   ],
   ice: [
     hexes('#7b90a6', '#b5c5d4', '#dbe6ee', '#f2f6fa'),
     hexes('#66584e', '#a59f98', '#d5d9dc', '#eef2f5'),
     hexes('#5d7f96', '#93b8c9', '#c9e0e8', '#eef7f9'),
+    hexes('#7a5a50', '#b89484', '#e0ccc0', '#f4ece6'), // tholin-pink nitrogen ice
+    hexes('#5a8c8c', '#94c4bc', '#cce6dc', '#f0f8f2'), // methane frost
+    hexes('#4c5054', '#868c90', '#bcc2c6', '#e6eaec'), // dirty grey
   ],
   ocean: [
     hexes('#0a2644', '#12456c', '#2b6887', '#d4cdaa'),
     hexes('#0b2e3a', '#14566a', '#3a7f86', '#cfc9a8'),
     hexes('#10203f', '#243f73', '#4a6a94', '#c9bfa6'),
+    hexes('#08303a', '#0e5560', '#2f8a84', '#d8d2b0'), // shallow teal seas
+    hexes('#0c1840', '#1c3070', '#44609c', '#c4bca8'), // deep indigo
   ],
   terran: [
     hexes('#1d3927', '#3b6536', '#858556', '#b49f78', '#e4e0d8'),
     hexes('#26341f', '#56683a', '#97895a', '#b7a184', '#e6e2da'),
     hexes('#2b2f1c', '#6b6a34', '#a58a4e', '#bf9f7c', '#e8e2d4'),
+    hexes('#34361c', '#70702e', '#b09448', '#c8a878', '#ece6d8'), // ochre savannah
+    hexes('#182c26', '#2e5240', '#6c7c5a', '#a09880', '#e2e4e0'), // cool boreal
   ],
   // Under red-dwarf light photosynthesis runs dark: terminator vegetation is near black.
   eyeball: [
     hexes('#262320', '#36372a', '#564733', '#877558', '#d4ccbc'),
     hexes('#231f24', '#3a2f36', '#5a4a44', '#8a7864', '#d6cec2'),
     hexes('#1d2622', '#2c3d33', '#55523a', '#8c7c5c', '#d8d2c4'),
+    hexes('#2a1c18', '#44302a', '#6a4c38', '#94785a', '#d8ccb8'), // rust dusk
+    hexes('#161c26', '#243442', '#4a5248', '#847a60', '#d2d0c6'), // blue-black mats
   ],
   iceGiant: [
     hexes('#5ab0c4', '#7acbd4', '#4695b3', '#a3dce2'),
     hexes('#2c5aa8', '#467ac8', '#3665b8', '#7aa3e2'),
     hexes('#4fa38e', '#74c4a8', '#3f8a80', '#a6dcc8'),
     hexes('#6f7fb8', '#8f9fd0', '#5a68a0', '#b9c4e4'),
+    hexes('#1f5c66', '#2f8088', '#17474f', '#63aaa8'), // deep teal
+    hexes('#a8cfe0', '#c4e0ea', '#8cbcd4', '#e0f0f4'), // pale high haze
   ],
 };
 
 const GAS_PALETTES = {
-  hot: [hexes('#254568', '#386a9a', '#1b314c', '#5589b8', '#2e5580'), hexes('#2a5560', '#3f8088', '#1c3a44', '#6aa6a8', '#d8e2e0')],
+  hot: [
+    hexes('#254568', '#386a9a', '#1b314c', '#5589b8', '#2e5580'),
+    hexes('#2a5560', '#3f8088', '#1c3a44', '#6aa6a8', '#d8e2e0'),
+    hexes('#3a1c24', '#5c2c34', '#24121a', '#84444a', '#482028'), // alkali-dark maroon
+  ],
   warm: [
     hexes('#c4ab85', '#a37b58', '#e1d3b3', '#85664d', '#d4bd95'),
     hexes('#b98f6a', '#8c5a3e', '#dcc3a0', '#6e4a38', '#c9a67c'),
     hexes('#c9a08c', '#a8705c', '#e6cdb8', '#7f5648', '#d8b49c'),
     hexes('#d8ccb4', '#8f8f98', '#ece4d2', '#6f7684', '#bdb09a'),
+    hexes('#b8a868', '#8c7c44', '#d8cc98', '#6c6038', '#c8b87c'), // olive gold
+    hexes('#9cb0a8', '#6c8880', '#d4dcd0', '#4c6460', '#b8c4b8'), // slate green and cream
   ],
   cold: [
     hexes('#d3c49b', '#bda87c', '#e4dabb', '#ab956c', '#cbb98c'),
     hexes('#c8bfae', '#a89c88', '#ddd6c6', '#8f8474', '#b9ae9a'),
     hexes('#b7a9c4', '#9485a8', '#d2c8dc', '#7a6c90', '#a698b8'),
     hexes('#c2c49c', '#9ea078', '#dcdcbc', '#84865e', '#b4b68c'),
+    hexes('#a8b8c8', '#8498ac', '#ccd8e0', '#687c94', '#98a8bc'), // ammonia-haze blue grey
   ],
 };
 
@@ -474,9 +515,9 @@ function tintPalette(palette: readonly RGB[], rng: Rng, amount = 1): RGB[] {
   const warm = amount * rng.range(-0.07, 0.07);
   const green = amount * rng.range(-0.03, 0.03);
   return palette.map(([r, g, b]) => [
-    r4(clamp(r * gain * (1 + warm), 0, 0.9)),
-    r4(clamp(g * gain * (1 + green), 0, 0.9)),
-    r4(clamp(b * gain * (1 - warm), 0, 0.9)),
+    r4(clamp(r * gain * (1 + warm), 0, MAX_ALBEDO)),
+    r4(clamp(g * gain * (1 + green), 0, MAX_ALBEDO)),
+    r4(clamp(b * gain * (1 - warm), 0, MAX_ALBEDO)),
   ]);
 }
 
@@ -630,7 +671,8 @@ function ringDef(spec: RingSpec, radius: number, seed: number): RingDef {
 
 /**
  * Pick the jump-beacon parking radius around `body`: above 8.5 radii, below 0.47 SOI, and clear of
- * rings, moons (with their SOIs) and anything else already orbiting there. Returns null if no gap fits.
+ * rings, moons (their SOIs and 9 of their radii) and anything else already orbiting there. Returns
+ * null if no gap fits.
  */
 function beaconRadius(body: BodyDef, moons: BodyDef[], occupied: [number, number][]): number | null {
   const lo = Math.max(8.5 * body.radius, (body.rings?.outerRadius ?? 0) * 1.1);
@@ -639,7 +681,9 @@ function beaconRadius(body: BodyDef, moons: BodyDef[], occupied: [number, number
   const bands: [number, number][] = occupied.map(([a, b]) => [a * 0.96, b * 1.04]);
   for (const m of moons) {
     if (!m.orbit) continue;
-    bands.push([m.orbit.a * (1 - m.orbit.e) - 1.6 * m.soi, m.orbit.a * (1 + m.orbit.e) + 1.6 * m.soi]);
+    // Clear of the moon's SOI, and of the 8 radii inside which a jump drive will not engage.
+    const clear = Math.max(1.6 * m.soi, 9 * m.radius);
+    bands.push([m.orbit.a * (1 - m.orbit.e) - clear, m.orbit.a * (1 + m.orbit.e) + clear]);
   }
   const steps = 60;
   for (let k = 0; k <= steps; k++) {
@@ -746,6 +790,8 @@ export function buildSystem(spec: SystemSpec, pos: V3): SystemDef {
     const atmosphere = atmoSpec ? buildAtmosphere(atmoSpec, mu, radius, temperature) : null;
 
     const visual: BodyVisualDef = { ...defaultVisual(b.cls, seed, temperature, sp.color), ...b.visual, seed };
+    // Nothing solid reflects more than fresh snow: cap albedos so sunlit surfaces stay inside the HDR budget.
+    visual.palette = visual.palette.map(([r, g, bl]): RGB => [Math.min(r, MAX_ALBEDO), Math.min(g, MAX_ALBEDO), Math.min(bl, MAX_ALBEDO)]);
     const pop = stationPopAt.get(b.key) ?? 0;
     if (b.visual?.cityLights === undefined) {
       visual.cityLights = pop > 0 && !isGiant(b.cls) ? r3(clamp((Math.log10(pop) - 3.5) / 4, 0.05, 1)) : 0;
@@ -1338,7 +1384,8 @@ const HABITABLE: readonly BodyClass[] = ['eyeball', 'terran', 'ocean'];
 
 function rockyClass(flux: number, mass: number, locked: boolean, rng: Rng, habChance: number): BodyClass {
   const m = mass / EARTH_MASS;
-  if (flux > 55) return m >= 0.08 ? 'lava' : 'barren';
+  // Rock at the noon point of a locked world melts at about 110 times Earth's sunlight (1,250 K).
+  if (flux > 110) return m >= 0.08 ? 'lava' : 'barren';
   if (flux > 6) return m >= 0.45 && rng.chance(0.4) ? 'desert' : 'barren';
   if (flux > 1.75) return m >= 0.4 ? (rng.chance(0.65) ? 'desert' : 'rocky') : m >= 0.15 && rng.chance(0.5) ? 'rocky' : 'barren';
   if (flux > 0.32) {
@@ -1459,7 +1506,8 @@ function draftPlanets(slot: GalaxySlot, starMass: number, sp: StarPhysics, rng: 
       limit: Math.min(0.4 * hillRadius(s.a, e, s.mass, M), 0.5 * soiRadius(s.a, s.mass, M)),
       moons: [],
     };
-    if (giant && flux < 0.5 && rng.chance(cls === 'gasGiant' ? 0.5 : 0.38)) {
+    // Rings need a turning giant: a tide-locked one has no tilt, and its rings would lie edge-on to the star, unlit.
+    if (giant && flux < 0.5 && s.a >= 0.35 * lock && rng.chance(cls === 'gasGiant' ? 0.5 : 0.38)) {
       const rocheIce = rocheLimit(draft.radius, meanDensity(draft.mass, draft.radius), RING_ICE_DENSITY) / draft.radius;
       const inner = rng.range(1.22, 1.6);
       const outer = Math.min(0.95 * rocheIce, rng.range(1.95, 2.6));
@@ -1513,7 +1561,8 @@ function draftMoons(p: PlanetDraft, starMass: number, moonsSurvive: boolean, rng
   let a = aMin * rng.range(1.02, 1.5);
   while (out.length < want && a < aMax) {
     const big = out.length > 0 || rng.chance(0.4);
-    const mass = Math.min(cap, big ? logRange(rng, 8e21, 2.2e23) : logRange(rng, 2e20, 6e21));
+    // A moon system holds about 1e-4 of its planet's mass; no single moon more than a few times that.
+    const mass = Math.min(cap * rng.range(0.35, 1), big ? logRange(rng, 8e21, 2.2e23) : logRange(rng, 2e20, 6e21));
     const volcanic = big && out.every((m) => m.cls !== 'lava') && a < 8 * p.radius && rng.chance(0.14);
     const cls: BodyClass = volcanic ? 'lava' : p.flux < 0.15 ? (rng.chance(0.78) ? 'ice' : 'barren') : 'barren';
     out.push(moon(cls, mass, a, rng.range(0.001, 0.012)));
@@ -1705,8 +1754,11 @@ function draftSystem(slot: GalaxySlot, id: string, name: string, theme: NameThem
           return h.cls === 'ice' || h.cls === 'barren' ? ['extraction', 'colony'] : ['colony', 'extraction'];
       }
     };
-    /** A second orbit around `h`, a short transfer above the first: Hohmann cost between 0.55 and 3.5 km/s if possible. */
-    const higherOrbit = (h: Host, firstAlt: number): number | null => {
+    /**
+     * A second orbit around `h`, a short transfer above the first. `good` when the Hohmann cost between
+     * the two lands between 0.6 and 2.8 km/s; otherwise the highest orbit that fits (a cheap hop).
+     */
+    const higherOrbit = (h: Host, firstAlt: number): { altitude: number; good: boolean } | null => {
       const top = h.radius + airGuess(h);
       const r1 = top + firstAlt;
       const options = [1.35, 1.6, 1.9, 2.3, 2.8, 3.5, 4.5, 6].filter((f) => r1 * f < 0.8 * h.limit && r1 * f < 7.5 * h.radius);
@@ -1716,19 +1768,40 @@ function draftSystem(slot: GalaxySlot, id: string, name: string, theme: NameThem
         return dv >= 600 && dv <= 2800;
       });
       const f = good.length > 0 ? srng.pick(good.slice(0, 3)) : options[options.length - 1];
-      return r1 * f - top;
+      return { altitude: r1 * f - top, good: good.length > 0 };
+    };
+    /**
+     * An orbit of the giant just outside (failing that, inside) the orbit of one of its moons, clear of
+     * every moon's sphere of influence: about a kilometre per second from the moon's own stations.
+     * Returned in giant radii.
+     */
+    const besideMoon = (giant: Host, moon: MoonDraft): number | null => {
+      const reach = (m: MoonDraft): number => 1.3 * soiRadius(m.a, m.mass, giant.mass);
+      const floor = Math.max(2.2 * giant.radius, 1.1 * (giant.planet.rings?.outer ?? 0) * giant.radius);
+      for (const f of [1.12, 1.18, 1.25, 0.88, 0.82, 1.33]) {
+        const r = moon.a * f;
+        if (r < floor || r > 0.8 * giant.limit) continue;
+        if (giant.planet.moons.every((m) => r > m.a * (1 + m.e) + reach(m) || r < m.a * (1 - m.e) - reach(m))) return r / giant.radius;
+      }
+      return null;
     };
     const giantOrbit = (h: Host): number => (h.planet.rings ? h.planet.rings.outer * srng.range(1.07, 1.16) : srng.range(1.5, 2.2));
 
-    // 2. A partner a short transfer away: higher around the same world, or at the giant the capital's moon circles.
+    // 2. A partner a short transfer away: higher around the same world or, where a small moon leaves no
+    //    room for a second orbit worth the name, circling the giant just beyond the capital's moon.
     if (stations.length < slot.stations) {
       let partner: StationVisualId = PARTNER_TYPE[primary];
       if (partner === capitalType) partner = 'outpost';
-      const alt = higherOrbit(main, capitalAlt);
-      if (alt !== null) add(main, partner, { altitude: alt }, stationEconomies(partner, main, true), secondaryPop(partner));
-      else if (main.moon) {
-        const giantHost = giants.find((g) => g.planet === main.planet);
-        if (giantHost) add(giantHost, 'refinery', { orbitRadii: giantOrbit(giantHost) }, ['refinery', 'extraction'], secondaryPop('refinery'));
+      const higher = higherOrbit(main, capitalAlt);
+      const giantHost = main.moon ? giants.find((g) => g.planet === main.planet) : undefined;
+      const beside = giantHost && main.moon && !higher?.good ? besideMoon(giantHost, main.moon) : null;
+      if (giantHost && beside !== null) {
+        add(giantHost, partner, { orbitRadii: beside }, stationEconomies(partner, giantHost, true), secondaryPop(partner));
+        usedHosts.delete(giantHost.key); // the giant can still take a refinery by its rings
+      } else if (higher) {
+        add(main, partner, { altitude: higher.altitude }, stationEconomies(partner, main, true), secondaryPop(partner));
+      } else if (giantHost) {
+        add(giantHost, 'refinery', { orbitRadii: giantOrbit(giantHost) }, ['refinery', 'extraction'], secondaryPop('refinery'));
       }
     }
 
@@ -1778,7 +1851,7 @@ function draftSystem(slot: GalaxySlot, id: string, name: string, theme: NameThem
   const frontierBonus = slot.tier === 0 ? 0.15 : 0;
   const richness = (): number => r3(clamp(mrng.range(0.25, 0.9) + frontierBonus, 0.2, 1));
   const addSite = (kind: 'ring' | 'belt', parentKey: string, parentName: string, s: Partial<SiteSpec>, ores: OreTable): void => {
-    const siteNm = siteName(mrng, kind, parentName, used);
+    const siteNm = siteName(mrng, kind, parentName, used, slot.tier === 0);
     sites.push({ key: slug(siteNm), name: siteNm, parent: parentKey, kind, radius: 0, richness: richness(), ores: oreMix(ores, mrng), ...s });
   };
   const beltTable = (flux: number): OreTable => (flux > 2 ? ORE_TABLES.beltHot : flux > 0.12 ? ORE_TABLES.beltMid : ORE_TABLES.beltCold);
@@ -1904,10 +1977,12 @@ function writeLore(system: SystemDef, draft: DraftSystem, slot: GalaxySlot, them
     else if (main.cls === 'terran' || main.cls === 'ocean') feature = `${main.name} has open sky and standing water, and its people know what that is worth.`;
     else if (main.cls === 'ice') feature = `Life here turns on the ice of ${main.name}.`;
     else feature = `Its stations hang over ${main.name}, a world nobody would choose and thousands have.`;
-    if (ringed && ringed !== main) feature += ` The rings of ${ringed.name} are its other landmark.`;
   } else if (temperate) feature = `Its temperate world, ${temperate.name}, has never had a charter filed on it.`;
   else if (ringed) feature = `Its ringed giant, ${ringed.name}, has never been scooped.`;
-  else feature = `It has ${planets.length} worlds and no footprints on any of them.`;
+  else {
+    const big = [...planets].sort((x, y) => y.mass - x.mass)[0];
+    feature = isGiant(big.cls) ? `Its giant, ${big.name}, has never been scooped.` : `Its largest world, ${big.name}, has been mapped from orbit and no closer.`;
+  }
   system.description = systemLore({
     name: system.name,
     role: slot.role.replace(/\{name\}/g, system.name),
@@ -1918,6 +1993,21 @@ function writeLore(system: SystemDef, draft: DraftSystem, slot: GalaxySlot, them
     population: system.population,
     feature,
   });
+}
+
+/** Delta-v under which a transfer between two stations counts as a short hop, m/s. */
+export const SHORT_HOP_DV = 4000;
+
+/** Cheapest station-to-station transfer in a system by `estimateTransferDv`, m/s (Infinity with fewer than two stations). */
+export function cheapestHop(system: SystemDef): number {
+  let best = Infinity;
+  for (let i = 0; i < system.stations.length; i++) {
+    for (let j = i + 1; j < system.stations.length; j++) {
+      const dv = estimateTransferDv(system, system.stations[i].id, system.stations[j].id);
+      if (dv !== undefined && dv < best) best = dv;
+    }
+  }
+  return best;
 }
 
 /** Generate, build and check one procedural system; a roll that breaks a physical rule is thrown away and re-rolled. */
@@ -1936,6 +2026,8 @@ function generateSystem(slot: GalaxySlot, id: string, name: string, theme: NameT
     }
     lastProblems = validateSystem(system);
     if (slot.tier > 0 && system.stations.length < Math.min(2, slot.stations)) lastProblems.push(`${id}: too few stations`);
+    // Wanted, not required: two stations a short transfer apart. Give up asking after a dozen rolls.
+    if (attempt < 12 && system.stations.length >= 2 && cheapestHop(system) > SHORT_HOP_DV) lastProblems.push(`${id}: no two stations within a short transfer`);
     if (lastProblems.length > 0) continue;
     for (const n of trial) used.add(n);
     writeLore(system, draft, slot, theme, decks);
@@ -2198,6 +2290,15 @@ export function generateGalaxy(seed: number): GalaxyDef {
   const themes = root.fork('themes').shuffle([...NAME_THEMES]);
   const nameRng = root.fork('stars');
 
+  // One naming theme per generated system, none used twice (there are more themes than systems).
+  // Systems nobody has settled take a theme that a passing survey crew could have chosen.
+  const themeOf = new Map<string, NameTheme>();
+  for (const slot of GALAXY_SLOTS) {
+    if (slot.showcase || slot.tier > 0) continue;
+    const k = themes.findIndex((t) => t.surveyNamed);
+    themeOf.set(slot.key, themes.splice(k >= 0 ? k : 0, 1)[0]);
+  }
+  let generated = 0;
   const systems: SystemDef[] = GALAXY_SLOTS.map((slot, idx) => {
     const pos = positions[idx];
     if (slot.showcase) {
@@ -2207,7 +2308,7 @@ export function generateGalaxy(seed: number): GalaxyDef {
     }
     const kind = slot.star === 'brownDwarf' ? 'dim' : slot.star === 'K' || slot.star === 'G' || slot.star === 'F' ? 'bright' : 'ember';
     const name = pickStarName(nameRng, kind, used);
-    const theme = themes[idx % themes.length];
+    const theme = themeOf.get(slot.key) ?? themes[generated++ % themes.length];
     return generateSystem(slot, slug(name), name, theme, pos, root.fork(`system:${slot.key}`), used, decks);
   });
 

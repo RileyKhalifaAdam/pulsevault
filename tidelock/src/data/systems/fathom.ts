@@ -134,7 +134,7 @@ export const FATHOM: SystemSpec = {
       atmosphere: null,
       visual: { palette: hexes('#66584e', '#a59f98', '#d5d9dc', '#eef2f5'), roughness: 0.35, craters: 0.4, ice: 1 },
       description:
-        'Hadal is the outermost world of Fathom, eighty-five kelvin of nitrogen frost over water-ice bedrock. ' +
+        'Hadal is the outermost world of Fathom, eighty-five kelvin of carbon-dioxide frost over water-ice bedrock. ' +
         'The League keeps its oldest claims here, and its longest feuds.',
     },
   ],

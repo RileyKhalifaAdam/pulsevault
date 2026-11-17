@@ -69,6 +69,8 @@ export interface NameTheme {
   key: string;
   /** Completes the sentence "Its worlds are named …". */
   origin: string;
+  /** The origin speaks of a survey crew, not of settlers: fits systems nobody has ever lived in. */
+  surveyNamed?: boolean;
   names: readonly string[];
 }
 
@@ -79,6 +81,7 @@ export interface NameTheme {
 export const NAME_THEMES: readonly NameTheme[] = [
   {
     key: 'weaving',
+    surveyNamed: true,
     origin: 'from the loom, after the textile cooperative that paid for the first survey',
     names: ['Warp', 'Weft', 'Heddle', 'Shuttle', 'Selvage', 'Bobbin', 'Skein', 'Distaff', 'Treadle', 'Raddle', 'Tenter', 'Fleece'],
   },
@@ -94,11 +97,13 @@ export const NAME_THEMES: readonly NameTheme[] = [
   },
   {
     key: 'coast',
+    surveyNamed: true,
     origin: 'for a coastline on old Earth that the survey captain\'s family still told stories about',
     names: ['Shoal', 'Eddy', 'Skerry', 'Tarn', 'Firth', 'Holm', 'Ness', 'Strand', 'Spit', 'Weir', 'Mere', 'Fen'],
   },
   {
     key: 'clockwork',
+    surveyNamed: true,
     origin: 'for the parts of a clock, in the order the expedition\'s instrument-maker listed them',
     names: ['Gnomon', 'Fusee', 'Bezel', 'Arbor', 'Detent', 'Pinion', 'Ratchet', 'Vernier', 'Alidade', 'Remontoire', 'Foliot', 'Mainspring'],
   },
@@ -109,11 +114,13 @@ export const NAME_THEMES: readonly NameTheme[] = [
   },
   {
     key: 'hearth',
+    surveyNamed: true,
     origin: 'for things found around a kitchen fire, a crew joke that outlived the crew',
     names: ['Kettle', 'Trivet', 'Bellows', 'Andiron', 'Skillet', 'Ladle', 'Hob', 'Crock', 'Larder', 'Griddle', 'Saltbox', 'Bannock'],
   },
   {
     key: 'music',
+    surveyNamed: true,
     origin: 'in the terms of music, by a survey pilot who had wanted to be a composer',
     names: ['Cadence', 'Descant', 'Ostinato', 'Chanter', 'Hemiola', 'Coda', 'Fermata', 'Madrigal', 'Tacet', 'Rondo', 'Burden', 'Tierce'],
   },
@@ -134,6 +141,7 @@ export const NAME_THEMES: readonly NameTheme[] = [
   },
   {
     key: 'winds',
+    surveyNamed: true,
     origin: 'for the great winds of Earth, by people who had only ever felt air from a duct',
     names: ['Bora', 'Mistral', 'Sirocco', 'Levanter', 'Khamsin', 'Tramontane', 'Harmattan', 'Zonda', 'Simoom', 'Etesian', 'Solano', 'Brickfielder'],
   },
@@ -144,6 +152,7 @@ export const NAME_THEMES: readonly NameTheme[] = [
   },
   {
     key: 'cartography',
+    surveyNamed: true,
     origin: 'out of a map-maker\'s vocabulary, the Survey Office\'s idea of a joke',
     names: ['Graticule', 'Isobar', 'Datum', 'Rhumb', 'Contour', 'Legend', 'Cartouche', 'Portolan', 'Benchmark', 'Azimuth', 'Meander', 'Hachure'],
   },
@@ -159,6 +168,7 @@ export const NAME_THEMES: readonly NameTheme[] = [
   },
   {
     key: 'mining',
+    surveyNamed: true,
     origin: 'in the plain words of hard-rock miners',
     names: ['Adit', 'Stope', 'Winze', 'Gangue', 'Sump', 'Lode', 'Stull', 'Crosscut', 'Hoist', 'Collar', 'Tailing', 'Overburden'],
   },
@@ -169,11 +179,13 @@ export const NAME_THEMES: readonly NameTheme[] = [
   },
   {
     key: 'knots',
+    surveyNamed: true,
     origin: 'for knots and rope-work, by a rigger who could tie every one of them',
     names: ['Bowline', 'Sheepshank', 'Clove', 'Bight', 'Splice', 'Lanyard', 'Becket', 'Grommet', 'Toggle', 'Fid', 'Whipping', 'Seizing'],
   },
   {
     key: 'pottery',
+    surveyNamed: true,
     origin: 'from the potter\'s shed, for no reason anyone wrote down',
     names: ['Slip', 'Glaze', 'Grog', 'Saggar', 'Bisque', 'Sgraffito', 'Celadon', 'Raku', 'Engobe', 'Greenware', 'Banding', 'Terracotta'],
   },
@@ -240,20 +252,23 @@ const RING_WORDS = ['Frazil', 'Nilas', 'Graupel', 'Firn', 'Sastrugi', 'Verglas',
 /** Words for loose rock. */
 const BELT_WORDS = ['Talus', 'Scree', 'Moraine', 'Cobble', 'Breccia', 'Erratic', 'Clast', 'Scoria', 'Tephra', 'Gravel', 'Shingle', 'Boulder'] as const;
 
-/** A name for a mining site in a ring or a rubble belt around `parentName`. */
-export function siteName(rng: Rng, kind: 'ring' | 'belt', parentName: string, used: Set<string>): string {
+/**
+ * A name for a mining site in a ring or a rubble belt around `parentName`. `unworked` sites (in
+ * systems nobody has settled) get surveyors' names only: no claims, cuts or workings.
+ */
+export function siteName(rng: Rng, kind: 'ring' | 'belt', parentName: string, used: Set<string>, unworked = false): string {
   const S = (): string => rng.pick(SURNAMES);
   const patterns =
     kind === 'ring'
       ? [
           () => `The ${rng.pick(RING_WORDS)} Shoals`,
           () => `${rng.pick(RING_WORDS)} Drift`,
-          () => `${S()}'s Cut`,
-          () => `${parentName} ${rng.pick(['A', 'B', 'C', 'D'])}-Ring Workings`,
+          unworked ? () => `The ${rng.pick(RING_WORDS)} Reach` : () => `${S()}'s Cut`,
+          unworked ? () => `${parentName} ${rng.pick(['A', 'B', 'C', 'D'])}-Ring Shoals` : () => `${parentName} ${rng.pick(['A', 'B', 'C', 'D'])}-Ring Workings`,
         ]
       : [
           () => `The ${rng.pick(BELT_WORDS)} Scatter`,
-          () => `${S()}'s Claim`,
+          unworked ? () => `The ${rng.pick(BELT_WORDS)} Drift` : () => `${S()}'s Claim`,
           () => `${rng.pick(BELT_WORDS)} Field`,
           () => `The ${rng.pick(BELT_WORDS)} Tumble`,
         ];
