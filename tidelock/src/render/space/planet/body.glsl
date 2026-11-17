@@ -283,9 +283,9 @@ void main() {
     hc = mix(hc, vec3(1.0, 0.72, 0.30), smoothstep(0.55, 1.0, heat));
     ground += hc * (heat * heat * sqrt(heat) * uEmis.a);
 #elif EMISSIVE == 2
-    float night = smoothstep(0.10, -0.06, muS);
+    float night = smoothstep(0.13, -0.05, muS);          // lights come on in deep twilight
     float sparkle = 1.0 + dF * 3.0 + dA * 1.2;
-    ground += uEmis.rgb * (emis * emis * night * max(sparkle, 0.15) * (1.0 - cloudA * 0.85));
+    ground += uEmis.rgb * (emis * emis * night * max(sparkle, 0.15) * (1.0 - cloudA * 0.6));
 #endif
 
     surf = mix(ground, cloudC, cloudA);

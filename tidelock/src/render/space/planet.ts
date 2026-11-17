@@ -12,9 +12,12 @@
 //     body-space normal + emissive mask (RGBA8); clouds (R8); giants bake a single albedo cube.
 //     A small tiling detail texture (shared by all bodies) carries the surface from the baked texel
 //     scale down to low orbit.
-//   * LOD by apparent size: bodies are baked at 256 px per cube face at creation and re-baked at 512 / 1024
-//     (quality permitting) when they grow on screen, one face-pass per update() so there is no long stall;
-//     they drop back when they shrink. Scatter steps and optional taps also scale with pixelRadius.
+//   * LOD by apparent size: a body is baked at its tier's smallest cube (256 px per face; 512 on ultra) at
+//     creation and re-baked at 512 / 1024 (quality permitting) when it grows on screen, one cube face per
+//     update() so there is no long stall; it drops back when it shrinks, so only the one or two bodies the
+//     player is close to hold big textures. Scatter steps and optional taps also scale with pixelRadius.
+//     Texture memory per body at the top LOD of each tier (solid world with clouds / giant):
+//     low 4.5 / 2 MiB, medium 18 / 8 MiB, high 66 / 32 MiB, ultra 72 / 32 MiB; every body at rest: 4.5 / 2.
 //
 // Conventions
 //   * Unit sphere at the origin: radius 1 = def.radius. The scene manager only positions and uniformly

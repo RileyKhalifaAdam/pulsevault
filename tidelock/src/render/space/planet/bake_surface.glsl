@@ -81,8 +81,9 @@ void main() {
     float s = p.x + fbm(p * 3.0 + 33.0, 4) * 0.10;
     float iceEdge = -0.20 + 0.50 * uIce;
     float coast = smoothstep(0.0, 0.004, h) * (0.35 + 0.65 * smoothstep(0.2, 0.01, h));
-    float ring = exp(-pow((s - iceEdge - 0.10) / 0.15, 2.0));
-    emis = cityLights(p, coast * ring * 1.3);
+    // settlements hug the twilight band: from the temperate ring across the terminator onto the ice margin
+    float ring = exp(-pow((s - 0.5 * iceEdge - 0.02) / 0.16, 2.0));
+    emis = cityLights(p, coast * ring * 1.9);
     #else
     // sealed colonies on dead worlds: sparse, clustered
     float site = smoothstep(0.12, 0.35, fbm(p * 2.2 + 140.0, 4));
@@ -144,7 +145,7 @@ void main() {
   scorched = mix(scorched, vec3(0.62, 0.59, 0.52) * (0.9 + fine * 0.5), pan * 0.45);
   float collar = smoothstep(0.72, 0.88, s + fibre * 0.08);
   scorched = mix(scorched, scorched * vec3(0.46, 0.36, 0.30), collar * 0.75);
-  float pupil = smoothstep(0.87, 0.915, s + fibre * 0.04 + fine * 0.03);
+  float pupil = smoothstep(0.885, 0.92, s + fibre * 0.012 + fine * 0.02 + fbm(p * 7.0 + 19.0, 4) * 0.035);
   scorched = mix(scorched, vec3(0.026, 0.022, 0.021) * (1.0 + fine * 1.2 + fibre * 0.6), pupil * 0.95);
   col = mix(col, scorched, dry);
   // ice sheet over the terminator and night side; frozen seas read smoother and bluer

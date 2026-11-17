@@ -101,8 +101,13 @@ export interface StationSpec {
   /** Key of the body it orbits. */
   parent: string;
   visualId: StationVisualId;
-  /** Circular-orbit altitude, m above the parent's surface (1-bar level for giants). */
+  /**
+   * Orbit altitude, m above the top of the parent's atmosphere (above the surface of an airless
+   * body). Ignored when `orbitRadii` is given.
+   */
   altitude: number;
+  /** Orbit radius in multiples of the parent's radius, for stations parked beside rings or between moons. */
+  orbitRadii?: number;
   e?: number;
   /** rad from the reference plane; omitted = parent's equatorial plane. */
   i?: number;
@@ -128,11 +133,14 @@ export interface SiteSpec {
   /** Key of the body it orbits; 'star' for a heliocentric belt. */
   parent: string;
   kind: 'ring' | 'belt';
-  /** Orbit radius (semi-major axis), m from the parent's centre. */
+  /** Orbit radius (semi-major axis), m from the parent's centre. Ignored when `radii` is given. */
   radius: number;
+  /** Orbit radius in multiples of the parent's radius (ring sites). */
+  radii?: number;
   e?: number;
   i?: number;
   lan?: number;
+  argp?: number;
   m0?: number;
   richness: number;
   ores: { commodityId: string; weight: number }[];

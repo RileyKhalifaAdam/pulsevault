@@ -27,6 +27,9 @@ export function makeLoreDecks(rng: Rng): LoreDecks {
 
 const deal = <T>(decks: LoreDecks, key: string, options: readonly T[]): T => options[decks.draw(key, options.length)];
 
+/** "an M4V", "a K2V", "an L6": a spectral class with the article it takes when read aloud. */
+const classed = (spectralClass: string): string => `${/^[AEFHILMNORSX]/.test(spectralClass) ? 'an' : 'a'} ${spectralClass}`;
+
 /** "17 hours", "4.3 days", "2.6 years": an orbital or rotation period in words. */
 export function periodWords(seconds: number): string {
   const h = seconds / 3600;
@@ -54,8 +57,8 @@ export function starLore(decks: LoreDecks, c: StarLoreCtx): string {
   const frac = c.mass < 0.995 ? `${Math.round(c.mass * 100)} % of a solar mass` : `${c.mass.toFixed(2)} solar masses`;
   if (c.kind === 'brownDwarf') {
     return deal(decks, 'star:bd', [
-      `${c.name} never lit. It is a ${c.spectralClass} brown dwarf, ${frac}, glowing a dull magenta at ${c.temperature} K from the heat of its own slow collapse.`,
-      `A ${c.spectralClass} brown dwarf of ${frac}: too small to fuse hydrogen, too big to be called a planet. At ${c.temperature} K ${c.name} shows as a dim coal against the stars.`,
+      `${c.name} never lit. It is ${classed(c.spectralClass)} brown dwarf, ${frac}, glowing a dull magenta at ${c.temperature} K from the heat of its own slow collapse.`,
+      `${c.name} is ${classed(c.spectralClass)} brown dwarf of ${frac}: too small to fuse hydrogen, too big to be called a planet. At ${c.temperature} K it shows as a dim coal against the stars.`,
     ]);
   }
   if (c.kind === 'whiteDwarf') {
@@ -70,17 +73,18 @@ export function starLore(decks: LoreDecks, c: StarLoreCtx): string {
           ? 'A few times a year it throws an X-ray flare that sends every crew to shelter.'
           : 'It is old and quiet for its kind, and flares only rarely.';
     return deal(decks, 'star:m', [
-      `${c.name} is a ${c.spectralClass} red dwarf of ${frac}, burning slowly enough to outlast every bright star in the sky. ${flares}`,
+      `${c.name} is ${classed(c.spectralClass)} red dwarf of ${frac}, burning slowly enough to outlast every bright star in the sky. ${flares}`,
       `A small ${c.spectralClass} ember at ${c.temperature} K, ${c.name} gives a steady orange-red light. ${flares}`,
-      `${c.name} is a ${c.spectralClass} dwarf, ${frac}, its light the colour of a banked fire. ${flares}`,
+      `${c.name} is ${classed(c.spectralClass)} dwarf, ${frac}, its light the colour of a banked fire. ${flares}`,
       `Like most stars of the Reach, ${c.name} is a red dwarf: class ${c.spectralClass}, ${c.temperature} K, ${frac}. ${flares}`,
     ]);
   }
   const hue = letter === 'K' ? 'amber' : letter === 'G' ? 'yellow-white' : 'white';
+  const aHue = letter === 'K' ? `an ${hue}` : `a ${hue}`;
   return deal(decks, 'star:bright', [
-    `${c.name} is a ${c.spectralClass} star of ${frac}: ${hue}, steady, and dazzling by the standards of the Reach.`,
-    `Pilots raised under red dwarfs squint at ${c.name}, a ${hue} ${c.spectralClass} star of ${frac} whose worlds turn and have real days.`,
-    `A ${hue} ${c.spectralClass} sun at ${c.temperature} K, ${c.name} is one of the few stars in the Reach bright enough to cast a hard shadow.`,
+    `${c.name} is ${classed(c.spectralClass)} star of ${frac}: ${hue}, steady, and dazzling by the standards of the Reach.`,
+    `Pilots raised under red dwarfs squint at ${c.name}, ${aHue} ${c.spectralClass} star of ${frac} whose worlds turn and have real days.`,
+    `${c.name} is ${aHue} ${c.spectralClass} sun at ${c.temperature} K, one of the few stars in the Reach bright enough to cast a hard shadow.`,
   ]);
 }
 
@@ -106,11 +110,29 @@ export interface BodyLoreCtx {
   hasAir: boolean;
   /** System has stations. */
   settled: boolean;
+  /** A station orbits this body or one of its moons. */
+  hasStation: boolean;
   /** Mass in Earth masses. */
   massEarth: number;
+  /** Mean radius, m. */
+  radius: number;
 }
 
-type Line = (c: BodyLoreCtx) => string;
+/** A sentence, optionally one that only fits some bodies. */
+type Line = ((c: BodyLoreCtx) => string) & { when?: (c: BodyLoreCtx) => boolean };
+
+/** Restrict a line to the bodies it is true of. */
+const when = (test: (c: BodyLoreCtx) => boolean, line: (c: BodyLoreCtx) => string): Line => Object.assign(line, { when: test });
+const lived = (c: BodyLoreCtx): boolean => c.hasStation;
+
+/** Deal the next line from a deck that fits this body; undefined if none does. */
+function dealLine(decks: LoreDecks, key: string, lines: readonly Line[], c: BodyLoreCtx): Line | undefined {
+  for (let n = 0; n < lines.length * 2; n++) {
+    const line = lines[decks.draw(key, lines.length)];
+    if (!line.when || line.when(c)) return line;
+  }
+  return lines.find((l) => !l.when || l.when(c));
+}
 
 interface ClassLore {
   planet: Line[];
@@ -154,9 +176,11 @@ const LORE: Record<Exclude<BodyClass, 'star'>, ClassLore> = {
     ],
     moon: [
       (c) => `A cratered moon of ${c.parentName}, ${c.name} keeps one battered face turned to its planet.`,
-      (c) => `${c.name} is a captured lump of rock on a ${periodWords(c.period)} orbit around ${c.parentName}, pocked and dust-grey.`,
+      when((c) => c.radius < 7e5, (c) => `${c.name} is a captured lump of rock that rounds ${c.parentName} every ${periodWords(c.period)}, pocked and dust-grey.`),
+      when((c) => c.radius >= 1.2e6, (c) => `${c.name} is a dead world in its own right, a grey sphere bigger than many planets, cratered since the day it cooled.`),
+      when((c) => c.radius >= 7e5, (c) => `Old lava plains cover half of ${c.name}; the rest is highland, bright and broken, and all of it rounds ${c.parentName} every ${periodWords(c.period)}.`),
       (c) => `Tides from ${c.parentName} stopped ${c.name}'s spin long ago; its far side has never seen the planet at all.`,
-      (c) => `${c.name} is small, dark and irregular, more a mountain in orbit than a world.`,
+      when((c) => c.radius < 4.5e5, (c) => `${c.name} is small, dark and irregular, more a mountain in orbit than a world.`),
       (c) => `Dust the colour of slate covers ${c.name} to a depth nobody has measured.`,
     ],
     settled: [
@@ -177,10 +201,11 @@ const LORE: Record<Exclude<BodyClass, 'star'>, ClassLore> = {
   },
   rocky: {
     planet: [
-      (c) => `${c.name} is a cold desert of rust-coloured rock under a thin carbon-dioxide sky.`,
+      when((c) => c.temperature < 265, (c) => `${c.name} is a cold desert of rust-coloured rock under a thin carbon-dioxide sky.`),
+      when((c) => c.temperature >= 300, (c) => `${c.name} is a baked plain of red rock under air too thin to hold the heat: an oven at noon, a freezer at midnight.`),
       (c) => `Canyons deep enough to hold their own weather cut across ${c.name}; dust storms can hide the surface for weeks.`,
       (c) => `Thin dry air and ${c.temperature} K at the surface: ${c.name} is almost a place people could live, which is the cruel part.`,
-      (c) => `${c.name} has frost at the poles, dry riverbeds at the equator and air too thin to carry a sound.`,
+      when((c) => c.temperature < 285, (c) => `${c.name} has frost at the poles, dry riverbeds at the equator and air too thin to carry a sound.`),
       (c) => `Old shield volcanoes stand above the dust on ${c.name}, tall enough to reach out of most of its atmosphere.`,
     ],
     moon: [
@@ -188,11 +213,11 @@ const LORE: Record<Exclude<BodyClass, 'star'>, ClassLore> = {
       (c) => `A rust-red moon of ${c.parentName} with a wisp of atmosphere, ${c.name} was a planet in its own right before it was captured.`,
     ],
     settled: [
-      () => 'Pressure-dome homesteads dot the lowlands, growing lichen-crop under glass.',
-      () => 'Its canyon settlements trade in salvage and stubbornness.',
+      when((c) => c.temperature < 340, () => 'Pressure-dome homesteads dot the lowlands, growing lichen-crop under glass.'),
+      when((c) => c.temperature < 340, () => 'Its canyon settlements trade in salvage and stubbornness.'),
       () => 'Aerobraking pilots like it: the air is thin enough to forgive a steep pass.',
-      () => 'Water is mined from buried glaciers and argued over at every council.',
-      () => 'The old charter towns here have never paid a tax they did not first dispute.',
+      when((c) => c.temperature < 280, () => 'Water is mined from buried glaciers and argued over at every council.'),
+      when((c) => c.temperature < 340, () => 'The old charter towns here have never paid a tax they did not first dispute.'),
     ],
     wild: [
       () => 'The dry valleys suggest it was wetter once; nobody has been down to check.',
@@ -203,16 +228,19 @@ const LORE: Record<Exclude<BodyClass, 'star'>, ClassLore> = {
   },
   desert: {
     planet: [
-      (c) => `${c.name} is hot, dry and bright: dune seas the size of continents and salt flats where oceans used to be.`,
+      when((c) => c.temperature >= 300, (c) => `${c.name} is hot, dry and bright: dune seas the size of continents and salt flats where oceans used to be.`),
+      when((c) => c.temperature < 320, (c) => `${c.name} is a dry world of ochre plains and bare rock, mild at noon and bitter after dark, with just enough air to carry the dust.`),
       (c) => `A haze of dust keeps the sky of ${c.name} the colour of brass and its surface near ${c.temperature} K.`,
       (c) => `Wind is the only thing that moves on ${c.name}; it has carved the highlands into ridges a kilometre tall.`,
       (c) => `${c.name} kept its atmosphere and lost its water, leaving evaporite basins that glare white from orbit.`,
-      (c) => `${c.name} is a furnace with weather: thick dry air, ${c.temperature} K at noon, storms that sandblast anything left outside.`,
+      when((c) => c.temperature >= 380, (c) => `${c.name} is a furnace with weather: thick dry air, ${c.temperature} K in the shade, storms that sandblast anything left outside.`),
     ],
     settled: [
-      () => 'Deep wells and mirrored roofs keep its towns alive; the salt goes offworld by the kilotonne.',
-      () => 'Its people live in the canyons and come out at dusk.',
-      () => 'The flats are mined for lithium and soda, and for fossils nobody can agree on.',
+      when((c) => c.hasStation && c.temperature < 360, () => 'Deep wells and mirrored roofs keep its towns alive; the salt goes offworld by the kilotonne.'),
+      when((c) => c.hasStation && c.temperature < 360, () => 'Its people live in the canyons and come out at dusk.'),
+      when((c) => c.temperature < 450, () => 'The flats are mined for lithium and soda, and for fossils nobody can agree on.'),
+      when((c) => c.temperature >= 360, () => 'Nothing is built on it; the heat sees to that.'),
+      when((c) => c.temperature >= 360, () => 'Automated salt rigs work the cooler basins and are written off every few years.'),
       () => 'Its dense air makes it the best aerobraking target in the system, and the busiest.',
     ],
     wild: [
@@ -223,17 +251,17 @@ const LORE: Record<Exclude<BodyClass, 'star'>, ClassLore> = {
   },
   ice: {
     planet: [
-      (c) => `${c.name} is a shell of water ice over rock, fractured by tides and smooth between the cracks.`,
+      (c) => `${c.name} is a shell of water ice over rock, cracked by its own slow freezing and smooth between the cracks.`,
       (c) => `Far from ${c.starName}, ${c.name} is frozen through: nitrogen frost on water-ice bedrock at ${c.temperature} K.`,
       (c) => `Long reddish stains mark where brine has welled up through the crust of ${c.name} and frozen.`,
       (c) => `${c.name} is white, quiet and very cold, its few craters softened by ice that flows like slow water.`,
-      (c) => `Under the ice of ${c.name} there is an ocean, kept liquid by the slow flexing of its ${periodWords(c.period)} orbit.`,
+      when((c) => c.massEarth >= 0.2, (c) => `Under the ice of ${c.name} there is an ocean, kept liquid by the heat of a rock core that has not finished cooling.`),
       (c) => `${c.name} takes ${periodWords(c.period)} to circle ${c.starName}, which from here is only the brightest star in a dark sky.`,
     ],
     moon: [
       (c) => `${c.name} is an ice moon of ${c.parentName}, its surface a web of ridges where the crust has cracked and healed.`,
-      (c) => `Tidal flexing keeps a sea of brine under the shell of ${c.name}; plumes at its south pole feed a faint halo of frost.`,
-      (c) => `A small bright moon, ${c.name} is mostly ice around a core of rock no bigger than an asteroid.`,
+      when((c) => c.radius >= 6e5, (c) => `Tidal flexing keeps a sea of brine under the shell of ${c.name}; plumes at its south pole feed a faint halo of frost.`),
+      when((c) => c.radius < 9e5, (c) => `A small bright moon, ${c.name} is mostly ice around a core of rock no bigger than an asteroid.`),
       (c) => `${c.name} circles ${c.parentName} every ${periodWords(c.period)}, frozen hard and scarred with chains of secondary craters.`,
       (c) => `Half of ${c.name} is clean ice and half is stained dark with dust swept up from the orbit of ${c.parentName}.`,
       (c) => `${c.name} is ${c.temperature} K at the equator and smoother than a billiard ball, resurfaced by its own slow ice.`,
@@ -241,7 +269,7 @@ const LORE: Record<Exclude<BodyClass, 'star'>, ClassLore> = {
     settled: [
       () => 'Ice crews cut it by the block; every glass of water in the system has probably been here.',
       () => 'Melt stations on the surface sell reaction mass to anyone who can make the descent.',
-      () => 'Its drill towns are warm, crowded and loyal to their own.',
+      when(lived, () => 'Its drill towns are warm, crowded and loyal to their own.'),
       () => 'The brine has turned up nothing alive, to the regret of several institutes.',
       () => 'Smugglers favour its far side, where the bulk of the moon blocks every prying antenna.',
       () => 'Claim markers ring its poles, most of them lapsed.',
@@ -261,9 +289,9 @@ const LORE: Record<Exclude<BodyClass, 'star'>, ClassLore> = {
       (c) => `From orbit ${c.name} is dark blue and white, with no land larger than a city.`,
     ],
     settled: [
-      () => 'Its people live on raft-towns and anchored platforms, farming kelp and brine shrimp.',
-      () => 'The archipelagos are the most expensive addresses for ten light-years.',
-      () => 'Fresh food goes up; everything else comes down.',
+      when(lived, () => 'Its people live on raft-towns and anchored platforms, farming kelp and brine shrimp.'),
+      when(lived, () => 'The archipelagos are the most expensive addresses for ten light-years.'),
+      when(lived, () => 'Fresh food goes up; everything else comes down.'),
     ],
     wild: [
       () => 'It is the kind of world charters are written for, and nobody has filed one.',
@@ -277,9 +305,9 @@ const LORE: Record<Exclude<BodyClass, 'star'>, ClassLore> = {
       (c) => `Cloud, sea and green-brown land: ${c.name} is one of the few worlds in the Reach that needs no dome.`,
     ],
     settled: [
-      () => 'Land here is inherited, never sold, and the queue for residency runs to decades.',
-      () => 'Its farms feed half the neighbouring systems.',
-      () => 'Every child in the Reach has seen pictures of its coasts.',
+      when(lived, () => 'Land here is inherited, never sold, and the queue for residency runs to decades.'),
+      when(lived, () => 'Its farms feed half the neighbouring systems.'),
+      when(lived, () => 'Every child in the Reach has seen pictures of its coasts.'),
     ],
     wild: [
       () => 'That it is still unclaimed says more about the distance than the world.',
@@ -295,11 +323,11 @@ const LORE: Record<Exclude<BodyClass, 'star'>, ClassLore> = {
       (c) => `${c.name} circles ${c.starName} every ${periodWords(c.period)} without ever turning its back. Winds from the night side keep the twilight cool and wet.`,
     ],
     settled: [
-      () => 'Its cities follow the terminator in a broken chain, each built in the long shadow of the next ridge.',
-      () => 'Dark-leaved crops grow in the permanent dusk, four harvests a year.',
-      () => 'Children here learn sunward and nightward before they learn left and right.',
-      () => 'The night ice is mined, the noon salt is mined, and the twilight between is farmed to the last terrace.',
-      () => 'Every town keeps a flare bell, and everyone knows the way to the cellars.',
+      when(lived, () => 'Its cities follow the terminator in a broken chain, each built in the long shadow of the next ridge.'),
+      when(lived, () => 'Dark-leaved crops grow in the permanent dusk, four harvests a year.'),
+      when(lived, () => 'Children here learn sunward and nightward before they learn left and right.'),
+      when(lived, () => 'The night ice is mined, the noon salt is mined, and the twilight between is farmed to the last terrace.'),
+      when(lived, () => 'Every town keeps a flare bell, and everyone knows the way to the cellars.'),
     ],
     wild: [
       () => 'The twilight belt is empty. It will not stay empty once someone files the survey.',
@@ -315,7 +343,7 @@ const LORE: Record<Exclude<BodyClass, 'star'>, ClassLore> = {
     ],
     settled: [
       () => 'Scoop ships work its cloud tops for hydrogen, a legal trade with an alarming accident rate.',
-      () => 'Its moons are the reason anyone is here.',
+      when(lived, () => 'Its moons are the reason anyone is here.'),
       () => 'Traffic control keeps a standing warning about its radiation belts.',
       () => 'Freighters fall past it to steal a little speed on the way out.',
     ],
@@ -346,10 +374,12 @@ const RING_LINES: Line[] = [
 /** One or two sentences of survey prose for a generated planet or moon. */
 export function bodyLore(decks: LoreDecks, c: BodyLoreCtx): string {
   const lore = LORE[c.cls as Exclude<BodyClass, 'star'>];
-  const first = c.isMoon && lore.moon ? deal(decks, `${c.cls}:moon`, lore.moon) : deal(decks, `${c.cls}:planet`, lore.planet);
-  let second: Line;
-  if (c.ringed) second = deal(decks, 'rings', RING_LINES);
-  else second = c.settled ? deal(decks, `${c.cls}:settled`, lore.settled) : deal(decks, `${c.cls}:wild`, lore.wild);
+  const first =
+    (c.isMoon && lore.moon ? dealLine(decks, `${c.cls}:moon`, lore.moon, c) : undefined) ?? dealLine(decks, `${c.cls}:planet`, lore.planet, c) ?? lore.planet[0];
+  let second: Line | undefined;
+  if (c.ringed) second = dealLine(decks, 'rings', RING_LINES, c);
+  else if (c.settled) second = dealLine(decks, `${c.cls}:settled`, lore.settled, c);
+  second = second ?? dealLine(decks, `${c.cls}:wild`, lore.wild, c) ?? lore.wild[0];
   return `${first(c)} ${second(c)}`;
 }
 
@@ -457,10 +487,34 @@ const STATION_TRADE: Record<EconomyType, StationLine[]> = {
   ],
 };
 
+/** What a frontier outpost lives on; the big-station lines would overstate it. */
+const OUTPOST_TRADE: Partial<Record<EconomyType, StationLine[]>> = {
+  service: [
+    () => 'It sells fuel, relays messages and minds its own business.',
+    () => 'Customs, a fuel line and a noticeboard: everything a passing ship needs and nothing more.',
+    () => 'Pilots stop for propellant and stay for the gossip, which is fresher here than at the capital.',
+  ],
+  tourism: [
+    () => 'It has a viewing gallery, six cabins and a waiting list.',
+    () => 'People pay a month\'s wages to spend a night at its windows.',
+  ],
+  colony: [
+    () => 'It is young, short of everything, and pays well for basics.',
+    () => 'Its market wants food, machines and medicine, in that order.',
+    () => 'The crew are waiting for the colony ships that were promised, and trading in the meantime.',
+  ],
+  extraction: [
+    () => 'Miners sell raw ore here and buy what they need to go back out.',
+    () => 'Its assay office is the busiest room aboard.',
+    () => 'Claim crews rotate through on six-week shifts and spend their pay before they leave.',
+  ],
+};
+
 /** Two sentences for a generated station: what it looks like, what it trades. */
 export function stationLore(decks: LoreDecks, c: StationLoreCtx): string {
   const shape = deal(decks, `st:${c.visualId}`, STATION_SHAPE[c.visualId]);
-  const trade = deal(decks, `trade:${c.economy}`, STATION_TRADE[c.economy]);
+  const small = c.visualId === 'outpost' ? OUTPOST_TRADE[c.economy] : undefined;
+  const trade = small ? deal(decks, `trade:outpost:${c.economy}`, small) : deal(decks, `trade:${c.economy}`, STATION_TRADE[c.economy]);
   const seat = c.capital ? ' The system is governed from here.' : '';
   return `${shape(c)} ${trade(c)}${seat}`;
 }

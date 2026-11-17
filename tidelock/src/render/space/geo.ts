@@ -92,6 +92,8 @@ export interface HullStyleOpts {
   ao?: number;
   /** grime amount 0..1 (default 0.5) */
   grime?: number;
+  /** livery slot: 0 = use `tint` as is, 1 primary, 2 secondary, 3 accent (tint then multiplies the livery colour) */
+  slot?: number;
 }
 
 /** Opaque PBR finish. `tint` is linear albedo (keep <= 0.8). */
@@ -109,7 +111,7 @@ export function hullStyle(layer: number, tint: RGB, metal: number, rough: number
     f0: o.heat ?? 0,
     f1: o.engineHeat ?? 0,
     f2: o.grime ?? 0.5,
-    f3: 0,
+    f3: (o.slot ?? 0) / 3,
   };
 }
 
@@ -128,6 +130,8 @@ export interface GlowStyleOpts {
   switched?: boolean;
   /** window mode: window pitch, m (default 0.7) */
   cell?: number;
+  /** window mode: the strip runs along uv.y instead of uv.x */
+  alongV?: boolean;
 }
 
 /** Opaque emissive surface. `intensity` is HDR radiance (lights 2-8, engine cores 10-60). */
@@ -145,7 +149,7 @@ export function glowStyle(mode: number, color: RGB, intensity: number, o: GlowSt
     f0: o.switched ? 1 : 0,
     f1: Math.min(1, (o.cell ?? 0.7) / 4),
     f2: o.duty ?? 0.5,
-    f3: 0,
+    f3: o.alongV ? 1 : 0,
   };
 }
 
@@ -172,9 +176,9 @@ export function glassStyle(): Style {
   return { ch: CH_GLASS, r: 1, g: 1, b: 1, a: 1, s0: 0, s1: 0, s2: 0, s3: 0, f0: 0, f1: 0, f2: 0, f3: 0 };
 }
 
-/** Alpha-blended marking drawn from the decal atlas. */
-export function decalStyle(tint: RGB, alpha = 1): Style {
-  return { ch: CH_DECAL, r: tint[0], g: tint[1], b: tint[2], a: alpha, s0: 0, s1: 0, s2: 0, s3: 0, f0: 0, f1: 0, f2: 0, f3: 0 };
+/** Alpha-blended marking drawn from the decal atlas. `slot` > 0 multiplies the tint by a livery colour (1 primary, 2 secondary, 3 accent). */
+export function decalStyle(tint: RGB, alpha = 1, slot = 0): Style {
+  return { ch: CH_DECAL, r: tint[0], g: tint[1], b: tint[2], a: alpha, s0: slot, s1: 0, s2: 0, s3: 0, f0: 0, f1: 0, f2: 0, f3: 0 };
 }
 
 // ------------------------------------------------------------------------------------------ decal atlas layout
