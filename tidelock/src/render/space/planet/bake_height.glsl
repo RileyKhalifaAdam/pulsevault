@@ -139,22 +139,30 @@ vec4 terrain(vec3 p) {
   float rdg = ridged(q * 3.5 + 9.0, 5);
   float h = big * 0.8 + rdg * 0.22 * (0.4 + uRough);
   float amt = 0.25 + 0.75 * uLavaAmt;
-  // magma seas fill the lowlands; the whole day side on a tidally locked world
-  float level = mix(-0.30, 0.02, amt) + uLocked * 0.75 * smoothstep(-0.15, 0.85, p.x);
+  // magma seas fill the deepest basins; the whole day side on a tidally locked world
+  float level = mix(-0.44, -0.13, amt) + uLocked * 0.85 * smoothstep(-0.15, 0.85, p.x);
   float sea = smoothstep(level + 0.035, level - 0.035, big + fbm(q * 5.0 + 17.0, 3) * 0.2);
+  // volcanic provinces: most of the crust is old and nearly sealed, a few regions are wide open
+  float activity = smoothstep(-0.10, 0.26, fbm(q * 1.5 + 61.0, 4) + (amt - 0.6) * 0.5);
   vec3 wq = q + vnoise3(p * 4.0 + 61.0) * 0.06;
-  vec3 w1 = worley(wq * 4.2);
-  vec3 w2 = worley(wq * 11.0 + 7.0);
-  vec3 w3 = worley(wq * 29.0 + 3.0);
+  vec3 w1 = worley(wq * 3.6);
+  vec3 w2 = worley(wq * 9.5 + 7.0);
+  vec3 w3 = worley(wq * 19.0 + 3.0);
   float e1 = w1.y - w1.x;
   float e2 = w2.y - w2.x;
   float e3 = w3.y - w3.x;
-  float crack1 = 1.0 - smoothstep(0.0, 0.045, e1);
-  float crack2 = (1.0 - smoothstep(0.0, 0.07, e2)) * smoothstep(-0.1, 0.2, fbm(q * 2.6 + 33.0, 3) + amt * 0.25 - 0.1);
-  float halo = (1.0 - smoothstep(0.0, 0.30, e1)) * 0.10 + (1.0 - smoothstep(0.0, 0.35, e2)) * 0.05;
-  // crust rafts on the seas: bright molten gaps, darker cooled plates
-  float rafts = mix(1.0, 0.10 + 0.25 * w3.z, smoothstep(0.02, 0.16, e3) * smoothstep(0.9, 0.2, sea * (0.35 + amt)));
-  float heat = max(max(crack1 * 0.85, crack2 * 0.55) + halo, sea * rafts);
+  // rift system: a few long primary rifts everywhere, a finer web only where the province is active
+  float crack1 = (1.0 - smoothstep(0.0, 0.034, e1)) * mix(0.22, 1.0, activity);
+  float crack2 = (1.0 - smoothstep(0.0, 0.055, e2)) * activity * smoothstep(-0.05, 0.25, fbm(q * 2.6 + 33.0, 3) + 0.05);
+  float halo = ((1.0 - smoothstep(0.0, 0.26, e1)) * 0.10 + (1.0 - smoothstep(0.0, 0.30, e2)) * 0.05 * activity) * mix(0.3, 1.0, activity);
+  // crust plates on the magma seas: dull cooling plates split by bright molten seams; upwellings and
+  // (on a locked world) the sub-stellar region run hotter
+  float seamW = 0.085 / max(uFine, 0.3);
+  float seam = max((1.0 - smoothstep(0.0, seamW, e3)) * min(uFine * 1.6, 1.0), (1.0 - smoothstep(0.0, 0.05, e2)) * 0.9);
+  float upwell = smoothstep(0.05, 0.45, fbm(q * 3.1 + 90.0, 4) + 0.12);
+  float plate = 0.12 + 0.16 * w3.z + 0.24 * upwell + 0.30 * uLocked * smoothstep(0.35, 1.0, p.x);
+  float seaHeat = max(plate, seam * (0.7 + 0.3 * upwell));
+  float heat = max(max(crack1 * 0.9, crack2 * 0.6) + halo, sea * seaHeat);
   // calderas
   vec3 wv = worley(q * 2.3 + 51.0);
   float vent = smoothstep(0.05, 0.0, wv.x) * step(0.6, wv.z);
@@ -169,28 +177,37 @@ vec4 terrain(vec3 p) {
   vec3 q = p + vnoise3(p * 1.0 + 3.0) * 0.30;
   float big = fbm(q * 1.4, 5);
   float h = big * 0.25 + fbm(p * 9.0 + 13.0, 5) * 0.05 * (0.4 + uRough);
-  // lineae: three families of long arcuate fractures
-  float d1 = lineDist(q, 1.3, vec3(70.0));
-  float d2 = lineDist(q, 2.9, vec3(44.0, 12.0, 91.0));
-  float d3 = lineDist(q, 6.3, vec3(15.0, 77.0, 23.0)) + fbm(p * 22.0, 2) * 0.003;
-  float d4 = lineDist(q, 13.0, vec3(5.0, 27.0, 63.0));
-  float l1 = 1.0 - smoothstep(0.004, 0.011, d1);
-  float l2 = 1.0 - smoothstep(0.003, 0.008, d2);
-  float l3 = (1.0 - smoothstep(0.0015, 0.005, d3)) * 0.8;
-  float l4 = (1.0 - smoothstep(0.001, 0.003, d4)) * 0.5 * smoothstep(-0.05, 0.15, fbm(q * 2.2 + 8.0, 3));
-  float lin = max(max(l1, l2), max(l3, l4));
-  // double ridge: raised flanks, central trough
-  float ridge = (1.0 - smoothstep(0.006, 0.016, d1)) + (1.0 - smoothstep(0.004, 0.012, d2)) * 0.7 + (1.0 - smoothstep(0.002, 0.007, d3)) * 0.4;
-  h += ridge * 0.012 - lin * 0.018;
-  // chaos terrain
-  float chaos = smoothstep(0.10, 0.30, fbm(q * 2.4 + 37.0, 4));
+  // lineae: long fractures that follow great and small circles (tidal stress cracks), each present along
+  // only part of its length, in a few width classes; slightly wavy so they do not look ruled
+  vec3 ql = normalize(p + vnoise3(p * 2.3 + 60.0) * 0.035);
+  float wMin = 0.0011 / max(uFine, 0.2);
+  float lin = 0.0;
+  float ridge = 0.0;
+  float halo = 0.0;
+  for (int i = 0; i < 46; i++) {
+    vec3 r = hash33(ivec3(i, 17, 91));
+    vec3 r2 = hash33(ivec3(i, 53, 7));
+    vec3 n = normalize(r * 2.0 - 1.0 + 1e-4);
+    float c = (r2.x - 0.5) * 0.9 * step(0.35, r2.z);
+    float d = abs(dot(ql, n) - c) / sqrt(1.0 - c * c);
+    float w0 = mix(0.0010, 0.0065, r2.y * r2.y * r2.y);
+    float w = max(w0, wMin);
+    float seg = smoothstep(-0.05, 0.22, gnoise(ql * 1.6 + r * 50.0) + (r2.z - 0.5) * 0.7);
+    float l = (1.0 - smoothstep(w * 0.55, w * 1.5, d)) * seg * (w0 / w);
+    lin = max(lin, l * (0.55 + 0.45 * r2.y));
+    ridge += (smoothstep(w * 4.0, w * 1.6, d) - (1.0 - smoothstep(w * 0.3, w * 1.2, d)) * 1.6) * seg * w * 140.0;
+    halo = max(halo, smoothstep(w * 9.0, w * 1.5, d) * seg * smoothstep(0.003, 0.006, w0));
+  }
+  h += ridge * 0.010;
+  // chaos terrain: broken, rafted ice in a few provinces
+  float chaos = smoothstep(0.10, 0.32, fbm(q * 2.4 + 37.0, 4));
   vec3 w = worley(p * 34.0);
   h += chaos * ((w.y - w.x) * 0.03 - 0.012);
   vec3 c = craterLayer(p, 6.7, 0.08 + 0.5 * uCraters, 0.7);
   h += c.x;
   vec3 c2 = craterLayer(p, 19.0, 0.08 + 0.5 * uCraters, 0.8);
   h += c2.x;
-  return vec4(h, lin, max(chaos * (0.5 + 0.5 * w.z), 0.0) - (c.y + c2.y) * 0.8, fbm(p * 23.0 + 80.0, 4));
+  return vec4(h, max(lin, halo * 0.32), max(chaos * (0.62 + 0.25 * w.z + 0.5 * (w.y - w.x)), 0.0) - (c.y + c2.y) * 0.8, fbm(p * 23.0 + 80.0, 4));
 #else
   return vec4(0.0);
 #endif
@@ -211,11 +228,12 @@ void main() {
   float cap = smoothstep(edge - 0.02, edge + 0.02, abs(p.y) + fbm(p * 4.0 + 33.0, 4) * 0.10 + max(t.r, 0.0) * 0.25);
   t.r = mix(t.r, max(t.r, 0.012 + 0.02 * cap), cap);
 #elif CLS == CLS_EYEBALL
-  // +X is the sub-stellar point. Night side: ice sheet. Day side: seas boiled off into salt pans.
-  float s = p.x + fbm(p * 3.0 + 33.0, 4) * 0.12;
-  float iceEdge = -0.06 - (1.0 - uIce) * 0.5;
-  float night = smoothstep(iceEdge + 0.04, iceEdge - 0.04, s);
-  float dry = smoothstep(0.26, 0.42, s);
+  // +X is the sub-stellar point. From there outward: scorched face (old sea beds are salt pans), a
+  // temperate ring just sunward of the terminator, then the ice sheet over the terminator and night side.
+  float s = p.x + fbm(p * 3.0 + 33.0, 4) * 0.10;
+  float iceEdge = -0.20 + 0.50 * uIce;
+  float night = smoothstep(iceEdge + 0.035, iceEdge - 0.035, s);
+  float dry = smoothstep(iceEdge + 0.24, iceEdge + 0.36, s);
   float h0 = t.r;
   float dome = smoothstep(iceEdge, iceEdge - 0.6, s);
   float crev = 1.0 - smoothstep(0.002, 0.007, lineDist(p, 5.1, vec3(15.0, 77.0, 23.0)));

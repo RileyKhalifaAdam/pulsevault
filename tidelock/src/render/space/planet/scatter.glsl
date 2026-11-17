@@ -1,15 +1,17 @@
 // ---------------------------------------------------------------------------------------------
-// Analytic single-scattering atmosphere shared by the surface, limb and ring shaders.
+// Analytic single-scattering atmosphere shared by the surface, limb and ring code in body.glsl.
 // All lengths are in body radii (surface at r = 1); density falls off exponentially with scale
-// height uAtmo.y and is treated as zero above the shell radius uAtmo.x.
-// SCATTER_STEPS must be #defined by the including shader.
+// height uAtmo.y and is treated as zero above the shell radius uAtmo.x. Everything is in the
+// body-fixed frame (the CPU rotates the camera and the sun into it).
+// MAX_SCATTER_STEPS must be #defined by the including shader; uSteps (<= MAX) is the live count.
 // ---------------------------------------------------------------------------------------------
 uniform vec4 uAtmo;        // x = shell radius, y = scale height, z = Mie g, w = multiple-scattering boost
 uniform vec3 uBetaR;       // molecular scattering coefficient at the surface, per body radius
 uniform vec3 uBetaE;       // total extinction coefficient at the surface, per body radius
 uniform float uBetaM;      // haze (Mie) scattering coefficient at the surface, per body radius
-uniform vec3 uSunDir;      // unit, world axes, from the body toward the star
+uniform vec3 uSunDir;      // unit, body frame, from the body toward the star
 uniform vec3 uSunColor;    // linear star colour * intensity (sun-lit white = this)
+uniform int uSteps;
 
 // Integral of density along a ray leaving radius r with zenith cosine mu, out to space
 // (Chapman grazing-incidence function, Schueler's closed-form approximation).
@@ -39,20 +41,23 @@ vec3 sunTransmittance(float r, float mu) {
 }
 
 // In-scattered radiance along o + d * t for t in [t0, t1]; `trans` receives the view transmittance.
+// Samples are spaced uniformly: with the shell capped at ~8 scale heights a grazing chord is a
+// Gaussian of sigma = sqrt(H) sampled about once per sigma, where the trapezoid rule is near exact.
 vec3 atmoScatter(vec3 o, vec3 d, float t0, float t1, out vec3 trans) {
   float H = uAtmo.y;
-  float dt = (t1 - t0) / float(SCATTER_STEPS);
+  int steps = min(uSteps, MAX_SCATTER_STEPS);
+  float dt = (t1 - t0) / float(steps);
   float mu = dot(d, uSunDir);
   float g = uAtmo.z;
   float phR = 0.1875 * (1.0 + mu * mu);
   float phM = 0.25 * (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * mu, 1.5);
-  vec3 sum = vec3(0.0);
-  vec3 sumM = vec3(0.0);
+  vec3 sumR = vec3(0.0);
   float odV = 0.0;
   float rhoPrev = 0.0;
   float rPrev = 0.0;
   vec3 sPrev = vec3(0.0);
-  for (int i = 0; i <= SCATTER_STEPS; i++) {
+  for (int i = 0; i <= MAX_SCATTER_STEPS; i++) {
+    if (i > steps) break;
     float t = t0 + dt * float(i);
     vec3 x = o + d * t;
     float r = max(length(x), 1.0);
@@ -64,11 +69,11 @@ vec3 atmoScatter(vec3 o, vec3 d, float t0, float t1, out vec3 trans) {
     }
     float muS = dot(x, uSunDir) / r;
     vec3 s = rho * exp(-uBetaE * (odV + opticalLength(r, muS))) * planetShadow(r, muS);
-    if (i > 0) sum += 0.5 * (s + sPrev) * dt;
+    if (i > 0) sumR += 0.5 * (s + sPrev) * dt;
     rhoPrev = rho;
     rPrev = r;
     sPrev = s;
   }
   trans = exp(-uBetaE * odV);
-  return sum * (uBetaR * (phR * uAtmo.w) + vec3(uBetaM * phM)) * uSunColor;
+  return sumR * (uBetaR * (phR * uAtmo.w) + vec3(uBetaM * phM)) * uSunColor;
 }

@@ -45,8 +45,9 @@ vec3 bandColor(float x, out float belt) {
   float tb = fract((i + 1.0) * 0.618034 + hash11(i + 8.0) * 0.25);
   float t = smoothstep(0.36, 0.64, f);
   belt = mix(mod(i, 2.0), mod(i + 1.0, 2.0), t);
-  vec3 ca = ramp(ta) * mix(1.0, 0.72, mod(i, 2.0) * uContrast);
-  vec3 cb = ramp(tb) * mix(1.0, 0.72, mod(i + 1.0, 2.0) * uContrast);
+  // belts (odd bands) are darker and warmer than the zones between them
+  vec3 ca = ramp(ta) * mix(vec3(1.06), vec3(0.62, 0.55, 0.50), mod(i, 2.0) * uContrast);
+  vec3 cb = ramp(tb) * mix(vec3(1.06), vec3(0.62, 0.55, 0.50), mod(i + 1.0, 2.0) * uContrast);
   return mix(ca, cb, t);
 }
 
@@ -63,7 +64,7 @@ void main() {
 
   // advect: curl-noise eddies + alternating zonal jets
   float F = 2.6;
-  float A = 0.085 * uTurb;
+  float A = 0.062 * uTurb;
   for (int k = 0; k < 4; k++) {
     float x = bandCoord(q.y);
     float fx = fract(x);

@@ -78,10 +78,11 @@ void main() {
     float clim = 1.0 - smoothstep(0.72, 0.90, lat);
     emis = cityLights(p, coast * clim);
     #elif CLS == CLS_EYEBALL
-    float s = p.x + fbm(p * 3.0 + 33.0, 4) * 0.12;
-    float coast = smoothstep(0.0, 0.004, h) * (0.3 + 0.7 * smoothstep(0.2, 0.01, h));
-    float ring = exp(-pow((s + 0.06) / 0.17, 2.0));
-    emis = cityLights(p, coast * ring);
+    float s = p.x + fbm(p * 3.0 + 33.0, 4) * 0.10;
+    float iceEdge = -0.20 + 0.50 * uIce;
+    float coast = smoothstep(0.0, 0.004, h) * (0.35 + 0.65 * smoothstep(0.2, 0.01, h));
+    float ring = exp(-pow((s - iceEdge - 0.10) / 0.15, 2.0));
+    emis = cityLights(p, coast * ring * 1.3);
     #else
     // sealed colonies on dead worlds: sparse, clustered
     float site = smoothstep(0.12, 0.35, fbm(p * 2.2 + 140.0, 4));
@@ -102,7 +103,7 @@ void main() {
   float belt = exp(-pow((lat - 0.40) / 0.15, 2.0));
   float moist = clamp(0.58 + hv.g * 0.85 - belt * 0.55 + (1.0 - smoothstep(0.0, 0.10, el)) * 0.12, 0.0, 1.0);
   float arid = 1.0 - moist;
-  float t = clamp(arid * 0.52 + pow(el, 0.8) * 1.15 + fine * 0.10, 0.0, 1.0);
+  float t = clamp(arid * 0.62 - 0.06 + pow(el, 0.8) * 0.95 + fine * 0.10, 0.0, 1.0);
   col = ramp(t);
   // dense forest darkens wet lowlands; grassland lightens the transition
   col *= mix(1.0, 0.70, smoothstep(0.55, 0.95, moist) * smoothstep(0.25, 0.6, temp) * smoothstep(0.35, 0.0, el));
@@ -121,25 +122,33 @@ void main() {
 
   #elif CLS == CLS_EYEBALL
   float fine = hv.a;
-  float s = p.x + fbm(p * 3.0 + 33.0, 4) * 0.12;
-  float iceEdge = -0.06 - (1.0 - uIce) * 0.5;
-  float night = smoothstep(iceEdge + 0.04, iceEdge - 0.04, s);
-  float dry = smoothstep(0.26, 0.42, s);
+  float s = p.x + fbm(p * 3.0 + 33.0, 4) * 0.10;
+  float iceEdge = -0.20 + 0.50 * uIce;
+  float night = smoothstep(iceEdge + 0.035, iceEdge - 0.035, s);
+  float dry = smoothstep(iceEdge + 0.24, iceEdge + 0.36, s);
   float el = max(h, 0.0);
-  // temperate ring: lush near the terminator, drying toward the day side
-  float moist = clamp(0.75 - smoothstep(-0.05, 0.40, s) * 0.85 + fine * 0.5, 0.0, 1.0);
+  // temperate ring: lush (dark) against the ice, drying toward the day side
+  float moist = clamp(0.85 - smoothstep(iceEdge + 0.04, iceEdge + 0.34, s) * 0.85 + fine * 0.5, 0.0, 1.0);
   float t = clamp((1.0 - moist) * 0.5 + pow(el, 0.8) * 1.1 + fine * 0.10, 0.0, 1.0);
   col = ramp(t);
   col *= mix(1.0, 0.72, smoothstep(0.5, 0.9, moist) * smoothstep(0.3, 0.0, el));
   col = mix(col, vec3(0.50, 0.45, 0.34), smoothstep(0.010, 0.0, h) * 0.4);
-  // scorched day side: baked rock, desert varnish toward the sub-stellar point, salt pans in old sea beds
-  vec3 scorched = ramp(clamp(0.55 + el * 1.2 + fine * 0.3, 0.0, 1.0));
-  scorched = mix(scorched, scorched * vec3(0.55, 0.42, 0.36), smoothstep(0.55, 0.95, s + fine * 0.25));
-  float pan = smoothstep(0.0, -0.05, hv.g);
-  scorched = mix(scorched, vec3(0.62, 0.59, 0.52) * (0.9 + fine * 0.5), pan * 0.85);
+  // scorched face. "Iris": wind-streaked desert whose dune fields and yardangs radiate from the
+  // sub-stellar point; "pupil": a dark glassy basalt shield where the star stands at the zenith.
+  float ang = atan(p.z, p.y);
+  vec3 rc = vec3(cos(ang) * 9.0, sin(ang) * 9.0, s * 2.6);
+  float fibre = fbm(rc + 50.0, 5) + 0.6 * fbm(rc * vec3(2.9, 2.9, 2.2) + 9.0, 4);
+  vec3 scorched = ramp(clamp(0.66 + el * 0.8 + fibre * 0.50 + fine * 0.20, 0.0, 1.0));
+  scorched *= vec3(1.12, 0.98, 0.84) * (0.95 + 0.45 * fibre);
+  float pan = smoothstep(0.0, -0.05, hv.g) * smoothstep(0.80, 0.55, s);
+  scorched = mix(scorched, vec3(0.62, 0.59, 0.52) * (0.9 + fine * 0.5), pan * 0.45);
+  float collar = smoothstep(0.72, 0.88, s + fibre * 0.08);
+  scorched = mix(scorched, scorched * vec3(0.46, 0.36, 0.30), collar * 0.75);
+  float pupil = smoothstep(0.87, 0.915, s + fibre * 0.04 + fine * 0.03);
+  scorched = mix(scorched, vec3(0.026, 0.022, 0.021) * (1.0 + fine * 1.2 + fibre * 0.6), pupil * 0.95);
   col = mix(col, scorched, dry);
-  // night-side ice sheet; frozen seas read smoother and bluer
-  vec3 ice = vec3(0.70, 0.76, 0.82) * (0.92 + fine * 0.35);
+  // ice sheet over the terminator and night side; frozen seas read smoother and bluer
+  vec3 ice = vec3(0.72, 0.77, 0.82) * (0.92 + fine * 0.35);
   ice = mix(ice, vec3(0.50, 0.62, 0.74), smoothstep(0.0, -0.06, hv.g) * 0.6);
   col = mix(col, ice, night);
   // alpine snow in the ring
@@ -160,6 +169,8 @@ void main() {
   col *= mix(1.0, 0.55, smoothstep(-0.02, -0.28, hv.g));
   col *= mix(1.0, 0.70, clamp(hv.b, 0.0, 1.0));
   col *= 0.94 + fine * 0.3;
+  // dark, wind-scoured provinces against bright dust plains
+  col *= mix(0.66, 1.10, smoothstep(-0.22, 0.20, fbm(p * 1.6 + 7.0, 5) + fine * 0.15));
   float edge = 1.0 - uIce * 0.20;
   float cap = smoothstep(edge - 0.015, edge + 0.015, lat + fbm(p * 5.0 + 33.0, 4) * 0.06);
   col = mix(col, vec3(0.74, 0.76, 0.78), cap);
@@ -167,7 +178,8 @@ void main() {
 
   #elif CLS == CLS_DESERT
   float fine = hv.a;
-  col = ramp(clamp(0.45 + h * 0.75 + fine * 0.18, 0.0, 1.0));
+  col = ramp(clamp(0.45 + h * 0.85 + fine * 0.18, 0.0, 1.0));
+  col *= mix(0.70, 1.08, smoothstep(-0.25, 0.18, fbm(p * 1.5 + 7.0, 5) + fine * 0.15));
   float mesa = smoothstep(0.05, 0.30, h);
   col *= 1.0 + 0.10 * sin(h * 150.0 + fine * 6.0) * mesa;
   vec3 sand = ramp(0.5) * vec3(1.18, 1.08, 0.92);
@@ -186,12 +198,15 @@ void main() {
 
   #elif CLS == CLS_ICE
   float fine = hv.a;
-  col = ramp(clamp(0.74 + h * 1.4 + fine * 0.28, 0.30, 1.0));
-  vec3 stain = mix(uPal[0], uPal[min(1, uPalN - 1)], 0.25 + fine);
-  float chaos = max(hv.b, 0.0);
-  col = mix(col, mix(col, stain, 0.65), chaos * 0.7);
-  col = mix(col, stain * (0.85 + fine * 0.5), clamp(hv.g, 0.0, 1.0) * 0.85);
-  col = mix(col, vec3(0.80, 0.82, 0.84), clamp(-hv.b, 0.0, 1.0) * 0.6);
+  // plains: provinces of older (duller, faintly stained) and younger (bright, bluish) ice
+  float prov = fbm(p * 2.2 + 21.0, 5);
+  float mott = fbm(p * 11.0 + 5.0, 4);
+  col = ramp(clamp(0.74 + h * 1.5 + prov * 0.55 + mott * 0.22 + fine * 0.22, 0.34, 1.0));
+  vec3 stain = uPal[0] * vec3(1.08, 0.92, 0.80) * (0.75 + fine * 0.7 + mott * 0.4);
+  float chaos = max(hv.b, 0.0) * (0.75 + mott * 1.2 + fine * 0.8);
+  col = mix(col, mix(col, stain, 0.8), clamp(chaos, 0.0, 1.0) * 0.8);
+  col = mix(col, stain, clamp(hv.g * 1.15, 0.0, 1.0) * 0.92);
+  col = mix(col, vec3(0.84, 0.86, 0.88), clamp(-hv.b, 0.0, 1.0) * 0.6);
   code = 0.75 * (1.0 - clamp(hv.g + chaos, 0.0, 1.0) * 0.7);
   #else
   col = vec3(0.3);

@@ -58,6 +58,9 @@ export function orbitalPeriod(mu: number, a: number): number {
   return a > 0 && a < Infinity ? TAU * Math.sqrt((a * a * a) / mu) : Infinity;
 }
 
+/** Alias of {@link orbitalPeriod}: period (s) of an orbit with semi-major axis `a` (m) around `mu`. */
+export const period = orbitalPeriod;
+
 /** Mean motion (rad/s) for semi-major axis `a` (m); for hyperbolas (a < 0) the hyperbolic mean motion. */
 export function meanMotion(mu: number, a: number): number {
   const A = Math.abs(a);
@@ -73,6 +76,7 @@ export function synodicPeriod(t1: number, t2: number): number {
 /** Sphere-of-influence radius (m) of a body of mass `m` orbiting a body of mass `M` at semi-major axis `a` (m). */
 export const soiRadius = (a: number, m: number, M: number): number => a * Math.pow(m / M, 0.4);
 
+/** Result of {@link hohmann}: the two burns, the coast time and the phasing of a two-impulse transfer. SI units. */
 export interface HohmannTransfer {
   /** Prograde Δv of the departure burn, m/s (negative = retrograde, i.e. when r2 < r1). */
   dv1: number;
@@ -352,16 +356,22 @@ export function orbitNormalFromElements(el: OrbitElements, out: V3 = { x: 0, y: 
 
 let _lastNu = 0;
 
+/** Smallest |1 - e| stateToElements will return on the near-parabolic branch (2^-51, exactly representable on both sides of 1). */
+const PARABOLIC_SNAP = 4.440892098500626e-16;
+
 /**
  * Classical elements of the orbit through state `sv` (relative to a body with `mu`) at sim time `t`
  * (which becomes the epoch). Writes into `out` and returns it; no allocation. Never returns NaN for a
  * finite state with r > 0:
  *   * circular orbits (e < 1e-11) get e = 0, argp = 0 and the mean anomaly measured from the node;
  *   * equatorial orbits (prograde or retrograde) get lan = 0, with the node on +X;
- *   * an exactly parabolic state is nudged to e = 1 ± 1e-13 with the same periapsis;
+ *   * an exactly parabolic state is nudged to e = 1 ± 4.4e-16 with the same periapsis;
  *   * a radial (rectilinear) trajectory gets e = 1 with a finite `a` and an arbitrary plane through r.
- * Round trip state -> elements -> state is exact to rounding except in those snapped cases, where the
- * relative error stays below ~1e-10.
+ * Angles: `i` in [0, π], `lan` and `argp` in [0, 2π), elliptic `m0` in (-π, π] (negative = before periapsis).
+ * Round trip state -> elements -> state is exact to rounding for ordinary orbits. (a, e) cannot hold
+ * 1 - e to better than ~1e-16, so for extreme shapes the relative error grows: ~1e-11 for ordinary
+ * near-parabolic states, up to ~1e-5 for needle-thin, almost rectilinear ones (periapsis below
+ * ~1e-10 of the current radius). Use state vectors + propagateState where that matters.
  */
 export function stateToElementsTo(out: OrbitElements, sv: StateVector, mu: number, t = 0): OrbitElements {
   const rx = sv.r.x;
@@ -403,24 +413,39 @@ export function stateToElementsTo(out: OrbitElements, sv: StateVector, mu: numbe
     ey = -uy;
     ez = -uz;
   }
+  // Unit orbit normal. For nearly radial motion r × v is mostly rounding noise (relative error
+  // ~1e-16/sin(angle between r and v)), so force it exactly perpendicular to r: the position then lies
+  // in the element plane whatever the noise did to the plane's roll about r.
+  {
+    const k = (hx * rx + hy * ry + hz * rz) / (r * r);
+    hx -= k * rx;
+    hy -= k * ry;
+    hz -= k * rz;
+  }
   const hm = Math.sqrt(hx * hx + hy * hy + hz * hz);
   const wx = hx / hm;
   const wy = hy / hm;
   const wz = hz / hm;
 
-  // Semi-major axis and eccentricity, each taken from the best-conditioned source for the regime.
+  // Semi-major axis, eccentricity and anomaly, each taken from the best-conditioned source for the
+  // regime. `e` stored as a double is only known to ~1e-16, which matters as soon as 1 - e is small:
+  //   * "thin" (elongated orbit, well away from periapsis: alpha·r > √(2p/r); also every rectilinear
+  //     case): energy gives `a`, the anomaly comes from the radial scalars (r, r·v), so the radius is
+  //     reproduced exactly and only the small transverse offset carries the error in e;
+  //   * otherwise, e >= 0.5 (around periapsis, incl. near-parabolic where energy is ill conditioned):
+  //     `a` is defined from p and e, which keeps the periapsis and the shape p/(1 + e·cos ν) exact;
+  //   * e < 0.5: plain textbook, a = 1/alpha.
   let a: number;
   let thin = false;
-  if (p <= 1e-6 * r) {
-    // Needle-thin or rectilinear: energy is well conditioned, shape comes from p.
+  if (e >= 0.5 && (p < 5e-11 * r || 2 * p < alpha * alpha * r * r * r)) {
     thin = true;
     if (Math.abs(alpha) * r < 1e-12) alpha = 1e-12 / r; // radial *and* parabolic: a very long ellipse
     a = 1 / alpha;
     const pa = p * alpha;
     e = 1 - pa / (1 + Math.sqrt(Math.max(0, 1 - pa)));
-  } else if (Math.abs(alpha) * r < 0.1) {
-    // Near-parabolic: energy is ill conditioned, so define `a` from p and e (keeps the shape exact).
-    if (Math.abs(1 - e) < 1e-13) e = alpha > 0 ? 1 - 1e-13 : 1 + 1e-13;
+  } else if (e >= 0.5) {
+    // e = 1 exactly has no (a, e) representation: step a few ulp to the side the energy indicates.
+    if (Math.abs(1 - e) < PARABOLIC_SNAP) e = alpha > 0 ? 1 - PARABOLIC_SNAP : 1 + PARABOLIC_SNAP;
     a = p / ((1 - e) * (1 + e));
   } else {
     a = 1 / alpha;
@@ -469,7 +494,9 @@ export function stateToElementsTo(out: OrbitElements, sv: StateVector, mu: numbe
       E = 2 * Math.atan2(Math.sqrt(Math.max(0, 1 - e)) * Math.sin(0.5 * nu), Math.sqrt(1 + e) * Math.cos(0.5 * nu));
     }
     const s = Math.sin(E);
-    m0 = wrapTau((1 - e) * s + eMinusSin(E, s));
+    // Deliberately not wrapped to [0, 2π): adding 2π would wipe out the tiny mean anomalies of
+    // near-parabolic orbits (huge `a`), where 1e-16 rad is still thousands of kilometres.
+    m0 = (1 - e) * s + eMinusSin(E, s);
   } else {
     let H: number;
     if (thin) {
@@ -906,6 +933,7 @@ function trueAnomalyOfConic(c: Conic): number {
 
 // ===================================================================================== orbit summary
 
+/** Summary of the conic through a state, as returned by {@link orbitInfo}. SI units; vectors in non-rotating system axes relative to the orbited body. */
 export interface OrbitInfo {
   /** Classical elements with epoch = the `t` passed to orbitInfo. */
   elements: OrbitElements;
@@ -998,6 +1026,7 @@ export function orbitInfo(sv: StateVector, mu: number, t = 0): OrbitInfo {
   };
 }
 
+/** Manoeuvre axes of a state (unit vectors in system axes): burns are expressed as prograde / normal / radial components. */
 export interface OrbitalFrame {
   /** Unit vector along the velocity. */
   prograde: V3;
@@ -1080,6 +1109,7 @@ export function orbitalFrame(sv: StateVector): OrbitalFrame {
 
 // ===================================================================================== closest approach
 
+/** A local minimum of the separation between two orbiting objects. */
 export interface Approach {
   /** Sim time of the approach, s. */
   t: number;
@@ -1089,6 +1119,7 @@ export interface Approach {
   relSpeed: number;
 }
 
+/** Options of {@link closestApproach} / {@link closestApproaches}. */
 export interface ApproachOptions {
   /** Sim time at which `svA` and `svB` are valid, s. Default: `tStart`. */
   epoch?: number;
@@ -1335,6 +1366,7 @@ export class SystemModel {
   private readonly beaconParent: number;
   private readonly tmp = newState();
 
+  /** Build the model. Throws if the first body is not the primary, a parent is listed after its child, or an id is duplicated / unknown. */
   constructor(def: SystemDef) {
     this.def = def;
     this.bodies = def.bodies;
@@ -1387,6 +1419,7 @@ export class SystemModel {
     return i;
   }
 
+  /** True if the system has a body with this id. */
   hasBody(bodyId: string): boolean {
     return this.index.has(bodyId);
   }
@@ -1612,6 +1645,7 @@ export class SystemModel {
 
 // ===================================================================================== patched conics
 
+/** Why a {@link TrajectoryPatch} ends; see `TrajectoryPatch.endReason`. */
 export type PatchEndReason = 'soi-exit' | 'soi-enter' | 'impact' | 'atmosphere' | 'max-time' | 'closed';
 
 /** One conic arc of a predicted trajectory, inside a single sphere of influence. */
@@ -1644,7 +1678,7 @@ export interface TrajectoryPatch {
   periapsisRadius: number;
   /** Sim time of the first periapsis passage inside [tStart, tEnd], or null if the arc ends before reaching it. */
   periapsisTime: number | null;
-  /** Apoapsis radius of the conic, m (Infinity when open). */
+  /** Apoapsis radius of the conic, m (Infinity when open — patches are derived data: recompute after a load, do not save them as JSON). */
   apoapsisRadius: number;
   /** Sim time of the first apoapsis passage inside [tStart, tEnd], or null. */
   apoapsisTime: number | null;
@@ -1652,6 +1686,7 @@ export interface TrajectoryPatch {
   period: number;
 }
 
+/** Where a prediction starts: a coasting state, the body it is relative to, and its sim time. */
 export interface TrajectoryStart {
   /** Body the state is relative to. */
   bodyId: string;
@@ -1660,6 +1695,7 @@ export interface TrajectoryStart {
   t: number;
 }
 
+/** Limits and switches of {@link predictTrajectory}. */
 export interface PredictOptions {
   /** Maximum number of conic arcs to return. Default 4. */
   maxPatches?: number;
@@ -1823,7 +1859,10 @@ function normaliseFrame(model: SystemModel, bi: number, sv: StateVector, t: numb
     const parent = model._parent[bi];
     if (parent >= 0) {
       conicFromState(_pc, sv, body.mu);
-      if (_pc.r > body.soi && (_pc.sigma >= 0 || _pc.rp >= body.soi)) {
+      // Outside (or within a hair of the boundary and leaving): it belongs to the parent. The hair
+      // mirrors the child-side rule below, so a state sitting on an SOI never yields a zero-length arc.
+      const out = _pc.sigma >= 0 ? _pc.r > body.soi * (1 - 1e-6) && _pc.ra > body.soi : _pc.r > body.soi && _pc.rp >= body.soi;
+      if (out) {
         const rel = model._rel(bi, t);
         sv.r.x += rel.r.x;
         sv.r.y += rel.r.y;
@@ -1877,18 +1916,25 @@ function normaliseFrame(model: SystemModel, bi: number, sv: StateVector, t: numb
  *
  * If the start state is geometrically outside its body's SOI (and leaving), or inside a child's SOI,
  * the first patch is expressed in the frame it belongs to, so `patches[0].bodyId` can differ from
- * `start.bodyId`.
+ * `start.bodyId`. A non-finite start state (or one at r = 0) returns an empty array.
  *
  * Cost: well under a millisecond for typical 4-patch predictions; allocates only the returned patches.
  */
 export function predictTrajectory(model: SystemModel, start: TrajectoryStart, opts: PredictOptions = {}): TrajectoryPatch[] {
   const maxPatches = Math.max(1, opts.maxPatches ?? 4);
-  const maxDuration = opts.maxDuration ?? 100 * DAY;
+  // A finite horizon keeps every time finite even for an escape trajectory in the primary's frame.
+  const maxDuration = Math.min(Math.max(0, opts.maxDuration ?? 100 * DAY), 1e13);
   const searchPeriods = Math.max(1, opts.searchPeriods ?? 1);
   const stopAtAtmosphere = opts.stopAtAtmosphere ?? true;
   const patches: TrajectoryPatch[] = [];
   const sv = copyState(_pSv, start.sv);
   let t = start.t;
+  {
+    // Garbage in, nothing out: a non-finite state or one at the body's centre has no trajectory.
+    const r2 = sv.r.x * sv.r.x + sv.r.y * sv.r.y + sv.r.z * sv.r.z;
+    const v2 = sv.v.x * sv.v.x + sv.v.y * sv.v.y + sv.v.z * sv.v.z;
+    if (!(r2 > 0 && r2 < Infinity && v2 < Infinity && t > -Infinity && t < Infinity)) return patches;
+  }
   const tLimit = t + maxDuration;
   let bi = normaliseFrame(model, model.indexOf(start.bodyId), sv, t);
   const c = _pc;

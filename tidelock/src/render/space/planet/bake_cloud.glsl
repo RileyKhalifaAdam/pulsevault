@@ -2,7 +2,9 @@
 // Cloud layer bake: a raw "cloudiness" field in R (thresholded at runtime so cover and edge
 // softness stay adjustable and the edges can be eroded by the detail layer up close).
 // uStyle: 0 = temperate circulation (ITCZ, storm tracks, cyclones), 1 = tidally locked
-// (sub-stellar convective shield around +X), 2 = thin dust / cirrus.
+// (cloud over the terminator ring, clear dry air over the scorched face), 2 = thin dust / cirrus.
+// The field is built from four scales so the threshold cuts weather systems out of it rather than
+// blobs: synoptic "weather", warped frontal bands, ridged streaks and cellular cumulus fields.
 // ---------------------------------------------------------------------------------------------
 uniform int uStyle;
 uniform vec4 uVortex[8];     // xyz = centre (unit), w = radius (radians)
@@ -25,27 +27,36 @@ void main() {
     float d = acos(clamp(dot(q, c), -1.0, 1.0)) / uVortex[i].w;
     float fall = exp(-d * d * 1.3);
     q = rotAround(q, c, uVortexS[i] * fall);
-    core += fall * 0.22 - exp(-d * d * 55.0) * 0.6;
+    core += fall * 0.20 - exp(-d * d * 60.0) * 0.5;
   }
-  vec3 q2 = q + vnoise3(q * 2.1 + 5.0) * 0.22;
-  q2 += vnoise3(q2 * 5.5 + 17.0) * 0.07;
-  vec3 qs = vec3(q2.x, q2.y * 1.7, q2.z);
-  float base = fbm(qs * 2.6 + 9.0, 7);
-  float wisp = ridged(qs * 6.5 + 3.0, 4);
+  // synoptic scale: where the weather systems are
+  vec3 qw = q + vnoise3(q * 1.5 + 5.0) * 0.28;
+  float weather = fbm(qw * 2.1 + 9.0, 4);
+  // frontal bands: warped again and stretched along latitude circles
+  vec3 q2 = qw + vnoise3(qw * 4.6 + 17.0) * 0.09;
+  vec3 qs = vec3(q2.x, q2.y * 2.1, q2.z);
+  float mid = fbmGain(qs * 5.2 + 3.0, 6, 0.57);
+  float streak = ridged(qs * 3.7 + 31.0, 5);
+  // broken cumulus fields and fine wisps
+  float cells = billow(q2 * 24.0 + 7.0, 4);
+  float wisp = fbm(qs * 41.0 + 13.0, 3);
   float f;
   if (uStyle == 0) {
     float y = p.y + gnoise(p * 2.0 + 71.0) * 0.06;
-    float band = 0.10 * exp(-pow(y / 0.11, 2.0)) + 0.15 * exp(-pow((abs(y) - 0.72) / 0.16, 2.0)) -
-                 0.15 * exp(-pow((abs(y) - 0.36) / 0.13, 2.0));
-    f = base * 1.25 + (wisp - 0.3) * 0.16 + band + core;
+    float band = 0.09 * exp(-pow(y / 0.10, 2.0)) + 0.13 * exp(-pow((abs(y) - 0.72) / 0.16, 2.0)) -
+                 0.13 * exp(-pow((abs(y) - 0.36) / 0.13, 2.0));
+    f = weather * 0.95 + mid * 0.62 + (streak - 0.35) * 0.20 + (cells - 0.24) * 0.42 + wisp * 0.10 + band + core;
   } else if (uStyle == 1) {
     float s = p.x;
-    float band = 0.34 * smoothstep(0.15, 0.95, s) - 0.10 * exp(-pow((s - 0.05) / 0.2, 2.0)) - 0.06 * smoothstep(0.0, -0.8, s);
-    f = base * 1.15 + (wisp - 0.3) * 0.2 + band + core;
+    float band = 0.16 * exp(-pow((s - 0.12) / 0.22, 2.0)) - 0.30 * smoothstep(0.32, 0.62, s) - 0.45 * smoothstep(0.62, 0.9, s) + 0.05 * smoothstep(0.0, -0.7, s);
+    f = weather * 0.85 + mid * 0.62 + (streak - 0.35) * 0.24 + (cells - 0.24) * 0.40 + wisp * 0.10 + band + core;
   } else {
-    f = base * 0.9 + (wisp - 0.25) * 0.55 + core;
+    // high thin streamers: mostly streak, little bulk
+    vec3 qt = vec3(q2.x, q2.y * 3.4, q2.z);
+    float thin = ridged(qt * 2.9 + 51.0, 5);
+    f = weather * 0.95 + (thin - 0.32) * 0.26 + mid * 0.30 + wisp * 0.06;
   }
-  float v = clamp(f * 0.9 + 0.5, 0.0, 1.0);
+  float v = clamp(f * 0.85 + 0.5, 0.0, 1.0);
   if (uPack == 1) {
     fragColor = vec4(v, 0.0, 0.0, 1.0);
     return;
