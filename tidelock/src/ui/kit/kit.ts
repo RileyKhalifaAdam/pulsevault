@@ -19,9 +19,11 @@ export type Child = Node | string | number | boolean | null | undefined | Child[
 
 export type EventMap = { [K in keyof HTMLElementEventMap]?: (e: HTMLElementEventMap[K]) => void };
 
+export type ClassValue = string | false | null | undefined;
+
 export interface Props {
-  /** Class string or list (falsy entries are skipped). */
-  class?: string | (string | false | null | undefined)[];
+  /** Class string or list (falsy entries are skipped, so `cond && 'tl-x'` works). */
+  class?: ClassValue | ClassValue[];
   /** Inline style: css text or a map (custom properties allowed: { '--tl-c': '#fff' }). */
   style?: string | Record<string, string | number | null | undefined>;
   /** data-* attributes. */
@@ -83,6 +85,24 @@ export function rootOf(from?: Element | null): HTMLElement {
   return document.querySelector<HTMLElement>('.tl-root') ?? createRoot();
 }
 
+export interface Insets {
+  top: number;
+  right: number;
+  bottom: number;
+  left: number;
+}
+
+/** The root's safe-area insets in px (resolves the --tl-safe-* tokens, so harness overrides count). */
+export function safeInsets(root: HTMLElement): Insets {
+  const probe = document.createElement('div');
+  probe.style.cssText = 'position:absolute;visibility:hidden;pointer-events:none;padding:var(--tl-safe-t) var(--tl-safe-r) var(--tl-safe-b) var(--tl-safe-l)';
+  root.appendChild(probe);
+  const cs = getComputedStyle(probe);
+  const out = { top: parseFloat(cs.paddingTop) || 0, right: parseFloat(cs.paddingRight) || 0, bottom: parseFloat(cs.paddingBottom) || 0, left: parseFloat(cs.paddingLeft) || 0 };
+  probe.remove();
+  return out;
+}
+
 // ------------------------------------------------------------------ element builders
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -131,12 +151,16 @@ export function setAttr(el: Element, name: string, value: string | number | bool
   else el.setAttribute(name, value === true ? '' : String(value));
 }
 
+/** "button.tl-btn#go" -> "button". */
+type TagOf<S extends string> = S extends `${infer T}.${string}` ? TagOf<T> : S extends `${infer T}#${string}` ? TagOf<T> : S;
+/** The element type a spec string creates (falls back to HTMLElement for unknown or dynamic tags). */
+export type ElementOf<S extends string> = TagOf<S> extends keyof HTMLElementTagNameMap ? HTMLElementTagNameMap[TagOf<S>] : HTMLElement;
+
 /**
  * Create an element. `spec` is a tag with optional classes/id: "div", "button.tl-btn.tl-btn--primary", "div#hud".
  * The second argument may be a Props object, or omitted (null) to go straight to children.
  */
-export function h<K extends keyof HTMLElementTagNameMap>(spec: K, props?: Props | null, ...children: Child[]): HTMLElementTagNameMap[K];
-export function h(spec: string, props?: Props | null, ...children: Child[]): HTMLElement;
+export function h<S extends string>(spec: S, props?: Props | null, ...children: Child[]): ElementOf<S>;
 export function h(spec: string, props?: Props | null, ...children: Child[]): HTMLElement {
   const parts = spec.split(/(?=[.#])/);
   const el = document.createElement(parts[0] || 'div');
