@@ -1,0 +1,862 @@
+// TIDELOCK renderer + HDR post-processing pipeline.
+//
+//   layers (far scene, near scene, …) ──► one half-float HDR target (4x MSAA on high/ultra)
+//     ──► bloom: Karis-averaged bright pass + 13-tap downsample chain, tent upsample chain (half res ↓)
+//     ──► composite: sharpen · chromatic aberration · effects · bloom · exposure · vignette · AgX ·
+//                    split-tone grade · sRGB · dither (· grain)
+//     ──► FXAA + grain (only on the tiers without MSAA) ──► canvas
+//
+// A lean chain of full-screen-triangle passes instead of EffectComposer: no ping-pong copies, no
+// per-pass buffer allocation, and the one colour-space conversion is ours. Everything is linear
+// working space in half-float targets until the composite encodes sRGB, once.
+//
+// Resolution: the canvas backing store is `css size × min(devicePixelRatio, tier cap)` and never changes
+// with load. Only the HDR scene target is scaled (0.6–1.0, see post/dynres.ts); the composite magnifies
+// it. The bloom chain is sized from the canvas, so its look does not breathe with the resolution scale.
+//
+// MSAA note. three.js resolves *and invalidates* a multisampled render target at the end of every
+// `renderer.render()`, so a second layer drawn into the same target starts from undefined contents on
+// tile-based GPUs (every iPhone) — and each resolve is a full store/load of the 4x buffer. The MSAA
+// framebuffer is therefore owned here (raw GL renderbuffers), handed to three through a proxy render
+// target, and resolved exactly once per frame after the last layer.
+
+import * as THREE from 'three';
+import { detectGpu, type GpuInfo } from './post/detect';
+import { DynamicResolution } from './post/dynres';
+import {
+  BLOOM_DOWN_FRAG,
+  BLOOM_PREFILTER_FRAG,
+  BLOOM_UP_FRAG,
+  COMPOSITE_FRAG,
+  FULLSCREEN_VERT,
+  FXAA_FRAG,
+} from './post/shaders';
+
+// ---------------------------------------------------------------------------------------------- API
+
+export type Quality = 'low' | 'medium' | 'high' | 'ultra';
+
+export interface RenderLayer {
+  scene: THREE.Scene;
+  camera: THREE.Camera;
+  /** Clear depth before drawing this layer (the near scene over the far scene). */
+  clearDepth?: boolean;
+}
+
+export type EffectName = 'jump' | 'damage' | 'heat' | 'flash';
+
+type RGBTuple = readonly [number, number, number];
+
+/** Look controls; every field is optional and only the given ones change. */
+export interface GradeParams {
+  /** Tone-curve contrast around mid grey. 1 = AgX base curve. Default 1.1. */
+  contrast?: number;
+  /** 1 = neutral. Default 1.12. */
+  saturation?: number;
+  /** Split-tone colours (linear RGB, only their chroma matters). Defaults: cool shadows, warm highlights. */
+  shadowTint?: RGBTuple;
+  highlightTint?: RGBTuple;
+  /** Split-tone strength 0..1. Default 0.5. */
+  split?: number;
+  /** Vignette strength 0..1 (0.14 ≈ −0.6 EV in the corners). Default 0.14. */
+  vignette?: number;
+  /** Film grain amplitude in display units. Default 0.03. */
+  grain?: number;
+  /** Edge chromatic aberration in CSS px at the long-axis edge. Default 1. Ignored on `low`. */
+  aberration?: number;
+  /** Sharpen strength 0..1. Default 0.25. Only on `high` / `ultra`. */
+  sharpen?: number;
+  /** Scene value (max channel) where bloom starts, and the width of its soft knee. Defaults 1.0 / 0.5. */
+  bloomThreshold?: number;
+  bloomKnee?: number;
+  /** 0..1: how much of the bloom energy goes to the wide halo rather than the tight core. Default 0.65. */
+  bloomScatter?: number;
+}
+
+export interface PipelineStats {
+  /** Scene draw calls / triangles of the last frame (post passes excluded). */
+  drawCalls: number;
+  triangles: number;
+  /** Dynamic resolution scale in effect, 0.6..1. */
+  resolutionScale: number;
+  /** Smoothed interval between frames and its reciprocal. */
+  frameMs: number;
+  fps: number;
+  /** Tier the auto-detection recommends for this device (not necessarily the one in use). */
+  gpuTier: Quality;
+  /** Smoothed CPU time spent inside render(), ms. */
+  cpuMs: number;
+  /** Internal (scene) resolution and canvas backing-store resolution, px. */
+  width: number;
+  height: number;
+  outputWidth: number;
+  outputHeight: number;
+  /** MSAA samples in use (0 = FXAA path). */
+  msaa: number;
+  /** Full-screen post passes drawn last frame. */
+  postPasses: number;
+  /** Bytes of GPU memory held by the pipeline's targets (estimate). */
+  targetBytes: number;
+  gpuName: string;
+  software: boolean;
+}
+
+export interface PipelineOptions {
+  quality?: Quality | 'auto';
+  targetFps?: number;
+  /** Default: on, except under a software rasteriser (frame times are meaningless there). */
+  dynamicResolution?: boolean;
+}
+
+export interface RenderPipeline {
+  readonly renderer: THREE.WebGLRenderer;
+  readonly quality: Quality;
+  /**
+   * Internal pixels per CSS pixel right now (tier cap × dynamic scale). Screen-space-sized visuals
+   * (star points, line widths, sprites) multiply their CSS-pixel size by this.
+   */
+  readonly pixelRatio: number;
+  /** Draw the layers in order into the HDR target, then run the post chain to the canvas. */
+  render(layers: readonly RenderLayer[], dt: number): void;
+  resize(cssWidth: number, cssHeight: number, devicePixelRatio: number): void;
+  setQuality(q: Quality): void;
+  /** Exposure in stops (EV). 0 = sun-lit white diffuse lands just under display white. */
+  setExposure(ev: number): void;
+  setBloom(strength: number): void;
+  setGrade(params: GradeParams): void;
+  /** Screen-space accents, amount 0..1 (0 = off): jump stretch, damage vignette, heat haze, white flash. */
+  setEffect(name: EffectName, amount: number): void;
+  /** Turn the frame-time controller on/off; when off the scale is held at `fixedScale` (default 1). */
+  setDynamicResolution(enabled: boolean, fixedScale?: number): void;
+  /** Live counters. Returns the same object every call — copy it if you keep it. */
+  stats(): PipelineStats;
+  onContextLost: (() => void) | null;
+  onContextRestored: (() => void) | null;
+  dispose(): void;
+}
+
+// ---------------------------------------------------------------------------------------------- tiers
+
+interface Tier {
+  /** Device-pixel-ratio cap. */
+  dpr: number;
+  msaa: number;
+  chroma: boolean;
+  sharpen: boolean;
+  bloomHQ: boolean;
+  maxBloomLevels: number;
+}
+
+const TIERS: Record<Quality, Tier> = {
+  low: { dpr: 1.0, msaa: 0, chroma: false, sharpen: false, bloomHQ: false, maxBloomLevels: 5 },
+  medium: { dpr: 1.5, msaa: 0, chroma: true, sharpen: false, bloomHQ: true, maxBloomLevels: 6 },
+  high: { dpr: 2.0, msaa: 4, chroma: true, sharpen: true, bloomHQ: true, maxBloomLevels: 6 },
+  ultra: { dpr: 2.5, msaa: 4, chroma: true, sharpen: true, bloomHQ: true, maxBloomLevels: 7 },
+};
+
+const MIN_SCALE = 0.6;
+const BLOOM_CLAMP = 64;
+const LUMA_R = 0.2126;
+const LUMA_G = 0.7152;
+const LUMA_B = 0.0722;
+
+type Uniform<T> = { value: T };
+
+function passMaterial(
+  fragmentShader: string,
+  uniforms: Record<string, THREE.IUniform>,
+  extra?: THREE.ShaderMaterialParameters,
+): THREE.RawShaderMaterial {
+  return new THREE.RawShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    vertexShader: FULLSCREEN_VERT,
+    fragmentShader,
+    uniforms,
+    depthTest: false,
+    depthWrite: false,
+    blending: THREE.NoBlending,
+    ...extra,
+  });
+}
+
+function colorTarget(type: THREE.TextureDataType, depth: boolean): THREE.WebGLRenderTarget {
+  return new THREE.WebGLRenderTarget(1, 1, {
+    type,
+    format: THREE.RGBAFormat,
+    minFilter: THREE.LinearFilter,
+    magFilter: THREE.LinearFilter,
+    wrapS: THREE.ClampToEdgeWrapping,
+    wrapT: THREE.ClampToEdgeWrapping,
+    generateMipmaps: false,
+    depthBuffer: depth,
+    stencilBuffer: false,
+  });
+}
+
+/** three's XR hook for "render into this framebuffer"; public at runtime, missing from the typings. */
+interface ExternalFramebufferHost {
+  setRenderTargetFramebuffer(target: THREE.WebGLRenderTarget, framebuffer: WebGLFramebuffer): void;
+}
+
+// ---------------------------------------------------------------------------------------------- pipeline
+
+class Pipeline implements RenderPipeline {
+  readonly renderer: THREE.WebGLRenderer;
+  onContextLost: (() => void) | null = null;
+  onContextRestored: (() => void) | null = null;
+
+  private readonly canvas: HTMLCanvasElement;
+  private readonly gl: WebGL2RenderingContext;
+  private readonly gpu: GpuInfo;
+  private readonly hdrType: THREE.TextureDataType;
+  private readonly dyn: DynamicResolution;
+
+  private _quality: Quality;
+  private tier: Tier;
+  private lost = false;
+  private disposed = false;
+
+  // sizes
+  private cssW = 1;
+  private cssH = 1;
+  private dpr = 1;
+  private outRatio = 1; // canvas px per CSS px
+  private outW = 1;
+  private outH = 1;
+  private scale = 1;
+  private sceneW = 1;
+  private sceneH = 1;
+
+  // scene target: a plain render target, or (MSAA) raw renderbuffers behind a proxy + a resolve target
+  private msaa = 0;
+  private readonly sceneRT: THREE.WebGLRenderTarget;
+  private readonly msaaProxy: THREE.WebGLRenderTarget;
+  private readonly resolveRT: THREE.WebGLRenderTarget;
+  private msaaFbo: WebGLFramebuffer | null = null;
+  private msaaColor: WebGLRenderbuffer | null = null;
+  private msaaDepth: WebGLRenderbuffer | null = null;
+  private readonly invalidateList: number[];
+
+  // post targets
+  private readonly bloomRT: THREE.WebGLRenderTarget[] = [];
+  private bloomLevels = 0;
+  private readonly downStep: THREE.Vector2[] = [];
+  private readonly upStep: THREE.Vector2[] = [];
+  private readonly ldrRT: THREE.WebGLRenderTarget;
+
+  // full-screen pass plumbing
+  private readonly fsGeometry: THREE.BufferGeometry;
+  private readonly fsMesh: THREE.Mesh<THREE.BufferGeometry, THREE.RawShaderMaterial>;
+  private readonly fsCamera: THREE.Camera;
+  private readonly prefilterMat: THREE.RawShaderMaterial;
+  private readonly downMat: THREE.RawShaderMaterial;
+  private readonly upMat: THREE.RawShaderMaterial;
+  private readonly compositeMat: THREE.RawShaderMaterial;
+  private readonly fxaaMat: THREE.RawShaderMaterial;
+
+  // uniforms (shared objects, mutated in place — nothing is allocated per frame)
+  private readonly uPreSrc: Uniform<THREE.Texture | null> = { value: null };
+  private readonly uPreStep: Uniform<THREE.Vector2> = { value: new THREE.Vector2() };
+  private readonly uCurve: Uniform<THREE.Vector4> = { value: new THREE.Vector4() };
+  private readonly uDownSrc: Uniform<THREE.Texture | null> = { value: null };
+  private readonly uDownStep: Uniform<THREE.Vector2> = { value: new THREE.Vector2() };
+  private readonly uUpSrc: Uniform<THREE.Texture | null> = { value: null };
+  private readonly uUpStep: Uniform<THREE.Vector2> = { value: new THREE.Vector2() };
+  private readonly uScatter: Uniform<number> = { value: 0.65 };
+  private readonly uScene: Uniform<THREE.Texture | null> = { value: null };
+  private readonly uBloomTex: Uniform<THREE.Texture | null> = { value: null };
+  private readonly uSceneTexel: Uniform<THREE.Vector2> = { value: new THREE.Vector2(1, 1) };
+  private readonly uBloomTexel: Uniform<THREE.Vector2> = { value: new THREE.Vector2(1, 1) };
+  private readonly uOutSize: Uniform<THREE.Vector2> = { value: new THREE.Vector2(1, 1) };
+  private readonly uTone: Uniform<THREE.Vector4> = { value: new THREE.Vector4(1, 0.7, 1.1, 1.12) };
+  private readonly uLens: Uniform<THREE.Vector4> = { value: new THREE.Vector4(0.14, 0, 0, 0) };
+  private readonly uShadowTint: Uniform<THREE.Vector3> = { value: new THREE.Vector3(1, 1, 1) };
+  private readonly uHighTint: Uniform<THREE.Vector3> = { value: new THREE.Vector3(1, 1, 1) };
+  private readonly uFx: Uniform<THREE.Vector4> = { value: new THREE.Vector4(0, 0, 0, 0) };
+  private readonly uGrain: Uniform<THREE.Vector4> = { value: new THREE.Vector4(0, 1, 0, 0) };
+  private readonly uLdr: Uniform<THREE.Texture | null> = { value: null };
+  private readonly uLdrTexel: Uniform<THREE.Vector2> = { value: new THREE.Vector2(1, 1) };
+
+  // look state
+  private exposureEv = 0;
+  private bloomStrength = 0.7;
+  private readonly grade = {
+    contrast: 1.1,
+    saturation: 1.12,
+    shadowTint: [0.82, 0.97, 1.2] as [number, number, number],
+    highlightTint: [1.08, 1.0, 0.88] as [number, number, number],
+    split: 0.5,
+    vignette: 0.14,
+    grain: 0.03,
+    aberration: 1.0,
+    sharpen: 0.25,
+    bloomThreshold: 1.0,
+    bloomKnee: 0.5,
+    bloomScatter: 0.65,
+  };
+
+  // timing / stats
+  private time = 0;
+  private frame = 0;
+  private lastFrameAt = -1;
+  private cpuMs = 0;
+  private readonly statsOut: PipelineStats;
+
+  constructor(canvas: HTMLCanvasElement, opts: PipelineOptions) {
+    this.canvas = canvas;
+    const renderer = new THREE.WebGLRenderer({
+      canvas,
+      antialias: false, // AA is ours: MSAA on the HDR target or FXAA
+      alpha: false,
+      stencil: false,
+      depth: false, // nothing 3D is ever drawn to the default framebuffer
+      powerPreference: 'high-performance',
+      preserveDrawingBuffer: false,
+    });
+    this.renderer = renderer;
+    renderer.setPixelRatio(1); // sizes are managed here, in backing-store pixels
+    renderer.autoClear = false;
+    renderer.info.autoReset = false;
+    renderer.toneMapping = THREE.NoToneMapping; // tone mapping happens in the composite pass
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.setClearColor(0x000000, 1);
+
+    const gl = renderer.getContext() as WebGL2RenderingContext;
+    this.gl = gl;
+    const floatTargets = renderer.extensions.has('EXT_color_buffer_float') || renderer.extensions.has('EXT_color_buffer_half_float');
+    this.hdrType = floatTargets ? THREE.HalfFloatType : THREE.UnsignedByteType;
+    this.gpu = detectGpu(gl, floatTargets);
+    this.invalidateList = [gl.COLOR_ATTACHMENT0, gl.DEPTH_ATTACHMENT];
+
+    const q = opts.quality === undefined || opts.quality === 'auto' ? this.gpu.tier : opts.quality;
+    this._quality = q;
+    this.tier = TIERS[q];
+    this.dyn = new DynamicResolution({ targetFps: opts.targetFps ?? 60, minScale: MIN_SCALE, maxScale: 1, step: 0.05 });
+    this.dyn.enabled = opts.dynamicResolution ?? !this.gpu.software;
+
+    // targets (sized later)
+    this.sceneRT = colorTarget(this.hdrType, true);
+    this.msaaProxy = colorTarget(this.hdrType, true); // never initialised by three: stands in for our MSAA FBO
+    this.resolveRT = colorTarget(this.hdrType, false);
+    this.ldrRT = colorTarget(THREE.UnsignedByteType, false);
+
+    // full-screen triangle
+    this.fsGeometry = new THREE.BufferGeometry();
+    this.fsGeometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array([-1, -1, 0, 3, -1, 0, -1, 3, 0]), 3));
+    this.fsCamera = new THREE.Camera();
+    this.fsCamera.matrixWorldAutoUpdate = false;
+
+    this.prefilterMat = passMaterial(BLOOM_PREFILTER_FRAG, {
+      tSrc: this.uPreSrc,
+      uStep: this.uPreStep,
+      uCurve: this.uCurve,
+      uClamp: { value: BLOOM_CLAMP },
+    });
+    this.downMat = passMaterial(BLOOM_DOWN_FRAG, { tSrc: this.uDownSrc, uStep: this.uDownStep });
+    this.upMat = passMaterial(
+      BLOOM_UP_FRAG,
+      { tSrc: this.uUpSrc, uStep: this.uUpStep, uScatter: this.uScatter },
+      {
+        blending: THREE.CustomBlending,
+        blendEquation: THREE.AddEquation,
+        blendSrc: THREE.SrcAlphaFactor,
+        blendDst: THREE.OneMinusSrcAlphaFactor,
+        blendSrcAlpha: THREE.ZeroFactor,
+        blendDstAlpha: THREE.OneFactor,
+      },
+    );
+    this.compositeMat = passMaterial(COMPOSITE_FRAG, {
+      tScene: this.uScene,
+      tBloom: this.uBloomTex,
+      uSceneTexel: this.uSceneTexel,
+      uBloomTexel: this.uBloomTexel,
+      uOutSize: this.uOutSize,
+      uTone: this.uTone,
+      uLens: this.uLens,
+      uShadowTint: this.uShadowTint,
+      uHighTint: this.uHighTint,
+      uFx: this.uFx,
+      uGrain: this.uGrain,
+    });
+    this.fxaaMat = passMaterial(FXAA_FRAG, { tSrc: this.uLdr, uTexel: this.uLdrTexel, uGrain: this.uGrain });
+
+    this.fsMesh = new THREE.Mesh(this.fsGeometry, this.compositeMat);
+    this.fsMesh.frustumCulled = false;
+    this.fsMesh.matrixAutoUpdate = false;
+    this.fsMesh.matrixWorldAutoUpdate = false;
+
+    this.statsOut = {
+      drawCalls: 0,
+      triangles: 0,
+      resolutionScale: 1,
+      frameMs: 1000 / (opts.targetFps ?? 60),
+      fps: opts.targetFps ?? 60,
+      gpuTier: this.gpu.tier,
+      cpuMs: 0,
+      width: 1,
+      height: 1,
+      outputWidth: 1,
+      outputHeight: 1,
+      msaa: 0,
+      postPasses: 0,
+      targetBytes: 0,
+      gpuName: this.gpu.renderer,
+      software: this.gpu.software,
+    };
+
+    canvas.addEventListener('webglcontextlost', this.handleContextLost, false);
+    canvas.addEventListener('webglcontextrestored', this.handleContextRestored, false);
+
+    this.applyGrade();
+    this.configureTier();
+    const w = canvas.clientWidth || (typeof window !== 'undefined' ? window.innerWidth : 0) || canvas.width || 1;
+    const h = canvas.clientHeight || (typeof window !== 'undefined' ? window.innerHeight : 0) || canvas.height || 1;
+    this.resize(w, h, typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1);
+    // Warm-up: one empty frame compiles every program of the chain now rather than on the first real frame.
+    this.render(NO_LAYERS, 0);
+    this.lastFrameAt = -1;
+  }
+
+  get quality(): Quality {
+    return this._quality;
+  }
+
+  get pixelRatio(): number {
+    return this.outRatio * this.scale;
+  }
+
+  // ------------------------------------------------------------------------------------------ setup
+
+  /** Everything that depends on the tier but not on the size. */
+  private configureTier(): void {
+    const tier = this.tier;
+    this.msaa = this.hdrType === THREE.HalfFloatType ? this.supportedSamples(tier.msaa) : 0;
+    this.applyDefines();
+  }
+
+  private applyDefines(): void {
+    const tier = this.tier;
+    const defines: Record<string, string> = {};
+    if (this.msaa > 0) defines.FINAL = '';
+    if (tier.chroma) defines.CHROMA = '';
+    if (tier.sharpen) defines.SHARPEN = '';
+    if (tier.bloomHQ) defines.BLOOM_HQ = '';
+    this.compositeMat.defines = defines;
+    this.compositeMat.needsUpdate = true;
+  }
+
+  /** Largest MSAA sample count ≤ `wanted` that RGBA16F renderbuffers support (0 = none). */
+  private supportedSamples(wanted: number): number {
+    if (wanted <= 0) return 0;
+    const gl = this.gl;
+    let best = 0;
+    try {
+      const list = gl.getInternalformatParameter(gl.RENDERBUFFER, gl.RGBA16F, gl.SAMPLES) as Int32Array | null;
+      if (list) for (let i = 0; i < list.length; i++) if (list[i] <= wanted && list[i] > best) best = list[i];
+    } catch {
+      best = 0;
+    }
+    return best;
+  }
+
+  resize(cssWidth: number, cssHeight: number, devicePixelRatio: number): void {
+    const cssW = Math.max(1, Math.round(cssWidth));
+    const cssH = Math.max(1, Math.round(cssHeight));
+    const dpr = devicePixelRatio > 0 ? devicePixelRatio : 1;
+    const ratio = Math.min(dpr, this.tier.dpr);
+    const outW = Math.max(1, Math.round(cssW * ratio));
+    const outH = Math.max(1, Math.round(cssH * ratio));
+    this.cssW = cssW;
+    this.cssH = cssH;
+    this.dpr = dpr;
+    this.outRatio = ratio;
+    // The CSS box is set from the caller's numbers and is never touched by the resolution controller.
+    const style = this.canvas.style;
+    if (style) {
+      const sw = `${cssW}px`;
+      const sh = `${cssH}px`;
+      if (style.width !== sw) style.width = sw;
+      if (style.height !== sh) style.height = sh;
+    }
+    if (outW === this.outW && outH === this.outH && this.bloomLevels > 0) return;
+    this.outW = outW;
+    this.outH = outH;
+    this.renderer.setSize(outW, outH, false);
+    this.uOutSize.value.set(outW, outH);
+    this.uLdrTexel.value.set(1 / outW, 1 / outH);
+    this.allocOutputTargets();
+    this.allocSceneTarget();
+    this.dyn.reset();
+    this.lastFrameAt = -1;
+  }
+
+  setQuality(q: Quality): void {
+    if (q === this._quality) return;
+    this._quality = q;
+    this.tier = TIERS[q];
+    this.configureTier();
+    this.outW = this.outH = 0; // force reallocation
+    this.resize(this.cssW, this.cssH, this.dpr);
+  }
+
+  setDynamicResolution(enabled: boolean, fixedScale = 1): void {
+    this.dyn.enabled = enabled && !this.gpu.software;
+    if (!enabled) {
+      this.dyn.reset(Math.min(1, Math.max(MIN_SCALE, fixedScale)));
+      // an explicit fixed scale may be anything in range, not just a controller step
+      this.setScale(Math.min(1, Math.max(MIN_SCALE, fixedScale)));
+    }
+  }
+
+  private setScale(s: number): void {
+    if (s === this.scale) return;
+    this.scale = s;
+    this.allocSceneTarget();
+  }
+
+  /** Bloom chain and the LDR intermediate: sized from the canvas, independent of the dynamic scale. */
+  private allocOutputTargets(): void {
+    const w0 = Math.max(1, this.outW >> 1);
+    const h0 = Math.max(1, this.outH >> 1);
+    // Levels are chosen so the coarsest one is ~12 texels across the short side on every tier: the halo
+    // then covers the same fraction of the screen whatever the resolution.
+    const short = Math.min(w0, h0);
+    const levels = Math.min(this.tier.maxBloomLevels, Math.max(2, Math.round(Math.log2(Math.max(1, short / 12))) + 1));
+    while (this.bloomRT.length < levels) {
+      this.bloomRT.push(colorTarget(this.hdrType, false));
+      this.downStep.push(new THREE.Vector2());
+      this.upStep.push(new THREE.Vector2());
+    }
+    while (this.bloomRT.length > levels) {
+      this.bloomRT.pop()?.dispose();
+      this.downStep.pop();
+      this.upStep.pop();
+    }
+    this.bloomLevels = levels;
+    let w = w0;
+    let h = h0;
+    for (let i = 0; i < levels; i++) {
+      this.bloomRT[i].setSize(w, h);
+      this.downStep[i].set(0.5 / w, 0.5 / h); // one source texel of an ideal 2:1 step into level i
+      if (i > 0) this.upStep[i - 1].set(1 / w, 1 / h); // one texel of level i, used when upsampling into i-1
+      w = Math.max(1, w >> 1);
+      h = Math.max(1, h >> 1);
+    }
+    this.uBloomTexel.value.set(1 / w0, 1 / h0);
+    if (this.msaa === 0) this.ldrRT.setSize(this.outW, this.outH);
+    else this.ldrRT.dispose();
+  }
+
+  /** The HDR scene target at the current dynamic scale. */
+  private allocSceneTarget(): void {
+    const w = Math.max(1, Math.round(this.outW * this.scale));
+    const h = Math.max(1, Math.round(this.outH * this.scale));
+    this.sceneW = w;
+    this.sceneH = h;
+    this.uSceneTexel.value.set(1 / w, 1 / h);
+    if (this.msaa > 0 && !this.allocMsaa(w, h)) {
+      // The driver refused the multisampled half-float framebuffer: fall back to the FXAA path for good.
+      this.msaa = 0;
+      this.releaseMsaa();
+      this.applyDefines();
+      this.ldrRT.setSize(this.outW, this.outH);
+    }
+    if (this.msaa > 0) {
+      this.sceneRT.dispose();
+    } else {
+      this.releaseMsaa();
+      this.sceneRT.setSize(w, h);
+    }
+  }
+
+  private allocMsaa(w: number, h: number): boolean {
+    if (this.lost) return true;
+    const gl = this.gl;
+    const r = this.renderer;
+    if (!this.msaaFbo) {
+      this.msaaFbo = gl.createFramebuffer();
+      this.msaaColor = gl.createRenderbuffer();
+      this.msaaDepth = gl.createRenderbuffer();
+      if (!this.msaaFbo || !this.msaaColor || !this.msaaDepth) return false;
+    }
+    gl.bindRenderbuffer(gl.RENDERBUFFER, this.msaaColor);
+    gl.renderbufferStorageMultisample(gl.RENDERBUFFER, this.msaa, gl.RGBA16F, w, h);
+    gl.bindRenderbuffer(gl.RENDERBUFFER, this.msaaDepth);
+    gl.renderbufferStorageMultisample(gl.RENDERBUFFER, this.msaa, gl.DEPTH_COMPONENT24, w, h);
+    gl.bindRenderbuffer(gl.RENDERBUFFER, null);
+    // Framebuffer bindings go through three's state cache so it never disagrees with GL.
+    r.state.bindFramebuffer(gl.FRAMEBUFFER, this.msaaFbo);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, this.msaaColor);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, this.msaaDepth);
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    r.setRenderTarget(null);
+    if (!ok) return false;
+    this.msaaProxy.setSize(w, h);
+    this.resolveRT.setSize(w, h);
+    (r as unknown as ExternalFramebufferHost).setRenderTargetFramebuffer(this.msaaProxy, this.msaaFbo);
+    return true;
+  }
+
+  private releaseMsaa(): void {
+    const gl = this.gl;
+    if (this.msaaFbo) {
+      if (this.renderer.getRenderTarget() === this.msaaProxy) this.renderer.setRenderTarget(null);
+      gl.deleteFramebuffer(this.msaaFbo);
+    }
+    if (this.msaaColor) gl.deleteRenderbuffer(this.msaaColor);
+    if (this.msaaDepth) gl.deleteRenderbuffer(this.msaaDepth);
+    this.msaaFbo = this.msaaColor = this.msaaDepth = null;
+    this.resolveRT.dispose();
+  }
+
+  // ------------------------------------------------------------------------------------------ look
+
+  setExposure(ev: number): void {
+    this.exposureEv = Number.isFinite(ev) ? ev : 0;
+    this.uTone.value.x = Math.pow(2, this.exposureEv);
+  }
+
+  setBloom(strength: number): void {
+    this.bloomStrength = Number.isFinite(strength) ? Math.max(0, strength) : 0;
+    this.uTone.value.y = this.bloomStrength;
+  }
+
+  setGrade(params: GradeParams): void {
+    const g = this.grade;
+    if (params.contrast !== undefined) g.contrast = params.contrast;
+    if (params.saturation !== undefined) g.saturation = params.saturation;
+    if (params.shadowTint !== undefined) {
+      g.shadowTint[0] = params.shadowTint[0];
+      g.shadowTint[1] = params.shadowTint[1];
+      g.shadowTint[2] = params.shadowTint[2];
+    }
+    if (params.highlightTint !== undefined) {
+      g.highlightTint[0] = params.highlightTint[0];
+      g.highlightTint[1] = params.highlightTint[1];
+      g.highlightTint[2] = params.highlightTint[2];
+    }
+    if (params.split !== undefined) g.split = params.split;
+    if (params.vignette !== undefined) g.vignette = params.vignette;
+    if (params.grain !== undefined) g.grain = params.grain;
+    if (params.aberration !== undefined) g.aberration = params.aberration;
+    if (params.sharpen !== undefined) g.sharpen = params.sharpen;
+    if (params.bloomThreshold !== undefined) g.bloomThreshold = params.bloomThreshold;
+    if (params.bloomKnee !== undefined) g.bloomKnee = params.bloomKnee;
+    if (params.bloomScatter !== undefined) g.bloomScatter = params.bloomScatter;
+    this.applyGrade();
+  }
+
+  private applyGrade(): void {
+    const g = this.grade;
+    this.uTone.value.set(Math.pow(2, this.exposureEv), this.bloomStrength, Math.max(0.5, g.contrast), Math.max(0, g.saturation));
+    const split = Math.min(1, Math.max(0, g.split));
+    setTint(this.uShadowTint.value, g.shadowTint, split);
+    setTint(this.uHighTint.value, g.highlightTint, split);
+    const knee = Math.max(1e-3, g.bloomKnee);
+    const thr = Math.max(0, g.bloomThreshold);
+    this.uCurve.value.set(thr, thr - knee, 2 * knee, 0.25 / knee);
+    this.uScatter.value = Math.min(0.95, Math.max(0, g.bloomScatter));
+  }
+
+  setEffect(name: EffectName, amount: number): void {
+    const a = Number.isFinite(amount) ? Math.min(1, Math.max(0, amount)) : 0;
+    const fx = this.uFx.value;
+    if (name === 'jump') fx.x = a;
+    else if (name === 'damage') fx.y = a;
+    else if (name === 'heat') fx.z = a;
+    else if (name === 'flash') fx.w = a;
+  }
+
+  // ------------------------------------------------------------------------------------------ frame
+
+  render(layers: readonly RenderLayer[], dt: number): void {
+    if (this.lost || this.disposed) return;
+    const r = this.renderer;
+    const now = performance.now();
+
+    // Frame pacing -> dynamic resolution.
+    if (this.lastFrameAt >= 0) {
+      const s = this.dyn.update(now - this.lastFrameAt);
+      if (s !== this.scale) this.setScale(s);
+    }
+    this.lastFrameAt = now;
+    if (dt > 0 && dt < 1) this.time = (this.time + dt) % 3600;
+    this.frame = (this.frame + 1) & 255;
+
+    // ---- scene layers -> HDR target
+    r.info.reset();
+    const msaa = this.msaa > 0;
+    const target = msaa ? this.msaaProxy : this.sceneRT;
+    r.setRenderTarget(target);
+    r.setClearColor(0x000000, 1);
+    r.clear(true, true, false);
+    for (let i = 0; i < layers.length; i++) {
+      const layer = layers[i];
+      // A layer may have rendered shadow maps or other targets; three restores ours, but make sure.
+      if (r.getRenderTarget() !== target) r.setRenderTarget(target);
+      if (i > 0 && layer.clearDepth) r.clear(false, true, false);
+      r.render(layer.scene, layer.camera);
+    }
+    const st = this.statsOut;
+    st.drawCalls = r.info.render.calls;
+    st.triangles = r.info.render.triangles;
+    const sceneTex = msaa ? this.resolveMsaa() : this.sceneRT.texture;
+
+    // ---- bloom
+    let passes = 0;
+    const n = this.bloomLevels;
+    const bloom = this.bloomRT;
+    if (this.bloomStrength > 0) {
+      this.uPreSrc.value = sceneTex;
+      this.uPreStep.value.copy(this.downStep[0]);
+      this.pass(this.prefilterMat, bloom[0], true);
+      for (let i = 1; i < n; i++) {
+        this.uDownSrc.value = bloom[i - 1].texture;
+        this.uDownStep.value.copy(this.downStep[i]);
+        this.pass(this.downMat, bloom[i], true);
+      }
+      for (let i = n - 2; i >= 0; i--) {
+        this.uUpSrc.value = bloom[i + 1].texture;
+        this.uUpStep.value.copy(this.upStep[i]);
+        this.pass(this.upMat, bloom[i], false); // blends over the level already there
+      }
+      passes = 2 * n - 1;
+    }
+
+    // ---- composite (+ FXAA)
+    const g = this.grade;
+    const lens = this.uLens.value;
+    lens.x = g.vignette;
+    lens.y = g.aberration * 1.25 * this.outRatio;
+    // Sharpen harder the more the scene is being magnified.
+    lens.z = g.sharpen > 0 ? g.sharpen + (1 - this.scale) * 0.9 : 0;
+    lens.w = this.time;
+    this.uGrain.value.set(g.grain, Math.max(1, this.outRatio * 0.8), this.frame, 0);
+    this.uScene.value = sceneTex;
+    this.uBloomTex.value = bloom[0].texture;
+    if (msaa) {
+      this.pass(this.compositeMat, null, false);
+      passes += 1;
+    } else {
+      this.pass(this.compositeMat, this.ldrRT, true);
+      this.uLdr.value = this.ldrRT.texture;
+      this.pass(this.fxaaMat, null, false);
+      passes += 2;
+    }
+
+    st.postPasses = passes;
+    this.cpuMs += (performance.now() - now - this.cpuMs) * 0.1;
+  }
+
+  /** One full-screen triangle into `target` (null = canvas). */
+  private pass(material: THREE.RawShaderMaterial, target: THREE.WebGLRenderTarget | null, clear: boolean): void {
+    const r = this.renderer;
+    this.fsMesh.material = material;
+    r.setRenderTarget(target);
+    // Clearing tells a tile-based GPU it need not load the old contents of the target.
+    if (clear) r.clear(true, false, false);
+    r.render(this.fsMesh, this.fsCamera);
+  }
+
+  /** Resolve our MSAA framebuffer into the half-float resolve target, once per frame. */
+  private resolveMsaa(): THREE.Texture {
+    const gl = this.gl;
+    const r = this.renderer;
+    const rt = this.resolveRT;
+    let props = r.properties.get(rt) as { __webglFramebuffer?: WebGLFramebuffer };
+    if (props.__webglFramebuffer === undefined) {
+      r.initRenderTarget(rt);
+      props = r.properties.get(rt) as { __webglFramebuffer?: WebGLFramebuffer };
+    }
+    const state = r.state;
+    state.setScissorTest(false);
+    state.bindFramebuffer(gl.READ_FRAMEBUFFER, this.msaaFbo);
+    state.bindFramebuffer(gl.DRAW_FRAMEBUFFER, props.__webglFramebuffer ?? null);
+    gl.blitFramebuffer(0, 0, this.sceneW, this.sceneH, 0, 0, this.sceneW, this.sceneH, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    // Nothing reads the multisampled colour or depth again: let the GPU drop them instead of storing.
+    gl.invalidateFramebuffer(gl.READ_FRAMEBUFFER, this.invalidateList);
+    state.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+    state.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+    return rt.texture;
+  }
+
+  stats(): PipelineStats {
+    const st = this.statsOut;
+    st.resolutionScale = this.scale;
+    st.frameMs = this.dyn.frameMs;
+    st.fps = st.frameMs > 0 ? 1000 / st.frameMs : 0;
+    st.cpuMs = this.cpuMs;
+    st.width = this.sceneW;
+    st.height = this.sceneH;
+    st.outputWidth = this.outW;
+    st.outputHeight = this.outH;
+    st.msaa = this.msaa;
+    st.targetBytes = this.targetBytes();
+    return st;
+  }
+
+  private targetBytes(): number {
+    const scenePx = this.sceneW * this.sceneH;
+    const hdrBpp = this.hdrType === THREE.HalfFloatType ? 8 : 4;
+    // MSAA: colour + depth samples, plus the resolve texture. Otherwise colour + depth.
+    let bytes = this.msaa > 0 ? scenePx * (this.msaa * (hdrBpp + 4) + hdrBpp) : scenePx * (hdrBpp + 4);
+    for (let i = 0; i < this.bloomLevels; i++) bytes += this.bloomRT[i].width * this.bloomRT[i].height * hdrBpp;
+    if (this.msaa === 0) bytes += this.outW * this.outH * 4;
+    return bytes + this.outW * this.outH * 4; // canvas backing store
+  }
+
+  // ------------------------------------------------------------------------------------------ context
+
+  private readonly handleContextLost = (event: Event): void => {
+    event.preventDefault(); // allow restoration
+    this.lost = true;
+    this.onContextLost?.();
+  };
+
+  private readonly handleContextRestored = (): void => {
+    // three's own listener (registered first) has already rebuilt its GL state; its render targets,
+    // programs and buffers are recreated lazily. Only our raw GL objects have to be made again.
+    this.lost = false;
+    this.msaaFbo = this.msaaColor = this.msaaDepth = null;
+    this.renderer.info.autoReset = false;
+    this.renderer.setClearColor(0x000000, 1);
+    this.configureTier();
+    this.allocSceneTarget();
+    this.dyn.reset();
+    this.lastFrameAt = -1;
+    this.onContextRestored?.();
+  };
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.canvas.removeEventListener('webglcontextlost', this.handleContextLost, false);
+    this.canvas.removeEventListener('webglcontextrestored', this.handleContextRestored, false);
+    if (!this.lost) this.releaseMsaa();
+    this.sceneRT.dispose();
+    this.resolveRT.dispose();
+    this.msaaProxy.dispose();
+    this.ldrRT.dispose();
+    for (const rt of this.bloomRT) rt.dispose();
+    this.bloomRT.length = 0;
+    this.prefilterMat.dispose();
+    this.downMat.dispose();
+    this.upMat.dispose();
+    this.compositeMat.dispose();
+    this.fxaaMat.dispose();
+    this.fsGeometry.dispose();
+    this.renderer.dispose();
+  }
+}
+
+const NO_LAYERS: readonly RenderLayer[] = [];
+
+/** Split-tone multiplier: the tint's chroma at unit luminance, blended toward neutral by `strength`. */
+function setTint(out: THREE.Vector3, tint: readonly [number, number, number], strength: number): void {
+  const l = Math.max(1e-4, tint[0] * LUMA_R + tint[1] * LUMA_G + tint[2] * LUMA_B);
+  out.set(1 + (tint[0] / l - 1) * strength, 1 + (tint[1] / l - 1) * strength, 1 + (tint[2] / l - 1) * strength);
+}
+
+export function createPipeline(canvas: HTMLCanvasElement, opts: PipelineOptions = {}): RenderPipeline {
+  return new Pipeline(canvas, opts);
+}

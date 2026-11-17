@@ -1,0 +1,130 @@
+/* TIDELOCK interface tokens.
+ *
+ * Everything lives under .tl-root so nothing leaks into (or out of) the page. Colours follow
+ * docs/ARCHITECTURE.md "Interface": ember amber for primary/selection/prograde, ion cyan for
+ * information/targets/orbits, signal red for danger, go green for nominal/profit.
+ */
+.tl-root {
+  /* ---- accents ---- */
+  --tl-ember: #ffb454;
+  --tl-ember-hi: #ffd08a;
+  --tl-ember-lo: #c98228;
+  --tl-ion: #6fe3ff;
+  --tl-ion-lo: #3aa9c7;
+  --tl-red: #ff5a4d;
+  --tl-green: #63e6a1;
+  --tl-ember-rgb: 255, 180, 84;
+  --tl-ion-rgb: 111, 227, 255;
+  --tl-red-rgb: 255, 90, 77;
+  --tl-green-rgb: 99, 230, 161;
+
+  /* ---- ink ---- */
+  --tl-text: #e8eef5;
+  --tl-dim: #8fa3b8;
+  --tl-faint: #5d6e80; /* decoration, rulers, disabled — never body copy */
+  --tl-ink: #0b0d10; /* text on a filled ember / cyan surface */
+
+  /* ---- surfaces ---- */
+  --tl-void: #05070b;
+  --tl-glass: rgba(10, 14, 20, 0.72);
+  --tl-glass-strong: rgba(8, 11, 16, 0.9);
+  --tl-glass-solid: #0a0e14;
+  --tl-raise: rgba(255, 255, 255, 0.035);
+  --tl-raise-2: rgba(255, 255, 255, 0.07);
+  --tl-line: rgba(255, 255, 255, 0.08);
+  --tl-line-2: rgba(255, 255, 255, 0.16);
+  --tl-line-3: rgba(255, 255, 255, 0.32);
+  --tl-scrim: rgba(2, 4, 8, 0.62);
+
+  /* ---- powers & factions ---- */
+  --tl-assembly: #3fd0c9;
+  --tl-hegemony: #f2b84b;
+  --tl-league: #9b7bff;
+  --tl-independent: #8a97a6;
+  --tl-outlaw: #ff5a4d;
+
+  /* ---- type ---- */
+  --tl-font: 'DIN Alternate', 'Avenir Next', -apple-system, 'SF Pro Text', system-ui, sans-serif;
+  /* Prose: the same stack without the bold-only DIN face, so paragraphs stay light and readable. */
+  --tl-font-body: 'Avenir Next', -apple-system, 'SF Pro Text', system-ui, sans-serif;
+  --tl-fs-11: 11px;
+  --tl-fs-12: 12px;
+  --tl-fs-13: 13px;
+  --tl-fs-15: 15px;
+  --tl-fs-17: 17px;
+  --tl-fs-20: 20px;
+  --tl-fs-24: 24px;
+  --tl-fs-32: 32px;
+  --tl-fs-44: 44px;
+  --tl-track: 0.14em; /* uppercase labels */
+  --tl-track-wide: 0.24em; /* eyebrows, wordmark-adjacent */
+  --tl-track-tight: 0.04em; /* titles, numerals */
+
+  /* ---- space (4 px grid) ---- */
+  --tl-s1: 2px;
+  --tl-s2: 4px;
+  --tl-s3: 8px;
+  --tl-s4: 12px;
+  --tl-s5: 16px;
+  --tl-s6: 20px;
+  --tl-s7: 24px;
+  --tl-s8: 32px;
+  --tl-s9: 48px;
+  --tl-gutter: 16px; /* screen edge to content */
+  --tl-hit: 44px; /* minimum touch target */
+
+  /* ---- shape ---- */
+  --tl-r1: 2px;
+  --tl-r2: 4px;
+  --tl-r3: 8px;
+  --tl-chamfer: 9px;
+  --tl-blur: 18px;
+  --tl-blur-lite: 8px;
+
+  /* ---- layers ---- */
+  --tl-z-base: 0;
+  --tl-z-hud: 10;
+  --tl-z-screen: 20;
+  --tl-z-sheet: 40;
+  --tl-z-modal: 50;
+  --tl-z-pop: 60;
+  --tl-z-toast: 70;
+  --tl-z-splash: 90;
+
+  /* ---- motion ---- */
+  --tl-t1: 120ms;
+  --tl-t2: 180ms;
+  --tl-t3: 240ms;
+  --tl-ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --tl-ease-in: cubic-bezier(0.5, 0, 0.9, 0.4);
+  --tl-ease-io: cubic-bezier(0.45, 0, 0.2, 1);
+
+  /* ---- safe area (a harness or test may override these four) ---- */
+  --tl-safe-t: env(safe-area-inset-top, 0px);
+  --tl-safe-r: env(safe-area-inset-right, 0px);
+  --tl-safe-b: env(safe-area-inset-bottom, 0px);
+  --tl-safe-l: env(safe-area-inset-left, 0px);
+
+  /* ---- per-element tone: components read --tl-c, set by a .tl-tone-* class or inline ---- */
+  --tl-c: var(--tl-ember);
+}
+
+.tl-root .tl-tone-ember { --tl-c: var(--tl-ember); }
+.tl-root .tl-tone-ion { --tl-c: var(--tl-ion); }
+.tl-root .tl-tone-red { --tl-c: var(--tl-red); }
+.tl-root .tl-tone-green { --tl-c: var(--tl-green); }
+.tl-root .tl-tone-neutral { --tl-c: #c3cfdb; }
+.tl-root .tl-tone-dim { --tl-c: var(--tl-dim); }
+.tl-root .tl-tone-assembly { --tl-c: var(--tl-assembly); }
+.tl-root .tl-tone-hegemony { --tl-c: var(--tl-hegemony); }
+.tl-root .tl-tone-league { --tl-c: var(--tl-league); }
+.tl-root .tl-tone-independent { --tl-c: var(--tl-independent); }
+.tl-root .tl-tone-outlaw { --tl-c: var(--tl-outlaw); }
+
+@media (prefers-reduced-motion: reduce) {
+  .tl-root {
+    --tl-t1: 1ms;
+    --tl-t2: 1ms;
+    --tl-t3: 1ms;
+  }
+}
