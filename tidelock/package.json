@@ -1,0 +1,25 @@
+{
+  "name": "tidelock",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TIDELOCK — a hard-science space trading, politics and orbital-mechanics game for iPhone (WebGL2 PWA).",
+  "scripts": {
+    "build": "node build.mjs",
+    "build:single": "node build.mjs --single",
+    "serve": "node build.mjs --serve",
+    "harness": "node build.mjs --harness",
+    "typecheck": "tsc --noEmit -p .",
+    "test": "vitest run",
+    "shot": "node tools/shot.cjs"
+  },
+  "dependencies": {
+    "three": "0.180.0"
+  },
+  "devDependencies": {
+    "@types/three": "0.180.0",
+    "esbuild": "0.25.12",
+    "typescript": "5.9.3",
+    "vitest": "3.2.7"
+  }
+}
