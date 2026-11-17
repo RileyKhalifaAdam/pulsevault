@@ -77,7 +77,7 @@ if (has('scale')) pipeline.setDynamicResolution(false, num('scale', 1));
   if (has('sharpen')) g.sharpen = num('sharpen', 0);
   if (has('thr')) g.bloomThreshold = num('thr', 1);
   if (has('knee')) g.bloomKnee = num('knee', 0.5);
-  if (has('scatter')) g.bloomScatter = num('scatter', 0.65);
+  if (has('scatter')) g.bloomScatter = num('scatter', 0.7);
   pipeline.setGrade(g);
 }
 for (const name of str('effect', '').split(',')) {
@@ -335,7 +335,7 @@ envScene.add(
           c += vec3(1.0, 0.62, 0.36) * (30.0 * pow(s, 420.0) + 1.3 * pow(s, 7.0));
           // planet-shine: a broad cool limb below, brightest along its sunward edge
           float h = d.y + 0.3 * d.x + 0.25;
-          c += vec3(0.22, 0.4, 0.7) * (0.5 * smoothstep(0.05, -0.6, h) + 1.6 * exp(-40.0 * h * h));
+          c += vec3(0.3, 0.43, 0.62) * (0.45 * smoothstep(0.05, -0.6, h) + 0.9 * exp(-40.0 * h * h));
           gl_FragColor = vec4(c, 1.0);
         }`,
     }),

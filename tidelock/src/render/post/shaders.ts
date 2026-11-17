@@ -23,8 +23,9 @@ void main() {
  * texel — a star point, a specular sparkle — cannot flare into a flickering blob ("firefly"). The
  * averaged colour (already exposed) then goes through a soft-knee bright pass keyed on the max channel,
  * which keeps saturated emitters (red dwarfs, amber strips) blooming in their own colour.
- * `uStep` is half a destination texel, i.e. one source texel of an ideal 2:1 chain; it is tied to the
- * bloom target, not the scene target, so the footprint does not change with dynamic resolution.
+ * `uStep` is half a destination texel (one source texel when the scene is exactly twice the bloom
+ * target); it is tied to the bloom target, not the scene target, so the footprint does not change with
+ * dynamic resolution or the tier's pixel ratio.
  */
 export const BLOOM_PREFILTER_FRAG = /* glsl */ `
 precision highp float;
@@ -42,7 +43,9 @@ vec3 tap(float x, float y) {
   float s = c.r + c.g + c.b;
   if (isnan(s) || isinf(s) || !(s >= 0.0)) c = vec3(0.0);
   // Exposed values: what blooms is what ends up brighter than display white, at any exposure.
-  return min(max(c * uExposure, vec3(0.0)), vec3(uClamp));
+  // The ceiling is applied to the max channel — a per-channel clamp would turn a bright orange yellow.
+  c = max(c * uExposure, vec3(0.0));
+  return c * min(1.0, uClamp / max(max(c.r, max(c.g, c.b)), 1e-4));
 }
 float maxc(vec3 c) { return max(c.r, max(c.g, c.b)); }
 
@@ -156,7 +159,7 @@ vec3 filmGrain(vec3 srgb, vec2 fragCoord, vec4 grain) {
  * Compile-time switches (set from the quality tier):
  *   FINAL      last pass (MSAA tiers): add film grain, alpha = 1. Otherwise alpha carries luma for FXAA.
  *   CHROMA     edge chromatic aberration (2 extra scene taps)
- *   SHARPEN    unsharp mask in a compressed HDR space (4 extra scene taps)
+ *   SHARPEN    contrast-adaptive sharpening in a compressed HDR space (4 extra scene taps)
  *   BLOOM_HQ   4-tap tent when magnifying the half-res bloom
  * Screen-space effects are uniform-driven branches of this one program, so triggering a jump never
  * compiles a shader mid-flight.
@@ -281,14 +284,29 @@ void main() {
 #ifdef SHARPEN
     vec3 sharp = vec3(0.0);
     if (uLens.z > 0.0) {
-      // Unsharp mask in a Reinhard-compressed space so HDR edges do not ring.
-      vec3 cc = col / (1.0 + maxc(col));
+      // Contrast-adaptive sharpening (after AMD CAS) in a Reinhard-compressed space. The amount falls
+      // to zero where the neighbourhood already spans the range — an emissive strip on a hull, a star on
+      // black — so HDR edges get no halo and no hue shift; only soft, low-contrast detail is lifted.
       vec3 n0 = sceneTap(uv + vec2(uSceneTexel.x, 0.0));
       vec3 n1 = sceneTap(uv - vec2(uSceneTexel.x, 0.0));
       vec3 n2 = sceneTap(uv + vec2(0.0, uSceneTexel.y));
       vec3 n3 = sceneTap(uv - vec2(0.0, uSceneTexel.y));
-      vec3 blur = (n0 / (1.0 + maxc(n0)) + n1 / (1.0 + maxc(n1)) + n2 / (1.0 + maxc(n2)) + n3 / (1.0 + maxc(n3))) * 0.25;
-      vec3 sc = clamp(cc + (cc - blur) * uLens.z, 0.0, 0.995);
+      vec3 cc = col / (1.0 + maxc(col));
+      n0 /= 1.0 + maxc(n0);
+      n1 /= 1.0 + maxc(n1);
+      n2 /= 1.0 + maxc(n2);
+      n3 /= 1.0 + maxc(n3);
+      const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+      float l0 = dot(cc, LUMA), la = dot(n0, LUMA), lb = dot(n1, LUMA), lc = dot(n2, LUMA), ld = dot(n3, LUMA);
+      float mn = min(l0, min(min(la, lb), min(lc, ld)));
+      float mx = max(l0, max(max(la, lb), max(lc, ld)));
+      float amp = sqrt(clamp(min(mn, 1.0 - mx) / max(mx, 1e-4), 0.0, 1.0));
+      float w = -0.2 * amp * min(uLens.z, 1.0);
+      // …and the result may not leave the range of its neighbourhood, per channel: transitions get
+      // steeper, but nothing overshoots into a ring (a blue outline around an amber strip).
+      vec3 lo = min(cc, min(min(n0, n1), min(n2, n3)));
+      vec3 hi = max(cc, max(max(n0, n1), max(n2, n3)));
+      vec3 sc = clamp((cc + (n0 + n1 + n2 + n3) * w) / (1.0 + 4.0 * w), lo, min(hi, vec3(0.995)));
       sharp = sc / (1.0 - maxc(sc)) - col;
     }
 #endif
@@ -322,16 +340,18 @@ void main() {
   float vig = 1.0 / (1.0 + rv2 * uLens.x);
   col *= vig * vig;
   float flash = uFx.w;
-  col = col * (1.0 + 4.0 * flash) + vec3(flash * flash * 2.5 * (1.0 - 0.45 * rv2));
+  col = col * (1.0 + 4.0 * flash) + vec3(flash * flash * 3.0 * (1.0 - 0.6 * rv2));
   if (heat > 0.0) {
-    // Plasma sheath: ragged streamers flowing up the frame edges, hotter (whiter) where they are dense.
+    // Plasma sheath: fine filaments streaming up from the frame edges, additive and translucent so the
+    // scene reads through them; only their densest cores go white-hot.
     vec2 hq = vec2(vUv.x * uOutSize.x / uOutSize.y, vUv.y);
-    float s1 = vnoise(vec2(hq.x * 10.0, hq.y * 2.4 - time * 2.6));
-    float s2 = vnoise(vec2(hq.x * 27.0 + 7.1, hq.y * 5.5 - time * 4.4));
-    float streak = s1 * 0.65 + s2 * 0.35;
-    float sheath = smoothstep(0.85, 2.1, e2 + (streak - 0.5) * 1.1) * (0.25 + 1.5 * streak * streak);
-    float glow = heat * heat * sheath;
-    col += vec3(1.0, 0.33, 0.07) * (glow * 2.6) + vec3(1.0, 0.72, 0.42) * (glow * glow * 3.0);
+    float s1 = vnoise(vec2(hq.x * 14.0, hq.y * 1.6 - time * 2.6));
+    float s2 = vnoise(vec2(hq.x * 46.0 + 7.1, hq.y * 3.5 - time * 4.4));
+    float s3 = vnoise(vec2(hq.x * 120.0 + 3.3, hq.y * 7.0 - time * 7.0));
+    float streak = s1 * 0.5 + s2 * 0.32 + s3 * 0.18;
+    float reach = smoothstep(0.95, 2.2, e2 + (streak - 0.5) * 0.8);
+    float glow = heat * heat * reach * (0.2 + 1.6 * streak * streak);
+    col += vec3(1.0, 0.24, 0.04) * glow + vec3(1.0, 0.55, 0.25) * (glow * glow * 0.8);
   }
 
   // ---- display transform + grade
@@ -351,7 +371,7 @@ void main() {
     col = mix(col, vec3(grey), 0.35 * dmg);
     col = mix(col, col * vec3(1.0, 0.2, 0.15) + vec3(0.36, 0.008, 0.0), edge);
   }
-  col = mix(col, vec3(1.0), flash * flash * (3.0 - 2.0 * flash) * (1.0 - 0.3 * rv2 * (1.0 - flash)));
+  col = mix(col, vec3(1.0), flash * flash * flash);
 
   vec3 srgb = linearToSrgb(clamp(col, 0.0, 1.0));
 #ifdef FINAL

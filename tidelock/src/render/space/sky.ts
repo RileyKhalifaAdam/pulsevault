@@ -4,9 +4,14 @@
 // Cost at run time: two draw calls (one cube-mapped box, one THREE.Points), one cube fetch per pixel.
 // Everything expensive (many-octave noise for the band, dust and nebulae) is evaluated exactly once, at
 // creation, into an RGBA8 cube map:
-//   rgb = sqrt(radiance)   (gamma-2 encoded, dithered, so dark gradients do not band)
+//   rgb = sqrt(radiance / 0.6)   (gamma-2 encoded, dithered, so dark gradients do not band)
 //   a   = dust transmittance (the star points read it in the vertex shader, so stars thin out and redden
 //         behind the dust lanes exactly where the baked haze is dark)
+//
+// The stars are point sprites sized in pixels of the current render target. Each is the image a camera
+// would record: a gaussian core whose width follows the pixel density (never below ~0.6 px, so it cannot
+// shimmer; total light is conserved), faint power-law wings and, for the handful that saturate the
+// sensor, a burnt-out core with a soft glow and six thin diffraction spikes.
 //
 // The module also owns the small prefiltered environment (PMREM) the ships use for reflections: the sky plus
 // an optional soft lobe for the star ("the star's light slot", see setStarLight).
@@ -64,8 +69,16 @@ uint tlPcg(uint v) {
   uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
   return (w >> 22u) ^ w;
 }
+// Lattice hash: one multiply per axis and a two-round finaliser (about a third of the cost of chaining
+// tlPcg three times, which matters because every noise octave calls it eight times).
 uint tlHash3(ivec3 p) {
-  return tlPcg(uint(p.x) + tlPcg(uint(p.y) + tlPcg(uint(p.z))));
+  uint h = uint(p.x) * 0x9E3779B1u + uint(p.y) * 0x85EBCA77u + uint(p.z) * 0xC2B2AE3Du;
+  h ^= h >> 15u;
+  h *= 0x2C1B3C6Du;
+  h ^= h >> 12u;
+  h *= 0x297A2D39u;
+  h ^= h >> 15u;
+  return h;
 }
 float tlH31(ivec3 p) {
   return float(tlHash3(p) >> 8u) * (1.0 / 16777216.0);
@@ -194,9 +207,15 @@ bakeScene.matrixAutoUpdate = false;
 
 /**
  * Render `material` (a full-screen RawShaderMaterial with an `int uFace` uniform) into the six faces of a
- * cube render target. Renderer state (target, auto-clear, XR) is restored afterwards.
+ * cube render target. `beforeFace` may set further per-face uniforms. Renderer state (target, auto-clear,
+ * XR) is restored afterwards.
  */
-export function bakeCubeFaces(renderer: THREE.WebGLRenderer, target: THREE.WebGLCubeRenderTarget, material: THREE.RawShaderMaterial): void {
+export function bakeCubeFaces(
+  renderer: THREE.WebGLRenderer,
+  target: THREE.WebGLCubeRenderTarget,
+  material: THREE.RawShaderMaterial,
+  beforeFace?: (face: number) => void,
+): void {
   const oldTarget = renderer.getRenderTarget();
   const oldFace = renderer.getActiveCubeFace();
   const oldMip = renderer.getActiveMipmapLevel();
@@ -209,6 +228,7 @@ export function bakeCubeFaces(renderer: THREE.WebGLRenderer, target: THREE.WebGL
   bakeMesh.material = material;
   for (let face = 0; face < 6; face++) {
     material.uniforms.uFace.value = face;
+    if (beforeFace) beforeFace(face);
     material.uniformsNeedUpdate = true;
     renderer.setRenderTarget(target, face);
     renderer.render(bakeScene, bakeCamera);
@@ -219,9 +239,20 @@ export function bakeCubeFaces(renderer: THREE.WebGLRenderer, target: THREE.WebGL
   releaseFullscreenTriangle();
 }
 
+const syncPixel = new Uint8Array(4);
+
+/**
+ * Block until the GPU has executed everything submitted so far (gl.finish() does not do that in every
+ * browser; a one-pixel read-back does). `rgba8Cube` is any RGBA8 cube target of this renderer. Used once
+ * after a bake so the cost lands at load time, where it is measured, instead of in the first frame.
+ */
+export function finishGpu(renderer: THREE.WebGLRenderer, rgba8Cube: THREE.WebGLCubeRenderTarget): void {
+  renderer.readRenderTargetPixels(rgba8Cube, 0, 0, 1, 1, syncPixel, 0);
+}
+
 // ------------------------------------------------------------------------------------------- sky recipe
 
-const SKY_MAX = 1.0; // radiance that maps to 1.0 in the gamma-2 encoded cube
+const SKY_MAX = 0.6; // radiance that maps to 1.0 in the gamma-2 encoded cube
 
 interface NebulaSpec {
   dir: THREE.Vector3;
@@ -254,7 +285,8 @@ interface SkyRecipe {
   bulgeTint: [number, number, number];
   nebulae: NebulaSpec[];
   galaxies: { dir: THREE.Vector3; size: number; intensity: number; ratio: number; angle: number }[];
-  clusters: { dir: THREE.Vector3; radius: number; count: number; temp: number }[];
+  /** `lead`: how many of the cluster's stars are bright enough to stand out. */
+  clusters: { dir: THREE.Vector3; radius: number; count: number; temp: number; lead?: number }[];
 }
 
 function randomUnit(rng: Rng, out: THREE.Vector3): THREE.Vector3 {
@@ -295,16 +327,16 @@ function makeRecipe(skySeed: number): SkyRecipe {
     gx,
     gy,
     gz,
-    diskBright: rng.range(0.03, 0.055),
-    bulgeBright: rng.range(0.045, 0.085),
-    thickness: rng.range(0.055, 0.1),
-    dust: rng.range(0.7, 1.35),
-    bulgeL: rng.range(0.22, 0.36),
-    bulgeB: rng.range(0.13, 0.21),
+    diskBright: rng.range(0.06, 0.085),
+    bulgeBright: rng.range(0.16, 0.24),
+    thickness: rng.range(0.045, 0.072),
+    dust: rng.range(0.75, 1.3),
+    bulgeL: rng.range(0.26, 0.4),
+    bulgeB: rng.range(0.16, 0.24),
     cloudiness: rng.range(0.65, 1),
     noiseOffset: rng.range(0, 90),
-    diskTint: [0.8 + 0.06 * warmth, 0.87, 1.0 - 0.07 * warmth],
-    bulgeTint: [1.0, 0.83 - 0.03 * warmth, 0.6 - 0.07 * warmth],
+    diskTint: [0.78 + 0.06 * warmth, 0.87, 1.0 - 0.06 * warmth],
+    bulgeTint: [1.0, 0.79 - 0.03 * warmth, 0.5 - 0.06 * warmth],
     nebulae: [],
     galaxies: [],
     clusters: [],
@@ -315,15 +347,19 @@ function makeRecipe(skySeed: number): SkyRecipe {
   const count = rng.chance(0.75) ? 2 : 1;
   for (let i = 0; i < count; i++) {
     const major = i === 0;
-    const lon = (rng.chance(0.5) ? 1 : -1) * rng.range(major ? 0.5 : 0.3, major ? 2.3 : 3.0);
-    const lat = (rng.chance(0.5) ? 1 : -1) * (major ? rng.range(0.03, 0.2) : rng.range(0.12, 0.5));
-    const dir = fromGalactic(recipe, lon, lat, new THREE.Vector3());
     const type = types[i];
+    let size = major ? rng.range(0.13, 0.22) : rng.range(0.07, 0.12);
+    if (type === 2) size *= 0.8; // remnants are compact
+    const dir = new THREE.Vector3();
+    for (let attempt = 0; attempt < 24; attempt++) {
+      const lon = (rng.chance(0.5) ? 1 : -1) * rng.range(major ? 0.6 : 0.5, major ? 2.3 : 3.0);
+      const lat = (rng.chance(0.5) ? 1 : -1) * (major ? rng.range(0.04, 0.2) : rng.range(0.12, 0.5));
+      fromGalactic(recipe, lon, lat, dir);
+      if (recipe.nebulae.every((o) => o.dir.angleTo(dir) > (o.size + size) * 2.6)) break;
+    }
     const x = new THREE.Vector3();
     const y = new THREE.Vector3();
     tangentFrame(dir, rng.range(0, Math.PI * 2), x, y);
-    let size = major ? rng.range(0.2, 0.33) : rng.range(0.09, 0.16);
-    if (type === 2) size *= 0.7; // remnants are compact
     recipe.nebulae.push({
       dir,
       size,
@@ -362,12 +398,44 @@ function makeRecipe(skySeed: number): SkyRecipe {
   // Young clusters inside emission regions and the star that lights each reflection nebula.
   for (const n of recipe.nebulae) {
     if (n.type === 1) recipe.clusters.push({ dir: n.dir.clone(), radius: n.size * 0.22, count: 70, temp: 18000 });
-    if (n.type === 3) recipe.clusters.push({ dir: n.dir.clone().addScaledVector(n.x, 0.22 * n.size).normalize(), radius: n.size * 0.1, count: 14, temp: 12000 });
+    if (n.type === 3) recipe.clusters.push({ dir: n.dir.clone().addScaledVector(n.x, Math.tan(n.size) * 0.22).normalize(), radius: n.size * 0.12, count: 16, temp: 13000, lead: 3 });
   }
   return recipe;
 }
 
 // ---------------------------------------------------------------------------------------------- shaders
+
+/** A nebula is evaluated out to this many angular radii from its centre. */
+const NEBULA_REACH = 2.7;
+
+/** Direction of cube face texel (s, t in -1..1), GL convention (mirrors tlFaceDir in the noise library). */
+function faceDir(face: number, s: number, t: number, out: THREE.Vector3): THREE.Vector3 {
+  if (face === 0) return out.set(1, -t, -s);
+  if (face === 1) return out.set(-1, -t, s);
+  if (face === 2) return out.set(s, 1, t);
+  if (face === 3) return out.set(s, -1, -t);
+  if (face === 4) return out.set(s, -t, 1);
+  return out.set(-s, -t, -1);
+}
+
+/** Can a cone (unit axis, half-angle) touch a cube face? Sampled on a grid; errs on the side of yes. */
+function coneTouchesFace(axis: THREE.Vector3, halfAngle: number, face: number): boolean {
+  const limit = Math.cos(Math.min(Math.PI, halfAngle + 0.12));
+  const v = new THREE.Vector3();
+  const N = 12;
+  for (let i = 0; i <= N; i++) {
+    for (let j = 0; j <= N; j++) {
+      if (faceDir(face, (i / N) * 2 - 1, (j / N) * 2 - 1, v).normalize().dot(axis) >= limit) return true;
+    }
+  }
+  return false;
+}
+
+/** Rotation of the six-bladed iris whose diffraction spikes show on every bright point source, rad. */
+export const SPIKE_ROTATION = 0.26;
+/** Strength of the point-spread function's wings relative to its core. */
+const HALO_K = '0.012';
+const SPIKE_K = '0.012';
 
 const SKY_BAKE_FS = /* glsl */ `
 precision highp float;
@@ -382,10 +450,12 @@ uniform vec4 uBandA;      // disk brightness, bulge brightness, thickness, dust 
 uniform vec4 uBandB;      // bulge sigma (lon), bulge sigma (lat), cloudiness, noise offset
 uniform vec3 uDiskTint;
 uniform vec3 uBulgeTint;
+uniform vec2 uGrain;      // grain frequencies (tied to the cube resolution)
 uniform vec4 uNebDir[2];  // xyz direction, w angular radius
 uniform vec4 uNebPar[2];  // type, seed, intensity, colour mix
 uniform vec3 uNebX[2];
 uniform vec3 uNebY[2];
+uniform vec2 uNebOn;      // per nebula: 1 when it can touch the face being baked (a uniform, so a real branch)
 uniform vec4 uGxDir[3];   // xyz direction, w angular size
 uniform vec4 uGxPar[3];   // intensity, axis ratio, position angle, -
 
@@ -394,46 +464,70 @@ out vec4 outColor;
 ${NOISE_GLSL}
 
 const vec3 HA = vec3(1.0, 0.09, 0.07);    // hydrogen-alpha: deep red (kept away from magenta)
+const vec3 HA_BRIGHT = vec3(1.0, 0.3, 0.24);  // where it is dense, hydrogen-beta lifts it to salmon
 const vec3 O3 = vec3(0.07, 0.72, 0.66);   // doubly ionised oxygen: teal
 const vec3 REFL = vec3(0.22, 0.42, 1.0);  // dust-scattered blue starlight
 
 // Unresolved starlight of the galaxy and the dust in front of it.
 vec3 galaxy(vec3 d, out vec3 trans) {
+  trans = vec3(1.0);
   vec3 g = vec3(dot(d, uGx), dot(d, uGy), dot(d, uGz));
   float off = uBandB.w;
+  float toward = 0.5 + 0.5 * g.x;                       // 1 toward the core, 0 at the anticentre
+  float h = uBandA.z * (0.55 + 0.9 * toward * toward);  // scale height, in sin(latitude)
   float warp = 0.05 * fbm(g * 1.6 + off, 3);
   float sb = g.y + warp;
   float ab = abs(sb);
-  float toward = 0.5 + 0.5 * g.x;
-  float h = uBandA.z * (0.6 + 0.8 * toward);
 
-  float disk = exp(-ab / h) * (0.1 + 0.9 * pow(toward, 1.7));
-  disk += 0.07 * exp(-ab / (h * 3.5)) * (0.25 + 0.75 * toward);
-  float bulge = exp(-(g.z * g.z / (uBandB.x * uBandB.x) + sb * sb / (uBandB.y * uBandB.y))) * smoothstep(0.0, 0.55, g.x);
+  // central bulge: a slightly boxy ellipse
+  vec2 bq = vec2(g.z / uBandB.x, sb / uBandB.y);
+  float bulge = g.x > 0.0 ? exp(-1.1 * pow(dot(bq, bq), 0.68)) * smoothstep(0.0, 0.5, g.x) : 0.0;
 
-  // star clouds: large patches of denser / thinner unresolved stars
-  float c1 = fbm(g * 4.2 + off + 11.0, 5);
-  float clouds = mix(1.0, 0.4 + 1.35 * smoothstep(-0.5, 0.55, c1), uBandB.z);
-  // semi-resolved grain
-  float grain = 0.84 + 0.2 * gnoise(g * 140.0 + off) + 0.12 * gnoise(g * 310.0 + off);
+  // nothing but black sky far from the plane: skip the expensive part there
+  float reach = h * 8.0;
+  if (ab > reach && bulge < 0.003) return vec3(0.0);
+  float fade = 1.0 - smoothstep(reach * 0.65, reach, ab);
 
-  // dust: a warped sheet hugging the plane plus filaments reaching off it
-  vec3 q = vec3(g.x, sb * 2.3, g.z);
-  vec3 w = q * 2.5 + off;
-  w += 0.65 * fbm3(q * 1.8 + 3.7, 3);
-  float d1 = fbm(w * 1.5, 6);
-  float d2 = ridged(w * 2.6 + 5.0, 5);
-  float plane = exp(-(sb * sb) / (h * h * 0.8));
-  float tau = uBandA.w * (4.6 * plane * smoothstep(-0.28, 0.38, d1) * (0.3 + 0.7 * toward)
-                        + 2.6 * pow(d2, 2.6) * exp(-ab / (h * 2.8)) * smoothstep(-0.35, 0.3, d1) * (0.35 + 0.65 * toward));
-  trans = exp(-tau * vec3(0.62, 1.0, 1.55));
+  float lonP = 0.13 + 0.87 * pow(toward, 2.2);
+  float disk = (exp(-ab / h) + 0.09 * exp(-ab / (h * 3.2))) * lonP * fade;
 
-  vec3 col = (uDiskTint * (disk * clouds * uBandA.x) + uBulgeTint * (bulge * (0.7 + 0.3 * clouds) * uBandA.y)) * grain;
+  // star clouds: large patches of denser / thinner unresolved stars, mottled at a smaller scale
+  float c1 = fbm(g * 3.4 + off + 11.0, 5);
+  float c2 = fbm(g * 9.0 + off + 23.0, 4);
+  float clouds = mix(1.0, (0.4 + 1.25 * smoothstep(-0.45, 0.55, c1)) * (1.0 + 0.45 * c2), uBandB.z);
+  // semi-resolved grain: the haze is made of stars
+  // (band-limited noise a few texels wide plus per-texel white noise: nothing that can alias into a lattice)
+  float grain = 1.0 + 0.2 * gnoise(g * uGrain.x + off) + 0.14 * gnoise(g * uGrain.y + off)
+              + 0.12 * (tlH31(ivec3(gl_FragCoord.xy, uFace + 7)) - 0.5);
 
-  // faint, tiny hydrogen knots strung along the plane (distant star-forming regions)
-  float kn = smoothstep(0.42, 0.75, gnoise(q * 19.0 + off * 1.7)) * plane * (0.2 + 0.8 * toward);
-  col += HA * (kn * 0.035);
-  return col * trans;
+  // dust: a warped sheet hugging the mid-plane (the rift) and filaments straying off it
+  vec3 q = vec3(g.x, sb * 2.4, g.z);
+  vec3 w = q * 2.3 + off;
+  w += 0.75 * fbm3(q * 1.4 + 3.7, 3);
+  float n1 = fbm(w * 1.25, 6);
+  float n2 = ridged(w * 2.3 + 5.0, 5);
+  float n3 = fbm(w * 6.0 + 9.0, 4);
+  float mid = sb - 0.6 * h * fbm(g * 2.6 + off + 7.0, 2);
+  float sheet = exp(-(mid * mid) / (h * h * 0.22));
+  float wisps = exp(-ab / (h * 2.6));
+  // the lane has sharp, filamentary edges (ridged term) and holes (n1); wisps are thin dark tendrils
+  float lane = smoothstep(0.3, 0.62, 0.5 + 0.5 * n1 + 0.55 * n2 + 0.22 * n3 - 0.25);
+  float tendril = n2 * n2 * smoothstep(-0.3, 0.3, n1 - 0.35 * n3);
+  float dens = sheet * lane + 1.5 * wisps * tendril;
+  float tau = uBandA.w * 3.6 * dens * (0.3 + 0.7 * toward);
+  trans = exp(-tau * vec3(0.58, 1.0, 1.6));
+
+  // warm old stars toward the core, cooler young ones in the outer disc
+  vec3 diskTint = mix(uDiskTint, uBulgeTint, 0.5 * toward * toward * toward);
+  vec3 light = diskTint * (disk * clouds * uBandA.x) + uBulgeTint * (bulge * (0.7 + 0.3 * clouds) * uBandA.y);
+  // some of the stars are in front of the dust, so a lane is never a hole
+  const float FG = 0.13;
+  vec3 col = light * (FG + (1.0 - FG) * trans) * grain;
+
+  // small hydrogen knots strung along the dust lanes (distant star-forming regions)
+  float kn = smoothstep(0.5, 0.86, gnoise(g * 15.0 + off * 1.7)) * exp(-(mid * mid) / (h * h * 0.7)) * (0.2 + 0.8 * toward);
+  col += HA * (kn * 0.045 * (0.35 + 0.65 * trans.g));
+  return col;
 }
 
 // One nebula. Returns emitted light; multiplies 'trans' by its own foreground dust.
@@ -441,7 +535,7 @@ vec3 nebula(vec3 d, vec4 nd, vec4 np, vec3 nx, vec3 ny, inout vec3 trans) {
   if (np.x < 0.5) return vec3(0.0);
   float cz = dot(d, nd.xyz);
   float size = nd.w;
-  if (cz < cos(min(size * 2.7, 1.45))) return vec3(0.0);
+  if (cz < cos(min(size * ${NEBULA_REACH.toFixed(1)}, 1.45))) return vec3(0.0);
   vec2 u = vec2(dot(d, nx), dot(d, ny)) / (max(cz, 0.1) * tan(size));
   float r = length(u);
   float sd = np.y;
@@ -454,33 +548,42 @@ vec3 nebula(vec3 d, vec4 nd, vec4 np, vec3 nx, vec3 ny, inout vec3 trans) {
     // --- emission region: red hydrogen shell around a teal oxygen core, eaten by dark globules
     float n1 = fbm(wp * 1.25, 6) * 0.5 + 0.5;
     float rid = ridged(wp * 1.9 + 5.0, 5);
-    float env = exp(-r * r * 1.7);
+    // lopsided envelope: the cloud is not a disc
+    vec2 ue = u + 0.4 * fbm3(vec3(u * 0.8, sd + 17.0), 2).xy;
+    float re = length(ue * vec2(1.0, mix(0.75, 1.35, np.w)));
+    float env = exp(-re * re * 1.7);
     float envIn = exp(-r * r * 5.5);
     // cavity blown by the central cluster
     float cav = smoothstep(0.08, 0.5, r + 0.25 * (n1 - 0.5));
-    float ha = env * cav * (1.5 * pow(n1, 2.4) + 1.1 * pow(rid, 3.2) * smoothstep(1.5, 0.25, r));
+    // ionisation fronts: thin bright contours where the gas piles up
+    float front = smoothstep(0.44, 0.5, n1) * (1.0 - smoothstep(0.5, 0.64, n1));
+    float ha = env * cav * (1.3 * pow(n1, 2.3) + 1.5 * pow(rid, 3.0) * smoothstep(1.6, 0.2, r) + 0.55 * front);
     float n2 = fbm(wp * 1.6 + 9.0, 5) * 0.5 + 0.5;
     float o3 = envIn * (0.35 + 1.2 * pow(n2, 2.0));
     float dk = smoothstep(0.5, 0.74, fbm(wp * 2.2 + 23.0, 6) * 0.5 + 0.5) * exp(-r * r * 0.8);
     float dk2 = pow(ridged(wp * 3.1 + 41.0, 4), 3.0) * exp(-r * r * 1.2);
     tl = exp(-(dk * 3.2 + dk2 * 2.0) * vec3(0.7, 1.0, 1.4));
-    e = (HA * ha * mix(1.25, 0.7, np.w) + O3 * o3 * mix(0.35, 0.95, np.w)) * 0.2;
+    vec3 hcol = mix(HA, HA_BRIGHT, smoothstep(0.5, 2.0, ha));
+    e = (hcol * ha * mix(1.25, 0.7, np.w) + O3 * o3 * mix(0.35, 0.95, np.w)) * 0.19;
     // thin bright rims where the dark lanes face the cluster
     e += HA * (0.05 * dk * (1.0 - dk) * 4.0 * env);
   } else if (np.x < 2.5) {
-    // --- supernova remnant: a thin, broken shell of interleaved teal and red filaments
+    // --- supernova remnant: a broken shell of long, delicate, braided filaments - mostly hydrogen red,
+    // with oxygen teal strands where the shock is fastest (one side of the shell)
     float a = atan(u.y, u.x);
     vec3 pa = vec3(cos(a) * 1.7, sin(a) * 1.7, sd);
-    float rr = r * (1.0 + 0.22 * fbm(pa * 0.9, 3));
-    vec3 pf = vec3(cos(a) * 2.6, sin(a) * 2.6, rr * 7.5 + sd);
-    pf += 0.4 * fbm3(pf * 0.6 + 2.0, 3);
-    float f1 = pow(ridged(pf, 5), 4.5);
-    float f2 = pow(ridged(pf * 1.7 + 7.3, 5), 5.5);
-    float gaps = smoothstep(-0.25, 0.35, fbm(pa * 1.3 + 4.0, 3));
-    float shell = exp(-pow((rr - 0.8) / 0.17, 2.0)) * (0.25 + 0.75 * gaps);
-    float inner = 0.3 * exp(-pow((rr - 0.5) / 0.26, 2.0));
-    e = (O3 * f1 * mix(0.55, 1.2, np.w) + HA * f2 * mix(1.3, 0.6, np.w)) * (shell + inner) * 1.15;
-    e += (HA * 0.6 + O3 * 0.4) * (0.012 * smoothstep(0.95, 0.3, rr));
+    float off0 = smoothstep(0.08, 0.4, r);          // angle-driven terms fade out toward the centre
+    float rr = r * (1.0 + 0.2 * off0 * fbm(pa * 0.9, 3));
+    vec3 pf = vec3(u * 2.3, sd);
+    pf += 0.5 * fbm3(pf * 0.8 + 2.0, 3);
+    float f1 = 3.0 * pow(ridged(pf, 5), 5.0);
+    float f2 = 3.0 * pow(ridged(pf * 1.35 + 7.3, 5), 5.0);
+    float gaps = mix(0.5, smoothstep(-0.3, 0.3, fbm(pa * 1.2 + 4.0, 3)), off0);
+    // a thin shell seen in projection: bright at the rim, faint across the face
+    float shell = (exp(-pow((rr - 0.82) / 0.16, 2.0)) + 0.3 * smoothstep(0.95, 0.5, rr)) * (0.2 + 0.8 * gaps);
+    float side = mix(0.5, 0.5 + 0.5 * cos(a - sd), off0);
+    e = (HA * f2 * mix(1.2, 0.8, np.w) + O3 * f1 * (0.15 + 0.85 * side * side)) * shell * 0.26;
+    e += (HA * 0.7 + O3 * 0.3) * (0.006 * smoothstep(0.95, 0.3, rr));
   } else {
     // --- dark molecular cloud with a blue reflection glow around one embedded star
     float n1 = fbm(wp * 1.3, 6) * 0.5 + 0.5;
@@ -527,6 +630,7 @@ void main() {
   vec3 col = galaxy(d, trans);
   for (int i = 0; i < 3; i++) col += farGalaxy(d, uGxDir[i], uGxPar[i]) * trans;
   for (int i = 0; i < 2; i++) {
+    if (uNebOn[i] < 0.5) continue;
     vec3 tn = vec3(1.0);
     vec3 e = nebula(d, uNebDir[i], uNebPar[i], uNebX[i], uNebY[i], tn);
     col = col * tn + e;
@@ -573,38 +677,50 @@ in float aFlux;     // relative flux, 1 = faintest catalogued star
 uniform mat4 modelViewMatrix;
 uniform mat4 projectionMatrix;
 uniform lowp samplerCube uSky;
-uniform vec4 uParams;    // x: core sigma (px), y: flux -> peak radiance gain, z: peak cap, w: halo reach (px)
+uniform vec4 uParams;    // x: core sigma (px), y: flux -> radiance gain, z: sensor saturation, w: largest wing radius (px)
 uniform vec2 uViewport;  // px
 out vec3 vColor;
-out vec4 vShape;         // x: 0.5 / sigma^2, y: sprite size (px), z: standout 0..1, w: sigma (px)
+out vec4 vShape;         // x: brightness, y: sprite size (px), z: 0.5 / sigma^2, w: wing radius (px), 0 = no wings
+out float vSpike;
+
+const float EPS = 0.003;       // radiance at which an image is cut off
+const float HALO_K = ${HALO_K};
+const float SPIKE_K = ${SPIKE_K};
 
 void main() {
   vec4 clip = projectionMatrix * vec4(mat3(modelViewMatrix) * position, 1.0);
   float dust = textureLod(uSky, position, 0.0).a;
   float t = pow(max(dust, 0.0), aColor.a * 2.4);
   float b = aFlux * uParams.y * t;
-  if (b < 0.006 || clip.w <= 0.0) {
+  if (b < 0.008 || clip.w <= 0.0) {
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
     gl_PointSize = 1.0;
     vColor = vec3(0.0);
-    vShape = vec4(1.0);
+    vShape = vec4(0.0, 1.0, 1.0, 0.0);
+    vSpike = 0.0;
     return;
   }
-  float over = max(b / uParams.z, 1.0);
-  float sigma = uParams.x * pow(over, 0.23);
-  float peak = min(b, uParams.z) * (1.0 + 0.4 * log2(over));
-  float stand = smoothstep(5.0, 45.0, over);
-  float coreSize = 2.0 * ceil(3.2 * sigma) + 1.0;
-  float haloSize = coreSize + 2.0 * uParams.w * (0.45 + 0.55 * stand);
-  // fade the wide glow out before the sprite centre leaves the screen (points are clipped by their centre)
+  // A camera's point-spread function: a gaussian core plus faint power-law wings. The image of a faint
+  // star is just the core; a bright one saturates the sensor, so its core grows and its wings show.
+  float sigma = uParams.x;
+  float rc = sigma * sqrt(2.0 * log(max(b / EPS, 1.5)));
+  float hk = b * HALO_K / EPS;
+  float rw = hk > 1.0 ? 2.5 * sigma * sqrt(pow(hk, 0.6667) - 1.0) : 0.0;
+  float spike = smoothstep(10.0, 60.0, b);
+  if (spike > 0.0) rw = max(rw, 6.3 * sigma * sqrt(max(b * SPIKE_K * spike / EPS - 1.0, 0.0)));
+  rw = min(rw, uParams.w);
+  // fade the wings out before the sprite centre leaves the screen (points are clipped by their centre)
   vec2 ndc = clip.xy / clip.w;
   vec2 edgePx = (1.0 - abs(ndc)) * 0.5 * uViewport;
-  stand *= clamp(min(edgePx.x, edgePx.y) / (0.5 * haloSize), 0.0, 1.0);
-  float size = stand > 0.001 ? haloSize : coreSize;
+  rw = min(rw, max(min(edgePx.x, edgePx.y) * 1.5, 0.0));
+  bool wings = rw > rc + 0.5;
+  float size = 2.0 * ceil(wings ? rw : rc) + 1.0;
   // dust reddens what it does not hide
-  vec3 redden = mix(vec3(1.0, 0.72, 0.45), vec3(1.0), smoothstep(0.0, 1.0, t));
-  vColor = aColor.rgb * redden * peak;
-  vShape = vec4(0.5 / (sigma * sigma), size, stand, sigma);
+  vec3 redden = mix(vec3(1.0, 0.7, 0.42), vec3(1.0), smoothstep(0.0, 1.0, t));
+  vec3 c = aColor.rgb * redden;
+  vColor = c / max(c.r, max(c.g, c.b));
+  vShape = vec4(b, size, 0.5 / (sigma * sigma), wings ? rw : 0.0);
+  vSpike = spike;
   gl_Position = vec4(clip.xy, 0.0, clip.w);
   gl_PointSize = size;
 }
@@ -612,27 +728,44 @@ void main() {
 
 const STAR_FS = /* glsl */ `
 precision highp float;
+uniform vec4 uParams;
 in vec3 vColor;
 in vec4 vShape;
+in float vSpike;
 out vec4 outColor;
+
+const float HALO_K = ${HALO_K};
+const float SPIKE_K = ${SPIKE_K};
+
 void main() {
   vec2 d = (gl_PointCoord - 0.5) * vShape.y;
   float r2 = dot(d, d);
-  float i = exp(-r2 * vShape.x);
-  if (vShape.z > 0.0) {
-    // bright standouts: a faint scattering skirt and four thin diffraction spikes, fixed to the camera
-    float half_ = 0.5 * vShape.y;
-    float win = clamp(1.0 - r2 / (half_ * half_), 0.0, 1.0);
+  float b = vShape.x;
+  float e = b * exp(-r2 * vShape.z);
+  if (vShape.w > 0.0) {
+    float s2 = 0.5 / vShape.z;
+    float win = clamp(1.0 - r2 / (vShape.w * vShape.w), 0.0, 1.0);
     win *= win;
-    float s = vShape.w;
-    float halo = 0.035 / (1.0 + r2 / (s * s * 5.0));
-    vec2 a = abs(d);
-    float across = min(a.x, a.y);
-    float along = max(a.x, a.y);
-    float spike = exp(-across * across / (0.5 * s * s)) / (1.0 + along * along / (s * s * 30.0));
-    i += vShape.z * win * (halo + 0.09 * spike);
+    float hx = 1.0 + r2 / (6.25 * s2);
+    float wing = HALO_K / (hx * sqrt(hx));
+    if (vSpike > 0.0) {
+      // six thin diffraction spikes: the same six-bladed iris as the lens glare on the system's star
+      float sp = 0.0;
+      for (int i = 0; i < 3; i++) {
+        float a = ${SPIKE_ROTATION.toFixed(4)} + float(i) * 1.0471976;
+        vec2 dir = vec2(cos(a), sin(a));
+        float along = dot(d, dir);
+        float across = d.x * dir.y - d.y * dir.x;
+        sp += exp(-across * across / (0.6 * s2)) / (1.0 + along * along / (40.0 * s2));
+      }
+      wing += SPIKE_K * vSpike * sp;
+    }
+    e += b * wing * win;
   }
-  outColor = vec4(vColor * i, 0.0);
+  // the sensor saturates: cores burn out to white, wings keep the star's colour
+  float i = min(e, uParams.z);
+  vec3 col = mix(vColor, vec3(1.0), 0.8 * smoothstep(0.8, 5.0, e));
+  outColor = vec4(col * i, 0.0);
 }
 `;
 
@@ -717,8 +850,9 @@ function buildCatalogue(recipe: SkyRecipe, skySeed: number, count: number): Cata
       const rr = c.radius * Math.sqrt(-Math.log(1 - rng.next() * 0.98)) * 0.75;
       const a = rng.range(0, Math.PI * 2);
       v.copy(c.dir).addScaledVector(ax, Math.tan(rr) * Math.cos(a)).addScaledVector(ay, Math.tan(rr) * Math.sin(a)).normalize();
-      const t = rng.chance(0.8) ? c.temp * rng.range(0.7, 1.3) : rng.range(3500, 5000);
-      put(v, Math.min(900, 2.5 * powerFlux(400)), t, 0.25);
+      const lead = i < (c.lead ?? 0);
+      const t = lead || rng.chance(0.8) ? c.temp * rng.range(0.7, 1.3) : rng.range(3500, 5000);
+      put(v, lead ? rng.range(90, 420) : Math.min(900, 2.5 * powerFlux(400)), t, lead ? 0 : 0.25);
     }
   }
 
@@ -727,7 +861,7 @@ function buildCatalogue(recipe: SkyRecipe, skySeed: number, count: number): Cata
   // nearby field stars: isotropic, hold the bright standouts, mostly in front of the dust
   for (let i = 0; i < fieldCount && n < count; i++) {
     randomUnit(rng, v);
-    const f = powerFlux(9000);
+    const f = powerFlux(4000);
     put(v, f, temperature(), rng.next() * (f > 60 ? 0.15 : 0.7));
   }
   // bulge: old, warm, faint, deep behind the dust
@@ -741,8 +875,8 @@ function buildCatalogue(recipe: SkyRecipe, skySeed: number, count: number): Cata
   while (n < count) {
     const lon = rng.range(-Math.PI, Math.PI);
     const toward = 0.5 + 0.5 * Math.cos(lon);
-    if (rng.next() > 0.1 + 0.9 * Math.pow(toward, 1.7)) continue;
-    const h = recipe.thickness * (0.6 + 0.8 * toward) * 1.25;
+    if (rng.next() > 0.13 + 0.87 * Math.pow(toward, 2.2)) continue;
+    const h = recipe.thickness * (0.55 + 0.9 * toward * toward) * 1.3;
     const sb = (rng.chance(0.5) ? 1 : -1) * h * -Math.log(1 - rng.next());
     if (Math.abs(sb) > 0.98) continue;
     fromGalactic(recipe, lon, sb, v);
@@ -761,8 +895,6 @@ const QUALITY: Record<Quality, { cube: number; stars: number; env: number }> = {
 };
 
 export interface SkyUpdateContext {
-  /** Reserved (the sky is fixed in system axes and needs no camera orientation today). */
-  cameraQuat?: THREE.Quaternion;
   /** Camera exposure applied to the whole sky (1 = default; lower it when a sunlit world fills the view). */
   exposure?: number;
 }
@@ -782,6 +914,8 @@ export interface Sky {
   setStarLight(dirWorld: THREE.Vector3, color: THREE.Color, intensity: number): void;
   /** Milliseconds spent baking at creation (GPU-synchronised). */
   readonly bakeMs: number;
+  /** GPU memory held by this sky (textures, render targets, vertex buffers), bytes. */
+  readonly gpuBytes: number;
   /** World directions of this sky's features (galactic core, galactic north, nebula centres). */
   readonly landmarks: { core: THREE.Vector3; north: THREE.Vector3; nebulae: THREE.Vector3[] };
   dispose(): void;
@@ -789,10 +923,12 @@ export interface Sky {
 
 const ENV_LOBE_K = 0.02; // exp(-(1-cos)/k): about 11 degrees to 1/e
 
-/** Flux of the faintest catalogued star -> peak radiance of its (minimum-size) image. */
-const STAR_GAIN = 0.034;
-/** Above this peak radiance a star image grows instead of getting brighter (as on film / a sensor). */
-const STAR_PEAK_CAP = 2.6;
+/** Flux of the faintest catalogued star -> peak radiance of its image. */
+const STAR_GAIN = 0.05;
+/** Above this radiance a star image saturates and grows instead of getting brighter (as on a sensor). */
+const STAR_PEAK_CAP = 3.0;
+/** Gaussian sigma of a star image in device pixels at pixel ratio 1. */
+const STAR_SIGMA = 0.62;
 /** The sky is dim; this is how much of it the reflection environment carries (1 = physically equal). */
 const ENV_SKY_GAIN = 1.0;
 
@@ -851,15 +987,25 @@ export function createSky(renderer: THREE.WebGLRenderer, skySeed: number, qualit
       uBandB: { value: new THREE.Vector4(recipe.bulgeL, recipe.bulgeB, recipe.cloudiness, recipe.noiseOffset) },
       uDiskTint: { value: new THREE.Vector3(...recipe.diskTint) },
       uBulgeTint: { value: new THREE.Vector3(...recipe.bulgeTint) },
+      uGrain: { value: new THREE.Vector2(cubeSize * 0.08, cubeSize * 0.17) },
       uNebDir: { value: nebDir },
       uNebPar: { value: nebPar },
       uNebX: { value: nebX },
       uNebY: { value: nebY },
+      uNebOn: { value: new THREE.Vector2(0, 0) },
       uGxDir: { value: gxDir },
       uGxPar: { value: gxPar },
     },
   });
-  bakeCubeFaces(renderer, cubeTarget, bakeMaterial);
+  // the nebula code is skipped outright on the faces a nebula cannot reach (most of them)
+  bakeCubeFaces(renderer, cubeTarget, bakeMaterial, (face) => {
+    const on = bakeMaterial.uniforms.uNebOn.value as THREE.Vector2;
+    const touches = (i: number): number => {
+      const nb = recipe.nebulae[i];
+      return nb && coneTouchesFace(nb.dir, Math.min(nb.size * NEBULA_REACH, 1.45), face) ? 1 : 0;
+    };
+    on.set(touches(0), touches(1));
+  });
   bakeMaterial.dispose();
 
   // ---- background box
@@ -887,7 +1033,7 @@ export function createSky(renderer: THREE.WebGLRenderer, skySeed: number, qualit
   starGeometry.setAttribute('aColor', new THREE.BufferAttribute(cat.color, 4, true));
   starGeometry.setAttribute('aFlux', new THREE.BufferAttribute(cat.flux, 1));
   starGeometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1);
-  const starParams = new THREE.Vector4(0.62, STAR_GAIN, STAR_PEAK_CAP, 22);
+  const starParams = new THREE.Vector4(STAR_SIGMA, STAR_GAIN, STAR_PEAK_CAP, 28);
   const starViewport = new THREE.Vector2(1, 1);
   const starMaterial = new THREE.RawShaderMaterial({
     glslVersion: THREE.GLSL3,
@@ -911,16 +1057,25 @@ export function createSky(renderer: THREE.WebGLRenderer, skySeed: number, qualit
   stars.name = 'sky.stars';
   const viewport = new THREE.Vector4();
   let exposure = 1;
+  // largest sprite the GPU will draw; the wings of the brightest stars are kept inside it
+  const gl = renderer.getContext();
+  const sizeRange = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE) as Float32Array | null;
+  const maxWing = Math.max(4, ((sizeRange ? sizeRange[1] : 64) - 3) / 2);
   stars.onBeforeRender = (r) => {
     // sizes are in pixels of whatever is being rendered to right now (dynamic resolution, DPR 2-3)
     r.getCurrentViewport(viewport);
     const w = Math.max(1, viewport.z);
     const h = Math.max(1, viewport.w);
     starViewport.set(w, h);
-    const scale = Math.min(2.2, Math.max(0.8, Math.sqrt(Math.min(w, h) / 786)));
-    starParams.x = 0.62 * scale;
-    starParams.y = STAR_GAIN * exposure / (scale * scale);
-    starParams.w = 22 * scale;
+    // s = device pixels per CSS pixel of an iPhone-sized screen (pixel ratio x dynamic resolution scale).
+    // A star image keeps roughly the same apparent size at every resolution - a little tighter at high
+    // density, never under ~0.6 px so it cannot shimmer - and its peak is adjusted to keep its total light.
+    const s = Math.min(w, h) / 393;
+    const sigma = Math.max(STAR_SIGMA * 0.9, STAR_SIGMA * Math.pow(s, 0.85));
+    const keep = (s * STAR_SIGMA) / sigma;
+    starParams.x = sigma;
+    starParams.y = STAR_GAIN * exposure * Math.min(2, Math.max(0.5, keep * keep));
+    starParams.w = Math.min(28 * Math.max(1, s), maxWing);
   };
 
   const group = new THREE.Group();
@@ -966,15 +1121,18 @@ export function createSky(renderer: THREE.WebGLRenderer, skySeed: number, qualit
   const envTarget = pmremTarget as unknown as THREE.WebGLRenderTarget;
   envTarget.texture.name = 'tidelock.sky.env';
 
-  // force the GPU to finish so the bake time is honest (and the first frame does not hitch instead)
-  const gl = renderer.getContext();
-  gl.finish();
+  // wait for the GPU so the bake time is honest (and the first frame does not hitch instead)
+  finishGpu(renderer, cubeTarget);
   const bakeMs = performance.now() - t0;
+  // sky cube (RGBA8) + environment cube + CubeUV target and the PMREM generator's scratch copy (RGBA16F) + stars
+  const pmremBytes = envTarget.width * envTarget.height * 8;
+  const gpuBytes = cubeSize * cubeSize * 6 * 4 + q.env * q.env * 6 * 8 + pmremBytes * 2 + q.stars * 20 + 24 * 12;
 
   return {
     object3d: group,
     envMap: envTarget.texture,
     bakeMs,
+    gpuBytes,
     landmarks: { core: recipe.gx.clone(), north: recipe.gy.clone(), nebulae: recipe.nebulae.map((nb) => nb.dir.clone()) },
     update(ctx: SkyUpdateContext): void {
       if (ctx.exposure !== undefined) {

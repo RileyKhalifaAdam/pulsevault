@@ -5,17 +5,23 @@
 // the display refresh: a frame that takes 9 ms and one that takes 15 ms both arrive after 16.7 ms. So the
 // controller cannot read head-room; it works like this instead:
 //
-//   * DOWN  — when the smoothed interval stays more than `OVER` above the target for `downDelay`
-//             seconds (frames are being dropped), step the scale down, proportionally to the overshoot.
-//   * UP    — when the interval has sat on the target for `upDelay` seconds, probe one step up.
-//   * BACK-OFF — if a probe is followed by a drop within `probeWindow`, the scale it tried is too
-//             expensive: double `upDelay` (to at most `maxUpDelay`) before trying again. A probe that
-//             survives halves it again. This, the dead band between OVER and UNDER and the settle time
-//             after every change are the hysteresis that stops the scale from oscillating.
+//   * DOWN  — when the smoothed interval stays more than `OVER` above the target for `DOWN_DELAY`
+//             seconds (frames are being dropped), step the scale down. On a vsync'd display a frame
+//             that is 1 ms late and one that is 15 ms late look the same, so the overshoot is not
+//             trusted: the first step is at most 10 %, consecutive ones 15 % and 20 %.
+//   * UP    — when the interval has sat on the target for `upDelay` seconds, raise the scale one step
+//             — on trial. If frames drop within `TRIAL` seconds, the raise failed: go straight back to
+//             the scale that worked, remember the failed scale as a ceiling and double the delay (to at
+//             most `MAX_UP_DELAY`) before testing that ceiling again. Climbing back *below* the ceiling
+//             always uses the short delay. A raise that survives its trial clears the ceiling.
+//             This, the dead band between OVER and UNDER and the settle time after every change are
+//             the hysteresis that keeps the scale from oscillating.
 //   * RATE CAP — if the interval is still over target at the minimum scale (Low Power Mode pins Safari
 //             to 30 Hz; a CPU-bound frame does not get cheaper with fewer pixels), resolution is not the
-//             bottleneck. The controller adopts the measured interval as its target and climbs back up
-//             by probing, instead of rendering a blurry image for nothing.
+//             bottleneck. The controller adopts the measured rate (a peak-hold of the smoothed interval,
+//             so alternating good and bad stretches do not fool it) as its target and climbs back up by
+//             raising on trial, instead of rendering a blurry image for nothing. When the cap lifts, the
+//             peak-hold decays and the real target is restored.
 
 export interface DynResOptions {
   targetFps?: number;
@@ -27,13 +33,19 @@ export interface DynResOptions {
 
 const OVER = 1.12;
 const UNDER = 1.05;
-const SETTLE = 0.6; // s without decisions after a change (lets the smoothed interval catch up)
+const SETTLE = 0.6; // s without decisions after a step down (lets the smoothed interval catch up)
+const SETTLE_UP = 0.25; // s after a raise: a failed trial should cost as few dropped frames as possible
 const DOWN_DELAY = 0.4; // s over budget before stepping down
-const BASE_UP_DELAY = 2.5; // s on target before the first probe
-const MAX_UP_DELAY = 40;
-const PROBE_WINDOW = 3; // s after a probe during which a drop counts as "that probe failed"
+const TRIAL_DOWN_DELAY = 0.25; // … while a raise is on trial
+const BASE_UP_DELAY = 2.5; // s on target before a raise
+const MAX_UP_DELAY = 30;
+const TRIAL = 8; // s a raise stays on trial
 const CAP_DELAY = 3; // s over budget at the minimum scale before adopting the measured rate
 const HITCH_MS = 250; // intervals longer than this are pauses (tab switch, GC, shader compile), not load
+const PEAK_DECAY = 4; // ms per second: how fast the peak-hold of the smoothed interval lets go
+const DROP_FLOOR = [0.9, 0.85, 0.8]; // largest step down for the 1st, 2nd, 3rd+ consecutive drop
+const CAP_MARGIN = 1.08;
+const CALM = 1.5; // s on target after which the next drop counts as a first one again
 
 export class DynamicResolution {
   enabled = true;
@@ -48,12 +60,19 @@ export class DynamicResolution {
   private targetMs: number;
   /** Target actually being held (>= targetMs when the frame rate is capped from outside). */
   private heldMs: number;
+  /** Peak-hold of frameMs: the worst recent smoothed interval. */
+  private peakMs: number;
   private overTime = 0;
   private underTime = 0;
   private atMinOverTime = 0;
   private settle = 0;
   private upDelay = BASE_UP_DELAY;
-  private sinceProbe = Infinity;
+  /** Scale in effect before the raise now on trial, or -1. */
+  private trialFrom = -1;
+  private sinceRaise = Infinity;
+  /** Lowest scale that recently failed its trial. */
+  private ceiling = Infinity;
+  private dropStreak = 0;
 
   constructor(opts: DynResOptions = {}) {
     this.minScale = opts.minScale ?? 0.6;
@@ -62,6 +81,7 @@ export class DynamicResolution {
     this.targetMs = 1000 / (opts.targetFps ?? 60);
     this.heldMs = this.targetMs;
     this.frameMs = this.targetMs;
+    this.peakMs = this.targetMs;
     this.scale = this.maxScale;
   }
 
@@ -78,11 +98,14 @@ export class DynamicResolution {
   /** Forget history (after a resize, a quality change or a context restore). Keeps the current scale. */
   reset(scale?: number): void {
     if (scale !== undefined) this.scale = this.quantise(scale);
-    this.frameMs = this.heldMs = this.targetMs;
+    this.frameMs = this.peakMs = this.heldMs = this.targetMs;
     this.overTime = this.underTime = this.atMinOverTime = 0;
     this.settle = SETTLE;
     this.upDelay = BASE_UP_DELAY;
-    this.sinceProbe = Infinity;
+    this.trialFrom = -1;
+    this.sinceRaise = Infinity;
+    this.ceiling = Infinity;
+    this.dropStreak = 0;
   }
 
   /**
@@ -93,9 +116,18 @@ export class DynamicResolution {
     if (!(intervalMs > 0) || intervalMs > HITCH_MS) return this.scale;
     const dt = intervalMs / 1000;
     this.frameMs += (intervalMs - this.frameMs) * 0.1;
+    this.peakMs = Math.max(this.frameMs, this.peakMs - PEAK_DECAY * dt);
     if (!this.enabled) return this.scale;
 
-    this.sinceProbe += dt;
+    this.sinceRaise += dt;
+    if (this.trialFrom >= 0 && this.sinceRaise >= TRIAL) {
+      // The raise held. If it reached the old ceiling, the ceiling is gone and so is the back-off.
+      if (this.scale >= this.ceiling - 1e-6) {
+        this.ceiling = Infinity;
+        this.upDelay = BASE_UP_DELAY;
+      }
+      this.trialFrom = -1;
+    }
     if (this.settle > 0) {
       this.settle -= dt;
       return this.scale;
@@ -109,51 +141,70 @@ export class DynamicResolution {
     } else if (ms < target * UNDER) {
       this.underTime += dt;
       this.overTime = Math.max(0, this.overTime - dt);
+      if (this.underTime > CALM) this.dropStreak = 0;
     } else {
       this.overTime = Math.max(0, this.overTime - dt * 0.5);
       this.underTime = 0;
     }
 
-    // The outside world got faster again (Low Power Mode off, a heavy scene left): re-aim at the real target.
-    if (this.heldMs > this.targetMs && ms < this.heldMs * 0.8) {
-      this.heldMs = Math.max(this.targetMs, ms);
-      this.underTime = 0;
+    // The outside world got faster again (Low Power Mode off, a CPU-heavy stretch over): re-aim, in
+    // stages as the peak-hold lets go, until the real target is back.
+    if (this.heldMs > this.targetMs) {
+      if (this.peakMs < this.targetMs * UNDER) {
+        this.heldMs = this.targetMs;
+        this.underTime = 0;
+      } else if (this.peakMs < this.heldMs * 0.8) {
+        this.heldMs = this.peakMs;
+        this.underTime = 0;
+      }
     }
 
-    if (this.overTime > DOWN_DELAY) {
+    const onTrial = this.trialFrom >= 0 && this.scale > this.trialFrom;
+    if (this.overTime > (onTrial ? TRIAL_DOWN_DELAY : DOWN_DELAY)) {
       if (this.scale > this.minScale + 1e-6) {
-        // Fragment cost goes roughly with pixel count, i.e. scale^2.
-        const f = Math.min(0.95, Math.max(0.8, Math.sqrt(target / ms)));
-        let next = this.quantise(this.scale * f);
-        if (next >= this.scale) next = this.quantise(this.scale - this.step);
-        if (this.sinceProbe < PROBE_WINDOW) this.upDelay = Math.min(MAX_UP_DELAY, this.upDelay * 2);
-        this.sinceProbe = Infinity;
-        this.change(next);
+        let next: number;
+        if (onTrial) {
+          next = this.trialFrom;
+          this.ceiling = Math.min(this.ceiling, this.scale);
+          this.upDelay = Math.min(MAX_UP_DELAY, this.upDelay * 2);
+        } else {
+          // Fragment cost goes roughly with pixel count, i.e. scale^2.
+          const floor = DROP_FLOOR[Math.min(this.dropStreak, DROP_FLOOR.length - 1)];
+          const f = Math.min(0.95, Math.max(floor, Math.sqrt(target / ms)));
+          next = this.quantise(this.scale * f);
+          if (next >= this.scale) next = this.quantise(this.scale - this.step);
+          this.dropStreak++;
+        }
+        this.trialFrom = -1;
+        this.change(next, SETTLE);
       } else {
         this.atMinOverTime += dt;
         if (this.atMinOverTime > CAP_DELAY) {
-          this.heldMs = ms;
+          // A little head-room: the peak-hold has decayed since the worst moment, and the new target
+          // must put that moment below the UNDER line or the scale would never be raised again.
+          this.heldMs = Math.max(ms, this.peakMs) * CAP_MARGIN;
           this.atMinOverTime = 0;
           this.overTime = this.underTime = 0;
         }
       }
-    } else if (this.underTime > this.upDelay && this.scale < this.maxScale - 1e-6) {
-      if (this.sinceProbe !== Infinity && this.sinceProbe >= PROBE_WINDOW) {
-        this.upDelay = Math.max(BASE_UP_DELAY, this.upDelay * 0.5); // the last probe held
+    } else if (this.scale < this.maxScale - 1e-6) {
+      const next = this.quantise(this.scale + this.step);
+      if (this.underTime > (next >= this.ceiling - 1e-6 ? this.upDelay : BASE_UP_DELAY)) {
+        this.trialFrom = this.scale;
+        this.sinceRaise = 0;
+        this.change(next, SETTLE_UP);
       }
-      this.sinceProbe = 0;
-      this.change(this.quantise(this.scale + this.step));
     }
     if (ms <= target * OVER) this.atMinOverTime = 0;
     return this.scale;
   }
 
-  private change(next: number): void {
+  private change(next: number, settle: number): void {
     this.scale = next;
-    this.settle = SETTLE;
+    this.settle = settle;
     this.overTime = this.underTime = 0;
     // Start the new measurement from the target instead of dragging the old overshoot along.
-    this.frameMs = this.heldMs;
+    this.frameMs = this.peakMs = this.heldMs;
   }
 
   private quantise(s: number): number {

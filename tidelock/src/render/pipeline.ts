@@ -12,7 +12,8 @@
 //
 // Resolution: the canvas backing store is `css size × min(devicePixelRatio, tier cap)` and never changes
 // with load. Only the HDR scene target is scaled (0.6–1.0, see post/dynres.ts); the composite magnifies
-// it. The bloom chain is sized from the canvas, so its look does not breathe with the resolution scale.
+// it. The bloom chain is sized from the CSS size, so its look neither breathes with the resolution scale
+// nor changes between quality tiers.
 //
 // MSAA note. three.js resolves *and invalidates* a multisampled render target at the end of every
 // `renderer.render()`, so a second layer drawn into the same target starts from undefined contents on
@@ -64,12 +65,12 @@ export interface GradeParams {
   grain?: number;
   /** Lateral chromatic aberration: red/blue shift in CSS px in the frame corners. Default 0.3. Off on `low`. */
   aberration?: number;
-  /** Sharpen strength 0..1. Default 0.25. Only on `high` / `ultra`. */
+  /** Contrast-adaptive sharpen strength 0..1. Default 0.4. Only on `high` / `ultra`. */
   sharpen?: number;
   /** Exposed scene value (max channel) where bloom starts, and the width of its soft knee. Defaults 1.0 / 0.5. */
   bloomThreshold?: number;
   bloomKnee?: number;
-  /** 0..1: how much of the bloom energy goes to the wide halo rather than the tight core. Default 0.65. */
+  /** 0..1: how much of the bloom energy goes to the wide halo rather than the tight core. Default 0.7. */
   bloomScatter?: number;
 }
 
@@ -122,12 +123,15 @@ export interface RenderPipeline {
   setQuality(q: Quality): void;
   /** Exposure in stops (EV). 0 = sun-lit white diffuse (1.0) lands just under display white (0.76 linear). */
   setExposure(ev: number): void;
-  /** Fraction of the light above the bloom threshold that is scattered into the halo. Default 0.12; 0 = off. */
+  /** Fraction of the light above the bloom threshold that is scattered into the halo. Default 0.15; 0 = off. */
   setBloom(strength: number): void;
   setGrade(params: GradeParams): void;
   /** Screen-space accents, amount 0..1 (0 = off): jump stretch, damage vignette, heat haze, white flash. */
   setEffect(name: EffectName, amount: number): void;
-  /** Turn the frame-time controller on/off; when off the scale is held at `fixedScale` (default 1). */
+  /**
+   * Turn the frame-time controller on/off; when off the scale is held at `fixedScale` (0.6..1, default 1).
+   * It stays off under a software rasteriser.
+   */
   setDynamicResolution(enabled: boolean, fixedScale?: number): void;
   /** Live counters. Returns the same object every call — copy it if you keep it. */
   stats(): PipelineStats;
@@ -152,7 +156,7 @@ const TIERS: Record<Quality, Tier> = {
   low: { dpr: 1.0, msaa: 0, chroma: false, sharpen: false, bloomHQ: false, maxBloomLevels: 5 },
   medium: { dpr: 1.5, msaa: 0, chroma: true, sharpen: false, bloomHQ: true, maxBloomLevels: 6 },
   high: { dpr: 2.0, msaa: 4, chroma: true, sharpen: true, bloomHQ: true, maxBloomLevels: 6 },
-  ultra: { dpr: 2.5, msaa: 4, chroma: true, sharpen: true, bloomHQ: true, maxBloomLevels: 7 },
+  ultra: { dpr: 2.5, msaa: 4, chroma: true, sharpen: true, bloomHQ: true, maxBloomLevels: 6 },
 };
 
 const MIN_SCALE = 0.6;
@@ -264,13 +268,13 @@ class Pipeline implements RenderPipeline {
   private readonly uDownStep: Uniform<THREE.Vector2> = { value: new THREE.Vector2() };
   private readonly uUpSrc: Uniform<THREE.Texture | null> = { value: null };
   private readonly uUpStep: Uniform<THREE.Vector2> = { value: new THREE.Vector2() };
-  private readonly uScatter: Uniform<number> = { value: 0.65 };
+  private readonly uScatter: Uniform<number> = { value: 0.7 };
   private readonly uScene: Uniform<THREE.Texture | null> = { value: null };
   private readonly uBloomTex: Uniform<THREE.Texture | null> = { value: null };
   private readonly uSceneTexel: Uniform<THREE.Vector2> = { value: new THREE.Vector2(1, 1) };
   private readonly uBloomTexel: Uniform<THREE.Vector2> = { value: new THREE.Vector2(1, 1) };
   private readonly uOutSize: Uniform<THREE.Vector2> = { value: new THREE.Vector2(1, 1) };
-  private readonly uTone: Uniform<THREE.Vector4> = { value: new THREE.Vector4(1, 0.12, 1, 1) };
+  private readonly uTone: Uniform<THREE.Vector4> = { value: new THREE.Vector4(1, 0.15, 1, 1) };
   private readonly uLens: Uniform<THREE.Vector4> = { value: new THREE.Vector4(0.2, 0, 0, 0) };
   private readonly uShadowTint: Uniform<THREE.Vector3> = { value: new THREE.Vector3(1, 1, 1) };
   private readonly uHighTint: Uniform<THREE.Vector3> = { value: new THREE.Vector3(1, 1, 1) };
@@ -280,8 +284,11 @@ class Pipeline implements RenderPipeline {
   private readonly uLdrTexel: Uniform<THREE.Vector2> = { value: new THREE.Vector2(1, 1) };
 
   // look state
+  private scatter = 0.7;
+  private scatter0 = 0.7; // blend into the finest bloom level, see updateScatter0()
+  private bloomTexelCss = 1; // size of a level-0 bloom texel, CSS px
   private exposureEv = 0;
-  private bloomStrength = 0.12;
+  private bloomStrength = 0.15;
   private readonly grade = {
     contrast: 1.0,
     saturation: 1.04,
@@ -291,10 +298,10 @@ class Pipeline implements RenderPipeline {
     vignette: 0.2,
     grain: 0.025,
     aberration: 0.3,
-    sharpen: 0.25,
+    sharpen: 0.4,
     bloomThreshold: 1.0,
     bloomKnee: 0.5,
-    bloomScatter: 0.65,
+    bloomScatter: 0.7,
   };
 
   // timing / stats
@@ -503,11 +510,14 @@ class Pipeline implements RenderPipeline {
   }
 
   setDynamicResolution(enabled: boolean, fixedScale = 1): void {
-    this.dyn.enabled = enabled && !this.gpu.software;
-    if (!enabled) {
-      this.dyn.reset(Math.min(1, Math.max(MIN_SCALE, fixedScale)));
+    if (enabled) {
+      // Never under a software rasteriser: its frame times would only drive the scale to the floor.
+      this.dyn.enabled = !this.gpu.software;
+      this.dyn.reset(this.scale); // the controller carries on from here, on its own grid
+    } else {
+      this.dyn.enabled = false;
       // an explicit fixed scale may be anything in range, not just a controller step
-      this.setScale(Math.min(1, Math.max(MIN_SCALE, fixedScale)));
+      this.setScale(Math.min(1, Math.max(MIN_SCALE, Number.isFinite(fixedScale) ? fixedScale : 1)));
     }
   }
 
@@ -517,10 +527,25 @@ class Pipeline implements RenderPipeline {
     this.allocSceneTarget();
   }
 
+  /**
+   * The bloom weights are anchored to physical size so every tier shows the same halo. The chain gives
+   * level k the weight (1 - s) s^k. The reference chain starts at texels of 1 CSS px; a chain that
+   * starts coarser (low-DPR canvases) begins further down that series: its first level stands for the
+   * reference's first m = 1 + log2(texel size in CSS px) levels and keeps their combined weight.
+   */
+  private updateScatter0(): void {
+    const m = Math.min(3, Math.max(1, 1 + Math.log2(this.bloomTexelCss)));
+    this.scatter0 = Math.pow(this.scatter, m);
+  }
+
   /** Bloom chain and the LDR intermediate: sized from the canvas, independent of the dynamic scale. */
   private allocOutputTargets(): void {
-    const w0 = Math.max(1, this.outW >> 1);
-    const h0 = Math.max(1, this.outH >> 1);
+    // Level 0 has texels of 1 CSS px wherever the canvas is fine enough to feed it (>= 1.4 px per CSS px),
+    // so medium, high and ultra build the very same chain; coarser canvases start at half their resolution.
+    const perOutPx = this.outRatio >= 1.4 ? 1 / this.outRatio : 0.5;
+    this.bloomTexelCss = 1 / (this.outRatio * perOutPx);
+    const w0 = Math.max(1, Math.round(this.outW * perOutPx));
+    const h0 = Math.max(1, Math.round(this.outH * perOutPx));
     // Levels are chosen so the coarsest one is ~12 texels across the short side on every tier: the halo
     // then covers the same fraction of the screen whatever the resolution.
     const short = Math.min(w0, h0);
@@ -540,12 +565,13 @@ class Pipeline implements RenderPipeline {
     let h = h0;
     for (let i = 0; i < levels; i++) {
       this.bloomRT[i].setSize(w, h);
-      this.downStep[i].set(0.5 / w, 0.5 / h); // one source texel of an ideal 2:1 step into level i
+      this.downStep[i].set(0.5 / w, 0.5 / h); // half a texel of level i = one source texel of a 2:1 step
       if (i > 0) this.upStep[i - 1].set(1 / w, 1 / h); // one texel of level i, used when upsampling into i-1
       w = Math.max(1, w >> 1);
       h = Math.max(1, h >> 1);
     }
     this.uBloomTexel.value.set(1 / w0, 1 / h0);
+    this.updateScatter0();
     if (this.msaa === 0) this.ldrRT.setSize(this.outW, this.outH);
     else this.ldrRT.dispose();
   }
@@ -659,7 +685,8 @@ class Pipeline implements RenderPipeline {
     const knee = Math.max(1e-3, g.bloomKnee);
     const thr = Math.max(0, g.bloomThreshold);
     this.uCurve.value.set(thr, thr - knee, 2 * knee, 0.25 / knee);
-    this.uScatter.value = Math.min(0.95, Math.max(0, g.bloomScatter));
+    this.scatter = Math.min(0.95, Math.max(0, g.bloomScatter));
+    this.updateScatter0();
   }
 
   setEffect(name: EffectName, amount: number): void {
@@ -680,8 +707,8 @@ class Pipeline implements RenderPipeline {
 
     // Frame pacing -> dynamic resolution.
     if (this.lastFrameAt >= 0) {
-      const s = this.dyn.update(now - this.lastFrameAt);
-      if (s !== this.scale) this.setScale(s);
+      const s = this.dyn.update(now - this.lastFrameAt); // always fed: it also smooths the frame time for stats()
+      if (this.dyn.enabled && s !== this.scale) this.setScale(s);
     }
     this.lastFrameAt = now;
     if (dt > 0 && dt < 1) this.time = (this.time + dt) % 3600;
@@ -722,6 +749,7 @@ class Pipeline implements RenderPipeline {
       for (let i = n - 2; i >= 0; i--) {
         this.uUpSrc.value = bloom[i + 1].texture;
         this.uUpStep.value.copy(this.upStep[i]);
+        this.uScatter.value = i === 0 ? this.scatter0 : this.scatter;
         this.pass(this.upMat, bloom[i], false); // blends over the level already there
       }
       passes = 2 * n - 1;
@@ -733,7 +761,7 @@ class Pipeline implements RenderPipeline {
     lens.x = g.vignette;
     lens.y = g.aberration * this.outRatio;
     // Sharpen harder the more the scene is being magnified.
-    lens.z = g.sharpen > 0 ? g.sharpen + (1 - this.scale) * 0.9 : 0;
+    lens.z = g.sharpen > 0 ? g.sharpen + (1 - this.scale) * 1.2 : 0;
     lens.w = this.time;
     this.uGrain.value.set(g.grain, Math.max(1, this.outRatio * 0.8), this.frame, 0);
     this.uScene.value = sceneTex;
