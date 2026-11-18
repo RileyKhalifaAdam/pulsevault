@@ -5,6 +5,8 @@
 //   node build.mjs --harness <name>   -> bundles dev/harness/<name>.ts to dist/dev/<name>.{js,html}
 //   node build.mjs --serve [port]     -> build, then serve dist/ on http://localhost:<port> (default 8080)
 //   node build.mjs --minify           -> minified production bundle
+//   node build.mjs --artifact         -> also writes dist/tidelock-artifact.html: a self-contained FRAGMENT (no
+//                                        doctype/html/head/body) for the Claude page viewer, which wraps it itself
 //
 // GLSL (*.glsl) and CSS (*.css) files import as strings.
 
@@ -77,6 +79,46 @@ async function buildGame() {
   console.log(`built dist/game.js (${(size / 1024).toFixed(0)} KiB)`);
 }
 
+// The page the owner actually plays: one fragment, everything inline, no requests, no service worker.
+// The host wraps it in its own <html>/<head>/<body> (and pads :root by the top/bottom safe areas), so this
+// file must not carry those tags; the canvas and UI root are position:fixed and handle their own insets.
+async function buildArtifact() {
+  const res = await build({
+    ...common,
+    format: 'iife',
+    entryPoints: [path.join(root, 'src/main.ts')],
+    write: false,
+    minify: true,
+    sourcemap: false,
+    legalComments: 'none',
+    define: { __DEV__: 'false' },
+  });
+  let js = res.outputFiles[0].text;
+  if (js.includes('<!--')) console.warn('warning: the bundle contains "<!--"; check the inline script still parses');
+  js = js.replace(/<\/(script)/gi, '<\\/$1');
+  const css = [
+    'html,body{height:100%}',
+    'html{box-sizing:border-box;overflow:hidden}',
+    'body{margin:0;background:#05070B;color-scheme:dark;overflow:hidden;position:relative;overscroll-behavior:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent;touch-action:none;-webkit-text-size-adjust:100%}',
+    '#boot{position:fixed;inset:0;display:grid;place-items:center;padding:24px;text-align:center;color:#8fa3b8;font:500 12px/1.6 -apple-system,"SF Pro Text",system-ui,sans-serif;letter-spacing:.32em;text-transform:uppercase}',
+  ].join('\n');
+  // Last-resort message if the game throws before its own error panel is up (same script, runs first).
+  const guard = "window.addEventListener('error',function(e){if(window.__tlErr)return;var b=document.getElementById('boot');if(b){b.style.letterSpacing='0';b.style.textTransform='none';b.style.color='#FF5A4D';b.textContent='TIDELOCK could not start: '+(e&&e.message?e.message:'script error');}});";
+  const frag = [
+    '<title>TIDELOCK</title>',
+    '<meta name="claude:viewport-fit-sides" content="cover">',
+    `<style>\n${css}\n</style>`,
+    '<div id="boot">Tidelock</div>',
+    `<script>${guard}\n${js}</script>`,
+    '',
+  ].join('\n');
+  const out = path.join(dist, 'tidelock-artifact.html');
+  await fs.writeFile(out, frag);
+  const bytes = Buffer.byteLength(frag);
+  if (bytes > 16 * 1024 * 1024) throw new Error(`artifact is ${bytes} bytes: over the 16 MB limit`);
+  console.log(`artifact fragment: dist/tidelock-artifact.html (${(bytes / 1024).toFixed(0)} KiB)`);
+}
+
 async function buildHarness(name) {
   const entry = path.join(root, 'dev/harness', `${name}.ts`);
   if (!existsSync(entry)) throw new Error(`no such harness: ${entry}`);
@@ -119,4 +161,5 @@ function serve(port) {
 const harness = valueOf('--harness');
 if (harness) await buildHarness(harness);
 else await buildGame();
+if (!harness && has('--artifact')) await buildArtifact();
 if (has('--serve')) serve(Number(valueOf('--serve') ?? 8080));

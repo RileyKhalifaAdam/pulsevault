@@ -569,6 +569,8 @@
 /* ================================================================== quality & motion preferences */
 .tl-root[data-fx='lite'] * { -webkit-backdrop-filter: none !important; backdrop-filter: none !important; }
 .tl-root[data-fx='lite'] .tl-panel, .tl-root[data-fx='lite'] .tl-comms { background-color: var(--tl-glass-strong); }
+/* without blur, anything that floats over text must be opaque or the text underneath ghosts through */
+.tl-root[data-fx='lite'] :is(.tl-sheet, .tl-modal, .tl-pop, .tl-toast) { background-color: var(--tl-glass-solid); }
 
 @media (prefers-reduced-motion: reduce) {
   .tl-root *, .tl-root *::before, .tl-root *::after { animation-duration: 1ms !important; animation-delay: 0ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }

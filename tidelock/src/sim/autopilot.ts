@@ -659,7 +659,7 @@ export function stepAutopilot(ap: AutopilotState, vessel: Vessel, ctx: Autopilot
     failAutopilot(ap, vessel, `Flight computer fault: ${e instanceof Error ? e.message : 'unknown'}`);
   }
   if (!(out.maxWarp >= 1)) out.maxWarp = 1;
-  out.engaged = ap.mode !== 'idle';
+  out.engaged = (ap.mode as string) !== 'idle';
   return out;
 }
 

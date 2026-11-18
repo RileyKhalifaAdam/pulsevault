@@ -2,7 +2,6 @@
 // Static data (galaxy, system model, layouts, ship statistics) is regenerated from `seed` and `loadout`.
 
 import type { Quat, V3 } from '../../core/types';
-import { createAutopilot, type AutopilotState } from '../autopilot';
 import { initEconomy, type EconomyState } from '../economy';
 import type { Vessel } from '../physics';
 import type { ManeuverNode } from '../planner';
@@ -30,8 +29,17 @@ export const CAPTURE_SPEED = 3;
 export const AUTOPILOT_CAPTURE_DISTANCE = 120;
 export const AUTOPILOT_CAPTURE_SPEED = 10;
 /** Undocking: the ship is carried this far out along the berth axis (m from the mating point) in this many seconds. */
-export const RELEASE_DISTANCE = 20;
-export const RELEASE_TIME = 6;
+export const RELEASE_DISTANCE = 60;
+export const RELEASE_TIME = 12;
+/** Speed the ship is left with when the berth lets go, m/s. */
+export const RELEASE_SPEED = 2;
+/** Station tug: works within this range (m) and below this relative speed (m/s); the tow takes TUG_MIN..TUG_MAX seconds. */
+export const TUG_RANGE = 50e3;
+export const TUG_SPEED = 200;
+export const TUG_MIN_TIME = 15;
+export const TUG_MAX_TIME = 40;
+/** The flight computer drops out of warp and starts turning this long before a burn, s. */
+export const SLEW_LEAD = 20;
 /** Clearance lapses beyond this multiple of the control-zone radius. */
 export const CLEARANCE_RANGE = 1.5;
 
@@ -98,6 +106,8 @@ export interface DockingClearance {
 /** The ship being moved by a berth: drawn in after soft capture, or carried clear after undocking. Station-local frame. */
 export interface BerthTransit {
   kind: 'capture' | 'release';
+  /** Capture only: true when a station tug is towing the ship in from a distance. */
+  tug: boolean;
   stationId: string;
   portId: string;
   /** Sim time it started and how long it takes, s. */
@@ -106,6 +116,33 @@ export interface BerthTransit {
   /** Pose it started from: position (station-local m) and attitude (ship-local -> station-local). */
   p0: V3;
   q0: Quat;
+}
+
+export type AssistMode = 'idle' | 'executeNode' | 'flyPlan' | 'goToStation' | 'dock' | 'matchVelocity';
+
+/** The flight computer (assist.ts). Plain JSON. */
+export interface AssistState {
+  mode: AssistMode;
+  /** Station the command is about, if any. */
+  stationId: string | null;
+  /** '' | 'clear' | 'plan' | 'coast' | 'slew' | 'burn' | 'arrive' | 'tug' */
+  phase: string;
+  /** One line for the HUD. */
+  status: string;
+  failed: string | null;
+  /** goToStation: plans made after the first one. */
+  replans: number;
+  /** Node being flown, when its burn should start (sim s) and its burn vector (system axes, m/s). */
+  nodeId: string | null;
+  burnStart: number;
+  dv: V3 | null;
+  /** Sim time and propellant (kg) when the command was engaged. */
+  t0: number;
+  fuel0: number;
+}
+
+export function newAssist(): AssistState {
+  return { mode: 'idle', stationId: null, phase: '', status: '', failed: null, replans: 0, nodeId: null, burnStart: 0, dv: null, t0: 0, fuel0: 0 };
 }
 
 /** Progress of the node burn being flown. */
@@ -131,9 +168,7 @@ export interface GameState {
   nodes: ManeuverNode[];
   nodeSeq: number;
   burn: BurnTrack | null;
-  autopilot: AutopilotState;
-  /** Warp ceiling the autopilot asked for at its last step. */
-  apMaxWarp: number;
+  assist: AssistState;
   docking: DockingClearance;
   /** Berth the ship is in while docked. */
   dockedPortId: string | null;
@@ -176,8 +211,7 @@ export function newGameState(galaxy: GalaxyDef, seed: number, pilotName: string,
     nodes: [],
     nodeSeq: 1,
     burn: null,
-    autopilot: createAutopilot(),
-    apMaxWarp: 1,
+    assist: newAssist(),
     docking: { stationId: null, portId: null, granted: false },
     dockedPortId: portId,
     transit: null,

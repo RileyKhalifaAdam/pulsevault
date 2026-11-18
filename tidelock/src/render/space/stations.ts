@@ -1075,6 +1075,81 @@ function buildRingHabitat(k: Kit): void {
   });
 }
 
+// ================================================================================================ outpost
+
+/**
+ * Frontier outpost, built to the OUTPOST dimensions the colliders use: a truss spine along +Y, a docking node at
+ * the origin with the two berths on its +-Z faces, habitat cans along X, a second pair of cans higher up,
+ * solar wings, radiators, a propellant sphere and an antenna farm on top.
+ */
+function buildOutpost(k: Kit): void {
+  const D = OUTPOST;
+  const core = k.newPart('core', 0);
+  const hero = k.hero;
+  const seg = hero ? 14 : 8;
+  k.use(core, () => {
+    const b = k.b;
+    /** Window strips on four sides of a can built in a `between` frame (axis along local Z). */
+    const strips = (r: number, len: number, st: Style): void => {
+      const d = len * 0.8;
+      b.at(0, r, len / 2, () => k.winPanel(3, d, st));
+      b.at(0, -r, len / 2, () => k.winPanel(3, d, st), Math.PI);
+      b.at(r, 0, len / 2, () => k.winPanel(3, d, st), 0, 0, -Math.PI / 2);
+      b.at(-r, 0, len / 2, () => k.winPanel(3, d, st), 0, 0, Math.PI / 2);
+    };
+    const can = (ax: number, y: number, bx: number, r: number, st: Style, win: Style): void => {
+      b.between(ax, y, 0, bx, y, 0, (len) => {
+        b.cyl(r, r, len, st, { segs: seg, bevel: 0.5 });
+        strips(r + 0.2, len, win);
+        if (hero) for (const f of [0.06, 0.94]) b.at(0, 0, len * f, () => b.ring(r, r + 0.7, 1.4, H.s1, { segs: seg, bevel: 0.2 }));
+      });
+    };
+
+    // spine
+    k.truss(0, -D.trussHalf + 4, 0, 0, D.trussHalf - 6, 0, 7, 16, 0.4);
+    // docking node: the berth decks sit on its +-Z faces
+    b.at(0, 0, 0, () => b.box(22, 20, 19, H.p2, { bevel: 1.2 }));
+    b.at(0, 13, 0, () => b.box(12, 6, 12, H.s1, { bevel: 0.8 }));
+    b.at(0, -13, 0, () => b.box(12, 6, 12, H.s1, { bevel: 0.8 }));
+    // habitat cans along X, and the second pair higher up the truss
+    for (const s of [1, -1]) can(s * 10, 0, s * D.habHalf, 6.6, H.p0, WIN.small);
+    can(-D.canHalf, D.canY, D.canHalf, 6, H.p1, WIN.hab);
+    b.at(0, D.canY, 0, () => b.box(9, 9, 13.4, H.s0, { bevel: 0.6 }));
+
+    // solar wings: four panels a side on a boom, faces toward +-Z
+    for (const s of [1, -1]) {
+      b.strut(s * 3, D.wingY, 0, s * D.wingReach, D.wingY, 0, 0.55, H.steel, 6);
+      const span = (D.wingReach - 12) / 4;
+      for (let i = 0; i < 4; i++) {
+        b.at(s * (12 + span * (i + 0.5)), D.wingY, 0.7, () => b.box(span - 1, 15, 0.3, H.solar));
+        if (hero) b.strut(s * (12 + span * i), D.wingY - 7.5, 0.3, s * (12 + span * i), D.wingY + 7.5, 0.3, 0.25, H.steel, 4);
+      }
+      k.beacon(s * (D.wingReach + 1), D.wingY, 0, RED, 2.4, s > 0 ? 0 : 0.5, 6);
+      // radiators, edge-on to the star
+      b.strut(s * 3, D.radiatorY, 0, s * 32, D.radiatorY, 0, 0.45, H.steel, 6);
+      b.at(s * 20, D.radiatorY, 0, () => b.box(23, 0.3, 12, H.s2));
+    }
+
+    // propellant sphere, antenna farm, lights
+    b.at(0, D.tankY, 0, () => k.tankSphere(15));
+    b.at(0, D.trussHalf - 6, 0, () => b.box(11, 2.5, 11, H.s1, { bevel: 0.4 }));
+    b.at(0, D.trussHalf - 4.6, 0, () => k.dishMast(6, 5, 0.6, 0.8));
+    if (hero) {
+      b.at(3.6, D.trussHalf - 4.6, -3.4, () => k.dishMast(2.4, 3, 0.9, 3.6));
+      for (let y = -D.trussHalf + 10; y < D.trussHalf - 8; y += 12) {
+        k.lamp(3.9, y, 3.9, COOL, 5, 1.8);
+        k.lamp(-3.9, y, -3.9, COOL, 5, 1.8);
+      }
+    }
+    k.beacon(0, -D.trussHalf + 2, 0, WHITE, 2.4, 0.25, 6);
+    for (const s of [1, -1]) {
+      k.flood(0, D.canY - 7, s * 7, 0, 2, s * 11, 70, 1.3);
+      k.flood(0, -9, s * 12, 0, D.tankY, s * 9, 50, 1.0, 52, false);
+    }
+    k.berths();
+  });
+}
+
 // ================================================================================================ registry
 
 interface ArchetypeDef {
@@ -1092,7 +1167,7 @@ const ARCHETYPES: Record<StationVisualId, ArchetypeDef> = {
   ringHabitat: { build: buildRingHabitat, uvScale: 0.22, livery: { primary: [0.6, 0.61, 0.6], secondary: [0.1, 0.108, 0.125], accent: [0.72, 0.36, 0.05] }, flood: [1.0, 0.93, 0.8], heat: 0.5 },
   spindle: { build: buildRingHabitat, uvScale: 0.22, livery: { primary: [0.5, 0.51, 0.52], secondary: [0.09, 0.095, 0.11], accent: [0.05, 0.42, 0.45] }, flood: [1.0, 0.93, 0.8], heat: 0.5 },
   refinery: { build: buildRingHabitat, uvScale: 0.22, livery: { primary: [0.33, 0.32, 0.3], secondary: [0.085, 0.085, 0.09], accent: [0.62, 0.4, 0.04] }, flood: [1.0, 0.72, 0.36], heat: 0.62 },
-  outpost: { build: buildRingHabitat, uvScale: 0.5, livery: { primary: [0.55, 0.54, 0.5], secondary: [0.12, 0.125, 0.14], accent: [0.6, 0.2, 0.05] }, flood: [1.0, 0.9, 0.75], heat: 0.45 },
+  outpost: { build: buildOutpost, uvScale: 0.5, livery: { primary: [0.55, 0.54, 0.5], secondary: [0.12, 0.125, 0.14], accent: [0.6, 0.2, 0.05] }, flood: [1.0, 0.9, 0.75], heat: 0.45 },
   drydock: { build: buildRingHabitat, uvScale: 0.22, livery: { primary: [0.42, 0.43, 0.45], secondary: [0.1, 0.105, 0.115], accent: [0.66, 0.44, 0.04] }, flood: [1.0, 0.95, 0.86], heat: 0.4 },
   citadel: { build: buildRingHabitat, uvScale: 0.2, livery: { primary: [0.2, 0.21, 0.23], secondary: [0.07, 0.072, 0.08], accent: [0.6, 0.08, 0.04] }, flood: [0.82, 0.9, 1.0], heat: 0.4 },
 };

@@ -1107,6 +1107,7 @@ class Manager implements SceneManager {
 
     // ---- camera-relative positions
     let nearest = 1e9;
+    let stationNear = 0; // 0..1: how much of the view a station takes (its own lamps must not be over-exposed)
     for (let i = 0; i < bodies.length; i++) {
       const b = bodies[i];
       b.rel.x = b.abs.x - camAbs.x;
@@ -1121,6 +1122,7 @@ class Manager implements SceneManager {
       st.rel.z = st.abs.z - camAbs.z;
       st.dist = Math.max(len3(st.rel), 1);
       nearest = Math.min(nearest, st.dist - st.layout.radius);
+      stationNear = Math.max(stationNear, smooth(0.02, 0.2, st.layout.radius / st.dist));
     }
     for (let i = 0; i < sites.length; i++) {
       const s = sites[i];
@@ -1473,7 +1475,9 @@ class Manager implements SceneManager {
 
     // ---- exposure: meter the light on the focus and the sun-lit worlds in view
     const metered = Math.max(0.5 * this.keyLevel + 0.6 * shineLevel + 4 * bright, 0.1);
-    const evWant = clamp(-Math.log2(metered / 0.5), EV_MIN, EV_MAX);
+    // Beside a station in eclipse the meter reads the dark hull and opened right up, so the station's windows and
+    // floodlights bloomed into a grey veil over the whole view: stop down toward the lamps' own level there.
+    const evWant = clamp(-Math.log2(metered / 0.5), EV_MIN, EV_MAX - (EV_MAX - 0.8) * stationNear);
     if (!this.evInit) {
       this.ev = evWant;
       this.evInit = true;
@@ -1612,8 +1616,9 @@ class Manager implements SceneManager {
       const reach = Math.max(p.radiusPx, PICK_RADIUS);
       const d = Math.hypot(p.x - x, p.y - y);
       if (d > reach) return;
-      // small things win over the world behind them; among equals the closest to the finger
-      const score = rank * 1e6 + (rank >= 2 ? p.radiusPx * 100 : 0) + d;
+      // small things win over the world behind them, things with a visible size over far points of light;
+      // among equals the closest to the finger
+      const score = (rank + (rank < 2 && p.radiusPx < 1 ? 0.5 : 0)) * 1e6 + (rank >= 2 ? p.radiusPx * 100 : 0) + d;
       if (score < bestScore) {
         bestScore = score;
         best = id;

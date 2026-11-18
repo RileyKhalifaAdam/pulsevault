@@ -182,8 +182,12 @@ export interface DockingView {
   blocked: string;
   /** Radius of the station's traffic-control zone, m. */
   controlZone: number;
-  /** 'capture' while the berth draws the ship in, 'release' while it slides clear after undocking. */
+  /** 'capture' while the berth (or the station tug) draws the ship in, 'release' while it slides clear after undocking. */
   transit: 'capture' | 'release' | null;
+  /** True while a station tug is towing the ship to its berth. */
+  tug: boolean;
+  /** Seconds until the capture / release in progress is over (0 when there is none): "Tug: 12 s". */
+  transitSeconds: number;
   /** With clearance: distance from the ship to the berth's mating point, m. Soft capture happens under 30 m and 3 m/s. */
   portDistance: number;
   /** With clearance: mating point relative to the ship, system axes, m. */
@@ -402,7 +406,11 @@ export interface GameSim {
 
   // ---- docking
   dockingState(): DockingView;
-  /** Ask a station for a berth (default: the targeted station, else the nearest). Works inside its control zone. */
+  /**
+   * Ask a station for a berth (default: the targeted station, else the nearest). Granted within 50 km and
+   * under 200 m/s relative: the station tug then takes the ship to the berth in 15-40 s (warp drops to 1).
+   * Flying to within 30 m of a berth's mating point under 3 m/s is a capture too, with or without clearance.
+   */
   requestDocking(stationId?: string): ActionResult;
   cancelDocking(): void;
   undock(): ActionResult;
