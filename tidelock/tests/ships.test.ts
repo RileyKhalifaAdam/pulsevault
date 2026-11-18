@@ -1,14 +1,12 @@
 // Tests for src/sim/ships.ts — the ship & module catalogue and the loadout maths.
 //
 // Independent references: stats are re-derived here from the raw catalogue rows, the rocket equation
-// is checked against a Simpson quadrature of F/m(t) (no logarithm), and one test flies a stock Wren
-// through sim/physics.ts (a free-space burn and aerobraking passes on the fixture system).
+// is checked against a Simpson quadrature of F/m(t) (no logarithm). The Wren's flight itself is proven on
+// the physical world (tests/worldCraft.test.ts, tests/session.test.ts).
 
 import { describe, expect, it } from 'vitest';
 import type { ModuleSlotType, ShipVisualId, VesselStats } from '../src/core/types';
 import { SHIP_LAYOUTS } from '../src/data/shipLayouts';
-import { SystemModel } from '../src/sim/orbit';
-import { coastVessel, createVessel, stepVessel } from '../src/sim/physics';
 import {
   BASE_SENSOR_RANGE,
   HULL_HEAT_CAPACITY,
@@ -42,7 +40,6 @@ import {
   type Loadout,
   type ModuleDef,
 } from '../src/sim/ships';
-import { TEST_IDS as ID, makeTestSystem } from './fixtures/system';
 
 const ALL_SHIPS: ShipVisualId[] = ['wren', 'drover', 'magpie', 'shrike', 'albatross', 'caravel', 'halberd'];
 const ALL_SLOT_TYPES: ModuleSlotType[] = ['engine', 'rcs', 'reactor', 'tank', 'cargo', 'shield', 'armor', 'weapon', 'radiator', 'jump', 'computer', 'scanner', 'utility'];
@@ -608,74 +605,5 @@ describe('stat comparisons for outfitting', () => {
     expect(by.shieldMax).toBeUndefined();
     const dock = compareStats(a, computeStats(withModule(base, slotOf('wren', 'utility'), null)));
     expect(dock.find((r) => r.key === 'hasDockingComputer')).toMatchObject({ from: 1, to: 0, verdict: -1 });
-  });
-});
-
-// ------------------------------------------------------------------------------------ through the flight model
-
-describe('a stock Wren in sim/physics', () => {
-  const model = new SystemModel(makeTestSystem());
-  const tessaly = model.body(ID.rocky);
-  const wren = stock('wren');
-
-  it('burns as the rocket equation says', () => {
-    // Far from the star (g ~ 1.6e-5 m/s²), at rest, nose along -Z, SAS off: a pure main-drive burn.
-    const v = createVessel(wren, { id: 'wren-1', soiBodyId: ID.star, r: { x: 1e12, y: 0, z: 0 }, v: { x: 0, y: 0, z: 0 }, sasMode: 'off' });
-    expect(v.fuel).toBe(wren.fuelCapacity);
-    expect(v.hull).toBe(wren.hullMax);
-    expect(v.shield).toBe(wren.shieldMax);
-    v.controls.throttle = 1;
-    const seconds = 30;
-    for (let i = 0; i < seconds * 60; i++) stepVessel(model, v, i / 60, 1 / 60);
-    const used = wren.fuelCapacity - v.fuel;
-    expect(used).toBeCloseTo((wren.mainThrust / wren.exhaustVelocity) * seconds, 3);
-    const speed = Math.hypot(v.v.x, v.v.y, v.v.z);
-    expect(speed).toBeCloseTo(deltaV(wren) - deltaV(wren, v.fuel), 2);
-    expect(Math.abs(speed / integrateBurn(wren, wren.fuelCapacity, 0, seconds) - 1)).toBeLessThan(1e-5);
-    expect(-v.v.z).toBeGreaterThan(0.999999 * speed); // along ship forward
-    expect(propellantFor(wren, speed)).toBeCloseTo(used, 2);
-    expect(burnTime(wren, speed)).toBeCloseTo(seconds, 3);
-    expect(v.heat).toBe(0);
-    expect(v.destroyed).toBe(false);
-  });
-
-  /** One aerobraking pass at Tessaly from a 12,000 km apoapsis down to periapsis altitude `hp` (the physics reference scenario). */
-  function aerobrake(stats: VesselStats, hp: number): { peak: number; hull: number; destroyed: boolean; events: string[] } {
-    const ra = 1.2e7;
-    const a = 0.5 * (ra + tessaly.radius + hp);
-    const va = Math.sqrt(tessaly.mu * (2 / ra - 1 / a));
-    const v = createVessel(stats, { id: 'wren-2', soiBodyId: ID.rocky, r: { x: -ra, y: 0, z: 0 }, v: { x: 0, y: 0, z: va }, sasMode: 'off' });
-    const coast = coastVessel(model, v, 0, 1e7);
-    expect(coast.stopReason).toBe('atmosphere');
-    const events: string[] = [];
-    const dt = 1 / 6;
-    let peak = 0;
-    for (let i = 0; i < 100000 && !v.destroyed; i++) {
-      const ev = stepVessel(model, v, coast.tReached + i * dt, dt);
-      peak = Math.max(peak, v.heat);
-      for (const e of ev) events.push(e.type);
-      if (ev.some((e) => e.type === 'atmosphere-exit' || e.type === 'impact')) break;
-    }
-    return { peak, hull: v.hull, destroyed: v.destroyed, events };
-  }
-
-  it('survives the 82 km aerobraking pass, burns up at 72 km, and a heat shield buys the deeper pass', () => {
-    const shallow = aerobrake(wren, 82000);
-    expect(shallow.events).toEqual(['atmosphere-exit']);
-    expect(shallow.peak).toBeGreaterThan(0.2 * wren.heatCapacity);
-    expect(shallow.peak).toBeLessThan(0.8 * wren.heatCapacity);
-    expect(shallow.hull).toBe(wren.hullMax);
-
-    const deep = aerobrake(wren, 72000);
-    expect(deep.events).toContain('overheat');
-    expect(deep.peak).toBeGreaterThan(wren.heatCapacity);
-    expect(deep.hull).toBeLessThan(wren.hullMax);
-
-    const coated = computeStats(withModule(defaultLoadout('wren'), slotOf('wren', 'utility', 1), 'utl_heat_1'));
-    expect(coated.heatShield).toBe(2.5);
-    const shielded = aerobrake(coated, 72000);
-    expect(shielded.events).toEqual(['atmosphere-exit']);
-    expect(shielded.peak).toBeLessThan(coated.heatCapacity);
-    expect(shielded.hull).toBe(coated.hullMax);
   });
 });

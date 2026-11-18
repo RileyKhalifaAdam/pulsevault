@@ -18,7 +18,8 @@ export type HoldMode =
   | 'radialIn'
   | 'target' // toward the selected target
   | 'antiTarget'
-  | 'burn'; // along the next planned burn
+  | 'burn' // along the next planned burn
+  | 'dock'; // docking collar onto the axis of the nearest free port (holds the heading when there is none)
 
 /** Why time acceleration is lower than requested ('' = it is not). */
 export type WarpLimit = '' | 'thrust' | 'rotation' | 'contact' | 'atmosphere' | 'proximity' | 'cpu' | 'docked';
@@ -193,9 +194,13 @@ export interface DockingView {
   portId: string | null;
   portOffset: V3;
   portAxis: V3;
+  /** Distance from the ship's docking collar to the port's mating point, m (Infinity without a port). */
+  portDistance: number;
   /** Latch tolerances and how the ship stands against them. */
-  alignment: number; // angle between ship forward and the approach axis, rad
-  lateral: number; // m off the port axis
+  alignment: number; // angle between the ship's collar axis and the reversed port axis, rad
+  lateral: number; // collar distance off the port axis, m
+  /** Speed toward the mating point relative to the station, m/s (negative when opening). */
+  closing: number;
   /** True when every latch condition holds this instant. */
   canLatch: boolean;
   dockedTo: string | null;

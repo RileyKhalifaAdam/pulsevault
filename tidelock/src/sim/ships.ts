@@ -26,7 +26,6 @@
 
 import type { ModuleSlot, ModuleSlotType, PadSize, ShipDef, ShipRole, ShipVisualId, VesselStats } from '../core/types';
 import { SHIP_LAYOUTS } from '../data/shipLayouts';
-import { burnDuration, createVessel, currentAccel, deltaVRemaining, propellantForDv, type Vessel } from './physics';
 
 // ===================================================================================== constants
 
@@ -989,35 +988,40 @@ export function swapCost(loadout: Loadout, slotIndex: number, moduleId: string |
 
 // ===================================================================================== rocket equation
 
-let _probe: Vessel | null = null;
-
-/** A scratch vessel carrying `stats`, so the Tsiolkovsky helpers of sim/physics.ts can be reused as they are. */
-function probe(stats: VesselStats, propellantKg: number, cargoKg: number): Vessel {
-  const p = _probe ?? (_probe = createVessel(stats, { id: 'ships-probe', soiBodyId: '', r: { x: 1, y: 0, z: 0 }, v: { x: 0, y: 0, z: 0 } }));
-  p.stats = stats;
-  p.fuel = propellantKg > 0 ? propellantKg : 0;
-  p.cargoMass = cargoKg > 0 ? cargoKg : 0;
-  return p;
-}
+const clamp01 = (x: number): number => (x < 0 ? 0 : x > 1 ? 1 : x);
+/** Total mass, kg, with that propellant and cargo on board. */
+const loadedMass = (stats: VesselStats, propellantKg: number, cargoKg: number): number =>
+  stats.dryMass + (propellantKg > 0 ? propellantKg : 0) + (cargoKg > 0 ? cargoKg : 0);
 
 /** Main-drive Δv, m/s, with `propellantKg` in the tank (default: full) and `cargoKg` in the hold (default: empty). */
 export function deltaV(stats: VesselStats, propellantKg: number = stats.fuelCapacity, cargoKg = 0): number {
-  return deltaVRemaining(probe(stats, propellantKg, cargoKg));
+  const m0 = loadedMass(stats, propellantKg, cargoKg);
+  const m1 = m0 - (propellantKg > 0 ? propellantKg : 0);
+  if (!(m1 > 0) || !(stats.exhaustVelocity > 0) || !(stats.mainThrust > 0)) return 0;
+  return stats.exhaustVelocity * Math.log(m0 / m1);
 }
 
 /** Main-drive acceleration, m/s², at `throttle` (0..1) for that propellant and cargo load; 0 with an empty tank. */
 export function accel(stats: VesselStats, propellantKg: number = stats.fuelCapacity, cargoKg = 0, throttle = 1): number {
-  return currentAccel(probe(stats, propellantKg, cargoKg), throttle);
+  if (!(propellantKg > 0)) return 0;
+  return (stats.mainThrust * clamp01(throttle)) / loadedMass(stats, propellantKg, cargoKg);
 }
 
 /** Propellant (kg) a main-drive burn of `dv` m/s consumes starting from that load. May exceed what is on board. */
 export function propellantFor(stats: VesselStats, dv: number, propellantKg: number = stats.fuelCapacity, cargoKg = 0): number {
-  return propellantForDv(probe(stats, propellantKg, cargoKg), dv);
+  const ve = stats.exhaustVelocity;
+  if (!(ve > 0)) return dv > 0 ? Infinity : 0;
+  return loadedMass(stats, propellantKg, cargoKg) * -Math.expm1(-Math.abs(dv) / ve);
 }
 
 /** Duration (s) of a main-drive burn of `dv` m/s starting from that load; Infinity if the tank cannot deliver it. */
 export function burnTime(stats: VesselStats, dv: number, propellantKg: number = stats.fuelCapacity, cargoKg = 0, throttle = 1): number {
-  return burnDuration(probe(stats, propellantKg, cargoKg), dv, throttle);
+  const thrust = stats.mainThrust * clamp01(throttle);
+  if (!(Math.abs(dv) > 0)) return 0;
+  if (!(thrust > 0) || !(stats.exhaustVelocity > 0)) return Infinity;
+  const prop = propellantFor(stats, dv, propellantKg, cargoKg);
+  if (prop > (propellantKg > 0 ? propellantKg : 0) * (1 + 1e-12)) return Infinity;
+  return (prop * stats.exhaustVelocity) / thrust;
 }
 
 /**

@@ -405,21 +405,15 @@ export function createFlightScreen(host: UiHost, scene: SceneManager, hooks: { p
     // docking guidance when a port is near, else the next planned burn
     const d = ses.docking();
     let mode = '';
-    if (!p.dockedTo && d.stationId && d.portId) {
+    if (!p.dockedTo && d.stationId && d.portId && d.distance < 5000) {
+      // the world's own docking read-out: collar-to-port distance, offset from the port axis, collar alignment,
+      // closing speed against the station — the latch closes when all of them are inside its tolerances
       mode = d.canLatch ? 'ready' : 'dock';
-      // closing speed along the line to the port: (v_player - v_station) · unit(portOffset)
-      let closing = d.relSpeed;
-      const craft = ses.craft();
-      const ol = Math.hypot(d.portOffset.x, d.portOffset.y, d.portOffset.z);
-      let pc = null, sc = null;
-      for (let i = 0; i < craft.length; i++) {
-        if (craft[i].isPlayer) pc = craft[i];
-        else if (craft[i].id === d.stationId) sc = craft[i];
-      }
-      if (pc && sc && ol > 1e-6) closing = ((pc.v.x - sc.v.x) * d.portOffset.x + (pc.v.y - sc.v.y) * d.portOffset.y + (pc.v.z - sc.v.z) * d.portOffset.z) / ol;
-      setInfoHead(`Dock · ${fmtDistance(ol)}`);
-      setInfoMain(d.canLatch ? 'Latch ready' : `${d.lateral.toFixed(1)} m off axis`);
-      setInfoSub(`${((d.alignment * 180) / Math.PI).toFixed(0)}° off · ${Math.abs(closing).toFixed(2)} m/s ${closing >= 0 ? 'closing' : 'opening'}`);
+      const closing = d.closing;
+      const ac = Math.abs(closing);
+      setInfoHead(`Port ${d.portId} · ${d.portDistance < 100 ? `${d.portDistance.toFixed(1)} m` : fmtDistance(d.portDistance)}`);
+      setInfoMain(d.canLatch ? 'Latch ready' : `${d.lateral < 100 ? `${d.lateral.toFixed(1)} m` : fmtDistance(d.lateral)} off axis`);
+      setInfoSub(`${((d.alignment * 180) / Math.PI).toFixed(0)}° off · ${ac < 0.005 ? 'holding' : `${ac < 10 ? `${ac.toFixed(2)} m/s` : fmtSpeed(ac)} ${closing > 0 ? 'closing' : 'opening'}`}`);
     } else if (!p.dockedTo && d.stationId && d.distance < 5000) {
       mode = 'dock';
       setInfoHead('Station near');

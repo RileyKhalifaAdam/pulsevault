@@ -21,8 +21,8 @@ import { createPipeline, type Quality } from '../../src/render/pipeline';
 import { createSceneManager, type Projection } from '../../src/render/scene';
 import { addStationExtra, beginFrame, createSceneFrame, setDockingGuide, type CameraMode } from '../../src/render/frame';
 import { generateGalaxy } from '../../src/sim/universe';
-import { SystemModel, newState, propagateStateTo } from '../../src/sim/orbit';
-import { stationAttitude } from '../../src/sim/physics';
+import { SystemModel, newState, orbitNormalFromElements, propagateStateTo } from '../../src/sim/orbit';
+import { Y_AXIS, qFromTo } from '../../src/core/vec';
 import type { BodyView, CraftView } from '../../src/game/api';
 import { STATION_LAYOUTS } from '../../src/data/stationLayouts';
 
@@ -120,6 +120,8 @@ function scan(id: string, orbits: number, score: (c: StationCtx) => number): Sta
   }
   return best;
 }
+/** Station-local +Y along the orbit normal, as the world sets its stations up. */
+const stationAttitude = (orbit: Parameters<typeof orbitNormalFromElements>[0]): Quat => qFromTo(Y_AXIS, orbitNormalFromElements(orbit));
 const angDiff = (a: number, b: number): number => Math.abs(Math.atan2(Math.sin(a - b), Math.cos(a - b)));
 function portWorld(stationId: string, portId: string): { pos: V3; dir: V3; up: V3 } {
   const def = model.station(stationId);

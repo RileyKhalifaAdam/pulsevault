@@ -41,6 +41,7 @@ export const SAS_MODES: { mode: HoldMode; label: string; short: string; icon: Ic
   { mode: 'target', label: 'Target', short: 'TGT', icon: 'target' },
   { mode: 'antiTarget', label: 'Anti-target', short: 'ATGT', icon: 'target' },
   { mode: 'burn', label: 'Burn', short: 'BURN', icon: 'node' },
+  { mode: 'dock', label: 'Dock port', short: 'DOCK', icon: 'dock' },
   { mode: 'off', label: 'Off', short: 'OFF', icon: 'sas' },
 ];
 

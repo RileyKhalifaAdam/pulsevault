@@ -24,7 +24,7 @@
 
 import * as THREE from 'three';
 import type { BodyDef, MiningSiteDef, Quat, StateVector, StationDef, StationLayout, SystemDef, V3 } from '../core/types';
-import { newColliderContact, stationAttitude, stationContact } from '../sim/physics';
+import { newColliderContact, stationContact } from '../data/colliders';
 import { SHIP_LAYOUTS } from '../data/shipLayouts';
 import { BERTHS, STATION_LAYOUTS } from '../data/stationLayouts';
 import type { Quality, RenderLayer, RenderPipeline } from './pipeline';
@@ -581,7 +581,7 @@ class Manager implements SceneManager {
         def,
         layout,
         visual,
-        q: stationAttitude(def.orbit),
+        q: { x: 0, y: 0, z: 0, w: 1 }, // overwritten every frame from the station craft in the world
         abs: v3(),
         vel: v3(),
         rel: v3(),
