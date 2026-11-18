@@ -14,6 +14,35 @@ frames, ship-local axes), the rendering contract, the performance budget and the
   visual harness headlessly and screenshot it (look at the PNG with the Read tool)
 - `node tools/shot.cjs index.html shots/game.png --device iphone15` — screenshot the game itself
 
+## Delivery target: the owner's iPhone, in an embedded page (binding for all client code)
+
+The owner plays on an iPhone and has no computer to hand. The game reaches them as ONE self-contained HTML page
+shown inside the Claude app's page viewer (a locked-down iframe; also openable in Safari). Nobody can open a
+console on that phone, and it cannot be tested on a real device before the owner sees it, so:
+
+- **Embedded sizing.** The page is a guest: size to the container with `height: 100%` on html/body, never
+  `100vh`/`100dvh`; re-layout on `resize` and `visualViewport` changes; the area can be smaller than the screen.
+  Pin edge controls with `env(safe-area-inset-*, 0px)` added to their own padding/offsets; keep a side gutter of
+  `max(16px, env(safe-area-inset-left/right, 0px))` for controls and text (the canvas itself is full-bleed).
+- **Blocked in the viewer (never call, never depend on):** `alert`/`confirm`/`prompt` (`confirm()` returns false at
+  once — every confirmation is an in-page sheet), service workers (guard registration and ignore failure),
+  downloads, `window.open`, `window.print`, fullscreen and orientation lock, camera/mic/motion, and ALL network
+  requests (no fetch of assets, no external fonts, scripts, images). Everything is inline or generated.
+- **Storage.** `localStorage` can throw or come back empty: wrap every access in try/catch, keep the game fully
+  playable without it, and keep the save under one key (`tidelock.save.v1`) plus settings (`tidelock.settings.v1`).
+- **iOS Safari touch.** `touch-action: none` on the game surface; `preventDefault` on `touchmove`, `gesturestart`
+  and double-tap so the page never rubber-bands, pinch-zooms or zooms on double tap; `-webkit-user-select: none`,
+  `-webkit-touch-callout: none`, `-webkit-tap-highlight-color: transparent`; pointer events with
+  `setPointerCapture`; real multi-touch (steer + throttle together); any text input has font-size >= 16px.
+- **iOS WebGL.** Device pixel ratio capped at 2; half-float colour targets only where the extension exists (the
+  pipeline detects it); survive context loss; frame-rate independent logic (Low Power Mode halves rAF to 30 fps);
+  stay inside the memory budget — iOS kills tabs that exceed it.
+- **Sound** only starts from a tap.
+- **Visible failures.** Uncaught errors and unhandled rejections must show an in-page panel with the message and
+  stack, a "Copy report" button (clipboard write inside the click handler, falling back to selectable text) and
+  "Reload"; a failed WebGL2 context shows a plain explanation. The owner's bug reports depend on this.
+- Both orientations must work by layout alone. No hover-only affordances.
+
 ## Rules
 
 - No external assets, fonts, CDNs or new npm dependencies: everything is procedural or inline.
