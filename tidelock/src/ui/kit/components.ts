@@ -99,13 +99,17 @@ export interface ScreenHeaderProps {
   onClose?: () => void;
   /** Player balance; animates when it changes. */
   credits?: number;
-  /** Extra right-hand readouts (kept to one or two short ones). */
+  /** Extra right-hand readouts on the title row (keep to one short one in portrait). */
   readouts?: HeaderReadout[];
   /** Hide the ember index mark. */
   plain?: boolean;
 }
 
-/** Screen title bar with back / close, a location line and credit / status readouts. */
+/**
+ * Screen title bar with back / close, a location line and credit / status readouts. Portrait: the
+ * location runs the full width above the title and the readouts share the title's baseline;
+ * landscape phones fold everything into one row.
+ */
 export function ScreenHeader(props: ScreenHeaderProps): Component<Pick<ScreenHeaderProps, 'title' | 'location' | 'credits'>> {
   const d = disposer();
   const titleEl = h('h1.tl-header__title', { text: props.title });
@@ -125,19 +129,19 @@ export function ScreenHeader(props: ScreenHeaderProps): Component<Pick<ScreenHea
     creditsTween = numberTween(fmtInt, props.credits);
     d.add(() => creditsTween?.destroy());
     readouts.appendChild(
-      h('div.tl-header__readout', null,
+      h('div.tl-header__readout.tl-header__readout--credits', null,
         h('span.tl-label', null, 'Credits'),
         h('span.tl-header__readout-v', null, creditsTween.el, h('span.tl-unit', null, 'cr'))),
     );
   }
   const navBtn = (name: IconName, label: string, fn: () => void): HTMLElement => {
-    const b = h('button.tl-header__nav', { attrs: { type: 'button', 'aria-label': label } }, icon(name, 24));
+    const b = h('button.tl-header__nav', { class: name === 'close' && 'tl-header__nav--close', attrs: { type: 'button', 'aria-label': label } }, icon(name, 24));
     d.add(onTap(b, fn, { cue: 'close' }));
     return b;
   };
-  const el = h('header.tl-header', { class: props.plain && 'tl-header--plain' },
+  const el = h('header.tl-header', { class: [props.plain && 'tl-header--plain', !props.onBack && 'tl-header--nonav', !props.onClose && 'tl-header--noclose'] },
     props.onBack ? navBtn('back', 'Back', props.onBack) : null,
-    h('div.tl-header__titles', null, locEl, titleEl),
+    locEl, titleEl,
     readouts.childElementCount ? readouts : null,
     props.onClose ? navBtn('close', 'Close', props.onClose) : null);
   return {
@@ -363,7 +367,6 @@ export function Toggle(props: ToggleProps): Component<Pick<ToggleProps, 'value' 
   const paint = (): void => {
     el.setAttribute('aria-checked', String(value));
     setText(stateEl, value ? 'On' : 'Off');
-    stateEl.style.textTransform = 'uppercase';
   };
   paint();
   const off = onTap(el, () => {
@@ -512,6 +515,8 @@ export interface StepperProps {
   format?: (value: number) => string;
   unit?: string;
   block?: boolean;
+  /** Narrower value field (tight rows beside a button). */
+  compact?: boolean;
   tone?: ToneOrColor;
   ariaLabel?: string;
   onChange?: (value: number) => void;
@@ -527,7 +532,7 @@ export function Stepper(props: StepperProps): Component<Pick<StepperProps, 'valu
   const valueEl = h('span.tl-num', { text: format(value) });
   const minus = h('button.tl-stepper__btn', { attrs: { type: 'button', 'aria-label': 'Decrease' } }, icon('minus', 20));
   const plus = h('button.tl-stepper__btn', { attrs: { type: 'button', 'aria-label': 'Increase' } }, icon('plus', 20));
-  const el = h('div.tl-stepper', { class: props.block && 'tl-stepper--block', attrs: { role: 'group', 'aria-label': props.ariaLabel ?? null } },
+  const el = h('div.tl-stepper', { class: [props.block && 'tl-stepper--block', props.compact && 'tl-stepper--compact'], attrs: { role: 'group', 'aria-label': props.ariaLabel ?? null } },
     minus, h('div.tl-stepper__value', null, valueEl, props.unit ? h('span.tl-unit', { text: props.unit }) : null), plus);
   setTone(el, props.tone);
   const paint = (): void => {
@@ -782,7 +787,9 @@ export interface ListRowProps {
   tone?: ToneOrColor;
   /** Right-hand figure. */
   value?: string;
-  /** Under the value: a delta() element, a unit, a countdown… */
+  /** Small-caps unit after the figure ("cr", "t"). */
+  unit?: string;
+  /** Under the value: a delta() element, a countdown… */
   note?: Child;
   chevron?: boolean;
   selected?: boolean;
@@ -792,7 +799,8 @@ export interface ListRowProps {
 /** One row: leading icon tile, title / subtitle / badges, trailing value + note, chevron. */
 export function ListRow(props: ListRowProps): Component<Pick<ListRowProps, 'title' | 'value' | 'selected' | 'note'>> {
   const titleEl = h('div.tl-listrow__title', { text: props.title });
-  const valueEl = h('div.tl-listrow__value.tl-num', { text: props.value ?? '' });
+  const valueText = document.createTextNode(props.value ?? '');
+  const valueEl = h('div.tl-listrow__value.tl-num', null, valueText, props.unit ? h('span.tl-unit', { text: props.unit }) : null);
   const noteEl = h('div', null, props.note);
   const el = h(props.onTap ? 'button.tl-listrow' : 'div.tl-listrow', { class: props.selected && 'tl-listrow--selected', attrs: props.onTap ? { type: 'button' } : undefined },
     props.icon ? h('span.tl-listrow__icon', null, icon(props.icon, 22)) : null,
@@ -807,7 +815,7 @@ export function ListRow(props: ListRowProps): Component<Pick<ListRowProps, 'titl
     el,
     update(p) {
       if (p.title !== undefined) setText(titleEl, p.title);
-      if (p.value !== undefined) setText(valueEl, p.value);
+      if (p.value !== undefined && valueText.data !== p.value) valueText.data = p.value;
       if (p.note !== undefined) setChildren(noteEl, p.note);
       if (p.selected !== undefined) el.classList.toggle('tl-listrow--selected', p.selected);
     },
@@ -1041,7 +1049,7 @@ export function Readout(props: ReadoutProps): Component<Pick<ReadoutProps, 'valu
   const valueText = document.createTextNode(props.value);
   const labelText = document.createTextNode(props.label);
   const el = h('div.tl-readout', { class: [props.size === 'lg' && 'tl-readout--lg', props.align === 'right' && 'tl-readout--right', props.tone && 'tl-readout--tone'] },
-    h('span.tl-label.tl-row', { style: 'gap:5px' }, props.icon ? icon(props.icon, 12) : null, labelText),
+    h('span.tl-label.tl-readout__k', null, props.icon ? icon(props.icon, 12) : null, labelText),
     h('span.tl-readout__v.tl-num', null, valueText, props.unit ? h('span.tl-unit', { text: props.unit }) : null));
   setTone(el, props.tone);
   return {
@@ -1236,7 +1244,7 @@ export function StackedInfluenceBar(props: InfluenceProps): Component<Pick<Influ
       bar.appendChild(seg);
       const row = h('div.tl-influence__row', null,
         h('span.tl-influence__sw'),
-        h('span.tl-row', { style: 'gap:8px' }, h('span.tl-influence__name', { text: s.label }), s.controlling ? Badge({ label: 'Control', tone: 'neutral' }).el : null, s.badges),
+        h('span.tl-row', { style: 'gap:8px' }, h('span.tl-influence__name', { text: s.label }), s.controlling ? h('span.tl-influence__ctrl', null, 'Control') : null, s.badges),
         h('span.tl-influence__pct.tl-num', { text: `${(s.value * 100).toFixed(1)}%` }),
         s.delta !== undefined ? delta(s.delta, { format: (a) => (a * 100).toFixed(1) }) : h('span'));
       setTone(row, s.color);

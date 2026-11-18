@@ -79,87 +79,87 @@ const ICONS = {
   hull: `M12 2.5l6 16.5-6-3-6 3zM12 8.5V12`,
   shield: `M12 3l7 3v5.5c0 4.5-3 8-7 9.5-4-1.5-7-5-7-9.5V6z`,
   heat: `M10 5a2 2 0 0 1 4 0v8.6a4 4 0 1 1-4 0zM12 9v6|${dot(12, 16.8, 1.5)}`,
-  fuel: `M12 3s-6.5 7.5-6.5 11.5a6.5 6.5 0 0 0 13 0C18.5 10.500 12 3 12 3zM9 14.500a3 3 0 0 0 3 3`,
-  power: `M13 2.5l-7.500 11h6l-1 8 8-11.500h-6z`,
+  fuel: `M12 3s-6.5 7.5-6.5 11.5a6.5 6.5 0 0 0 13 0C18.5 10.5 12 3 12 3zM9 14.5a3 3 0 0 0 3 3`,
+  power: `M13 2.5l-7.5 11h6l-1 8 8-11.5h-6z`,
   cargo: `M12 3l8 4.5v9L12 21l-8-4.5v-9zM4 7.5l8 4.5 8-4.5M12 12v9`,
   scanner: `${c(12, 12, 9)}M12 7a5 5 0 0 1 5 5M12 12l6.3-6.3|${dot(12, 12, 1.2)}|${dot(8, 15)}`,
-  weapon: `${c(9, 15, 4)}M11.800 12.200L19.500 4.500M17.500 3l3.500 3.500M3 21h12`,
-  mining: `M13.500 13l4-1.500 3.500 3-1 4.500-5 1.500-3-3zM3 3l8.500 8.500M12.500 8V5.500M8 12.500H5.500`,
-  scoop: `M5 9c0 6 4 10 7 10s7-4 7-10M9 3v6M12 3v8.500M15 3v6M12 19v2.500`,
+  weapon: `${c(9, 15, 4)}M11.8 12.2L19.5 4.5M17.5 3l3.5 3.5M3 21h12`,
+  mining: `M13.5 13l4-1.5 3.5 3-1 4.5-5 1.5-3-3zM3 3l8.5 8.5M12.5 8V5.5M8 12.5H5.5`,
+  scoop: `M5 9c0 6 4 10 7 10s7-4 7-10M9 3v6M12 3v8.5M15 3v6M12 19v2.5`,
   radiator: `M5 4h14v12H5zM9 4v12M12 4v12M15 4v12M12 16v5M9 21h6`,
 
   // ---------------------------------------------------------------- station services
-  market: `M4 8h15M15.500 4.500L19 8l-3.500 3.500M20 16H5M8.500 12.500L5 16l3.500 3.500`,
-  missions: `M7 4.500h10a1 1 0 0 1 1 1V20a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V5.500a1 1 0 0 1 1-1zM9.500 4.500V3h5v1.500M9 9.500h6M9 13h6M9 16.500h3.500`,
-  outfitting: `M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM16.500 14v5M14 16.500h5`,
-  shipyard: `M3 21V8.500L12 3l9 5.500V21M12 9l3 10-3-1.500L9 19z`,
-  refuel: `M10 5s-5.500 6.300-5.500 9.800a5.500 5.500 0 0 0 11 0C15.500 11.300 10 5 10 5zM18.500 3v5M16 5.500h5`,
-  repair: `M19.880 6.670A3.600 3.600 0 1 1 17.330 4.120L17.250 6.750zM13.600 9.200L4.900 17.900a1.700 1.700 0 0 0 2.400 2.400L16 11.600`,
-  survey: `${c(12, 12, 6.5)}M6.200 9.500q5.800 2.500 11.600 0M6.200 14.500q5.800 2.500 11.600 0M2.500 6V2.500H6M18 2.500h3.500V6M21.500 18v3.500H18M6 21.500H2.500V18`,
-  legal: `M12 4v16M8 20h8M5 7h14M5 7l-2.500 6.500h5zM19 7l-2.500 6.500h5z`,
-  blackmarket: `M3 9.500C3 8 6 7.500 8 7.500s3 1 4 1 2-1 4-1 5 .500 5 2c0 4-2.500 6.500-4.500 6.500s-3-2.500-4.500-2.500-2.500 2.500-4.500 2.500S3 13.500 3 9.500zM6.500 11a1.600 1.200 0 1 0 3.200 0 1.600 1.200 0 1 0-3.200 0M14.300 11a1.600 1.200 0 1 0 3.200 0 1.600 1.200 0 1 0-3.200 0`,
+  market: `M4 8h15M15.5 4.5L19 8l-3.5 3.5M20 16H5M8.5 12.5L5 16l3.5 3.5`,
+  missions: `M7 4.5h10a1 1 0 0 1 1 1V20a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V5.5a1 1 0 0 1 1-1zM9.5 4.5V3h5v1.5M9 9.5h6M9 13h6M9 16.5h3.5`,
+  outfitting: `M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM16.5 14v5M14 16.5h5`,
+  shipyard: `M3 21V8.5L12 3l9 5.5V21M12 9l3 10-3-1.5L9 19z`,
+  refuel: `M10 5s-5.5 6.3-5.5 9.8a5.5 5.5 0 0 0 11 0C15.5 11.3 10 5 10 5zM18.5 3v5M16 5.5h5`,
+  repair: `M19.88 6.67A3.6 3.6 0 1 1 17.33 4.12L17.25 6.75zM13.6 9.2L4.9 17.9a1.7 1.7 0 0 0 2.4 2.4L16 11.6`,
+  survey: `${c(12, 12, 6.5)}M6.2 9.5q5.8 2.5 11.6 0M6.2 14.5q5.8 2.5 11.6 0M2.5 6V2.5H6M18 2.5h3.5V6M21.5 18v3.5H18M6 21.5H2.5V18`,
+  legal: `M12 4v16M8 20h8M5 7h14M5 7l-2.5 6.5h5zM19 7l-2.5 6.5h5z`,
+  blackmarket: `M3 9.5C3 8 6 7.5 8 7.5s3 1 4 1 2-1 4-1 5 .5 5 2c0 4-2.5 6.5-4.5 6.5s-3-2.5-4.5-2.5-2.5 2.5-4.5 2.5S3 13.5 3 9.5zM6.5 11a1.6 1.2 0 1 0 3.2 0 1.6 1.2 0 1 0-3.2 0M14.3 11a1.6 1.2 0 1 0 3.2 0 1.6 1.2 0 1 0-3.2 0`,
   news: `M5 4h14v16H5zM8 8h8v3H8zM8 14h8M8 17h5`,
-  factions: `M6 3v18M6 4.500h12l-3 4 3 4H6`,
+  factions: `M6 3v18M6 4.5h12l-3 4 3 4H6`,
 
   // ---------------------------------------------------------------- commodity categories
-  food: `M12 21v-9M12 14.500c-4 0-6.500-2.500-6.500-6 3.500 0 6.500 2 6.500 6zM12 11.500c0-4 2.500-6.500 6.500-6.500 0 4-2.500 6.500-6.500 6.500z`,
+  food: `M12 21v-9M12 14.5c-4 0-6.5-2.5-6.5-6 3.5 0 6.5 2 6.5 6zM12 11.5c0-4 2.5-6.5 6.5-6.5 0 4-2.5 6.5-6.5 6.5z`,
   minerals: `M12 3l5 6-5 12L7 9zM7 9l5 3 5-3M12 12v9`,
-  metals: `M7 13h10l2.500 6h-15zM9 6h6l2 5H7z`,
-  chemicals: `M9.500 3h5M10.500 3v6L5 18.500A1.500 1.500 0 0 0 6.300 21h11.400a1.500 1.500 0 0 0 1.300-2.500L13.500 9V3M7.600 15h8.800`,
+  metals: `M7 13h10l2.5 6h-15zM9 6h6l2 5H7z`,
+  chemicals: `M9.5 3h5M10.5 3v6L5 18.5A1.5 1.5 0 0 0 6.3 21h11.4a1.5 1.5 0 0 0 1.3-2.5L13.5 9V3M7.6 15h8.8`,
   machinery: `${gear(12, 12, 9.2, 6.9, 8)}${c(12, 12, 2.8)}`,
   technology: `M7 7h10v10H7zM10 10h4v4h-4zM10 4v3M14 4v3M10 17v3M14 17v3M4 10h3M4 14h3M17 10h3M17 14h3`,
-  medicine: `M9.500 4h5v5.500H20v5h-5.500V20h-5v-5.500H4v-5h5.500z`,
-  consumer: `M12.500 3.500h8v8l-9 9-8-8z${c(16.5, 7.5, 1.3)}`,
-  energy: `M6 7h12v13.500H6zM10 7V4h4v3M12.800 10L10 14.500h4L11.200 19`,
-  weapons: `M12 2.500c2.500 2.500 3.500 5.500 3.500 8.500v7h-7v-7c0-3 1-6 3.500-8.500zM8.500 14.500h7M8.500 18L6 21.500M15.500 18l2.500 3.500`,
-  salvage: `M4 5h7L9 9l3 2-2.500 4 2 4H4zM14.500 5H20v14h-5.500l-2-4 2.500-4-3-2z`,
-  contraband: `M12 3l9 9-9 9-9-9zM9.500 9.500l5 5M14.500 9.500l-5 5`,
+  medicine: `M9.5 4h5v5.5H20v5h-5.5V20h-5v-5.5H4v-5h5.5z`,
+  consumer: `M12.5 3.5h8v8l-9 9-8-8z${c(16.5, 7.5, 1.3)}`,
+  energy: `M6 7h12v13.5H6zM10 7V4h4v3M12.8 10L10 14.5h4L11.2 19`,
+  weapons: `M12 2.5c2.5 2.5 3.5 5.5 3.5 8.5v7h-7v-7c0-3 1-6 3.5-8.5zM8.5 14.5h7M8.5 18L6 21.5M15.5 18l2.5 3.5`,
+  salvage: `M4 5h7L9 9l3 2-2.5 4 2 4H4zM14.5 5H20v14h-5.5l-2-4 2.5-4-3-2z`,
+  contraband: `M12 3l9 9-9 9-9-9zM9.5 9.5l5 5M14.5 9.5l-5 5`,
 
   // ---------------------------------------------------------------- status
-  warning: `M12 3.500L21.500 20h-19zM12 10v4.500|${dot(12, 17.2, 1)}`,
-  danger: `M8.300 3h7.400L21 8.300v7.400L15.700 21H8.300L3 15.700V8.300zM12 7.500V13|${dot(12, 16.2, 1)}`,
-  info: `${c(12, 12, 9)}M12 11v5.500|${dot(12, 7.8, 1)}`,
-  check: `M4.500 12.500l5 5L19.500 7`,
-  lock: `M6 11h12v9.500H6zM8.500 11V8a3.500 3.500 0 0 1 7 0v3M12 15v2.500`,
-  credits: `M17.950 6.650A8 8 0 1 0 17.950 17.350M2.500 10.200h8M2.500 13.800h8`,
-  repUp: `M6 12.500l6-6 6 6M6 18.500l6-6 6 6`,
-  repDown: `M6 5.500l6 6 6-6M6 11.500l6 6 6-6`,
-  time: `${c(12, 12, 9)}M12 7v5l3.500 2`,
-  distance: `M4 7v10M20 7v10M4.500 12h15M7.500 9.500L5 12l2.500 2.500M16.500 9.500L19 12l-2.500 2.500`,
-  trendUp: `M3 17l6-6 4 4 8-8M15.500 7H21v5.500`,
-  trendDown: `M3 7l6 6 4-4 8 8M15.500 17H21v-5.500`,
-  trendFlat: `M3 12h17.500M16.500 8l4 4-4 4`,
+  warning: `M12 3.5L21.5 20h-19zM12 10v4.5|${dot(12, 17.2, 1)}`,
+  danger: `M8.3 3h7.4L21 8.3v7.4L15.7 21H8.3L3 15.7V8.3zM12 7.5V13|${dot(12, 16.2, 1)}`,
+  info: `${c(12, 12, 9)}M12 11v5.5|${dot(12, 7.8, 1)}`,
+  check: `M4.5 12.5l5 5L19.5 7`,
+  lock: `M6 11h12v9.5H6zM8.5 11V8a3.5 3.5 0 0 1 7 0v3M12 15v2.5`,
+  credits: `${c(12, 12, 8.5)}M14.9 9.1A4.1 4.1 0 1 0 14.9 14.9M12 5.5v2.4M12 16.1v2.4`,
+  repUp: `M6 12.5l6-6 6 6M6 18.5l6-6 6 6`,
+  repDown: `M6 5.5l6 6 6-6M6 11.5l6 6 6-6`,
+  time: `${c(12, 12, 9)}M12 7v5l3.5 2`,
+  distance: `M4 7v10M20 7v10M4.5 12h15M7.5 9.5L5 12l2.5 2.5M16.5 9.5L19 12l-2.5 2.5`,
+  trendUp: `M3 17l6-6 4 4 8-8M15.5 7H21v5.5`,
+  trendDown: `M3 7l6 6 4-4 8 8M15.5 17H21v-5.5`,
+  trendFlat: `M3 12h17.5M16.5 8l4 4-4 4`,
 
   // ---------------------------------------------------------------- interface
-  close: `M5.500 5.500l13 13M18.500 5.500l-13 13`,
-  back: `M20 12H4.500M10.500 5.500L4 12l6.500 6.500`,
+  close: `M5.5 5.5l13 13M18.5 5.5l-13 13`,
+  back: `M20 12H4.5M10.5 5.5L4 12l6.5 6.5`,
   chevronRight: `M9 5l7 7-7 7`,
   chevronLeft: `M15 5l-7 7 7 7`,
   chevronUp: `M5 15l7-7 7 7`,
   chevronDown: `M5 9l7 7 7-7`,
   menu: `M4 7h16M4 12h16M4 17h10`,
-  settings: `M4 6h8.500M17.500 6H20${c(15, 6, 2)}M4 12h1.500M10.500 12H20${c(8, 12, 2)}M4 18h6.500M15.500 18H20${c(13, 18, 2)}`,
-  soundOn: `M4 9.500h3.500L12 5.500v13l-4.500-4H4zM15.500 9a4.500 4.500 0 0 1 0 6M18 6.500a8 8 0 0 1 0 11`,
-  soundOff: `M4 9.500h3.500L12 5.500v13l-4.500-4H4zM16 9.500l5 5M21 9.500l-5 5`,
-  play: `M7.500 4.500L19 12 7.500 19.500z`,
+  settings: `M4 6h8.5M17.5 6H20${c(15, 6, 2)}M4 12h1.5M10.5 12H20${c(8, 12, 2)}M4 18h6.5M15.5 18H20${c(13, 18, 2)}`,
+  soundOn: `M4 9.5h3.5L12 5.5v13l-4.5-4H4zM15.5 9a4.5 4.5 0 0 1 0 6M18 6.5a8 8 0 0 1 0 11`,
+  soundOff: `M4 9.5h3.5L12 5.5v13l-4.5-4H4zM16 9.5l5 5M21 9.5l-5 5`,
+  play: `M7.5 4.5L19 12 7.5 19.5z`,
   pause: `M8 5v14M16 5v14`,
   plus: `M12 5v14M5 12h14`,
   minus: `M5 12h14`,
-  filter: `M4 5h16l-6 7.500V19l-4-2v-4.500z`,
-  sort: `M7 4v16M3.500 16.500L7 20l3.500-3.500M17 20V4M13.500 7.500L17 4l3.500 3.500`,
+  filter: `M4 5h16l-6 7.5V19l-4-2v-4.5z`,
+  sort: `M7 4v16M3.5 16.5L7 20l3.5-3.5M17 20V4M13.5 7.5L17 4l3.5 3.5`,
   star: starPath(12, 12.6, 9.3, 3.9),
-  bookmark: `M7 3.500h10v17l-5-4-5 4z`,
-  search: `${c(10.5, 10.5, 6.5)}M15.300 15.300L20.500 20.500`,
+  bookmark: `M7 3.5h10v17l-5-4-5 4z`,
+  search: `${c(10.5, 10.5, 6.5)}M15.3 15.3L20.5 20.5`,
   more: `${dot(5.5, 12, 1.4)}|${dot(12, 12, 1.4)}|${dot(18.5, 12, 1.4)}`,
-  comms: `M4 5h16v11h-8l-4.500 4v-4H4zM8 9h8M8 12h5`,
-  station: `${c(12, 12, 8.5)}${c(12, 12, 2.6)}M12 3.500v5.900M12 14.600v5.900M3.500 12h5.900M14.600 12h5.900`,
-  planet: `${c(12, 12, 6)}M5.900 14.600C3.700 16.200 2.600 17.500 3 18.200c.800 1.400 5.500-.200 10.500-3.200s8.300-6.600 7.500-8c-.400-.700-2-.500-4.300.300`,
+  comms: `M4 5h16v11h-8l-4.5 4v-4H4zM8 9h8M8 12h5`,
+  station: `${c(12, 12, 8.5)}${c(12, 12, 2.6)}M12 3.5v5.9M12 14.6v5.9M3.5 12h5.9M14.6 12h5.9`,
+  planet: `${c(12, 12, 6)}M5.9 14.6C3.7 16.2 2.6 17.5 3 18.2c.8 1.4 5.5-.2 10.5-3.2s8.3-6.6 7.5-8c-.4-.7-2-.5-4.3.3`,
 
   // ---------------------------------------------------------------- powers & game mark
-  powerAssembly: `${c(12, 12, 4.8)}M12 7.200v9.600|${ringDots(12, 12, 9.4, 8, 1.05)}`,
-  powerHegemony: `M4 17.500h16M7 17.500a5 5 0 0 1 10 0M12 9V4.500M7.600 11.300L5 8.200M16.400 11.300L19 8.200M6.500 21h11`,
-  powerLeague: `M15 4.500A8.500 8.500 0 1 0 15 19.500 9 9 0 0 1 15 4.500zM18.500 8.700l1.900 3.300-1.900 3.300-1.900-3.300z`,
-  logo: `${c(12, 12, 8.5)}M20.500 12H23|f:M12 3.500a8.500 8.500 0 0 0 0 17 5.600 8.500 0 0 1 0-17z`,
+  powerAssembly: `${c(12, 12, 4.8)}M12 7.2v9.6|${ringDots(12, 12, 9.4, 8, 1.05)}`,
+  powerHegemony: `M4 17.5h16M7 17.5a5 5 0 0 1 10 0M12 9V4.5M7.6 11.3L5 8.2M16.4 11.3L19 8.2M6.5 21h11`,
+  powerLeague: `M15 4.5A8.5 8.5 0 1 0 15 19.5 9 9 0 0 1 15 4.5zM18.5 8.7l1.9 3.3-1.9 3.3-1.9-3.3z`,
+  logo: `${c(12, 12, 8.5)}M20.5 12H23|f:M12 3.5a8.5 8.5 0 0 0 0 17 5.6 8.5 0 0 1 0-17z`,
 } as const;
 
 export type IconName = keyof typeof ICONS;
@@ -240,11 +240,11 @@ const LETTERS: { d: string; w: number }[] = [
   { d: 'M0 0H17M8.5 0V24', w: 17 }, // T
   { d: 'M0 0V24', w: 0 }, // I
   { d: 'M0 0H7A12 12 0 0 1 7 24H0Z', w: 19 }, // D
-  { d: 'M0 0H15M0 12H11.500M0 24H15', w: 15 }, // E (stemless)
+  { d: 'M0 0H15M0 12H11.5M0 24H15', w: 15 }, // E (stemless)
   { d: 'M0 0V24H14', w: 14 }, // L
   { d: 'M0 12A12 12 0 1 0 24 12 12 12 0 1 0 0 12', w: 24 }, // O (the locked world)
-  { d: 'M21.190 4.290A12 12 0 1 0 21.190 19.710', w: 21.2 }, // C
-  { d: 'M0 0V24M15.500 0L4 12 15.500 24', w: 15.5 }, // K
+  { d: 'M21.19 4.29A12 12 0 1 0 21.19 19.71', w: 21.2 }, // C
+  { d: 'M0 0V24M15.5 0L4 12 15.5 24', w: 15.5 }, // K
 ];
 const LETTER_GAP = 11.5;
 const O_INDEX = 5;
@@ -287,7 +287,7 @@ export function wordmark(height = 24, opts: WordmarkOptions = {}): SVGSVGElement
   const crescent =
     opts.accent === false
       ? ''
-      : `<path class="tl-wordmark__ember" transform="translate(${n(oX)} 0)" d="M12 3.600a8.400 8.400 0 0 0 0 16.800 4.700 8.400 0 0 1 0-16.800z" fill="var(--tl-ember, #FFB454)" stroke="none"/>`;
+      : `<path class="tl-wordmark__ember" transform="translate(${n(oX)} 0)" d="M12 3.6a8.4 8.4 0 0 0 0 16.8 4.7 8.4 0 0 1 0-16.8z" fill="var(--tl-ember, #FFB454)" stroke="none"/>`;
   el.innerHTML = d + crescent;
   return el;
 }
@@ -327,13 +327,74 @@ export function logoMark(size = 120): SVGSVGElement {
 </defs>
 <circle cx="60" cy="60" r="60" fill="url(#${id}-g)"/>
 <path class="tl-logomark__bezel" d="${ticks}" stroke="currentColor" stroke-opacity=".34" stroke-width=".8"/>
+<circle cx="60" cy="60" r="32" fill="#05070B" fill-opacity=".82"/>
 <circle class="tl-logomark__ring" cx="60" cy="60" r="32" stroke="currentColor" stroke-width="1.6"/>
-<path class="tl-logomark__day" d="M60 31.500a28.500 28.500 0 0 0 0 57 15.500 28.500 0 0 1 0-57z" fill="url(#${id}-e)"/>
-<path d="M60 31.500a15.500 28.500 0 0 0 0 57" stroke="currentColor" stroke-opacity=".28" stroke-width=".8"/>
-<path d="M101.100 41.700A45 13-24 0 0 84.170 38.830M28.090 63.790A45 13-24 0 0 18.900 78.300" stroke="#6FE3FF" stroke-width="1" stroke-opacity=".4"/>
-<path class="tl-logomark__orbit" d="M18.900 78.300A45 13-24 0 0 101.100 41.700" stroke="#6FE3FF" stroke-width="1" stroke-opacity=".9"/>
-<circle class="tl-logomark__sat" cx="82.200" cy="63" r="2.300" fill="#6FE3FF"/>
+<path class="tl-logomark__day" d="M60 31.5a28.5 28.5 0 0 0 0 57 15.5 28.5 0 0 1 0-57z" fill="url(#${id}-e)"/>
+<path d="M60 31.5a15.5 28.5 0 0 0 0 57" stroke="currentColor" stroke-opacity=".28" stroke-width=".8"/>
+<path d="M101.1 41.7A45 13-24 0 0 84.17 38.83M28.09 63.79A45 13-24 0 0 18.9 78.3" stroke="#6FE3FF" stroke-width="1" stroke-opacity=".4"/>
+<path class="tl-logomark__orbit" d="M18.9 78.3A45 13-24 0 0 101.1 41.7" stroke="#6FE3FF" stroke-width="1" stroke-opacity=".9"/>
+<circle class="tl-logomark__sat" cx="82.2" cy="63" r="2.3" fill="#6FE3FF"/>
 <path d="M4 60h9M107 60h9" stroke="currentColor" stroke-opacity=".5" stroke-width="1"/>`;
+  return el;
+}
+
+// ------------------------------------------------------------------ app icon
+
+/**
+ * The home-screen icon as a full-bleed square SVG: the emblem (bolder, without the bezel) on a
+ * deep-space gradient above the thin ember crescent of a world's lit limb. Everything that matters
+ * sits inside the central 80 % so platform masks (iOS squircle, Android maskable) never clip it.
+ * tools/make-icons.cjs rasterises this to web/icon-*.png.
+ */
+export function appIcon(size = 512): SVGSVGElement {
+  const el = document.createElementNS(NS, 'svg');
+  el.setAttribute('viewBox', '0 0 512 512');
+  el.setAttribute('width', String(size));
+  el.setAttribute('height', String(size));
+  el.setAttribute('fill', 'none');
+  el.setAttribute('role', 'img');
+  el.setAttribute('aria-label', 'TIDELOCK');
+  el.setAttribute('class', 'tl-appicon');
+  const id = `tl-ai-${Math.random().toString(36).slice(2, 8)}`;
+  // A handful of fixed stars: [x, y, radius, opacity, warm]
+  const stars: [number, number, number, number, number][] = [
+    [58, 74, 2.2, 0.7, 0], [128, 38, 1.4, 0.45, 1], [431, 92, 2.4, 0.75, 0], [470, 208, 1.5, 0.5, 0], [392, 42, 1.3, 0.4, 1],
+    [44, 228, 1.6, 0.5, 1], [86, 332, 1.3, 0.4, 0], [452, 318, 1.8, 0.55, 1], [214, 58, 1.2, 0.35, 0], [318, 28, 1.5, 0.45, 0],
+  ];
+  const starMarkup = stars.map(([x, y, r, o, warm]) => `<circle cx="${x}" cy="${y}" r="${r}" fill="${warm ? '#FFD9B0' : '#DCE8FF'}" fill-opacity="${o}"/>`).join('');
+  // Emblem geometry is logoMark's 120-unit drawing, scaled about its centre onto (256, 226).
+  el.innerHTML = `
+<defs>
+  <radialGradient id="${id}-bg" cx="150" cy="96" r="560" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#182236"/><stop offset=".42" stop-color="#0A0F19"/><stop offset="1" stop-color="#030407"/>
+  </radialGradient>
+  <radialGradient id="${id}-halo" cx="256" cy="226" r="210" gradientUnits="userSpaceOnUse">
+    <stop offset=".3" stop-color="#FFB454" stop-opacity=".2"/><stop offset="1" stop-color="#FFB454" stop-opacity="0"/>
+  </radialGradient>
+  <radialGradient id="${id}-air" cx="256" cy="1140" r="840" gradientUnits="userSpaceOnUse">
+    <stop offset=".874" stop-color="#FF9A4A" stop-opacity=".5"/><stop offset=".905" stop-color="#FF8A3C" stop-opacity=".16"/><stop offset=".97" stop-color="#FF8A3C" stop-opacity="0"/>
+  </radialGradient>
+  <linearGradient id="${id}-rim" x1="0" y1="0" x2="512" y2="0" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#FFB454" stop-opacity=".15"/><stop offset=".3" stop-color="#FFD9A0"/><stop offset=".66" stop-color="#FFB454" stop-opacity=".75"/><stop offset="1" stop-color="#FFB454" stop-opacity=".1"/>
+  </linearGradient>
+  <linearGradient id="${id}-day" x1="28" y1="60" x2="62" y2="60" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#FFE0AE"/><stop offset=".5" stop-color="#FFB454"/><stop offset="1" stop-color="#F0903A" stop-opacity=".25"/>
+  </linearGradient>
+</defs>
+<rect width="512" height="512" fill="url(#${id}-bg)"/>
+${starMarkup}
+<rect width="512" height="512" fill="url(#${id}-air)"/>
+<circle cx="256" cy="1140" r="734" fill="#04060A"/>
+<path d="M-40 468.3A734 734 0 0 1 552 468.3" stroke="url(#${id}-rim)" stroke-width="5" stroke-linecap="round"/>
+<circle cx="256" cy="226" r="210" fill="url(#${id}-halo)"/>
+<g transform="translate(256 226) scale(3.55) translate(-60 -60)">
+  <path d="M101.1 41.7A45 13-24 0 0 84.17 38.83M28.09 63.79A45 13-24 0 0 18.9 78.3" stroke="#6FE3FF" stroke-width="1.7" stroke-opacity=".5"/>
+  <circle cx="60" cy="60" r="31" fill="#070A11"/>
+  <path d="M60 31.5a28.5 28.5 0 0 0 0 57 15.5 28.5 0 0 1 0-57z" fill="url(#${id}-day)"/>
+  <circle cx="60" cy="60" r="32" stroke="#E8EEF5" stroke-width="2.7"/>
+  <path d="M18.9 78.3A45 13-24 0 0 101.1 41.7" stroke="#6FE3FF" stroke-width="1.9" stroke-linecap="round"/>
+  <circle cx="82.2" cy="63" r="3.6" fill="#6FE3FF"/>
+</g>`;
   return el;
 }
 
@@ -359,18 +420,18 @@ export function portrait(seed = 0, size = 56): SVGSVGElement {
   const s = Math.abs(Math.floor(seed));
   const heads = [
     // bare head, short crop
-    'M19 26c0-6.500 4-10.500 9-10.500s9 4 9 10.500c0 6-4 10.500-9 10.500s-9-4.500-9-10.500zM19.500 22.500c3-1 5-3.500 5.500-6M36.500 23c-3-.500-5.500-3-6.500-6.500',
+    'M19 26c0-6.5 4-10.5 9-10.5s9 4 9 10.5c0 6-4 10.5-9 10.5s-9-4.5-9-10.5zM19.5 22.5c3-1 5-3.5 5.5-6M36.5 23c-3-.5-5.5-3-6.5-6.5',
     // pressure helmet with visor
-    'M17 27c0-8 5-13 11-13s11 5 11 13c0 5-2.500 9.500-6 10.500H23c-3.500-1-6-5.500-6-10.500zM20 24.500h16v6.500c-2 2-4.500 3-8 3s-6-1-8-3z',
+    'M17 27c0-8 5-13 11-13s11 5 11 13c0 5-2.5 9.5-6 10.5H23c-3.5-1-6-5.5-6-10.5zM20 24.5h16v6.5c-2 2-4.5 3-8 3s-6-1-8-3z',
     // hooded
-    'M28 12.500c-8 0-12 6.500-12 14.500 0 4 1 7.500 3 10h18c2-2.500 3-6 3-10 0-8-4-14.500-12-14.500zM21.500 28c0-4.500 2.800-7.500 6.500-7.500s6.500 3 6.500 7.500-2.800 8-6.500 8-6.500-3.500-6.500-8z',
+    'M28 12.5c-8 0-12 6.5-12 14.5 0 4 1 7.5 3 10h18c2-2.5 3-6 3-10 0-8-4-14.5-12-14.5zM21.5 28c0-4.5 2.8-7.5 6.5-7.5s6.5 3 6.5 7.5-2.8 8-6.5 8-6.5-3.5-6.5-8z',
     // officer cap
-    'M19.500 27c0 6 3.800 10 8.500 10s8.500-4 8.500-10M17 22.500h22l-2-6.500c-3-1.500-6-2-9-2s-6 .500-9 2zM16 23c4 1.500 8 2 12 2s8-.500 12-2',
+    'M19.5 27c0 6 3.8 10 8.5 10s8.5-4 8.5-10M17 22.5h22l-2-6.5c-3-1.5-6-2-9-2s-6 .5-9 2zM16 23c4 1.5 8 2 12 2s8-.5 12-2',
   ];
   const collars = [
-    'M9 52c1-8 6.500-11.500 13-12.500l6 5 6-5c6.500 1 12 4.500 13 12.500',
-    'M8 52c1.500-7.500 7-11 14-12h12c7 1 12.500 4.500 14 12M22 40v4.500h12V40',
-    'M10 52c1-7 6-11 12.500-12.500L28 47l5.500-7.500C40 41 45 45 46 52M28 47v5',
+    'M9 52c1-8 6.5-11.5 13-12.5l6 5 6-5c6.5 1 12 4.5 13 12.5',
+    'M8 52c1.5-7.5 7-11 14-12h12c7 1 12.5 4.5 14 12M22 40v4.5h12V40',
+    'M10 52c1-7 6-11 12.5-12.5L28 47l5.5-7.5C40 41 45 45 46 52M28 47v5',
   ];
   let scan = '';
   for (let y = 7; y < 50; y += 3) scan += `M5 ${y}h46`;

@@ -3,7 +3,7 @@
 //   import { createRoot, h, Panel, Button, DataTable, LineChart, toast, icon } from '../kit';
 //
 //   kit.ts         DOM builder, signals, gestures, scrolling, motion, style injection
-//   icons.ts       thin-line icon set, wordmark, emblem, comms portraits
+//   icons.ts       thin-line icon set, wordmark, emblem, app icon, comms portraits
 //   components.ts  in-flow components (panel, header, buttons, inputs, lists, table, gauges…)
 //   charts.ts      canvas sparkline / line / area / bar charts
 //   overlays.ts    modal, bottom sheet, toasts, help popover, comms message, splash

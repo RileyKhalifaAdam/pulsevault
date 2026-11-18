@@ -564,6 +564,7 @@ function solveUniversal(r0: number, sigma0: number, alpha: number, target: numbe
   }
   if (!(x > lo && x < hi)) x = lo > -Infinity && hi < Infinity ? 0.5 * (lo + hi) : target / r0;
 
+  let stepPrev = Infinity;
   for (let it = 0; it < 80; it++) {
     const x2 = x * x;
     const z = alpha * x2;
@@ -583,12 +584,23 @@ function solveUniversal(r0: number, sigma0: number, alpha: number, target: numbe
     const Fpp = sigma0 * u0 + (1 - alpha * r0) * u1;
     const disc = Math.sqrt(Math.abs(16 * Fp * Fp - 20 * F * Fpp));
     let xn = x - (5 * F) / (Fp + (Fp >= 0 ? disc : -disc));
+    // Converged to rounding (the step is below one ulp of x, so xn can coincide with a bracket end):
+    // stop here rather than "leave the bracket" and bisect far away, from where the exponential
+    // growth of F on a hyperbola makes the way back take more iterations than the loop allows.
+    if (Math.abs(xn - x) <= 1e-15 * Math.abs(xn)) return;
     if (!(xn > lo && xn < hi)) {
       if (lo > -Infinity && hi < Infinity) xn = 0.5 * (lo + hi);
       else if (hi === Infinity) xn = lo > 0 ? 2 * lo : Math.abs(target / r0);
       else xn = hi < 0 ? 2 * hi : -Math.abs(target / r0);
+    } else if (alpha < 0) {
+      // Hyperbola, far on the wrong side of the root (a steep inbound pass can throw the first step
+      // there): F grows exponentially, so steps shrink to a constant ≈ 1.7/√-α and crawl. When a
+      // step fails to halve the previous one, bisect the bracket instead.
+      const step = Math.abs(xn - x);
+      if (2 * step > stepPrev && step > 1e-6 * (hi - lo)) xn = 0.5 * (lo + hi);
     }
-    if (Math.abs(xn - x) <= 1e-15 * Math.abs(xn)) return;
+    stepPrev = Math.abs(xn - x);
+    if (stepPrev <= 1e-15 * Math.abs(xn)) return;
     x = xn;
   }
 }

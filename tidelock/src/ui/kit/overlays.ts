@@ -499,7 +499,7 @@ export function CommsMessage(props: CommsProps): Component<Pick<CommsProps, 'lin
   const nextBtn = Button({ label: 'Next', trailingIcon: 'chevronRight', variant: 'ghost', size: 'sm', onTap: () => advance(), cue: false });
   const el = h('div.tl-comms', { attrs: { role: 'group', 'aria-label': `Message from ${props.name}` } },
     h('div.tl-comms__portrait', null, typeof props.glyph === 'string' ? icon(props.glyph, 30) : portrait(props.glyph ?? 0, 58)),
-    h('div.tl-comms__who', null, nameEl, roleEl, h('span.tl-comms__signal', { attrs: { 'aria-hidden': 'true' } }, h('i'), h('i'), h('i'), h('i'))),
+    h('div.tl-comms__who', null, nameEl, h('span.tl-comms__signal', { attrs: { 'aria-hidden': 'true' } }, h('i'), h('i'), h('i'), h('i')), roleEl),
     textEl,
     h('div.tl-comms__foot', null, h('div.tl-row', { style: 'gap:0' }, pips, countEl), nextBtn.el));
   setTone(el, props.tone ?? 'ion');
@@ -610,8 +610,11 @@ function mulberry(seed: number): () => number {
   };
 }
 
-/** Paint the splash backdrop once: a sparse star field and the lit limb of a world along the bottom edge. */
-function paintSplashSky(canvas: HTMLCanvasElement): void {
+/**
+ * Paint the splash backdrop once: a sparse star field and the lit limb of a world along the bottom
+ * edge. `limb` is the height of the limb's crest above the bottom edge, px.
+ */
+function paintSplashSky(canvas: HTMLCanvasElement, limb: number): void {
   const w = canvas.clientWidth;
   const hgt = canvas.clientHeight;
   if (!w || !hgt) return;
@@ -638,7 +641,7 @@ function paintSplashSky(canvas: HTMLCanvasElement): void {
   // The limb: a huge dark disc rising from below with a thin ember terminator line.
   const R = Math.max(w, hgt) * 1.5;
   const cx = w * 0.5;
-  const cy = hgt + R - Math.min(hgt * 0.085, 64);
+  const cy = hgt + R - limb;
   const glow = ctx.createRadialGradient(cx, cy, R - 2, cx, cy, R + hgt * 0.22);
   glow.addColorStop(0, 'rgba(255, 170, 84, 0.26)');
   glow.addColorStop(0.25, 'rgba(255, 150, 70, 0.09)');
@@ -686,7 +689,8 @@ export function Splash(props: SplashProps = {}): Component<Pick<SplashProps, 'pr
   };
   setProgress(props.progress ?? 0);
   if (typeof ResizeObserver !== 'undefined') {
-    const ro = new ResizeObserver(() => paintSplashSky(sky));
+    // The crest clears the loader: --tl-limb above the bottom safe-area inset (see .tl-splash).
+    const ro = new ResizeObserver(() => paintSplashSky(sky, safeInsets(el).bottom + (parseFloat(getComputedStyle(el).getPropertyValue('--tl-limb')) || 112)));
     ro.observe(sky);
     d.add(() => ro.disconnect());
   }

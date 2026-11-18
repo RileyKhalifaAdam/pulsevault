@@ -48,6 +48,8 @@ export interface HullMaterials {
   /** materials indexed by geo.ts channel (CH_HULL, CH_GLASS, CH_GLOW, CH_FLARE, CH_DECAL) */
   byChannel: THREE.Material[];
   setLivery(l: Livery): void;
+  /** Station mode only (no-op otherwise): radiance a fully floodlit white surface re-emits, linear RGB. */
+  setFlood(color: RGB): void;
   update(ctx: HullMaterialCtx): void;
   dispose(): void;
 }
@@ -832,6 +834,9 @@ uniform vec3 uLivery[3];
 uniform float uHeat;
 uniform float uThrottle;
 uniform float uDamage;
+#ifdef HULL_STATION
+uniform vec3 uFlood;
+#endif
 varying vec4 vTint;
 varying vec4 vSurf;
 varying vec4 vFx;
@@ -866,6 +871,13 @@ if (hSlot > 0.5) hAlbedo *= uLivery[int(hSlot) - 1];
 float hTone = hTex.b;
 float hCav = clamp(1.0 - hTex.a * 2.0, 0.0, 1.0);
 float hEdge = clamp(hTex.a * 2.0 - 1.0, 0.0, 1.0);
+#ifdef HULL_STATION
+// megastructure plating: the same finish again, seven times coarser, so structure survives distance
+vec4 hBig = texture(uHullTex, vec3(vHullUv * (HULL_SCALE[hLi] * 0.14) + 0.31, hLayer));
+hTone = mix(hTone, hBig.b, 0.6);
+hCav = max(hCav, 0.9 * clamp(1.0 - hBig.a * 2.0, 0.0, 1.0));
+hEdge = max(hEdge, 0.6 * clamp(hBig.a * 2.0 - 1.0, 0.0, 1.0));
+#endif
 float hRough = vSurf.z;
 float hMetal = vSurf.y;
 float hAO = vTint.a;
@@ -896,12 +908,20 @@ float hHeatE = vFx.y * uThrottle;
 vec3 hEmis = vec3(1.0, 0.24, 0.035) * (hHeatA * hHeatA * 3.0 * (0.5 + 0.9 * hTone) * (1.0 - 0.7 * hCav))
            + mix(vec3(0.8, 0.06, 0.008), vec3(1.0, 0.42, 0.1), hHeatE) * (hHeatE * hHeatE * hHeatE * 0.9 * (0.55 + 0.9 * hTone));
 hEmis *= 1.0 - 0.6 * hScorch;
+#ifdef HULL_STATION
+// the engine-heat channel carries baked floodlight exposure instead: the surface re-emits its own colour
+hEmis = vec3(1.0, 0.24, 0.035) * (hHeatA * hHeatA * 3.0 * (0.5 + 0.9 * hTone) * (1.0 - 0.7 * hCav)) * (1.0 - 0.6 * hScorch)
+      + hAlbedo * uFlood * (vFx.y * vFx.y * (1.0 - 0.55 * hCav));
+#endif
 diffuseColor.rgb = hAlbedo;
 `;
 
 const HULL_FRAG_NORMAL = /* glsl */ `
 {
   vec3 hN = vec3((hTex.rg * 2.0 - 1.0) * HULL_NRM[hLi] * (1.0 - 0.35 * hWear), 0.0);
+#ifdef HULL_STATION
+  hN.xy += (hBig.rg * 2.0 - 1.0) * (HULL_NRM[hLi] * 0.85);
+#endif
   hN.z = sqrt(max(0.04, 1.0 - dot(hN.xy, hN.xy)));
   normal = normalize(hullTBN(-vViewPosition, normal, vHullUv) * hN);
 }
@@ -1096,6 +1116,13 @@ export interface HullMaterialOptions {
   /** texture-set seed (ships share one set per quality unless they ask for another seed) */
   seed?: number;
   quality: HullQuality;
+  /**
+   * Megastructure mode (stations.ts). Two changes to the hull finish: a second, seven times coarser sample
+   * of the layer adds large plating that still reads from kilometres away, and the per-vertex engine-heat
+   * mask (hullStyle `engineHeat`) is reinterpreted as baked floodlight exposure — the surface re-emits its
+   * own albedo times `flood` (linear RGB radiance of a fully lit white surface). Ships never set this.
+   */
+  station?: { flood: RGB };
 }
 
 /**
@@ -1114,11 +1141,18 @@ export function createHullMaterials(opts: HullMaterialOptions): HullMaterials {
     uLightsOn: { value: 1 },
     uHeat: { value: 0 },
     uDamage: { value: 0 },
+    uFlood: { value: new THREE.Vector3() },
   };
+  const station = opts.station;
+  if (station) U.uFlood.value.set(station.flood[0], station.flood[1], station.flood[2]);
 
   const hull = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5, metalness: 0 });
+  if (station) {
+    const withDefines = hull as THREE.Material & { defines?: Record<string, string> };
+    withDefines.defines = { ...(withDefines.defines ?? {}), HULL_STATION: '' };
+  }
   hull.onBeforeCompile = (shader) => {
-    Object.assign(shader.uniforms, { uHullTex: U.uHullTex, uLivery: U.uLivery, uHeat: U.uHeat, uThrottle: U.uThrottle, uDamage: U.uDamage });
+    Object.assign(shader.uniforms, { uHullTex: U.uHullTex, uLivery: U.uLivery, uHeat: U.uHeat, uThrottle: U.uThrottle, uDamage: U.uDamage, uFlood: U.uFlood });
     shader.vertexShader = shader.vertexShader.replace('#include <common>', `#include <common>\n${ATTR_VERT_PARS}`).replace('#include <begin_vertex>', `#include <begin_vertex>\n${ATTR_VERT}`);
     shader.fragmentShader = shader.fragmentShader
       .replace('#include <common>', `#include <common>\n${HULL_FRAG_PARS}`)
@@ -1129,7 +1163,7 @@ export function createHullMaterials(opts: HullMaterialOptions): HullMaterials {
       .replace('#include <emissivemap_fragment>', 'totalEmissiveRadiance += hEmis;')
       .replace('#include <aomap_fragment>', HULL_FRAG_AO);
   };
-  hull.customProgramCacheKey = () => 'tidelock-hull-2';
+  hull.customProgramCacheKey = () => (station ? 'tidelock-hull-2-station' : 'tidelock-hull-2');
 
   const glass = new THREE.MeshPhysicalMaterial({
     color: new THREE.Color(0.016, 0.022, 0.03),
@@ -1213,6 +1247,9 @@ export function createHullMaterials(opts: HullMaterialOptions): HullMaterials {
     decal,
     byChannel,
     setLivery,
+    setFlood(color: RGB): void {
+      U.uFlood.value.set(color[0], color[1], color[2]);
+    },
     update(ctx: HullMaterialCtx): void {
       U.uTime.value = ctx.time;
       U.uThrottle.value = ctx.throttle;

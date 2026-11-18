@@ -500,7 +500,9 @@ export interface DragOptions {
 /**
  * Pointer drag with axis lock and velocity. The element needs a matching `touch-action`
  * (none, pan-x or pan-y) so the browser does not claim the gesture — the kit's CSS sets it
- * for its own draggable parts.
+ * for its own draggable parts. While a pointer is down its moves are followed on the window, so
+ * a fast drag that leaves the element before the threshold is crossed is not lost (a mouse has
+ * no implicit capture) and child buttons keep receiving their own taps.
  */
 export function onDrag(el: HTMLElement, handlers: DragHandlers, opts: DragOptions = {}): () => void {
   const axis = opts.axis ?? 'both';
@@ -519,24 +521,16 @@ export function onDrag(el: HTMLElement, handlers: DragHandlers, opts: DragOption
     }
     return true;
   };
+  let untrack: () => void = () => {};
   const finish = (cancelled: boolean): void => {
     if (id === -1) return;
     const was = active;
     id = -1;
     active = false;
+    untrack();
     if (was && handlers.end) handlers.end(s, cancelled);
   };
-  const d = disposer();
-  d.add(listen(el, 'pointerdown', (e) => {
-    if (!e.isPrimary || e.button > 0 || id !== -1) return;
-    id = e.pointerId;
-    s.startX = s.x = e.clientX;
-    s.startY = s.y = e.clientY;
-    s.dx = s.dy = s.vx = s.vy = 0;
-    lastT = e.timeStamp;
-    if (threshold === 0 && !begin(e)) id = -1;
-  }));
-  d.add(listen(el, 'pointermove', (e) => {
+  const move = (e: PointerEvent): void => {
     if (e.pointerId !== id) return;
     const dt = Math.max(1, e.timeStamp - lastT);
     lastT = e.timeStamp;
@@ -550,15 +544,31 @@ export function onDrag(el: HTMLElement, handlers: DragHandlers, opts: DragOption
       const ax = Math.abs(s.dx);
       const ay = Math.abs(s.dy);
       if (Math.max(ax, ay) < threshold) return;
-      if ((axis === 'x' && ay > ax) || (axis === 'y' && ax > ay) || !begin(e)) {
-        id = -1;
-        return;
-      }
+      if ((axis === 'x' && ay > ax) || (axis === 'y' && ax > ay) || !begin(e)) return finish(true);
     }
     if (handlers.move) handlers.move(s, e);
+  };
+  const up = (e: PointerEvent): void => {
+    if (e.pointerId === id) finish(false);
+  };
+  const cancel = (e: PointerEvent): void => {
+    if (e.pointerId === id) finish(true);
+  };
+  const d = disposer();
+  d.add(listen(el, 'pointerdown', (e) => {
+    if (!e.isPrimary || e.button > 0 || id !== -1) return;
+    id = e.pointerId;
+    s.startX = s.x = e.clientX;
+    s.startY = s.y = e.clientY;
+    s.dx = s.dy = s.vx = s.vy = 0;
+    lastT = e.timeStamp;
+    const offs = [listen(window, 'pointermove', move), listen(window, 'pointerup', up), listen(window, 'pointercancel', cancel)];
+    untrack = () => {
+      for (const off of offs) off();
+      untrack = () => {};
+    };
+    if (threshold === 0 && !begin(e)) finish(true);
   }));
-  d.add(listen(el, 'pointerup', () => finish(false)));
-  d.add(listen(el, 'pointercancel', () => finish(true)));
   d.add(() => finish(true));
   return d.run;
 }

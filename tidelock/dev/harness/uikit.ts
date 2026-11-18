@@ -12,7 +12,7 @@
 
 import {
   createRoot, h, setStyle, staggerIn,
-  icon, logoMark, wordmark, ICON_GROUPS, type IconName,
+  icon, logoMark, wordmark, appIcon, ICON_GROUPS, type IconName,
   Panel, ScreenHeader, Screen, Button, IconButton, HoldButton, Toggle, Slider, Stepper, Tabs, SegmentedControl, Chips,
   Badge, delta, ListRow, List, DataTable, cellMain, cellFigure, cellStock, KeyValue, Readout, Gauge, ProgressBar,
   StackedInfluenceBar, EmptyState, Skeleton, setTone,
@@ -21,10 +21,15 @@ import {
   type Child, type Column, type ToneOrColor,
 } from '../../src/ui/kit';
 
+import * as kit from '../../src/ui/kit';
+
+// The whole kit, for scripted checks (tests/uikit.e2e.cjs) and poking around in the console.
+(window as unknown as { __kit: typeof kit }).__kit = kit;
+
 const q = new URLSearchParams(location.search);
 const page = q.get('page') ?? 'components';
 const landscape = window.innerWidth > window.innerHeight && window.innerHeight <= 520;
-const fmt = (n: number): string => Math.round(n).toLocaleString('en-US');
+const fmt = (n: number): string => (n < 0 ? '−' : '') + Math.abs(Math.round(n)).toLocaleString('en-US');
 
 // ------------------------------------------------------------------ harness chrome
 
@@ -42,40 +47,52 @@ const css = `
 
 /* market */
 .hx-market { flex: 1 1 0; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
-.hx-market__bar { display: flex; flex-direction: column; gap: 4px; padding: 0 var(--tl-gutter) 4px; }
+.hx-market__bar { display: flex; flex-direction: column; gap: 4px; padding: 0 var(--tl-gutter) 4px; min-width: 0; }
+.hx-market__top { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .hx-market__hold { flex: 1 1 0; min-width: 0; }
-.hx-land .hx-market { grid-template-columns: minmax(0, 1fr) 304px; column-gap: 12px; padding: 0 var(--tl-gutter) calc(var(--tl-safe-b) + 4px) 0; }
+.hx-land .hx-market { grid-template-columns: minmax(0, 1fr) 312px; column-gap: 12px; padding-right: var(--tl-gutter); }
 .hx-land .hx-market__bar { flex-direction: row; align-items: center; gap: 12px; padding-right: 0; }
 .hx-land .hx-market__bar .tl-seg { flex: none; width: 150px; }
-.hx-land .hx-market__detail { grid-column: 2; grid-row: 1 / span 2; align-self: stretch; }
-.hx-trend { display: flex; align-items: center; justify-content: flex-end; gap: 4px; color: var(--tl-dim); }
+.hx-land .hx-market__bar .tl-chips { flex: 1 1 0; min-width: 0; }
+.hx-market__detail { grid-column: 2; grid-row: 1 / span 2; align-self: start; }
+.hx-trend { display: flex; align-items: center; justify-content: flex-end; gap: 3px; color: var(--tl-dim); }
 .hx-trade { display: flex; flex-direction: column; gap: 10px; }
 .hx-trade__row { display: flex; gap: 8px; align-items: stretch; }
+.hx-trade__row .tl-btn { padding: 0 14px; }
+.hx-strong { color: var(--tl-text); margin-left: 6px; }
 
 /* hud bits */
 .hx-space { position: absolute; inset: 0; width: 100%; height: 100%; }
-.hx-hud { position: absolute; inset: 0; display: grid; gap: 10px; padding: calc(var(--tl-safe-t) + 8px) calc(var(--tl-safe-r) + 12px) calc(var(--tl-safe-b) + 10px) calc(var(--tl-safe-l) + 12px);
-  grid-template: 'read' auto 'toast' auto 'space' minmax(40px, 1fr) 'gauge' auto 'sas' auto 'comms' auto / minmax(0, 1fr); }
-.hx-land .hx-hud { padding-top: 12px; grid-template: 'read toast' auto 'space space' minmax(8px, 1fr) 'sas comms' auto 'gauge comms' auto / minmax(0, 1fr) 312px; column-gap: 12px; }
-.hx-hud .tl-toasts { position: relative; top: auto; left: auto; right: auto; width: auto; transform: none; grid-area: toast; }
-.hx-gauges { display: flex; flex-wrap: wrap; gap: 14px 18px; align-items: center; }
-.hx-gauges__radials { display: flex; gap: 12px; flex: none; justify-content: space-between; }
-.hx-port .hx-gauges__radials { width: 100%; padding: 0 6px; }
-.hx-gauges__bars { flex: 1 1 150px; min-width: 0; display: grid; gap: 12px 16px; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+.hx-hud { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 10px; padding: calc(var(--tl-safe-t) + 8px) calc(var(--tl-safe-r) + 12px) calc(var(--tl-safe-b) + 10px) calc(var(--tl-safe-l) + 12px); }
+.hx-hud__col { display: flex; flex-direction: column; gap: 10px; min-width: 0; min-height: 0; }
+.hx-port .hx-hud__col { display: contents; }
+.hx-land .hx-hud { flex-direction: row; gap: 12px; padding-top: 12px; }
+.hx-land .hx-hud__col--a { flex: 1 1 0; }
+.hx-land .hx-hud__col--b { flex: none; width: 312px; }
+.hx-hud__space { position: relative; flex: 1 1 0; min-height: 0; }
+.hx-hud .tl-toasts { position: relative; top: auto; left: auto; right: auto; width: auto; transform: none; }
+.hx-sas .tl-seg { background: var(--tl-glass); -webkit-backdrop-filter: blur(var(--tl-blur)); backdrop-filter: blur(var(--tl-blur)); }
+.hx-gauges { display: flex; flex-wrap: wrap; gap: 12px 16px; align-items: center; }
+.hx-gauges__radials { display: flex; gap: 8px; flex: none; justify-content: space-between; }
+.hx-port .hx-gauges__radials { width: 100%; padding: 0 8px; }
+.hx-gauges__bars { flex: 1 1 130px; min-width: 0; display: grid; gap: 10px 16px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.hx-land .hx-gauges { flex-wrap: nowrap; }
+.hx-land .hx-gauges__bars { grid-template-columns: minmax(0, 1fr); gap: 8px; }
 .hx-marker { position: absolute; display: flex; align-items: center; gap: 8px; color: var(--tl-c); }
 .hx-marker__tag { display: flex; flex-direction: column; gap: 2px; padding-left: 8px; border-left: 1px solid color-mix(in srgb, var(--tl-c) 60%, transparent); }
-.hx-marker__tag b { font-size: 11px; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; }
+.hx-marker__tag b { font-size: 11px; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; white-space: nowrap; }
 .hx-marker__tag span { font-size: 13px; color: var(--tl-text); }
 
 /* icons */
 .hx-icons { display: grid; grid-template-columns: repeat(auto-fill, minmax(78px, 1fr)); gap: 4px 2px; }
 .hx-icon { display: flex; flex-direction: column; align-items: center; gap: 7px; padding: 10px 0 8px; min-width: 0; color: var(--tl-text); }
-.hx-icon span { font-family: var(--tl-font-body); font-size: 11px; color: var(--tl-dim); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hx-icon span { font-family: var(--tl-font-body); font-size: 11px; line-height: 1.2; color: var(--tl-dim); max-width: 100%; text-align: center; }
 .hx-marks { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
 .hx-power { display: flex; align-items: center; gap: 10px; color: var(--tl-c); }
 .hx-power b { display: block; font-size: 13px; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; color: var(--tl-text); }
 .hx-power small { display: block; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--tl-dim); margin-top: 2px; }
-.hx-sizes { display: flex; align-items: flex-end; gap: 18px; color: var(--tl-text); }
+.hx-sizes { display: flex; align-items: flex-end; gap: 12px; color: var(--tl-text); }
+.hx-appicon { flex: none; overflow: hidden; border-radius: 22.5%; box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.1), 0 8px 24px rgba(0, 0, 0, 0.5); }
 
 /* faction */
 .hx-powers { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
@@ -143,22 +160,23 @@ function pageComponents(): void {
   const buttons = Panel({ title: 'Buttons', code: 'BTN' },
     h('div.hx-wrap', null,
       Button({ label: 'Accept contract', variant: 'primary', onTap: () => {} }).el,
-      Button({ label: 'Plot route', icon: 'node', onTap: () => {} }).el),
+      Button({ label: 'Cancel', variant: 'ghost', onTap: () => {} }).el),
     h('div.hx-wrap', null,
       Button({ label: 'Set target', variant: 'ion', icon: 'target', onTap: () => {} }).el,
-      Button({ label: 'Burn', variant: 'ember', icon: 'prograde', onTap: () => {} }).el,
-      Button({ label: 'Cancel', variant: 'ghost', onTap: () => {} }).el),
+      Button({ label: 'Burn', variant: 'ember', icon: 'prograde', onTap: () => {} }).el),
+    h('div.hx-wrap', null,
+      Button({ label: 'Plot route', icon: 'node', onTap: () => {} }).el,
+      Button({ label: 'Docked', disabled: true }).el),
     h('div.hx-wrap', null,
       IconButton('bookmark', 'Bookmark', () => {}, 'secondary').el,
       IconButton('filter', 'Filter', () => {}, 'secondary').el,
       IconButton('map', 'Map', () => {}, 'ion').el,
       IconButton('settings', 'Settings', () => {}).el,
-      Button({ label: 'Refuel', size: 'sm', icon: 'refuel', onTap: () => {} }).el,
-      Button({ label: 'Docked', disabled: true }).el),
+      Button({ label: 'Refuel', size: 'sm', icon: 'refuel', onTap: () => {} }).el),
     Button({ label: 'Buy 12 t', detail: '1,968 cr', variant: 'primary', block: true, onTap: () => {} }).el,
     h('div.hx-wrap', null,
-      HoldButton({ label: 'Hold to jettison', icon: 'cargo', onConfirm: () => toast({ title: 'Cargo jettisoned', message: '6 t of Scrap Hull Plate released.', tone: 'red' }) }).el,
-      Button({ label: 'Abandon', variant: 'danger', onTap: () => {} }).el));
+      HoldButton({ label: 'Hold to jettison', onConfirm: () => toast({ title: 'Cargo jettisoned', message: '6 t of Scrap Hull Plate released.', tone: 'red' }) }).el,
+      Button({ label: 'Abort', variant: 'danger', onTap: () => {} }).el));
 
   const inputs = Panel({ title: 'Controls', code: 'INP' },
     h('div.tl-col.tl-gap-0', null, toggles.map((t) => t.el)),
@@ -236,13 +254,13 @@ function pageComponents(): void {
 
   const list = Panel({ title: 'List', code: 'LST', flush: true },
     List([
-      ListRow({ icon: 'refuel', title: 'Refuel', subtitle: 'Liquid hydrogen · 85 cr / t', value: '272 cr', note: h('span.tl-cell-sub', null, '3.2 t'), onTap: () => {} }),
-      ListRow({ icon: 'repair', title: 'Repair hull', subtitle: 'Plating and seals · 14 % damage', value: '1,180 cr', tone: 'ember', selected: true, onTap: () => {} }),
-      ListRow({ icon: 'legal', title: 'Clear fines', subtitle: 'Chancel Audit Office', value: '0 cr', note: Badge({ label: 'Clean', tone: 'green', plain: true, dot: true }).el, tone: 'ion', onTap: () => {} }),
+      ListRow({ icon: 'refuel', title: 'Refuel', subtitle: 'Liquid hydrogen · 85 cr / t', value: '272', unit: 'cr', note: h('span.tl-cell-sub', null, '3.2 t'), onTap: () => {} }),
+      ListRow({ icon: 'repair', title: 'Repair hull', subtitle: 'Plating and seals · 14 % damage', value: '1,180', unit: 'cr', tone: 'ember', selected: true, onTap: () => {} }),
+      ListRow({ icon: 'legal', title: 'Clear fines', subtitle: 'Chancel Audit Office', value: '0', unit: 'cr', note: Badge({ label: 'Clean', tone: 'green', plain: true, dot: true }).el, tone: 'ion', onTap: () => {} }),
     ]).el);
 
   const table = Panel({ title: 'Data table', code: 'TBL', flush: true },
-    DataTable<MarketRow>({ scroll: false, columns: marketColumns('buy'), rows: MARKET.slice(0, 4), rowKey: (r) => r.id, sort: { id: 'price', dir: 'desc' }, selected: MARKET[1].id, onRowTap: () => {} }).el);
+    DataTable<MarketRow>({ scroll: false, columns: marketColumns('buy', true), rows: [MARKET[0], MARKET[4], MARKET[7], MARKET[13]], rowKey: (r) => r.id, sort: { id: 'price', dir: 'desc' }, selected: MARKET[4].id, onRowTap: () => {} }).el);
 
   const modal = (): void => Modal({
     title: 'Undock without clearance?', icon: 'warning', tone: 'ember',
@@ -264,7 +282,7 @@ function pageComponents(): void {
 
   const comms = CommsMessage({
     name: 'Rotunda Control', role: 'Quorum Delegacy · Traffic', tone: 'assembly', glyph: 3,
-    lines: ['Wren seven-one, you are inside the control zone. Hold three metres per second and take port M-04 on the dusk side.', 'Clamps will engage on soft capture. Welcome to the Rotunda, Captain.'],
+    lines: ['Wren seven\u2011one, you are inside the control zone. Hold three metres per second and take port M\u201104 on the dusk side.', 'Clamps will engage on soft capture. Welcome to the Rotunda, Captain.'],
   });
   if (q.get('anim') !== '1') comms.next();
 
@@ -281,8 +299,9 @@ function pageComponents(): void {
   if (overlay === 'modal') modal();
   if (overlay === 'sheet') sheet();
   if (overlay === 'toast') toasts();
-  if (overlay === 'help') requestAnimationFrame(() => (readouts.el.querySelector('.tl-help') as HTMLElement).dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 0 })));
   scrollTo(screen.body);
+  // The popover closes on scroll, so open it once the scroll position has settled.
+  if (overlay === 'help') setTimeout(() => (readouts.el.querySelector('.tl-help') as HTMLElement).dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 0 })), 200);
 }
 
 function scrollTo(body: HTMLElement): void {
@@ -324,16 +343,17 @@ const MARKET: MarketRow[] = [
   mk('water_ice', 'Water Ice', 'Minerals', 46, 40, 2100, 9000, 34, 1),
 ];
 
-function marketColumns(mode: 'buy' | 'sell'): Column<MarketRow>[] {
+/** Commodity columns; `dense` keeps only the trend arrow in the last column (narrow tables inside panels). */
+function marketColumns(mode: 'buy' | 'sell', dense = false): Column<MarketRow>[] {
   return [
     { id: 'name', label: 'Commodity', width: 'minmax(0, 1fr)', sortValue: (r) => r.name, render: (r) => cellMain(r.icon, r.name, r.cat) },
-    { id: 'price', label: 'cr / t', width: '82px', align: 'right', sortValue: (r) => r.price, render: (r) => cellFigure(fmt(r.price), delta((r.price - r.avg) / r.avg, { invert: mode === 'buy' })) },
-    { id: 'stock', label: mode === 'buy' ? 'Stock' : 'Demand', width: '68px', align: 'right', sortValue: (r) => r.stock, render: (r) => cellStock(r.stock / r.cap, fmt(r.stock), r.stock / r.cap < 0.18 ? 'ember' : 'ion') },
+    { id: 'price', label: 'cr / t', width: '74px', align: 'right', sortValue: (r) => r.price, render: (r) => cellFigure(fmt(r.price), delta((r.price - r.avg) / r.avg, { invert: mode === 'buy' })) },
+    { id: 'stock', label: mode === 'buy' ? 'Stock' : 'Demand', width: '70px', align: 'right', sortValue: (r) => r.stock, render: (r) => cellStock(r.stock / r.cap, fmt(r.stock), r.stock / r.cap < 0.18 ? 'ember' : 'ion') },
     {
-      id: 'trend', label: '7 d', width: '66px', align: 'right', sortValue: (r) => r.hist[r.hist.length - 1] - r.hist[0],
+      id: 'trend', label: '7 d', width: dense ? '34px' : '56px', align: 'right', sortValue: dense ? undefined : (r) => r.hist[r.hist.length - 1] - r.hist[0],
       render: (r) => {
         const ch = (r.hist[r.hist.length - 1] - r.hist[0]) / r.avg;
-        return h('div.hx-trend', null, Sparkline({ values: r.hist, width: 34, height: 22, tone: 'ion', dot: false }).el, icon(ch > 0.02 ? 'trendUp' : ch < -0.02 ? 'trendDown' : 'trendFlat', 14));
+        return h('div.hx-trend', null, dense ? null : Sparkline({ values: r.hist, width: 27, height: 22, tone: 'ion', dot: false }).el, icon(ch > 0.02 ? 'trendUp' : ch < -0.02 ? 'trendDown' : 'trendFlat', 14));
       },
     },
   ];
@@ -341,39 +361,42 @@ function marketColumns(mode: 'buy' | 'sell'): Column<MarketRow>[] {
 
 function pageMarket(): void {
   const mode = q.get('mode') === 'sell' ? 'sell' : 'buy';
-  const sel = MARKET.find((r) => r.id === 'twilight_grain')!;
+  const sel = MARKET.find((r) => r.id === 'fusion_pellets')!;
   const qty = 12;
+  const total = sel.price * qty;
+  const verb = mode === 'buy' ? 'Buy' : 'Sell';
+  const after = 48250 + (mode === 'buy' ? -total : total);
   const header = ScreenHeader({ title: 'Market', location: 'Ledgerline Exchange · Chancel', onBack: () => {}, credits: 48250 });
   const table = DataTable<MarketRow>({ columns: marketColumns(mode), rows: MARKET, rowKey: (r) => r.id, sort: { id: 'name', dir: 'asc' }, selected: sel.id, onRowTap: (r) => table.update({ selected: r.id }) });
-  const bar = h('div.hx-market__bar', null,
-    h('div.tl-row.tl-gap-3', null,
-      SegmentedControl({ value: mode, items: [{ id: 'buy', label: 'Buy' }, { id: 'sell', label: 'Sell' }] }).el,
-      h('div.hx-market__hold', null, Gauge({ label: 'Hold', icon: 'cargo', value: 14, max: 32, text: '14 / 32', unit: 't', tone: 'ion', thickness: 'thin' }).el)),
-    Chips({ inset: true, value: null, items: [
-      { id: 'food', label: 'Food', icon: 'food' }, { id: 'minerals', label: 'Minerals', icon: 'minerals' }, { id: 'metals', label: 'Metals', icon: 'metals' },
-      { id: 'energy', label: 'Energy', icon: 'energy' }, { id: 'machinery', label: 'Machinery', icon: 'machinery' }, { id: 'technology', label: 'Technology', icon: 'technology' },
-      { id: 'medicine', label: 'Medicine', icon: 'medicine' }, { id: 'consumer', label: 'Consumer', icon: 'consumer' },
-    ] }).el);
-  const total = `${fmt(sel.price * qty)} cr`;
-  const verb = mode === 'buy' ? 'Buy' : 'Sell';
-  const trade = (): HTMLElement => h('div.hx-trade__row', null,
-    Stepper({ value: qty, min: 0, max: 18, unit: 't', ariaLabel: 'Quantity' }).el,
-    Button({ label: verb, detail: total, variant: 'primary', block: true, onTap: () => {} }).el);
+  const hold = (): HTMLElement => Gauge({ label: 'Hold', icon: 'cargo', value: 14, max: 32, text: '14 / 32', unit: 't', tone: 'ion', thickness: 'thin' }).el;
+  const seg = SegmentedControl({ value: mode, items: [{ id: 'buy', label: 'Buy' }, { id: 'sell', label: 'Sell' }] }).el;
+  const chips = Chips({ inset: true, value: null, items: [
+    { id: 'food', label: 'Food', icon: 'food' }, { id: 'minerals', label: 'Minerals', icon: 'minerals' }, { id: 'metals', label: 'Metals', icon: 'metals' },
+    { id: 'energy', label: 'Energy', icon: 'energy' }, { id: 'machinery', label: 'Machinery', icon: 'machinery' }, { id: 'technology', label: 'Technology', icon: 'technology' },
+    { id: 'medicine', label: 'Medicine', icon: 'medicine' }, { id: 'consumer', label: 'Consumer', icon: 'consumer' },
+  ] }).el;
+  const bar = h('div.hx-market__bar', null, landscape ? [seg, chips] : [h('div.hx-market__top', null, seg, h('div.hx-market__hold', null, hold())), chips]);
+  const stepper = (compact: boolean): HTMLElement => Stepper({ value: qty, min: 0, max: 18, unit: 't', compact, ariaLabel: 'Quantity' }).el;
+  const buy = (): HTMLElement => Button({ label: `${verb} ${qty} t`, detail: `${fmt(total)} cr`, variant: 'primary', block: true, onTap: () => {} }).el;
+  if (landscape) {
+    // Landscape: the selected commodity gets a detail panel beside the table.
+    const detail = Panel({ title: sel.name, code: sel.cat, icon: sel.icon, tone: 'ember', class: 'hx-market__detail' },
+      KeyValue({ cols: 3, items: [
+        { k: 'Price', v: fmt(sel.price), unit: 'cr', tone: 'ember' }, { k: 'Average', v: fmt(sel.avg), unit: 'cr' },
+        { k: mode === 'buy' ? 'Stock' : 'Demand', v: fmt(sel.stock), unit: 't' },
+      ] }).el,
+      LineChart({ height: 72, scrub: true, series: [{ values: series(40, sel.price, 58, 1.6, 77), color: 'ember', area: true }], xLabels: ['−30 d', '−15 d', 'Now'], yTicks: 2, ariaLabel: `${sel.name} price, 30 days` }).el,
+      h('div.hx-trade__row', { style: 'align-items:center;gap:14px' }, stepper(true), h('div.tl-grow', null, hold())),
+      buy());
+    root.appendChild(Screen({ header, flush: true, scroll: false, body: h('div.hx-market', null, bar, table.el, detail.el) }).el);
+    return;
+  }
   const footer = h('div.hx-trade', null,
     h('div.tl-row.tl-row--between', null,
-      h('span.tl-label', null, `${sel.name} · ${fmt(sel.price)} cr / t`),
-      h('span.tl-label', null, 'Balance after ', h('span.tl-num', { style: 'color:var(--tl-text)' }, `${fmt(48250 - sel.price * qty)} cr`))),
-    trade());
-  const detail = Panel({ title: sel.name, code: sel.cat, icon: sel.icon, tone: 'ember', class: 'hx-market__detail hx-only-land' },
-    h('div.tl-row.tl-row--between.tl-row--top', null,
-      Readout({ label: 'Price', value: fmt(sel.price), unit: 'cr / t' }).el,
-      Readout({ label: 'Reach average', value: fmt(sel.avg), unit: 'cr', align: 'right' }).el,
-      Readout({ label: 'In hold', value: '0', unit: 't', align: 'right' }).el),
-    LineChart({ height: 92, scrub: true, series: [{ values: series(40, sel.price, 9, 0.2, 77), color: 'ember', area: true }], xLabels: ['−30 d', '−15 d', 'Now'], yTicks: 2 }).el,
-    trade());
-  const screen = Screen({ header, flush: true, scroll: false, body: h('div.hx-market', null, bar, table.el, detail.el), footer });
-  screen.foot?.classList.add('hx-only-port');
-  root.appendChild(screen.el);
+      h('span.tl-label', null, sel.name, h('span.tl-num.hx-strong', null, `${fmt(sel.price)} cr`)),
+      h('span.tl-label', null, 'After', h('span.tl-num.hx-strong', null, `${fmt(after)} cr`))),
+    h('div.hx-trade__row', null, stepper(false), Button({ label: verb, detail: `${fmt(total)} cr`, variant: 'primary', block: true, onTap: () => {} }).el));
+  root.appendChild(Screen({ header, flush: true, scroll: false, body: h('div.hx-market', null, bar, table.el), footer }).el);
 }
 
 // ------------------------------------------------------------------ page: mission
@@ -395,7 +418,7 @@ const MISSIONS: Mission[] = [
   { icon: 'survey', title: 'Orbital survey · Docket', faction: 'Chancel Audit Office', tone: 'assembly', tags: [{ label: 'Scanner', tone: 'ion' }, { label: 'Δv 5.1 km/s' }], reward: 12750, due: '9d 00h' },
   { icon: 'target', title: 'Bounty · Vex Corrigan', faction: 'The Quorum Delegacy', tone: 'assembly', tags: [{ label: 'Combat', tone: 'red' }, { label: 'Scorch clan', tone: 'outlaw' }], reward: 56000, due: '4d 08h' },
   { icon: 'scoop', title: 'Hydrogen run · Plenary', faction: 'Plenary Free Skimmers', tone: 'independent', tags: [{ label: 'Scoop', tone: 'ion' }, { label: '12 t' }], reward: 9600, due: '3d 16h' },
-  { icon: 'repair', title: 'Tug recovery · Rider', faction: 'Teller Shipwrights’ Lodge', tone: 'independent', tags: [{ label: 'Rendezvous' }, { label: 'Δv 2.2 km/s' }], reward: 22300, due: '5d 02h' },
+  { icon: 'repair', title: 'Tug recovery · Rider', faction: 'Teller Shipwrights’ Lodge', tone: 'independent', tags: [{ label: 'Tow' }, { label: 'Δv 2.2 km/s' }], reward: 22300, due: '5d 02h' },
   { icon: 'scanner', title: 'Relay repair · Recess', faction: 'Chancel Audit Office', tone: 'assembly', tags: [{ label: 'Satellite' }, { label: 'Δv 6.8 km/s', tone: 'red' }], reward: 31900, due: '8d 20h' },
 ];
 
@@ -415,9 +438,9 @@ function missionSheet(): ReturnType<typeof BottomSheet> {
       ] }).el).el,
   ];
   return BottomSheet({
-    eyebrow: 'Courier contract · Ledgerline Mutual', title: 'Bonded files for Teller Yards', tone: 'assembly',
+    eyebrow: 'Courier contract · Teller Yards', title: 'Bonded claim files', tone: 'assembly',
     headExtra: h('div.hx-wrap', { style: 'margin-top:6px;gap:6px' },
-      Badge({ label: 'Assembly', tone: 'assembly', icon: 'powerAssembly' }).el, Badge({ label: 'Rush', tone: 'ember', solid: true }).el, Badge({ label: 'Lawful', tone: 'green', dot: true }).el),
+      Badge({ label: 'Ledgerline Mutual', tone: 'assembly', icon: 'powerAssembly' }).el, Badge({ label: 'Rush', tone: 'ember', solid: true }).el, Badge({ label: 'Lawful', tone: 'green', dot: true }).el),
     body,
     footer: [Button({ label: 'Decline', variant: 'ghost', onTap: () => {} }).el, Button({ label: 'Accept contract', variant: 'primary', block: true, onTap: () => {} }).el],
   });
@@ -431,7 +454,7 @@ function pageMission(): void {
       icon: m.icon, title: m.title, tone: m.selected ? 'ember' : 'ion', selected: m.selected,
       subtitle: [dot, h('span.tl-ellipsis', null, m.faction)],
       meta: m.tags.map((t) => Badge({ label: t.label, tone: t.tone ?? 'neutral', solid: t.solid }).el),
-      value: `${fmt(m.reward)} cr`,
+      value: fmt(m.reward), unit: 'cr',
       note: h('span.tl-delta', null, icon('time', 12), m.due),
       onTap: () => {},
     });
@@ -478,8 +501,8 @@ const FACTIONS: Faction[] = [
 ];
 
 function pageFaction(): void {
-  const hist = FACTIONS.map((f, i) => series(30, f.inf * 100, 1.1, f.drift * 3, 40 + i));
-  const influence = Panel({ title: 'Influence', code: 'Day 412', icon: 'factions' },
+  const hist = FACTIONS.map((f, i) => series(30, f.inf * 100, 2.6, f.drift * 4, 40 + i));
+  const influence = Panel({ title: 'Influence', code: '5 factions', icon: 'factions' },
     StackedInfluenceBar({ scale: true, segments: FACTIONS.map((f) => ({ id: f.id, label: f.short, value: f.inf, color: f.color, delta: f.d, controlling: f.ctrl })) }).el);
   const history = Panel({ title: 'Last 30 days', code: '% share', icon: 'trendUp', tone: 'ion' },
     LineChart({ height: landscape ? 128 : 150, series: FACTIONS.map((f, i) => ({ values: hist[i], color: f.color, muted: i > 2 })), xLabels: ['−30 d', '−20 d', '−10 d', 'Now'], yFormat: (v) => `${v.toFixed(0)}`, markers: [{ index: 22, label: 'Election called', tone: 'ion' }], ariaLabel: 'Influence history' }).el,
@@ -494,7 +517,7 @@ function pageFaction(): void {
     h('div.hx-versus', null, side(FACTIONS[0], 2, false), h('span.tl-label', null, 'vs'), side(FACTIONS[1], 1, true)),
     h('div.hx-days', null, dayCells),
     h('p.tl-small', null, 'Control of The Rotunda is at stake. Missions and trade for either side move the count. Polls close in 2d 06h.'));
-  const factions = Panel({ title: 'Factions', code: '5 present', icon: 'station', flush: true },
+  const factions = Panel({ title: 'Factions', code: 'Standing', icon: 'station', flush: true },
     List(FACTIONS.map((f, i) => ListRow({
       icon: f.power ? 'powerAssembly' : 'factions', tone: f.color, title: f.name,
       subtitle: `${f.gov} · ${f.power ? 'Meridian Assembly' : 'Independent'}`,
@@ -513,11 +536,12 @@ function pageFaction(): void {
   };
   const powers = Panel({ title: 'Powers in the Reach', code: '24 systems', icon: 'map' },
     h('div.hx-powers', null, ptile('assembly', 'powerAssembly', 'Assembly', 9), ptile('hegemony', 'powerHegemony', 'Hegemony', 8), ptile('league', 'powerLeague', 'League', 5)));
-  const a = h('div.hx-col', null, influence.el, conflict.el, landscape ? powers.el : null);
+  const summary = Panel({ tight: true },
+    KeyValue({ cols: 3, items: [{ k: 'Allegiance', v: 'Assembly', tone: 'assembly' }, { k: 'Security', v: 'High', tone: 'green' }, { k: 'Population', v: '38.4 M' }] }).el);
+  const a = h('div.hx-col', null, summary.el, influence.el, conflict.el, landscape ? powers.el : null);
   const b = h('div.hx-col', null, history.el, factions.el, landscape ? null : powers.el);
   const screen = Screen({
-    header: ScreenHeader({ title: 'Politics', location: 'Chancel · Assembly space', locationIcon: 'planet', onBack: () => {},
-      readouts: [{ label: 'Security', value: 'High', tone: 'green' }, { label: 'Population', value: '38.4 M' }] }),
+    header: ScreenHeader({ title: 'Politics', location: 'Chancel system · Day 412', locationIcon: 'planet', onBack: () => {}, credits: 48250 }),
     body: h('div.hx-cols', null, a, b),
   });
   root.appendChild(screen.el);
@@ -574,16 +598,19 @@ function pageHudbits(): void {
   const space = h('canvas.hx-space');
   paintSpace(space);
   root.appendChild(space);
-  const read = Panel({ tight: true, class: 'hx-hud__read' },
+  const order = (el: HTMLElement, n: number): HTMLElement => {
+    el.style.order = String(n);
+    return el;
+  };
+  const read = Panel({ tight: true },
     KeyValue({ cols: 3, items: [
       { k: 'Altitude', v: '412.6', unit: 'km' }, { k: 'Orbital vel', v: '7.61', unit: 'km/s' }, { k: 'Δv', v: '4.82', unit: 'km/s', tone: 'ember' },
       { k: 'Apoapsis', v: '1,904', unit: 'km', tone: 'ion' }, { k: 'Periapsis', v: '398', unit: 'km', tone: 'ion' }, { k: 'Node in', v: '12m 40s', tone: 'ember' },
     ] }).el);
-  read.el.style.gridArea = 'read';
   const stack = ToastStack(root);
-  stack.push({ title: 'Burn complete', message: 'Apoapsis raised to 1,904 km · 212 m/s spent', tone: 'green', stamp: 'T+00:04', duration: 0 });
-  stack.push({ title: 'Entering Quorum control zone', tone: 'ion', icon: 'station', stamp: 'NOW', duration: 0 });
-  const rs = landscape ? 76 : 92;
+  stack.push({ title: 'Burn complete', message: 'Apoapsis 1,904 km · 212 m/s', tone: 'green', stamp: 'T+00:04', duration: 0 });
+  stack.push({ title: 'Quorum control zone', tone: 'ion', icon: 'station', stamp: 'NOW', duration: 0 });
+  const rs = landscape ? 64 : 84;
   const gauges = Panel({ tight: true },
     h('div.hx-gauges', null,
       h('div.hx-gauges__radials', null,
@@ -591,33 +618,31 @@ function pageHudbits(): void {
         Gauge({ kind: 'radial', value: 412, max: 600, text: '412', unit: 'K', label: 'Heat', tone: 'ion', zone: [480, 600], size: rs }).el,
         Gauge({ kind: 'radial', value: 82, max: 100, text: '82', unit: '%', label: 'Power', tone: 'green', size: rs }).el),
       h('div.hx-gauges__bars', null,
-        Gauge({ label: 'Propellant', icon: 'fuel', value: 0.68, text: '6.8', unit: 't', tone: 'ember' }).el,
-        Gauge({ kind: 'segmented', label: 'Hull', icon: 'hull', value: 0.86, text: '86', unit: '%', tone: 'green', segments: 12 }).el,
-        Gauge({ kind: 'segmented', label: 'Shield', icon: 'shield', value: 0.42, text: '42', unit: '%', tone: 'ion', segments: 12 }).el,
+        Gauge({ label: 'Propellant', icon: landscape ? undefined : 'fuel', value: 0.68, text: '6.8', unit: 't', tone: 'ember' }).el,
+        Gauge({ kind: 'segmented', label: 'Hull', icon: landscape ? undefined : 'hull', value: 0.86, text: '86', unit: '%', tone: 'green', segments: 12 }).el,
+        Gauge({ kind: 'segmented', label: 'Shield', icon: landscape ? undefined : 'shield', value: 0.42, text: '42', unit: '%', tone: 'ion', segments: 12 }).el,
         landscape ? null : Gauge({ label: 'RCS', icon: 'rcs', value: 0.91, text: '91', unit: '%', tone: 'neutral' }).el)));
-  gauges.el.style.gridArea = 'gauge';
-  const sas = h('div.tl-row', { style: 'grid-area:sas' },
-    h('div.tl-grow', null, SegmentedControl({ block: true, tone: 'ember', value: 'prograde', items: [
-      { id: 'sas', icon: 'sas', ariaLabel: 'Stability' }, { id: 'prograde', icon: 'prograde', ariaLabel: 'Prograde' }, { id: 'retrograde', icon: 'retrograde', ariaLabel: 'Retrograde' },
-      { id: 'normal', icon: 'normal', ariaLabel: 'Normal' }, { id: 'antinormal', icon: 'antinormal', ariaLabel: 'Anti-normal' }, { id: 'target', icon: 'target', ariaLabel: 'Target' }, { id: 'node', icon: 'node', ariaLabel: 'Manoeuvre' },
-    ] }).el));
-  sas.querySelector('.tl-seg')?.setAttribute('style', 'background:var(--tl-glass);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)');
+  const sas = h('div.hx-sas', null, SegmentedControl({ block: true, tone: 'ember', value: 'prograde', items: [
+    { id: 'sas', icon: 'sas', ariaLabel: 'Stability' }, { id: 'prograde', icon: 'prograde', ariaLabel: 'Prograde' }, { id: 'retrograde', icon: 'retrograde', ariaLabel: 'Retrograde' },
+    { id: 'normal', icon: 'normal', ariaLabel: 'Normal' }, { id: 'antinormal', icon: 'antinormal', ariaLabel: 'Anti-normal' }, { id: 'target', icon: 'target', ariaLabel: 'Target' }, { id: 'node', icon: 'node', ariaLabel: 'Manoeuvre' },
+  ] }).el);
   const comms = CommsMessage({
-    name: 'Rotunda Control', role: 'Traffic · Quorum Delegacy', tone: 'assembly', glyph: 3, compact: true,
-    lines: ['Wren seven-one, hold three metres per second inside the zone and take port M-04 on the dusk side.', 'Clamps engage on soft capture. Welcome to the Rotunda, Captain.'],
+    name: 'Rotunda Control', role: 'Quorum Delegacy · Traffic', tone: 'assembly', glyph: 3, compact: true,
+    lines: ['Wren seven\u2011one, hold three metres per second. Port M\u201104, dusk side.', 'Clamps engage on soft capture. Welcome to the Rotunda, Captain.'],
   });
   if (q.get('anim') !== '1') comms.next();
-  comms.el.style.gridArea = 'comms';
-  comms.el.style.alignSelf = 'end';
   const marker = (ic: IconName, tone: ToneOrColor, name: string, value: string, x: string, y: string): HTMLElement => {
     const el = h('div.hx-marker', { style: { left: x, top: y } }, icon(ic, 30), h('div.hx-marker__tag', null, h('b', null, name), h('span.tl-num', null, value)));
     setTone(el, tone);
     return el;
   };
-  const spaceArea = h('div', { style: 'grid-area:space;position:relative;min-height:0' },
-    marker('target', 'ion', 'Teller Yards', '1,204 km · 38 m/s', landscape ? '54%' : '34%', landscape ? '4%' : '18%'),
-    marker('prograde', 'ember', 'Prograde', '7.61 km/s', landscape ? '14%' : '6%', landscape ? '30%' : '62%'));
-  root.appendChild(h('div.hx-hud', null, read.el, stack.el, spaceArea, sas, gauges.el, comms.el));
+  const spaceArea = h('div.hx-hud__space', null,
+    marker('target', 'ion', 'Teller Yards', '1,204 km · 38 m/s', landscape ? '50%' : '42%', landscape ? '6%' : '6%'),
+    marker('prograde', 'ember', 'Prograde', '7.61 km/s', landscape ? '6%' : '5%', landscape ? '52%' : '56%'));
+  // Portrait stacks everything (CSS order); landscape splits into flight data (left) and comms (right).
+  root.appendChild(h('div.hx-hud', null,
+    h('div.hx-hud__col.hx-hud__col--a', null, order(read.el, 1), order(spaceArea, 3), order(gauges.el, 5)),
+    h('div.hx-hud__col.hx-hud__col--b', null, order(stack.el, 2), landscape ? order(h('div.tl-grow'), 3) : null, order(comms.el, 4), order(sas, 6))));
 }
 
 // ------------------------------------------------------------------ page: icons
@@ -629,20 +654,23 @@ function pageIcons(): void {
     return el;
   };
   const marks = Panel({ title: 'Marks', code: 'ID' },
-    h('div.hx-marks', null, logoMark(84), h('div.tl-col.tl-gap-3', null, wordmark(22), h('span.tl-label', null, 'Wordmark · emblem · app icon'))),
+    h('div.hx-marks', null, logoMark(84), h('div.tl-col.tl-gap-3', null, wordmark(22), h('span.tl-label', null, 'Emblem · wordmark'))),
+    h('div.tl-divider'),
+    h('div.hx-marks', null, h('div.hx-appicon', null, appIcon(64)), h('div.hx-appicon', null, appIcon(44)),
+      h('div.tl-col.tl-gap-1', null, h('span.tl-h3', null, 'App icon'), h('span.tl-label', null, '180 · 192 · 512 px'))),
     h('div.tl-divider'),
     h('div.hx-marks', { style: 'gap:14px 26px' },
       power('assembly', 'powerAssembly', 'Meridian Assembly', 'Ring of members'), power('hegemony', 'powerHegemony', 'Auric Hegemony', 'Day-side sun'), power('league', 'powerLeague', 'Umbral League', 'Night-side crescent')),
     h('div.tl-divider'),
     h('div.tl-row.tl-row--between', null,
       h('div.hx-sizes', null, [16, 20, 24, 32, 44].map((s) => icon('orbit', s))),
-      h('div.hx-sizes', { style: 'gap:12px' }, (['ember', 'ion', 'green', 'red'] as const).map((t) => {
+      h('div.hx-sizes', { style: 'gap:10px' }, (['ember', 'ion', 'green', 'red'] as const).map((t) => {
         const i = icon('prograde', 24);
         i.style.color = `var(--tl-${t})`;
         return i;
       }))));
   const groups = ICON_GROUPS.map((g) => Panel({ title: g.title, code: String(g.names.length) },
-    h('div.hx-icons', null, g.names.map((n) => h('div.hx-icon', null, icon(n, 24), h('span', null, n))))));
+    h('div.hx-icons', null, g.names.map((n) => h('div.hx-icon', null, icon(n, 24), h('span', null, n.replace(/([a-z])([A-Z])/g, '$1\u200b$2')))))));
   const all = [marks, ...groups];
   const cols = [h('div.hx-col'), h('div.hx-col')];
   all.forEach((p, i) => cols[landscape ? i % 2 : 0].appendChild(p.el));

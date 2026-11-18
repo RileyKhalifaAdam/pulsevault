@@ -273,12 +273,14 @@ function niceStep(raw: number): number {
   return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * p;
 }
 
+/** Compact axis number with a true minus sign: 950, 1,250, 12k, 3.4M, −900. */
 const compact = (v: number): string => {
   const a = Math.abs(v);
-  if (a >= 1e6) return `${(v / 1e6).toFixed(a >= 1e7 ? 0 : 1)}M`;
-  if (a >= 1e4) return `${(v / 1e3).toFixed(0)}k`;
-  if (a >= 1e3) return Math.round(v).toLocaleString('en-US');
-  return Number.isInteger(v) ? String(v) : v.toFixed(a < 10 ? 1 : 0);
+  const body = a >= 1e6 ? `${(a / 1e6).toFixed(a >= 1e7 ? 0 : 1)}M`
+    : a >= 1e4 ? `${(a / 1e3).toFixed(0)}k`
+    : a >= 1e3 ? Math.round(a).toLocaleString('en-US')
+    : Number.isInteger(a) ? String(a) : a.toFixed(a < 10 ? 1 : 0);
+  return v < 0 ? `−${body}` : body;
 };
 
 /** Line / area chart with a quiet grid, right-hand value scale, event markers and touch scrubbing. */
@@ -305,7 +307,7 @@ export function LineChart(props: LineChartProps): Component<Pick<LineChartProps,
     let gutter = 0;
     for (const v of tickVals) gutter = Math.max(gutter, ctx.measureText(fmt(v)).width);
     const hasMarkLabel = markers.some((m) => m.label);
-    const top = hasMarkLabel || props.scrub ? 18 : 7;
+    const top = hasMarkLabel ? 18 : 7;
     const bottom = hgt - (xLabels && xLabels.length ? 20 : 7);
     const left = 2;
     const right = Math.max(left + 10, w - Math.ceil(gutter) - 10);
@@ -406,11 +408,15 @@ export function LineChart(props: LineChartProps): Component<Pick<LineChartProps,
       const lead = series.find((sr) => !sr.muted) ?? series[0];
       const v = lead.values[i];
       if (Number.isFinite(v)) {
+        // Value tag at the top of the crosshair, on a dark plate so it reads over the grid and lines.
         const text = fmt(v);
         const tw = ctx.measureText(text).width;
+        const tx = clamp(sx - tw / 2, 4, right - tw - 4);
+        ctx.fillStyle = 'rgba(8, 11, 16, 0.9)';
+        ctx.fillRect(Math.round(tx) - 4, 0, Math.ceil(tw) + 8, 15);
         ctx.fillStyle = INK.text;
         ctx.textAlign = 'left';
-        ctx.fillText(text, clamp(sx - tw / 2, 0, right - tw), 7);
+        ctx.fillText(text, tx, 8);
       }
     }
   });
