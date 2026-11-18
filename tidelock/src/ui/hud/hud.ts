@@ -1,10 +1,13 @@
-// Flight HUD: thin-line instrumentation on dark glass over the live scene. Top: situation, orbit figures,
-// propellant, target and next-burn chips, flight-computer line. Bottom: one primary action that follows the
-// situation, time warp, SAS, roll, throttle. Direction markers and the target bracket follow scene.project().
+// Flight HUD: thin-line instrumentation on dark glass over the live scene, fed by the Session views only.
+// Top: primary body and situation, altitude / speed / apoapsis / periapsis, propellant and Δv, a warning line
+// (heat, hull, spin) when something is not nominal, the target chip and a docking / next-burn chip.
+// Bottom: undock (when latched), time acceleration (asked vs achieved, and why), hold mode, RCS mode, roll,
+// throttle. Direction markers and the target bracket follow scene.project().
 import type { UiHost, UiScreen } from '../host';
 import type { SceneManager, Projection } from '../../render/scene';
 import type { V3 } from '../../core/types';
-import { fmtCredits, fmtDistance, fmtDuration, fmtSpeed } from '../../core/units';
+import { fmtDistance, fmtDuration, fmtSpeed } from '../../core/units';
+import type { WarpLimit } from '../../game';
 import { h, icon, installStyles, onTap, type IconName } from '../kit';
 import { createFlightControls, type FlightControls } from '../controls/controls';
 
@@ -101,6 +104,15 @@ const CSS = `
 .hud-brk u:nth-child(3){left:0;bottom:0;border-width:0 0 1.5px 1.5px}
 .hud-brk u:nth-child(4){right:0;bottom:0;border-width:0 1.5px 1.5px 0}
 .hud-brk span{position:absolute;top:calc(100% + 4px);left:50%;transform:translateX(-50%);white-space:nowrap;font-size:11px;font-weight:600;letter-spacing:.08em;padding:2px 6px;background:rgba(8,12,18,.72);border-radius:2px;color:var(--tl-ion)}
+.hud-warn{margin-top:5px;padding-right:6px;font-size:11px;font-weight:600;letter-spacing:.04em;color:var(--tl-ember-hi)}
+.hud-warn.is-bad{color:var(--tl-red)}
+.hud-btn--rcs{width:52px;flex:none;padding:0;color:var(--tl-dim)}
+.hud-btn--rcs.is-on{background:rgba(255,180,84,.22);border-color:var(--tl-ember);color:var(--tl-ember)}
+.hud-stick.is-rcs{border-color:rgba(255,180,84,.8)}
+.hud-stick.is-rcs i{border-color:var(--tl-ember);background:rgba(255,180,84,.14)}
+.hud-chip--info.is-ready{border-color:var(--tl-green)}
+.hud-chip--info.is-ready b{color:var(--tl-green)}
+.hud-chip--info.is-dock b{color:var(--tl-ion)}
 @media (orientation:landscape){
  .hud-main{flex:0 1 390px}
  .hud-col{margin-left:auto;max-width:300px}
@@ -130,6 +142,9 @@ export interface FlightScreen extends UiScreen {
   controls: FlightControls;
 }
 
+const WHY: Record<WarpLimit, string> = { '': '', thrust: 'thrusting', rotation: 'turning', contact: 'in contact', atmosphere: 'in atmosphere', proximity: 'close to something', cpu: 'CPU budget', docked: 'docked' };
+const fmtX = (v: number): string => (v >= 1e6 ? `${+(v / 1e6).toFixed(1)}M` : v >= 1000 ? `${+(v / 1000).toFixed(1)}k` : v >= 10 ? String(Math.round(v)) : String(+v.toFixed(1)));
+
 export function createFlightScreen(host: UiHost, scene: SceneManager, hooks: { pause(): void }): FlightScreen {
   installStyles();
   if (!document.getElementById('tl-hud-css')) {
@@ -138,10 +153,12 @@ export function createFlightScreen(host: UiHost, scene: SceneManager, hooks: { p
     s.textContent = CSS;
     document.head.appendChild(s);
   }
-  const fail = (r: { ok: true } | { ok: false; reason: string }): void => {
-    if (!r.ok) host.toast(r.reason, 'warn');
+  const ses = host.session;
+  const warp = (dir: -1 | 1): void => {
+    if (dir > 0) ses.warpUp();
+    else ses.warpDown();
+    stamp = 1;
   };
-  const warp = (dir: -1 | 1): void => fail(dir > 0 ? host.game.warpUp() : host.game.warpDown());
   const controls = createFlightControls(host, { warp, map: () => host.go('map'), pause: hooks.pause });
 
   // ---------------------------------------------------------------- top
@@ -163,39 +180,45 @@ export function createFlightScreen(host: UiHost, scene: SceneManager, hooks: { p
   const fuelFill = h('i');
   const fuelDv = h('b');
   const setDv = text(fuelDv);
-  const main = h('div.hud-main.hud-plate', null,
+  const warn = h('div.hud-warn');
+  warn.hidden = true;
+  const setWarn = text(warn);
+  const main = h('div.hud-main.hud-plate', { attrs: { 'data-hud': 'main' } },
     h('div.hud-head', null, sit, mapBtn, menuBtn),
     h('div.hud-read', null, alt.el, spd.el, ap.el, pe.el),
-    h('div.hud-fuel', null, h('span', { text: 'PROP' }), h('div.hud-fuel-bar', null, fuelFill), fuelDv));
+    h('div.hud-fuel', null, h('span', { text: 'PROP' }), h('div.hud-fuel-bar', null, fuelFill), fuelDv),
+    warn);
 
   const tgtName = h('b');
   const tgtSub = h('i');
-  const tgt = h('button.hud-chip.hud-chip--tgt.hud-plate', { attrs: { type: 'button' } }, h('small', { text: 'Target · tap' }), tgtName, tgtSub);
-  const burnMain = h('b');
-  const burnSub = h('i');
-  const burn = h('div.hud-chip.hud-chip--burn.hud-plate', null, h('small', { text: 'Next burn' }), burnMain, burnSub);
-  const fcText = h('span');
-  const fcBtn = h('button', { attrs: { type: 'button' }, text: 'Disengage' });
-  const fc = h('div.hud-fc.hud-plate', null, fcText, fcBtn);
-  fc.hidden = true;
-  onTap(fcBtn, () => host.game.disengageAutopilot());
-  const side = h('div.hud-side', null, h('div.hud-chips', null, tgt, burn), fc);
+  const tgt = h('button.hud-chip.hud-chip--tgt.hud-plate', { attrs: { type: 'button', 'aria-label': 'Next target' } }, h('small', { text: 'Target · tap' }), tgtName, tgtSub);
+  const infoHead = h('small');
+  const infoMain = h('b');
+  const infoSub = h('i');
+  const info = h('div.hud-chip.hud-chip--burn.hud-chip--info.hud-plate', null, infoHead, infoMain, infoSub);
+  const side = h('div.hud-side', null, h('div.hud-chips', null, tgt, info));
   const top = h('div.hud-top', null, main, side);
 
-  const stationIds = (): string[] =>
-    host.game.contacts().filter((c) => c.kind === 'station').map((c) => ({ id: c.ref.id, d: c.distance })).sort((a, b) => a.d - b.d).map((c) => c.id);
+  /** Stations nearest first, then the bodies; one tap past the end clears the target. */
+  const targetIds = (): string[] => {
+    const craft = ses.craft();
+    let px = 0, py = 0, pz = 0;
+    for (const c of craft) if (c.isPlayer) { px = c.r.x; py = c.r.y; pz = c.r.z; }
+    const st = craft.filter((c) => c.kind === 'station').map((c) => ({ id: c.id, d: Math.hypot(c.r.x - px, c.r.y - py, c.r.z - pz) })).sort((a, b) => a.d - b.d).map((c) => c.id);
+    return [...st, ...ses.bodies().map((b) => b.id)];
+  };
   onTap(tgt, () => {
-    const ids = stationIds();
-    if (!ids.length) return;
-    const cur = host.game.target();
+    const ids = targetIds();
+    const cur = ses.target();
     const i = cur ? ids.indexOf(cur.id) : -1;
-    fail(host.game.setTarget({ kind: 'station', id: ids[(i + 1) % ids.length] }));
+    ses.setTarget(i + 1 < ids.length ? ids[i + 1] : null);
     stamp = 1;
   });
 
   // ---------------------------------------------------------------- bottom
   const primaryLabel = h('span');
   const primary = h('button.hud-btn.hud-primary', { attrs: { type: 'button' } }, primaryLabel);
+  primary.hidden = true;
   const setPrimaryText = text(primaryLabel);
   let primaryAct: (() => void) | null = null;
   onTap(primary, () => {
@@ -215,7 +238,7 @@ export function createFlightScreen(host: UiHost, scene: SceneManager, hooks: { p
     controls.sasDrawer,
     primary,
     h('div.hud-row', null, warpEl),
-    h('div.hud-row', null, controls.roll, controls.sas));
+    h('div.hud-row', null, controls.roll, controls.rcs, controls.sas));
   const bottom = h('div.hud-bottom', null, col, controls.throttle);
 
   // ---------------------------------------------------------------- markers
@@ -223,11 +246,10 @@ export function createFlightScreen(host: UiHost, scene: SceneManager, hooks: { p
   const mPro = mark('pro', 'prograde');
   const mRetro = mark('retro', 'retrograde');
   const mTgt = mark('tgt', 'target');
-  const mMnv = mark('mnv', 'node');
   const brkLabel = h('span');
   const setBrk = text(brkLabel);
   const brk = h('div.hud-brk', null, h('u'), h('u'), h('u'), h('u'), brkLabel);
-  const marks = h('div.hud-marks', null, mPro, mRetro, mMnv, mTgt, brk);
+  const marks = h('div.hud-marks', null, mPro, mRetro, mTgt, brk);
 
   const el = h('div.hud', null, controls.surface, controls.stick, marks, top, bottom);
   el.style.display = 'none';
@@ -254,7 +276,6 @@ export function createFlightScreen(host: UiHost, scene: SceneManager, hooks: { p
     let px = p.x;
     let py = p.y;
     if (!p.visible) {
-      // slide along the line from the screen centre to the (possibly far off-screen) point
       const cx = vw / 2;
       const cy = vh / 2;
       let dx = px - cx;
@@ -272,31 +293,50 @@ export function createFlightScreen(host: UiHost, scene: SceneManager, hooks: { p
     m.style.transform = `translate(${px.toFixed(1)}px,${py.toFixed(1)}px)`;
   };
 
+  /** Velocity of the player relative to the primary body (world axes) into `out`; false when unknown. */
+  const relVel = { x: 0, y: 0, z: 0 };
+  const playerRelVel = (): boolean => {
+    const craft = ses.craft();
+    const bodies = ses.bodies();
+    const pid = ses.flight().primaryId;
+    let ok = 0;
+    for (let i = 0; i < craft.length; i++)
+      if (craft[i].isPlayer) {
+        relVel.x = craft[i].v.x; relVel.y = craft[i].v.y; relVel.z = craft[i].v.z;
+        ok++;
+        break;
+      }
+    for (let i = 0; i < bodies.length; i++)
+      if (bodies[i].id === pid) {
+        relVel.x -= bodies[i].v.x; relVel.y -= bodies[i].v.y; relVel.z -= bodies[i].v.z;
+        ok++;
+        break;
+      }
+    return ok === 2;
+  };
+
   const updateMarkers = (): void => {
-    const g = host.game;
-    const pose = g.shipPose();
-    if (pose.docked || pose.destroyed) {
-      mPro.hidden = mRetro.hidden = mTgt.hidden = mMnv.hidden = brk.hidden = true;
+    const p = ses.player();
+    if (p.dockedTo || p.destroyed) {
+      mPro.hidden = mRetro.hidden = mTgt.hidden = brk.hidden = true;
       return;
     }
-    const v = pose.v;
-    placeDir(mPro, v.x, v.y, v.z, false);
-    placeDir(mRetro, -v.x, -v.y, -v.z, false);
-    const node = g.flightInfo().nextNode;
-    if (node) placeDir(mMnv, node.dir.x, node.dir.y, node.dir.z, true);
-    else mMnv.hidden = true;
-    const ti = g.targetInfo();
+    if (playerRelVel()) {
+      placeDir(mPro, relVel.x, relVel.y, relVel.z, false);
+      placeDir(mRetro, -relVel.x, -relVel.y, -relVel.z, false);
+    } else mPro.hidden = mRetro.hidden = true;
+    const ti = ses.target();
     if (!ti) {
       mTgt.hidden = brk.hidden = true;
       return;
     }
-    const p = scene.project(ti.ref.id, proj);
-    if (p.visible && Number.isFinite(p.x) && Number.isFinite(p.y)) {
-      const size = Math.min(240, Math.max(40, p.radiusPx * 2 + 14));
+    const pr = scene.project(ti.id, proj);
+    if (pr.visible && Number.isFinite(pr.x) && Number.isFinite(pr.y)) {
+      const size = Math.min(240, Math.max(40, pr.radiusPx * 2 + 14));
       brk.hidden = false;
       brk.style.width = brk.style.height = `${size.toFixed(0)}px`;
-      brk.style.transform = `translate(${(p.x - size / 2).toFixed(1)}px,${(p.y - size / 2).toFixed(1)}px)`;
-      brk.style.opacity = p.occluded ? '0.45' : '1';
+      brk.style.transform = `translate(${(pr.x - size / 2).toFixed(1)}px,${(pr.y - size / 2).toFixed(1)}px)`;
+      brk.style.opacity = pr.occluded ? '0.45' : '1';
       setBrk(fmtDistance(ti.distance));
       mTgt.hidden = true;
     } else {
@@ -309,99 +349,129 @@ export function createFlightScreen(host: UiHost, scene: SceneManager, hooks: { p
   const setSit = text(sit);
   const setTgtName = text(tgtName);
   const setTgtSub = text(tgtSub);
-  const setBurnMain = text(burnMain);
-  const setBurnSub = text(burnSub);
-  const setFc = text(fcText);
+  const setInfoHead = text(infoHead);
+  const setInfoMain = text(infoMain);
+  const setInfoSub = text(infoSub);
   const setWarpX = text(warpX);
   const setWarpWhy = text(warpWhy);
   let fuelShown = -1;
   let stamp = 1;
-  const setPrimary = (label: string, tone: string, act: (() => void) | null): void => {
-    setPrimaryText(label);
-    if (primary.dataset.tone !== tone) primary.dataset.tone = tone;
-    primaryAct = act;
-  };
-  const tIn = (s: number): string => (Number.isFinite(s) ? `in ${fmtDuration(s)}` : '');
+  const tIn = (s: number): string => (Number.isFinite(s) && s >= 0 ? `in ${fmtDuration(s)}` : '');
+  const pctOf = (x: number): string => `${Math.round(x * 100)}%`;
 
   const updateReadouts = (): void => {
-    const g = host.game;
-    const fi = g.flightInfo();
-    setSit(`${fi.soiBodyName} · ${fi.situation}`);
+    const fi = ses.flight();
+    const p = ses.player();
+    setSit(`${fi.primaryName} · ${fi.situation}`);
     alt.v(fmtDistance(fi.altitude));
     alt.s(Math.abs(fi.verticalSpeed) >= 0.5 ? `${fi.verticalSpeed > 0 ? '+' : '−'}${fmtSpeed(Math.abs(fi.verticalSpeed))}` : 'level');
-    spd.v(fmtSpeed(fi.orbitalSpeed));
-    spd.s(fi.throttle > 0 ? `${(fi.maxAccel * fi.throttle).toFixed(1)} m/s²` : 'coasting');
-    ap.v(Number.isFinite(fi.apoapsisAltitude) ? fmtDistance(fi.apoapsisAltitude) : 'escape');
+    spd.v(fmtSpeed(fi.speed));
+    spd.s(fi.accel > 0.005 ? `${fi.accel.toFixed(2)} m/s²` : 'coasting');
+    ap.v(Number.isFinite(fi.apoapsisAlt) ? fmtDistance(fi.apoapsisAlt) : 'escape');
     ap.s(tIn(fi.timeToApoapsis));
-    pe.v(fmtDistance(fi.periapsisAltitude));
+    pe.v(fmtDistance(fi.periapsisAlt));
     pe.s(tIn(fi.timeToPeriapsis));
-    const f = Math.round(fi.propellantFraction * 100);
+    const f = Math.round(p.propellantFraction * 100);
     if (f !== fuelShown) {
       fuelShown = f;
       fuelFill.style.transform = `scaleX(${(f / 100).toFixed(2)})`;
       fuelFill.classList.toggle('is-low', f < 10);
     }
-    setDv(`${f}% · Δv ${fmtSpeed(fi.deltaV)}`);
+    setDv(`${f}% · Δv ${fmtSpeed(p.deltaV)}`);
 
-    const ti = g.targetInfo();
+    // only what is not nominal
+    let w = '';
+    if (p.destroyed) w = `Destroyed${p.destroyedBy ? `: ${p.destroyedBy}` : ''}`;
+    else {
+      if (p.heat > 0.05) w += `Heat ${pctOf(p.heat)}`;
+      if (p.hull < 0.995) w += `${w ? ' · ' : ''}Hull ${pctOf(p.hull)}`;
+      if (p.spin > 0.03 && (p.hold === 'off' || p.spin > 0.35)) w += `${w ? ' · ' : ''}${p.hold === 'off' ? 'Tumbling' : 'Spin'} ${((p.spin * 180) / Math.PI).toFixed(1)}°/s`;
+      if (fi.dynamicPressure > 50) w += `${w ? ' · ' : ''}Q ${(fi.dynamicPressure / 1000).toFixed(1)} kPa`;
+    }
+    if (warn.hidden === !!w) warn.hidden = !w;
+    setWarn(w);
+    warn.classList.toggle('is-bad', p.destroyed || p.heat > 0.7 || p.hull < 0.5);
+
+    const ti = ses.target();
     if (ti) {
       setTgtName(ti.name);
-      const c = ti.closingSpeed;
-      setTgtSub(`${fmtDistance(ti.distance)} · ${Math.abs(c) < 0.05 ? 'holding' : `${fmtSpeed(Math.abs(c))} ${c > 0 ? 'closing' : 'opening'}`}`);
+      const c = ti.closing;
+      setTgtSub(`${fmtDistance(ti.distance)} · ${ti.relSpeed < 0.05 ? 'at rest' : `${fmtSpeed(ti.relSpeed)} ${Math.abs(c) < 0.05 ? 'across' : c > 0 ? 'closing' : 'opening'}`}`);
     } else {
       setTgtName('None');
-      setTgtSub('Tap to pick a station');
+      setTgtSub('Tap to pick a target');
     }
-    const n = fi.nextNode;
-    if (n) {
-      setBurnMain(n.burnStartsIn > 0 ? `T− ${fmtDuration(n.burnStartsIn)}` : 'Burning');
-      setBurnSub(`Δv ${fmtSpeed(n.dvRemaining)} · ${fmtDuration(n.burnDuration)}`);
+
+    // docking guidance when a port is near, else the next planned burn
+    const d = ses.docking();
+    let mode = '';
+    if (!p.dockedTo && d.stationId && d.portId) {
+      mode = d.canLatch ? 'ready' : 'dock';
+      // closing speed along the line to the port: (v_player - v_station) · unit(portOffset)
+      let closing = d.relSpeed;
+      const craft = ses.craft();
+      const ol = Math.hypot(d.portOffset.x, d.portOffset.y, d.portOffset.z);
+      let pc = null, sc = null;
+      for (let i = 0; i < craft.length; i++) {
+        if (craft[i].isPlayer) pc = craft[i];
+        else if (craft[i].id === d.stationId) sc = craft[i];
+      }
+      if (pc && sc && ol > 1e-6) closing = ((pc.v.x - sc.v.x) * d.portOffset.x + (pc.v.y - sc.v.y) * d.portOffset.y + (pc.v.z - sc.v.z) * d.portOffset.z) / ol;
+      setInfoHead(`Dock · ${fmtDistance(ol)}`);
+      setInfoMain(d.canLatch ? 'Latch ready' : `${d.lateral.toFixed(1)} m off axis`);
+      setInfoSub(`${((d.alignment * 180) / Math.PI).toFixed(0)}° off · ${Math.abs(closing).toFixed(2)} m/s ${closing >= 0 ? 'closing' : 'opening'}`);
+    } else if (!p.dockedTo && d.stationId && d.distance < 5000) {
+      mode = 'dock';
+      setInfoHead('Station near');
+      setInfoMain(fmtDistance(d.distance));
+      setInfoSub(`${fmtSpeed(d.relSpeed)} relative · no port in reach`);
     } else {
-      setBurnMain('—');
-      setBurnSub('No burn planned');
+      const now = ses.time();
+      const burns = ses.burns();
+      let next = null;
+      for (let i = 0; i < burns.length; i++) if (burns[i].t >= now - 1 && (!next || burns[i].t < next.t)) next = burns[i];
+      setInfoHead('Next burn');
+      if (next) {
+        setInfoMain(`T− ${fmtDuration(Math.max(0, next.t - now))}`);
+        setInfoSub(`Δv ${fmtSpeed(Math.hypot(next.prograde, next.normal, next.radial))}`);
+      } else {
+        setInfoMain('—');
+        setInfoSub('Plan one on the map');
+      }
+      info.style.opacity = next ? '1' : '0.6';
     }
-    burn.style.opacity = n ? '1' : '0.6';
+    if (mode) info.style.opacity = '1';
+    info.classList.toggle('is-dock', mode === 'dock');
+    info.classList.toggle('is-ready', mode === 'ready');
 
-    const apv = g.autopilot();
-    const fcOn = apv.engaged || !!apv.failed;
-    if (fc.hidden === fcOn) fc.hidden = !fcOn;
-    if (fcOn) {
-      setFc(apv.engaged ? apv.status || 'Flight computer engaged' : `Flight computer: ${apv.failed}`);
-      fc.classList.toggle('is-bad', !apv.engaged);
-      fcBtn.hidden = !apv.engaged;
+    const wv = ses.warp();
+    setWarpX(`×${fmtX(wv.achieved)}`);
+    warpX.classList.toggle('is-fast', wv.achieved > 1.05);
+    const limited = wv.limitedBy !== '' || wv.achieved < wv.requested * 0.9;
+    setWarpWhy(limited ? `asked ×${fmtX(wv.requested)} · ${WHY[wv.limitedBy] || 'limited'}` : wv.requested > 1 ? 'time acceleration' : 'real time');
+
+    // the one situational action: undock when latched, reset when the ship is gone
+    let label = '';
+    let tone = 'ember';
+    let act: (() => void) | null = null;
+    if (p.destroyed) {
+      label = 'Ship destroyed · reset to orbit';
+      tone = 'red';
+      act = () => host.reset();
+    } else if (p.dockedTo) {
+      const id = p.dockedTo;
+      const st = ses.craft().find((c) => c.id === id);
+      label = `Undock${st ? ` from ${st.name}` : ''}`;
+      act = () => {
+        if (!ses.undock()) host.toast('The latch did not release', 'warn');
+      };
     }
-
-    const w = g.warp();
-    setWarpX(`×${w.level >= 1000 ? `${w.level / 1000}k` : w.level}`);
-    warpX.classList.toggle('is-fast', w.level > 1);
-    setWarpWhy(w.limitReason || (w.level > 1 ? 'time warp' : 'real time'));
-
-    // the one primary action
-    const d = g.dockingState();
-    const pose = g.shipPose();
-    const target = g.target();
-    if (pose.destroyed) {
-      const q = g.rebuyQuote();
-      setPrimary(`Ship lost · replacement ${fmtCredits(q.cost)}`, 'red', () => fail(g.rebuy()));
-    } else if (d.transit === 'capture' || d.tug) {
-      setPrimary(`Tug docking · ${Math.max(0, Math.ceil(d.transitSeconds))} s`, 'dim', null);
-    } else if (d.transit === 'release') {
-      setPrimary(`Clearing the berth · ${Math.max(0, Math.ceil(d.transitSeconds))} s`, 'dim', null);
-    } else if (d.granted) {
-      setPrimary('Docking cleared · cancel', 'ion', () => g.cancelDocking());
-    } else if (d.canRequest) {
-      setPrimary('Request docking', 'green', () => fail(g.requestDocking()));
-    } else if (fi.canCallTender) {
-      const q = g.tenderQuote();
-      setPrimary(`Call fuel tender · ${fmtCredits(q.cost)}`, 'ember', () => fail(g.callTender()));
-    } else if (apv.engaged) {
-      setPrimary(`Flying: ${cap(apv.phase || apv.mode)}`, 'dim', null);
-    } else if (target && target.kind === 'station' && ti) {
-      const id = target.id;
-      setPrimary(`Go to ${ti.name}`, 'ember', () => fail(g.engageAutopilot({ kind: 'goToStation', stationId: id })));
-    } else {
-      setPrimary('Select a destination', 'ion', () => host.go('map'));
+    if (primary.hidden === !!label) primary.hidden = !label;
+    if (label) {
+      setPrimaryText(label);
+      if (primary.dataset.tone !== tone) primary.dataset.tone = tone;
     }
+    primaryAct = act;
   };
 
   return {
@@ -411,11 +481,10 @@ export function createFlightScreen(host: UiHost, scene: SceneManager, hooks: { p
       if (!el.isConnected) host.root.appendChild(el);
       el.style.display = '';
       controls.setActive(true);
-      // A sensible default destination: the nearest station that is not the one we just left.
-      const g = host.game;
-      if (!g.target() && !g.shipPose().docked) {
-        const far = g.contacts().filter((c) => c.kind === 'station' && c.distance > 5000).map((c) => ({ id: c.ref.id, d: c.distance })).sort((a, b) => a.d - b.d)[0];
-        if (far) g.setTarget({ kind: 'station', id: far.id });
+      // a sensible default target: the nearest station
+      if (!ses.target()) {
+        const ids = targetIds();
+        if (ids.length) ses.setTarget(ids[0]);
       }
       stamp = 1;
     },

@@ -19,10 +19,11 @@ import * as THREE from 'three';
 import type { Quat, V3 } from '../../src/core/types';
 import { createPipeline, type Quality } from '../../src/render/pipeline';
 import { createSceneManager, type Projection } from '../../src/render/scene';
-import { addShip, addStationExtra, beginFrame, createSceneFrame, setDockingGuide, type CameraMode } from '../../src/render/frame';
+import { addStationExtra, beginFrame, createSceneFrame, setDockingGuide, type CameraMode } from '../../src/render/frame';
 import { generateGalaxy } from '../../src/sim/universe';
 import { SystemModel, newState, propagateStateTo } from '../../src/sim/orbit';
 import { stationAttitude } from '../../src/sim/physics';
+import type { BodyView, CraftView } from '../../src/game/api';
 import { STATION_LAYOUTS } from '../../src/data/stationLayouts';
 
 const params = new URLSearchParams(location.search);
@@ -262,27 +263,45 @@ if (has('throttle')) setup.throttle = num('throttle', 0);
 const frame = createSceneFrame();
 let simTime = setup.time;
 const shipState = newState();
+// The world as a session would report it (barycentric states), computed here from the old rails for the harness.
+const sv = newState();
+const bodyViews: BodyView[] = system!.bodies.map((def) => ({ id: def.id, def, r: V(0, 0, 0), v: V(0, 0, 0), spinAxis: V(0, 1, 0), spinAngle: 0 }));
+const mkCraft = (id: string, kind: 'ship' | 'station'): CraftView => ({
+  id, name: id, kind, shipVisual: null, stationVisual: null, visualSeed: 0, r: V(0, 0, 0), v: V(0, 0, 0), q: { x: 0, y: 0, z: 0, w: 1 }, throttle: 0, rcs: V(0, 0, 0), heat: 0, hull: 1, isPlayer: false, dockedTo: null, radius: 10,
+});
+const shipCraft = mkCraft('player', 'ship');
+shipCraft.shipVisual = 'wren';
+shipCraft.visualSeed = 7;
+shipCraft.isPlayer = true;
+const craftViews: CraftView[] = [shipCraft, ...system!.stations.map((st) => {
+  const c = mkCraft(st.id, 'station');
+  c.stationVisual = st.visualId;
+  c.visualSeed = st.visualSeed;
+  c.q = stationAttitude(st.orbit);
+  return c;
+})];
 function fill(dt: number): void {
   beginFrame(frame, simTime, dt, 1);
-  const s = addShip(frame);
-  s.id = 'player';
-  s.visualId = 'wren';
-  s.seed = 7;
-  s.soiBodyId = WICK;
+  for (const b of bodyViews) {
+    model.bodyAbsState(b.id, simTime, sv);
+    b.r = V(sv.r.x, sv.r.y, sv.r.z);
+    b.v = V(sv.v.x, sv.v.y, sv.v.z);
+    b.spinAngle = (2 * Math.PI * simTime) / (Math.abs(b.def.rotationPeriod) > 1 ? b.def.rotationPeriod : 86400);
+  }
+  for (let i = 1; i < craftViews.length; i++) {
+    model.stationAbsState(craftViews[i].id, simTime, sv);
+    craftViews[i].r = V(sv.r.x, sv.r.y, sv.r.z);
+    craftViews[i].v = V(sv.v.x, sv.v.y, sv.v.z);
+  }
   // the Wren coasts on its Kepler orbit from the set-up state (attitude held inertially)
   propagateStateTo(shipState, setup, wick.mu, simTime - setup.time);
-  s.r.x = shipState.r.x;
-  s.r.y = shipState.r.y;
-  s.r.z = shipState.r.z;
-  s.v.x = shipState.v.x;
-  s.v.y = shipState.v.y;
-  s.v.z = shipState.v.z;
-  s.q.x = setup.q.x;
-  s.q.y = setup.q.y;
-  s.q.z = setup.q.z;
-  s.q.w = setup.q.w;
-  s.throttle = setup.throttle;
-  s.isPlayer = true;
+  model.bodyAbsState(WICK, simTime, sv);
+  shipCraft.r = V(sv.r.x + shipState.r.x, sv.r.y + shipState.r.y, sv.r.z + shipState.r.z);
+  shipCraft.v = V(sv.v.x + shipState.v.x, sv.v.y + shipState.v.y, sv.v.z + shipState.v.z);
+  shipCraft.q = setup.q;
+  shipCraft.throttle = setup.throttle;
+  frame.bodies = bodyViews;
+  frame.craft = craftViews;
   frame.camera.mode = setup.cam.mode;
   frame.camera.focusId = 'player';
   frame.camera.yaw = setup.cam.yaw;
@@ -312,7 +331,7 @@ function report(extra: string): void {
 
 async function main(): Promise<void> {
   const t0 = performance.now();
-  await scene.setSystem(system!, model, (f, label) => (info.textContent = `loading ${(f * 100).toFixed(0)}% ${label}`), { nearBodyId: WICK });
+  await scene.setSystem(system!, (f, label) => (info.textContent = `loading ${(f * 100).toFixed(0)}% ${label}`), { nearBodyId: WICK });
   const loadMs = performance.now() - t0;
   const frames = num('frames', 10);
   for (let i = 0; i < 80 && (i < frames || scene.busy()); i++) {

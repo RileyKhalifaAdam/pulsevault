@@ -1,759 +1,509 @@
-// Orbital map: a top-down 2D chart of the current system drawn on a canvas, with kit controls on top.
-// Screen x = system +X, screen y = system +Z (looking down from +Y, so prograde runs counter-clockwise).
-import { h, icon, onTap, onHoldRepeat, Button, Chips, Stepper, type IconName } from '../kit';
-import { fmtDate, fmtDistance, fmtDuration, fmtSpeed } from '../../core/units';
-import { newState, orbitNormalFromElements, propagateStateTo, sampleOrbit, samplePatch, type SystemModel } from '../../sim/orbit';
-import type { OrbitElements } from '../../core/types';
-import type { TargetRef } from '../../sim/game';
+// Map: the predicted path of the ship, drawn top-down (looking along -Y, so prograde runs counter-clockwise)
+// around the prediction's frame body. Everything comes from the Session: prediction() for the path, the
+// target's path and the events; bodies() / craft() for where things are now; burns() for the plan.
+// Drag to pan, pinch to zoom; tap a world or station to target it; tap the path to plan a burn there.
 import type { UiHost, UiScreen } from '../host';
-import { bodyClassLabel, put, screenRoot, stationKindLabel } from './shared';
+import type { PlannedBurn, PredictionEvent } from '../../game';
+import { fmtDistance, fmtDuration, fmtSpeed } from '../../core/units';
+import { h, icon, onHoldRepeat, onTap } from '../kit';
 
-type Focus = 'ship' | 'home' | 'target' | 'system';
-type Sel = { kind: 'station' | 'body' | 'node'; id: string } | null;
+const CSS = `
+.pm{position:absolute;inset:0;background:#05070b;pointer-events:auto;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;color:var(--tl-text);font-variant-numeric:tabular-nums;
+ --gx-l:max(16px,env(safe-area-inset-left,0px));--gx-r:max(16px,env(safe-area-inset-right,0px))}
+.pm canvas{position:absolute;left:0;top:0;width:100%;height:100%;touch-action:none}
+.pm [hidden]{display:none!important}
+.pm-plate{background:rgba(8,12,18,.82);border:1px solid rgba(111,227,255,.22);border-radius:4px}
+.pm-head{position:absolute;left:var(--gx-l);right:var(--gx-r);top:calc(8px + env(safe-area-inset-top,0px));display:flex;flex-wrap:wrap;gap:6px;align-items:stretch;pointer-events:none}
+.pm-head>*{pointer-events:auto}
+.pm-b{min-height:46px;min-width:46px;padding:0 12px;display:inline-flex;align-items:center;justify-content:center;gap:6px;color:var(--tl-text);font-size:12px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;white-space:nowrap}
+.pm-b.tl-pressed{background:rgba(111,227,255,.2)}
+.pm-title{flex:1 1 120px;min-width:0;padding:5px 10px;display:flex;flex-direction:column;justify-content:center}
+.pm-title small{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--tl-dim)}
+.pm-title b{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--tl-ion)}
+.pm-warp{display:flex;align-items:center}
+.pm-warp span{min-width:54px;text-align:center;font-size:14px;font-weight:600}
+.pm-warp span.is-fast{color:var(--tl-ember)}
+.pm-foot{position:absolute;left:var(--gx-l);right:var(--gx-r);bottom:calc(10px + env(safe-area-inset-bottom,0px));display:flex;flex-direction:column;gap:6px;align-items:center;pointer-events:none}
+.pm-hint{font-size:11px;color:var(--tl-dim);letter-spacing:.04em;text-align:center;padding:4px 10px;background:rgba(5,7,11,.7);border-radius:3px}
+.pm-ed{pointer-events:auto;width:100%;max-width:420px;padding:8px 10px;box-sizing:border-box}
+.pm-ed-head{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.pm-ed-head b{flex:1;min-width:0;font-size:13px;font-weight:600;color:var(--tl-ember);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pm-ed-head .pm-b{min-height:44px;border:1px solid var(--tl-line-2);border-radius:3px;font-size:11px}
+.pm-ed-head .pm-del{color:var(--tl-red);border-color:rgba(255,90,77,.5)}
+.pm-rows{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.pm-row{display:flex;align-items:center;border:1px solid var(--tl-line);border-radius:3px;min-width:0}
+.pm-row button{width:44px;height:46px;flex:none;font-size:20px;color:var(--tl-ion)}
+.pm-row button.tl-pressed{background:rgba(111,227,255,.2)}
+.pm-row div{flex:1;min-width:0;text-align:center;line-height:1.2}
+.pm-row small{display:block;font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:var(--tl-dim)}
+.pm-row b{display:block;font-size:13px;font-weight:600;white-space:nowrap}
+.pm-zoom{position:absolute;right:var(--gx-r);top:50%;transform:translateY(-50%);display:flex;flex-direction:column;pointer-events:auto}
+.pm-zoom button{width:46px;height:46px;font-size:22px;color:var(--tl-text)}
+.pm-zoom button.tl-pressed{background:rgba(111,227,255,.2)}
+`;
 
-interface Ell { parentId: string; a: number; b: number; e: number; px: number; pz: number; qx: number; qz: number }
-interface PatchGeo { bodyId: string; pts: Float64Array; n: number; tp: Float64Array; tn: number; t0: number; dt: number; planned: boolean }
-interface Marker { bodyId: string; x: number; z: number; label: string; ap: boolean }
-interface Hit { kind: 'station' | 'body' | 'node'; id: string; x: number; y: number; r: number }
-
-const C = { ion: '#6FE3FF', ember: '#FFB454', green: '#63E6A1', red: '#FF5A4D', text: '#E8EEF5', dim: '#8FA3B8' };
-const BODY_COLORS: Record<string, [string, string]> = {
-  star: ['#FFB27A', '#E0603A'], lava: ['#E8774A', '#3A0E08'], barren: ['#A39C94', '#1B1A19'], desert: ['#D9A866', '#2A1A0C'],
-  eyeball: ['#7CC4D6', '#0A1C26'], gasGiant: ['#D8B48A', '#2A1D12'], ice: ['#CFE4F0', '#16222B'], rocky: ['#B58A6A', '#20140D'],
-};
-const FONT = '600 11px "DIN Alternate", "Avenir Next", -apple-system, system-ui, sans-serif';
-const MAX_LOG = Math.log2(1 / 400); // closest zoom: 1 px = 400 m
-const TAU = Math.PI * 2;
-
-function ellOf(el: OrbitElements, parentId: string): Ell {
-  const s = sampleOrbit(el, 8); // first point is periapsis
-  const l = Math.hypot(s[0], s[1], s[2]) || 1;
-  const px = s[0] / l, py = s[1] / l, pz = s[2] / l;
-  const n = orbitNormalFromElements(el);
-  return { parentId, a: el.a, b: el.a * Math.sqrt(Math.max(0, 1 - el.e * el.e)), e: el.e, px, pz, qx: n.y * pz - n.z * py, qz: n.x * py - n.y * px };
-}
+const EVENT_LABEL: Record<PredictionEvent['kind'], string> = { periapsis: 'Pe', apoapsis: 'Ap', closestApproach: 'Closest', atmosphere: 'Atmosphere', impact: 'Impact', burn: 'Burn' };
+const fmtX = (v: number): string => (v >= 1e6 ? `${+(v / 1e6).toFixed(1)}M` : v >= 1000 ? `${+(v / 1000).toFixed(1)}k` : v >= 10 ? String(Math.round(v)) : String(+v.toFixed(1)));
 
 export function createMapScreen(host: UiHost): UiScreen {
-  const el = screenRoot(host, 'tls-map');
-  const canvas = h('canvas');
-  const ctx = canvas.getContext('2d') as CanvasRenderingContext2D;
+  if (!document.getElementById('tl-pm-css')) {
+    const s = document.createElement('style');
+    s.id = 'tl-pm-css';
+    s.textContent = CSS;
+    document.head.appendChild(s);
+  }
+  const ses = host.session;
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
 
-  // ---- chrome
-  const backBtn = h('button.tls-sq.tls-sq--frame', { attrs: { type: 'button', 'aria-label': 'Back' } }, icon('back', 22));
-  const titleB = h('b');
-  const titleS = h('span');
-  const warpV = h('div.tls-warp__v.tl-num');
-  const sq = (name: IconName, label: string, frame = false): HTMLElement => h('button.tls-sq', { class: frame && 'tls-sq--frame', attrs: { type: 'button', 'aria-label': label } }, icon(name, 20));
-  const warpDown = sq('minus', 'Slower');
-  const warpUp = sq('plus', 'Faster');
-  const limit = h('div.tls-map__limit');
-  const chipsWrap = h('div.tls-map__chips');
-  const top = h('div.tls-map__top', null,
-    h('div.tls-map__bar', null, backBtn, h('div.tls-map__title', null, titleB, titleS), h('div.tls-warp', null, warpDown, warpV, warpUp)),
-    chipsWrap, limit);
-  const zoomIn = sq('plus', 'Zoom in', true);
-  const zoomOut = sq('minus', 'Zoom out', true);
-  const zoom = h('div.tls-map__zoom', null, zoomIn, zoomOut);
-  const statusB = h('b');
-  const statusS = h('span');
-  const cardWrap = h('div');
-  const plotBtn = Button({ label: 'Plot course', variant: 'ion', onTap: doPlot });
-  const flyBtn = Button({ label: 'Go to target', variant: 'primary', onTap: doFly });
-  const clearBtn = Button({ icon: 'close', ariaLabel: 'Clear plan', variant: 'ghost', onTap: () => { host.game.clearNodes(); planMsg = ''; select(null); } });
-  clearBtn.el.classList.add('tls-narrow');
-  const dock = h('div.tls-map__dock', null, h('div.tls-map__status', null, statusB, statusS), cardWrap, h('div.tls-map__actions', null, plotBtn.el, flyBtn.el, clearBtn.el));
-  el.append(canvas, top, zoom, dock);
+  // ---------------------------------------------------------------- chrome
+  const back = h('button.pm-b.pm-plate', { attrs: { type: 'button', 'aria-label': 'Back to flight' } }, icon('back', 20), 'Flight');
+  const titleSmall = h('small', { text: 'Path around' });
+  const titleMain = h('b');
+  const frameBtn = h('button.pm-title.pm-plate', { attrs: { type: 'button', 'aria-label': 'Change the frame body' } }, titleSmall, titleMain);
+  const wDown = h('button.pm-b', { attrs: { type: 'button', 'aria-label': 'Slower time' }, text: '«' });
+  const wUp = h('button.pm-b', { attrs: { type: 'button', 'aria-label': 'Faster time' }, text: '»' });
+  const wX = h('span');
+  const head = h('div.pm-head', null, back, frameBtn, h('div.pm-warp.pm-plate', null, wDown, wX, wUp));
+  onTap(back, () => host.go('flight'));
+  onTap(wDown, () => ses.warpDown());
+  onTap(wUp, () => ses.warpUp());
+  const zIn = h('button', { attrs: { type: 'button', 'aria-label': 'Zoom in' }, text: '+' });
+  const zOut = h('button', { attrs: { type: 'button', 'aria-label': 'Zoom out' }, text: '−' });
+  const zFit = h('button', { attrs: { type: 'button', 'aria-label': 'Fit the path' }, text: '◎' });
+  const zoom = h('div.pm-zoom.pm-plate', null, zIn, zOut, zFit);
 
-  // ---- state
-  let focus: Focus = 'home';
-  let logS = -14, logT = -14;
-  let panX = 0, panZ = 0;
-  let anim = false;
+  const hint = h('div.pm-hint', { text: 'Tap the path to plan a burn · tap a world or station to target it' });
+  const edTitle = h('b');
+  const del = h('button.pm-b.pm-del', { attrs: { type: 'button' }, text: 'Delete' });
+  const done = h('button.pm-b', { attrs: { type: 'button' }, text: 'Done' });
+  const rows = h('div.pm-rows');
+  const ed = h('div.pm-ed.pm-plate', { attrs: { 'data-burn-editor': '1' } }, h('div.pm-ed-head', null, edTitle, del, done), rows);
+  ed.hidden = true;
+  const foot = h('div.pm-foot', null, hint, ed);
+  const el = h('div.pm', null, canvas, head, zoom, foot);
+  el.style.display = 'none';
+
+  // ---------------------------------------------------------------- view
+  let w = 1;
+  let hgt = 1;
+  let dpr = 1;
+  /** View centre relative to the frame body (world X, Z), m, and metres per CSS pixel. */
+  let cx = 0;
+  let cz = 0;
+  let mpp = 1e4;
   let needFit = true;
-  let W = 0, H = 0, dpr = 1;
-  let insetTop = 0, insetBottom = 0, insetRight = 0;
-  let layoutAge = 99;
-  let planMsg = '';
-  let planBad = false;
-  let sel: Sel = null;
-  let actKey = '';
-  let chipsKey = '';
-  let chips: ReturnType<typeof Chips<Focus>> | null = null;
-  let cardTick: (() => void) | null = null;
+  let frameChoice: string | null = null;
+  let selected: string | null = null;
+  const sx = (x: number): number => w / 2 + (x - cx) / mpp;
+  const sy = (z: number): number => hgt / 2 + (z - cz) / mpp;
 
-  // geometry caches (per model / per trajectory version)
-  let model: SystemModel | null = null;
-  let bodyEll = new Map<string, Ell>();
-  let stEll = new Map<string, Ell>();
-  let bIndex = new Map<string, number>();
-  let bX = new Float64Array(0), bZ = new Float64Array(0);
-  let maxA = 1;
-  let trajVersion = -1;
-  let trajGame: unknown = null;
-  let geo: PatchGeo[] = [];
-  let markers: Marker[] = [];
-  const hits: Hit[] = [];
-  const tmpV = { x: 0, y: 0, z: 0 };
-  const tmpS = newState();
-  let shipX = 0, shipZ = 0, camX = 0, camZ = 0, S = 1, vcx = 0, vcy = 0;
-
-  function ensureModel(): SystemModel {
-    const m = host.game.model;
-    if (m === model) return m;
-    model = m;
-    bodyEll = new Map();
-    stEll = new Map();
-    bIndex = new Map();
-    maxA = 1;
-    m.bodies.forEach((b, i) => {
-      bIndex.set(b.id, i);
-      if (b.orbit && b.parentId) {
-        bodyEll.set(b.id, ellOf(b.orbit, b.parentId));
-        if (b.parentId === m.primary.id) maxA = Math.max(maxA, b.orbit.a * (1 + b.orbit.e));
-      }
-    });
-    for (const s of m.def.stations) stEll.set(s.id, ellOf(s.orbit, s.parentBodyId));
-    bX = new Float64Array(m.bodies.length);
-    bZ = new Float64Array(m.bodies.length);
-    trajVersion = -1;
-    needFit = true;
-    return m;
-  }
-
-  const bx = (id: string): number => bX[bIndex.get(id) ?? 0];
-  const bz = (id: string): number => bZ[bIndex.get(id) ?? 0];
-
-  function targetPos(t: TargetRef | null, time: number): { x: number; z: number } | null {
-    const m = ensureModel();
-    if (!t) return null;
-    if (t.kind === 'body' && bIndex.has(t.id)) return { x: bx(t.id), z: bz(t.id) };
-    if (t.kind === 'station' && stEll.has(t.id)) {
-      const r = m.stationAbsState(t.id, time, tmpS).r;
-      return { x: r.x, z: r.z };
-    }
+  const frameBody = (): { r: { x: number; y: number; z: number }; v: { x: number; y: number; z: number }; id: string } | null => {
+    const id = ses.prediction().frameBodyId;
+    const b = ses.bodies();
+    for (let i = 0; i < b.length; i++) if (b[i].id === id) return b[i];
     return null;
-  }
+  };
+  const playerCraft = (): ReturnType<typeof ses.craft>[number] | null => {
+    const c = ses.craft();
+    for (let i = 0; i < c.length; i++) if (c[i].isPlayer) return c[i];
+    return null;
+  };
 
-  // ---- trajectory geometry
-  function rebuildTrajectory(): void {
-    const g = host.game;
-    const m = ensureModel();
-    const tv = g.trajectory();
-    trajVersion = tv.version;
-    trajGame = g;
-    geo = [];
-    markers = [];
-    const firstNodeT = tv.nodes.length ? tv.nodes[0].t : Infinity;
-    const out = newState();
-    tv.patches.forEach((p, i) => {
-      const n = 192;
-      const pts = samplePatch(p, n);
-      const dur = Math.min(p.tEnd - p.tStart, Number.isFinite(p.period) ? p.period : Infinity);
-      const tn = 72;
-      const tp = new Float64Array(tn * 2);
-      const dt = dur / (tn - 1);
-      for (let k = 0; k < tn; k++) {
-        propagateStateTo(out, p.svStart, p.mu, k * dt);
-        tp[2 * k] = out.r.x;
-        tp[2 * k + 1] = out.r.z;
-      }
-      geo.push({ bodyId: p.bodyId, pts, n, tp, tn, t0: p.tStart, dt, planned: p.tStart >= firstNodeT - 1e-3 });
-      if (i === 0 || i === tv.patches.length - 1) {
-        const body = m.body(p.bodyId);
-        const mark = (t: number | null, radius: number, ap: boolean): void => {
-          if (t === null || !Number.isFinite(radius) || !Number.isFinite(t)) return;
-          propagateStateTo(out, p.svStart, p.mu, t - p.tStart);
-          markers.push({ bodyId: p.bodyId, x: out.r.x, z: out.r.z, ap, label: `${ap ? 'Ap' : 'Pe'} ${fmtDistance(radius - body.radius)}` });
-        };
-        if (p.period === Infinity || p.apoapsisRadius - p.periapsisRadius > 0.004 * p.periapsisRadius) {
-          mark(p.apoapsisTime, p.apoapsisRadius, true);
-          mark(p.periapsisTime, p.periapsisRadius, false);
-        }
-      }
+  const fit = (): void => {
+    const pred = ses.prediction();
+    const fb = frameBody();
+    const pc = playerCraft();
+    let ext = 0;
+    for (let i = 0; i < pred.count; i++) ext = Math.max(ext, Math.abs(pred.points[4 * i]), Math.abs(pred.points[4 * i + 2]));
+    if (fb && pc) ext = Math.max(ext, Math.abs(pc.r.x - fb.r.x), Math.abs(pc.r.z - fb.r.z));
+    if (!(ext > 0)) ext = 1e7;
+    cx = cz = 0;
+    mpp = (ext * 1.2) / Math.max(60, Math.min(w, hgt) / 2 - 56);
+    needFit = false;
+  };
+  const zoomBy = (k: number, px = w / 2, py = hgt / 2): void => {
+    const wx = cx + (px - w / 2) * mpp;
+    const wz = cz + (py - hgt / 2) * mpp;
+    mpp = Math.min(1e10, Math.max(0.05, mpp * k));
+    cx = wx - (px - w / 2) * mpp;
+    cz = wz - (py - hgt / 2) * mpp;
+  };
+  onHoldRepeat(zIn, () => zoomBy(0.8));
+  onHoldRepeat(zOut, () => zoomBy(1.25));
+  onTap(zFit, fit);
+
+  // frame body: the primary (default) -> the body it orbits -> the star -> back
+  onTap(frameBtn, () => {
+    const sys = ses.system;
+    const primary = ses.flight().primaryId;
+    const def = sys.bodies.find((b) => b.id === primary);
+    const opts: (string | null)[] = [null];
+    const parent = def && (def as { parentId?: string | null }).parentId;
+    if (parent) opts.push(parent);
+    const star = sys.bodies[0]?.id;
+    if (star && star !== primary && !opts.includes(star)) opts.push(star);
+    const tg = ses.target();
+    if (tg && tg.kind === 'body' && tg.id !== primary && !opts.includes(tg.id)) opts.push(tg.id);
+    frameChoice = opts[(opts.indexOf(frameChoice) + 1) % opts.length];
+    ses.setPredictionFrame(frameChoice);
+    needFit = true;
+  });
+
+  // ---------------------------------------------------------------- burn editor
+  const burnOf = (id: string | null): PlannedBurn | null => {
+    if (!id) return null;
+    const list = ses.burns();
+    for (let i = 0; i < list.length; i++) if (list[i].id === id) return list[i];
+    return null;
+  };
+  const stepFor = (n: number, a: number, b: number, c: number): number => (n < 8 ? a : n < 22 ? b : c);
+  const mkRow = (label: string, apply: (dir: -1 | 1, n: number) => void): { el: HTMLElement; set: (s: string) => void } => {
+    const minus = h('button', { attrs: { type: 'button', 'aria-label': `${label} less` }, text: '−' });
+    const plus = h('button', { attrs: { type: 'button', 'aria-label': `${label} more` }, text: '+' });
+    const val = h('b');
+    onHoldRepeat(minus, (n) => apply(-1, n));
+    onHoldRepeat(plus, (n) => apply(1, n));
+    return { el: h('div.pm-row', null, minus, h('div', null, h('small', { text: label }), val), plus), set: (s) => { if (val.textContent !== s) val.textContent = s; } };
+  };
+  const dvRow = (label: string, key: 'prograde' | 'normal' | 'radial'): { el: HTMLElement; set: (s: string) => void } =>
+    mkRow(label, (dir, n) => {
+      const b = burnOf(selected);
+      if (b) ses.updateBurn(b.id, { [key]: b[key] + dir * stepFor(n, 1, 5, 25) });
     });
-  }
-
-  // ---- camera
-  function fitRadius(f: Focus): number {
-    const g = host.game;
-    const m = ensureModel();
-    const pose = g.shipPose();
-    const fi = g.flightInfo();
-    const r = Math.hypot(pose.r.x, pose.r.z);
-    if (f === 'system') return maxA * 1.12;
-    if (f === 'ship') {
-      if (pose.docked) return 2.5e6;
-      const ra = Number.isFinite(fi.apoapsisAltitude) ? fi.apoapsisAltitude + m.body(pose.soiBodyId).radius : r * 4;
-      return (r + Math.min(ra, r * 6)) * 1.1;
-    }
-    if (f === 'target') {
-      const t = g.target();
-      const ti = g.targetInfo();
-      if (t && t.kind === 'body') return m.body(t.id).radius * 6;
-      if (ti) return Math.max(6e4, ti.distance * 1.5);
-      return fitRadius('home');
-    }
-    let R = Math.max(m.body(pose.soiBodyId).radius * 2.5, r);
-    if (Number.isFinite(fi.apoapsisAltitude) && !pose.docked) R = Math.max(R, fi.apoapsisAltitude + m.body(pose.soiBodyId).radius);
-    for (const s of m.def.stations) if (s.parentBodyId === pose.soiBodyId) R = Math.max(R, s.orbit.a * (1 + s.orbit.e));
-    return R * 1.22;
-  }
-  const visW = (): number => Math.max(120, W - insetRight);
-  const visH = (): number => Math.max(120, H - insetTop - insetBottom);
-  const fitLog = (f: Focus): number => Math.log2((0.47 * Math.min(visW(), visH())) / fitRadius(f));
-  const minLog = (): number => Math.log2((0.4 * Math.min(visW(), visH())) / (maxA * 1.4));
-  const clampLog = (v: number): number => Math.min(MAX_LOG, Math.max(minLog(), v));
-
-  function setFocus(f: Focus, quiet = false): void {
-    if (f === 'target' && !host.game.target()) {
-      if (!quiet) host.toast('No target set. Tap a station on the map.', 'info');
-      chips?.update({ value: focus });
+  const rPro = dvRow('Prograde', 'prograde');
+  const rNor = dvRow('Normal', 'normal');
+  const rRad = dvRow('Radial', 'radial');
+  const rTime = mkRow('Time', (dir, n) => {
+    const b = burnOf(selected);
+    if (b) ses.updateBurn(b.id, { t: Math.max(ses.time() + 5, b.t + dir * stepFor(n, 10, 60, 300)) });
+  });
+  rows.append(rPro.el, rNor.el, rRad.el, rTime.el);
+  const select = (id: string | null): void => {
+    selected = id;
+    ed.hidden = !id;
+    hint.hidden = !!id;
+  };
+  onTap(del, () => {
+    if (selected) ses.removeBurn(selected);
+    select(null);
+  });
+  onTap(done, () => select(null));
+  const sgn = (v: number): string => `${v > 0 ? '+' : v < 0 ? '−' : ''}${Math.abs(v).toFixed(0)} m/s`;
+  const updateEditor = (): void => {
+    const b = burnOf(selected);
+    if (!b) {
+      if (selected) select(null);
       return;
     }
-    focus = f;
-    // keep the picture continuous: re-express the current centre relative to the new focus, then glide to it
-    const c = focusCentre(f);
-    panX = camX - c.x;
-    panZ = camZ - c.z;
-    logT = clampLog(fitLog(f));
-    anim = true;
-    chips?.update({ value: f });
-  }
+    edTitle.textContent = `Burn · T− ${fmtDuration(Math.max(0, b.t - ses.time()))} · Δv ${fmtSpeed(Math.hypot(b.prograde, b.normal, b.radial))}`;
+    rPro.set(sgn(b.prograde));
+    rNor.set(sgn(b.normal));
+    rRad.set(sgn(b.radial));
+    rTime.set(`T− ${fmtDuration(Math.max(0, b.t - ses.time()))}`);
+  };
 
-  const fc = { x: 0, z: 0 };
-  function focusCentre(f: Focus): { x: number; z: number } {
-    const g = host.game;
-    fc.x = 0; fc.z = 0;
-    if (f === 'ship') { fc.x = shipX; fc.z = shipZ; }
-    else if (f === 'home') { const id = g.shipPose().soiBodyId; fc.x = bx(id); fc.z = bz(id); }
-    else if (f === 'target') { const p = targetPos(g.target(), g.time()); fc.x = p ? p.x : shipX; fc.z = p ? p.z : shipZ; }
-    return fc;
-  }
-
-  // ---- gestures
-  const ptrs = new Map<number, { x: number; y: number }>();
-  let moved = 0, downAt = 0;
-  let pinch: { d0: number; log0: number; ax: number; az: number } | null = null;
+  // ---------------------------------------------------------------- taps, pan, pinch
+  const tapAt = (px: number, py: number): void => {
+    const pred = ses.prediction();
+    const fb = frameBody();
+    // 1. an existing burn
+    const burns = ses.burns();
+    for (const ev of pred.events) {
+      if (ev.kind !== 'burn' || Math.hypot(sx(ev.r.x) - px, sy(ev.r.z) - py) > 26) continue;
+      let best: PlannedBurn | null = null;
+      for (const b of burns) if (!best || Math.abs(b.t - ev.t) < Math.abs(best.t - ev.t)) best = b;
+      if (best) return select(best.id);
+    }
+    // 2. a station or a world: target it
+    if (fb) {
+      let hit: { id: string; name: string } | null = null;
+      let hd = 24;
+      for (const c of ses.craft()) {
+        if (c.isPlayer) continue;
+        const d = Math.hypot(sx(c.r.x - fb.r.x) - px, sy(c.r.z - fb.r.z) - py);
+        if (d < hd) { hd = d; hit = c; }
+      }
+      for (const b of ses.bodies()) {
+        const d = Math.hypot(sx(b.r.x - fb.r.x) - px, sy(b.r.z - fb.r.z) - py) - Math.min(b.def.radius / mpp, 40);
+        if (d < Math.min(hd, 14)) { hd = d; hit = { id: b.id, name: b.def.name }; }
+      }
+      if (hit) {
+        ses.setTarget(hit.id);
+        host.toast(`Target: ${hit.name}`, 'info');
+        return;
+      }
+    }
+    // 3. the path: plan a burn at the nearest point
+    const p = pred.points;
+    let bestD = 30;
+    let bestT = NaN;
+    for (let i = 0; i + 1 < pred.count; i++) {
+      const ax = sx(p[4 * i]), ay = sy(p[4 * i + 2]), bx = sx(p[4 * i + 4]), by = sy(p[4 * i + 6]);
+      const dx = bx - ax, dy = by - ay;
+      const l2 = dx * dx + dy * dy;
+      const u = l2 > 0 ? Math.min(1, Math.max(0, ((px - ax) * dx + (py - ay) * dy) / l2)) : 0;
+      const d = Math.hypot(ax + dx * u - px, ay + dy * u - py);
+      if (d < bestD) {
+        bestD = d;
+        bestT = p[4 * i + 3] + (p[4 * i + 7] - p[4 * i + 3]) * u;
+      }
+    }
+    if (Number.isFinite(bestT)) {
+      const id = ses.addBurn(Math.max(ses.time() + 10, bestT));
+      if (id) select(id);
+      else host.toast('A burn cannot be planned there', 'warn');
+      return;
+    }
+    select(null);
+  };
+  const pts = new Map<number, { x: number; y: number; x0: number; y0: number; t0: number; moved: boolean }>();
+  let pinch = 0;
   const local = (e: PointerEvent): { x: number; y: number } => {
     const r = canvas.getBoundingClientRect();
     return { x: e.clientX - r.left, y: e.clientY - r.top };
   };
-  const startPinch = (): void => {
-    const [a, b] = [...ptrs.values()];
-    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
-    pinch = { d0: Math.max(10, Math.hypot(a.x - b.x, a.y - b.y)), log0: logS, ax: panX + (mx - vcx) / S, az: panZ + (my - vcy) / S };
-    anim = false;
-  };
   canvas.addEventListener('pointerdown', (e) => {
-    try { canvas.setPointerCapture(e.pointerId); } catch { /* not capturable */ }
-    ptrs.set(e.pointerId, local(e));
-    if (ptrs.size === 1) { moved = 0; downAt = performance.now(); }
-    if (ptrs.size === 2) { startPinch(); moved = 999; }
+    e.preventDefault();
+    try {
+      canvas.setPointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+    const q = local(e);
+    pts.set(e.pointerId, { x: q.x, y: q.y, x0: q.x, y0: q.y, t0: performance.now(), moved: false });
+    pinch = 0;
   });
   canvas.addEventListener('pointermove', (e) => {
-    const p = ptrs.get(e.pointerId);
+    const p = pts.get(e.pointerId);
     if (!p) return;
     const q = local(e);
-    if (ptrs.size === 1) {
-      const dx = q.x - p.x, dy = q.y - p.y;
-      moved += Math.abs(dx) + Math.abs(dy);
-      if (moved > 6) { panX -= dx / S; panZ -= dy / S; anim = false; }
-    }
-    p.x = q.x; p.y = q.y;
-    if (ptrs.size === 2 && pinch) {
-      const [a, b] = [...ptrs.values()];
-      const d = Math.max(10, Math.hypot(a.x - b.x, a.y - b.y));
-      logS = logT = clampLog(pinch.log0 + Math.log2(d / pinch.d0));
-      const s = Math.pow(2, logS);
-      panX = pinch.ax - ((a.x + b.x) / 2 - vcx) / s;
-      panZ = pinch.az - ((a.y + b.y) / 2 - vcy) / s;
+    if (pts.size === 1) {
+      if (!p.moved && Math.hypot(q.x - p.x0, q.y - p.y0) > 8) p.moved = true;
+      if (p.moved) {
+        cx -= (q.x - p.x) * mpp;
+        cz -= (q.y - p.y) * mpp;
+      }
+      p.x = q.x;
+      p.y = q.y;
+    } else if (pts.size === 2) {
+      p.x = q.x;
+      p.y = q.y;
+      p.moved = true;
+      const [a, b] = [...pts.values()];
+      const d = Math.hypot(a.x - b.x, a.y - b.y);
+      if (pinch > 0 && d > 0) zoomBy(pinch / d, (a.x + b.x) / 2, (a.y + b.y) / 2);
+      pinch = d;
     }
   });
   const up = (e: PointerEvent): void => {
-    const p = ptrs.get(e.pointerId);
+    const p = pts.get(e.pointerId);
     if (!p) return;
-    ptrs.delete(e.pointerId);
-    pinch = null;
-    if (ptrs.size === 0 && e.type === 'pointerup' && moved <= 8 && performance.now() - downAt < 600) tap(p.x, p.y);
+    pts.delete(e.pointerId);
+    pinch = 0;
+    for (const o of pts.values()) o.moved = true;
+    if (e.type === 'pointerup' && !p.moved && performance.now() - p.t0 < 500) tapAt(p.x, p.y);
   };
   canvas.addEventListener('pointerup', up);
   canvas.addEventListener('pointercancel', up);
-  canvas.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
-  canvas.addEventListener('wheel', (e) => { e.preventDefault(); logS = logT = clampLog(logS - e.deltaY * 0.002); }, { passive: false });
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const r = canvas.getBoundingClientRect();
+    zoomBy(e.deltaY > 0 ? 1.15 : 0.87, e.clientX - r.left, e.clientY - r.top);
+  }, { passive: false });
 
-  function tap(x: number, y: number): void {
-    let best: Hit | null = null;
-    let bd = Infinity;
-    for (const hit of hits) {
-      const d = Math.hypot(hit.x - x, hit.y - y) - (hit.kind === 'node' ? 14 : hit.kind === 'station' ? 6 : 0);
-      if (d < hit.r && d < bd) { best = hit; bd = d; }
+  // ---------------------------------------------------------------- drawing
+  const line = (c: CanvasRenderingContext2D, p: Float64Array, n: number): void => {
+    c.beginPath();
+    for (let i = 0; i < n; i++) {
+      const x = sx(p[4 * i]);
+      const y = sy(p[4 * i + 2]);
+      if (i === 0) c.moveTo(x, y);
+      else c.lineTo(x, y);
     }
-    if (best) return select({ kind: best.kind, id: best.id });
-    // the trajectory: add a node at the nearest point
-    const g = host.game;
-    if (!g.shipPose().docked) {
-      let bt = -1, btd = 26;
-      for (const p of geo) {
-        const ox = bx(p.bodyId), oz = bz(p.bodyId);
-        for (let k = 1; k < p.tn; k++) {
-          const d = Math.hypot(vcx + (ox + p.tp[2 * k] - camX) * S - x, vcy + (oz + p.tp[2 * k + 1] - camZ) * S - y);
-          if (d < btd) { btd = d; bt = p.t0 + k * p.dt; }
-        }
-      }
-      if (bt > g.time() + 5) {
-        const r = g.addNode(bt);
-        if (r.ok && r.id) { host.sfx('tick'); return select({ kind: 'node', id: r.id }); }
-        if (!r.ok) host.toast(r.reason, 'warn');
-        return;
-      }
-    }
-    select(null);
-  }
-
-  // ---- bottom card
-  function select(s: Sel): void {
-    sel = s;
-    cardTick = null;
-    cardWrap.replaceChildren();
-    if (!s) return;
-    const g = host.game;
-    const m = ensureModel();
-    const close = sq('close', 'Close');
-    onTap(close, () => select(null));
-    if (s.kind === 'node') {
-      const node = g.nodes().find((n) => n.id === s.id);
-      if (!node) { sel = null; return; }
-      const nameEl = h('div.tls-card__name');
-      const subEl = h('div.tls-card__sub.tl-num');
-      const tEl = h('span.tl-num');
-      const mk = (label: string, key: 'prograde' | 'normal' | 'radial'): HTMLElement => h('div', null, h('div.tl-label', { text: label }),
-        Stepper({ value: Math.round(node.dv[key]), min: -9000, max: 9000, step: 5, unit: 'm/s', block: true, compact: true, ariaLabel: label,
-          format: (v) => `${v > 0 ? '+' : v < 0 ? '−' : ''}${Math.abs(v)}`,
-          onChange: (v) => { g.updateNode(s.id, { dv: { [key]: v } }); } }).el);
-      const earlier = h('button', { attrs: { type: 'button', 'aria-label': 'Earlier' } }, icon('chevronLeft', 20));
-      const later = h('button', { attrs: { type: 'button', 'aria-label': 'Later' } }, icon('chevronRight', 20));
-      const shift = (dir: number, n: number): void => {
-        const cur = g.nodes().find((x) => x.id === s.id);
-        if (cur) g.updateNode(s.id, { t: Math.max(g.time() + 5, cur.t + dir * (n > 12 ? 120 : 20)) });
-      };
-      onHoldRepeat(earlier, (n) => shift(-1, n));
-      onHoldRepeat(later, (n) => shift(1, n));
-      const del = Button({ label: 'Delete', variant: 'danger', size: 'sm', onTap: () => { g.removeNode(s.id); select(null); } });
-      const card = h('div.tls-card', { style: { '--tl-c': C.ember } },
-        h('div.tls-card__head', null, h('div', null, nameEl, subEl), del.el, close),
-        h('div.tls-node-grid', null, mk('Prograde', 'prograde'), mk('Normal', 'normal'), mk('Radial', 'radial'),
-          h('div', null, h('div.tl-label', { text: 'Burn time' }), h('div.tls-node-time', null, earlier, tEl, later))));
-      cardWrap.appendChild(card);
-      cardTick = () => {
-        const list = g.nodes();
-        const i = list.findIndex((n) => n.id === s.id);
-        if (i < 0) return select(null);
-        const view = g.trajectory().nodes.find((n) => n.id === s.id);
-        put(nameEl, `Node ${i + 1} · Δv ${fmtSpeed(view ? view.dvMagnitude : Math.hypot(list[i].dv.prograde, list[i].dv.normal, list[i].dv.radial))}`);
-        put(subEl, view ? `Burn ${fmtDuration(view.burnDuration)}${view.affordable ? '' : ' · not enough propellant'}${view.reached ? '' : ' · never reached'}` : '');
-        subEl.style.color = view && (!view.affordable || !view.reached) ? C.red : '';
-        put(tEl, `T− ${fmtDuration(list[i].t - g.time())}`);
-      };
-      cardTick();
-      return;
-    }
-    const ref: TargetRef = { kind: s.kind, id: s.id };
-    const isStation = s.kind === 'station';
-    const st = isStation ? m.def.stations.find((x) => x.id === s.id) : null;
-    const body = !isStation && m.hasBody(s.id) ? m.body(s.id) : null;
-    if (!st && !body) { sel = null; return; }
-    const distEl = h('div.tls-card__dist.tl-num');
-    const btn = Button({ label: 'Set target', icon: 'target', variant: 'ion', block: true, onTap: () => {
-      const cur = g.target();
-      const on = !!cur && cur.kind === ref.kind && cur.id === ref.id;
-      const r = g.setTarget(on ? null : ref);
-      if (!r.ok) host.toast(r.reason, 'bad');
-      else if (!on) host.sfx('confirm');
-      planMsg = '';
-    } });
-    const focusBtn = Button({ label: 'Centre', icon: 'search', variant: 'secondary', onTap: () => {
-      const p = targetPos(ref, g.time());
-      if (!p) return;
-      const c = focusCentre(focus);
-      panX = p.x - c.x; panZ = p.z - c.z;
-    } });
-    cardWrap.appendChild(h('div.tls-card', { style: { '--tl-c': isStation ? C.ion : C.text } },
-      h('div.tls-card__head', null,
-        h('div', null, h('div.tls-card__name', { text: st ? st.name : body!.name }),
-          h('div.tls-card__sub', { text: st ? `${stationKindLabel(st.visualId)} · orbits ${m.body(st.parentBodyId).name} at ${fmtDistance(st.orbit.a - m.body(st.parentBodyId).radius)}` : `${bodyClassLabel(body!.cls, body!.kind)} · radius ${fmtDistance(body!.radius)}` })),
-        distEl, close),
-      h('div.tl-row', null, btn.el, focusBtn.el)));
-    let last = '';
-    cardTick = () => {
-      const p = targetPos(ref, g.time());
-      if (p) put(distEl, fmtDistance(Math.hypot(p.x - shipX, p.z - shipZ)));
-      const cur = g.target();
-      const on = !!cur && cur.kind === ref.kind && cur.id === ref.id;
-      const key = on ? 'on' : 'off';
-      if (key !== last) { last = key; btn.update({ label: on ? 'Target set · clear' : 'Set target', icon: on ? 'check' : 'target' }); }
-    };
-    cardTick();
-  }
-
-  // ---- actions
-  function doPlot(): void {
-    const g = host.game;
-    if (!g.target()) { planMsg = 'Set a target first: tap a station on the map.'; planBad = true; return; }
-    const r = g.plan('toTarget');
-    planBad = !r.ok;
-    planMsg = r.ok ? [r.summary ?? 'Course plotted.', ...(r.warnings ?? [])].join(' · ') : r.reason;
-    host.sfx(r.ok ? 'confirm' : 'deny');
-    if (r.ok) { select(null); setFocus('home', true); }
-  }
-  function doFly(): void {
-    const g = host.game;
-    const ap = g.autopilot();
-    if (ap.engaged) { g.disengageAutopilot(); host.toast('Flight computer disengaged. You have the ship.', 'info'); return; }
-    const t = g.target();
-    let r;
-    if (g.nodes().length > 0) r = g.engageAutopilot({ kind: 'flyPlan' });
-    else if (t && t.kind === 'station') r = g.engageAutopilot({ kind: 'goToStation', stationId: t.id });
-    else { planMsg = 'Set a station as target first: tap one on the map.'; planBad = true; return; }
-    planBad = !r.ok;
-    planMsg = r.ok ? '' : r.reason;
-    host.sfx(r.ok ? 'confirm' : 'deny');
-  }
-  onTap(backBtn, () => host.go(host.game.dockedStation() ? 'station' : 'flight'));
-  onTap(warpDown, () => { host.game.warpDown(); });
-  onTap(warpUp, () => { const r = host.game.warpUp(); if (!r.ok) host.toast(r.reason, 'warn'); });
-  onHoldRepeat(zoomIn, () => { logT = clampLog(logT + 0.5); anim = true; });
-  onHoldRepeat(zoomOut, () => { logT = clampLog(logT - 0.5); anim = true; });
-
-  // ---- drawing
-  const sx = (x: number): number => vcx + (x - camX) * S;
-  const sy = (z: number): number => vcy + (z - camZ) * S;
-  function glow(color: string, width: number, alpha = 1, dash: number[] | null = null): void {
-    ctx.setLineDash(dash ?? []);
-    ctx.strokeStyle = color;
-    ctx.globalAlpha = alpha * 0.16;
-    ctx.lineWidth = width + 3.5;
-    ctx.stroke();
-    ctx.globalAlpha = alpha;
-    ctx.lineWidth = width;
-    ctx.stroke();
-    ctx.globalAlpha = 1;
-    ctx.setLineDash([]);
-  }
-  function ellPath(e: Ell, ox: number, oz: number): boolean {
-    const R = e.a * S;
-    if (R < 2) return false;
-    let e0 = 0, e1 = TAU, n = 128;
-    if (R > 2200) {
-      // far larger than the screen: sample only the stretch near the view
-      const vx = camX - ox, vz = camZ - oz;
-      const u = vx * e.px + vz * e.pz + e.a * e.e, v = vx * e.qx + vz * e.qz;
-      const viewR = Math.hypot(W, H) * 0.75;
-      if (Math.abs(Math.hypot(u, v) * S - R) > viewR * 1.6 + R * e.e) return false;
-      const ec = Math.atan2(v / e.b, u / e.a);
-      const w = Math.min(Math.PI, (2.4 * viewR) / R);
-      e0 = ec - w; e1 = ec + w; n = 96;
-    }
-    ctx.beginPath();
-    for (let k = 0; k <= n; k++) {
-      const E = e0 + ((e1 - e0) * k) / n;
-      const c = e.a * (Math.cos(E) - e.e), s = e.b * Math.sin(E);
-      const X = sx(ox + c * e.px + s * e.qx), Y = sy(oz + c * e.pz + s * e.qz);
-      if (k === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
-    }
-    return true;
-  }
-  function label(text: string, x: number, y: number, color: string, align: CanvasTextAlign = 'left'): void {
-    ctx.font = FONT;
-    ctx.textAlign = align;
-    ctx.lineWidth = 3;
-    ctx.strokeStyle = 'rgba(5, 7, 11, 0.85)';
-    ctx.strokeText(text, x, y);
-    ctx.fillStyle = color;
-    ctx.fillText(text, x, y);
-  }
-  function disc(x: number, y: number, r: number, cls: string, sun: number): void {
-    const [lit, dark] = BODY_COLORS[cls] ?? BODY_COLORS.rocky;
-    if (cls === 'star') {
-      const gr = Math.max(r * 3.2, 22);
-      const g = ctx.createRadialGradient(x, y, 0, x, y, gr);
-      g.addColorStop(0, 'rgba(255, 190, 140, 0.9)');
-      g.addColorStop(Math.min(0.9, r / gr), 'rgba(255, 140, 90, 0.55)');
-      g.addColorStop(1, 'rgba(255, 110, 60, 0)');
-      ctx.fillStyle = g;
-      ctx.beginPath(); ctx.arc(x, y, gr, 0, TAU); ctx.fill();
-      ctx.fillStyle = '#FFE3C4';
-      ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fill();
-      return;
-    }
-    const cx = Math.cos(sun), cy = Math.sin(sun);
-    const g = ctx.createLinearGradient(x + cx * r, y + cy * r, x - cx * r, y - cy * r);
-    g.addColorStop(0, lit);
-    g.addColorStop(0.46, lit);
-    g.addColorStop(0.6, dark);
-    g.addColorStop(1, '#04060A');
-    ctx.fillStyle = g;
-    ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fill();
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.28)';
-    ctx.lineWidth = 1;
-    ctx.stroke();
-    if (r > 5) { // thin atmosphere / rim glow on the lit side
-      ctx.strokeStyle = lit; ctx.globalAlpha = 0.35; ctx.lineWidth = 2.5;
-      ctx.beginPath(); ctx.arc(x, y, r + 2.5, sun - 1.3, sun + 1.3); ctx.stroke();
-      ctx.globalAlpha = 1;
-    }
-  }
-
-  function draw(): void {
-    const g = host.game;
-    const m = ensureModel();
-    const t = g.time();
-    const pose = g.shipPose();
-    const target = g.target();
-    const tv = g.trajectory();
-    if (tv.version !== trajVersion || trajGame !== g) rebuildTrajectory();
-
-    m.bodies.forEach((b, i) => { const p = m.bodyAbsPosition(b.id, t, tmpV); bX[i] = p.x; bZ[i] = p.z; });
-    shipX = bx(pose.soiBodyId) + pose.r.x;
-    shipZ = bz(pose.soiBodyId) + pose.r.z;
-    const c = focusCentre(focus);
-    camX = c.x + panX; camZ = c.z + panZ;
-    S = Math.pow(2, logS);
-    vcx = (W - insetRight) / 2;
-    vcy = insetTop + (H - insetTop - insetBottom) / 2;
-
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, W, H);
-    ctx.lineJoin = 'round';
-    hits.length = 0;
-
-    // body orbits
-    for (const b of m.bodies) {
-      const e = bodyEll.get(b.id);
-      if (!e) continue;
-      const isT = !!target && target.kind === 'body' && target.id === b.id;
-      if (e.a * S < 10 && !isT) continue;
-      if (ellPath(e, bx(e.parentId), bz(e.parentId))) glow(isT ? C.green : '#9FB4C8', isT ? 1.4 : 1, isT ? 0.9 : b.kind === 'moon' ? 0.28 : 0.34);
-    }
-    // sphere of influence of the world the ship is at
-    const home = m.body(pose.soiBodyId);
-    if (Number.isFinite(home.soi) && home.soi * S > 30 && home.soi * S < 6000) {
-      ctx.beginPath(); ctx.arc(sx(bx(home.id)), sy(bz(home.id)), home.soi * S, 0, TAU);
-      ctx.setLineDash([2, 6]); ctx.strokeStyle = 'rgba(143, 163, 184, 0.35)'; ctx.lineWidth = 1; ctx.stroke(); ctx.setLineDash([]);
-    }
-    // station orbits
-    for (const s of m.def.stations) {
-      const e = stEll.get(s.id)!;
-      const isT = !!target && target.kind === 'station' && target.id === s.id;
-      if (e.a * S < 12) continue;
-      if (ellPath(e, bx(e.parentId), bz(e.parentId))) glow(isT ? C.green : C.ion, isT ? 1.5 : 1, isT ? 0.95 : 0.3, isT ? null : [1, 5]);
-    }
-    // the ship's path: this orbit solid, legs after a node dashed
-    if (!pose.docked) {
-      for (const p of geo) {
-        const ox = bx(p.bodyId), oz = bz(p.bodyId);
-        ctx.beginPath();
-        for (let k = 0; k < p.n; k++) {
-          const X = sx(ox + p.pts[3 * k]), Y = sy(oz + p.pts[3 * k + 2]);
-          if (k === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
-        }
-        glow(p.planned ? C.ember : C.ion, 1.6, p.planned ? 0.95 : 0.9, p.planned ? [7, 5] : null);
-      }
-      for (const k of markers) {
-        const X = sx(bx(k.bodyId) + k.x), Y = sy(bz(k.bodyId) + k.z);
-        ctx.fillStyle = k.ap ? C.ion : C.ember;
-        ctx.beginPath();
-        if (k.ap) { ctx.moveTo(X, Y - 6); ctx.lineTo(X + 5, Y + 3); ctx.lineTo(X - 5, Y + 3); } else { ctx.moveTo(X, Y + 6); ctx.lineTo(X + 5, Y - 3); ctx.lineTo(X - 5, Y - 3); }
-        ctx.closePath(); ctx.fill();
-        label(k.label, X + 9, Y + 4, k.ap ? C.ion : C.ember);
-      }
-    }
-    // bodies
-    for (const b of m.bodies) {
-      const e = bodyEll.get(b.id);
-      const isT = !!target && target.kind === 'body' && target.id === b.id;
-      if (e && e.a * S < 9 && !isT) continue;
-      const X = sx(bx(b.id)), Y = sy(bz(b.id));
-      if (X < -4000 || X > W + 4000 || Y < -4000 || Y > H + 4000) continue;
-      const r = Math.max(b.kind === 'star' ? 6 : b.kind === 'moon' ? 2.5 : 3.5, b.radius * S);
-      disc(X, Y, r, b.cls, Math.atan2(-bz(b.id), -bx(b.id)));
-      const showLabel = !e || e.a * S > 30 || isT || b.id === pose.soiBodyId;
-      if (showLabel && r < 400) label(b.name.toUpperCase(), X, r > 40 ? Y + 4 : Y + r + 14, isT ? C.green : 'rgba(232, 238, 245, 0.85)', 'center');
-      if (isT) reticle(X, Y, r + 6, C.green);
-      hits.push({ kind: 'body', id: b.id, x: X, y: Y, r: Math.max(r, 20) });
-    }
-    // stations
-    for (const s of m.def.stations) {
-      const e = stEll.get(s.id)!;
-      const isT = !!target && target.kind === 'station' && target.id === s.id;
-      const isSel = !!sel && sel.kind === 'station' && sel.id === s.id;
-      if (e.a * S < 10 && !isT) continue;
-      const p = m.stationAbsState(s.id, t, tmpS).r;
-      const X = sx(p.x), Y = sy(p.z);
-      const col = isT ? C.green : C.ion;
-      ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.fillStyle = '#05070B';
-      ctx.beginPath(); ctx.moveTo(X, Y - 5.5); ctx.lineTo(X + 5.5, Y); ctx.lineTo(X, Y + 5.5); ctx.lineTo(X - 5.5, Y); ctx.closePath(); ctx.fill(); ctx.stroke();
-      ctx.fillStyle = col; ctx.fillRect(X - 1, Y - 1, 2, 2);
-      if (isT) reticle(X, Y, 11, C.green);
-      if (isSel && !isT) reticle(X, Y, 11, C.text);
-      if (e.a * S > 44 || isT || isSel) label(s.name.toUpperCase(), X + 12, Y - 8, col);
-      hits.push({ kind: 'station', id: s.id, x: X, y: Y, r: 22 });
-    }
-    // manoeuvre nodes
-    tv.nodes.forEach((n, i) => {
-      if (!n.reached) return;
-      const X = sx(bx(n.bodyId) + n.r.x), Y = sy(bz(n.bodyId) + n.r.z);
-      const on = !!sel && sel.kind === 'node' && sel.id === n.id;
-      ctx.strokeStyle = n.affordable ? C.ember : C.red; ctx.lineWidth = on ? 2.2 : 1.5; ctx.fillStyle = 'rgba(5, 7, 11, 0.9)';
-      ctx.beginPath(); ctx.arc(X, Y, on ? 9 : 7, 0, TAU); ctx.fill(); ctx.stroke();
-      ctx.fillStyle = n.affordable ? C.ember : C.red;
-      ctx.font = FONT; ctx.textAlign = 'center'; ctx.fillText(String(i + 1), X, Y + 4);
-      label(`ΔV ${fmtSpeed(n.dvMagnitude).toUpperCase()}`, X + 13, Y + 16, C.ember);
-      hits.push({ kind: 'node', id: n.id, x: X, y: Y, r: 26 });
-    });
-    // the ship
-    {
-      const X = sx(shipX), Y = sy(shipZ);
-      if (pose.docked) {
-        ctx.strokeStyle = C.text; ctx.lineWidth = 1.2;
-        ctx.beginPath(); ctx.arc(X, Y, 10, 0, TAU); ctx.stroke();
-        label('YOU · DOCKED', X + 14, Y + 16, C.text);
-      } else {
-        const a = Math.atan2(pose.v.z, pose.v.x);
-        ctx.save(); ctx.translate(X, Y); ctx.rotate(a);
-        ctx.fillStyle = 'rgba(111, 227, 255, 0.18)';
-        ctx.beginPath(); ctx.arc(0, 0, 12, 0, TAU); ctx.fill();
-        ctx.fillStyle = '#FFFFFF'; ctx.strokeStyle = C.ion; ctx.lineWidth = 1.5;
-        ctx.beginPath(); ctx.moveTo(9, 0); ctx.lineTo(-6, 5.5); ctx.lineTo(-3, 0); ctx.lineTo(-6, -5.5); ctx.closePath(); ctx.fill(); ctx.stroke();
-        ctx.restore();
-      }
-    }
-    // scale bar
-    {
-      const metres = 90 / S;
-      const p10 = Math.pow(10, Math.floor(Math.log10(metres)));
-      const nice = (metres / p10 >= 5 ? 5 : metres / p10 >= 2 ? 2 : 1) * p10;
-      const x0 = 14 + (insetLeft || 0), y0 = H - insetBottom - 10, w = nice * S;
-      ctx.strokeStyle = 'rgba(232, 238, 245, 0.6)'; ctx.lineWidth = 1;
-      ctx.beginPath(); ctx.moveTo(x0, y0 - 5); ctx.lineTo(x0, y0); ctx.lineTo(x0 + w, y0); ctx.lineTo(x0 + w, y0 - 5); ctx.stroke();
-      label(fmtDistance(nice).toUpperCase(), x0 + w + 8, y0 + 1, 'rgba(232, 238, 245, 0.7)');
-    }
-  }
-  let insetLeft = 0;
-  function reticle(x: number, y: number, r: number, color: string): void {
-    const k = r * 0.45;
-    ctx.strokeStyle = color; ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    for (const [dx, dy] of [[-1, -1], [1, -1], [1, 1], [-1, 1]] as const) {
-      ctx.moveTo(x + dx * r, y + dy * (r - k)); ctx.lineTo(x + dx * r, y + dy * r); ctx.lineTo(x + dx * (r - k), y + dy * r);
-    }
-    ctx.stroke();
-  }
-
-  // ---- per-frame chrome
-  function chrome(): void {
-    const g = host.game;
-    const m = ensureModel();
-    const pose = g.shipPose();
-    const fi = g.flightInfo();
-    const ap = g.autopilot();
-    const w = g.warp();
-    const t = g.target();
-    const ti = g.targetInfo();
-    const nodes = g.nodes().length;
-    put(titleB, `${m.def.name} system`);
-    put(titleS, fmtDate(g.time()));
-    const wv = `×${w.level.toLocaleString('en-US')}`;
-    if (warpV.dataset.v !== wv) { warpV.dataset.v = wv; warpV.replaceChildren(wv, h('small', { text: 'Time' })); }
-    put(limit, w.limitReason && w.requested >= w.maxAllowed ? `Warp limit ×${w.maxAllowed.toLocaleString('en-US')}: ${w.limitReason}` : '');
-
-    const homeName = m.body(pose.soiBodyId).name;
-    const ck = `${homeName}|${ti ? ti.name : ''}`;
-    if (ck !== chipsKey) {
-      chipsKey = ck;
-      chips?.destroy();
-      chips = Chips<Focus>({
-        items: [{ id: 'ship', label: 'Ship' }, { id: 'home', label: homeName }, { id: 'target', label: ti ? ti.name : 'Target' }, { id: 'system', label: 'System' }],
-        value: focus, clearable: false, tone: 'ion', onChange: (id) => { if (id) setFocus(id); },
-      });
-      chipsWrap.replaceChildren(chips.el);
-    }
-
-    // status
-    let line = planMsg;
-    let color = planBad ? C.red : C.ember;
-    if (ap.engaged) { line = ap.status || 'Flight computer engaged.'; color = C.green; }
-    else if (!line && ap.failed) { line = `Flight computer: ${ap.failed}`; color = C.red; }
-    else if (!line) {
-      color = C.dim;
-      line = pose.docked ? 'Docked. Launch from the station to fly.' : !t ? 'Tap a station to choose a target.' : nodes ? 'Course plotted. Fly it by hand, or let the flight computer.' : 'Plot a course, or hand the trip to the flight computer.';
-    }
-    put(statusB, line);
-    statusB.style.color = color;
-    let facts = pose.docked ? '' : `Ap ${fmtDistance(fi.apoapsisAltitude)} · Pe ${fmtDistance(fi.periapsisAltitude)} · Δv ${fmtSpeed(fi.deltaV)}`;
-    if (ti) facts += `${facts ? ' · ' : ''}${ti.name} ${fmtDistance(ti.distance)}`;
-    const ca = g.trajectory().closestApproach;
-    if (ca && !pose.docked && ca.t > g.time()) facts += ` · closest ${fmtDistance(ca.distance)} in ${fmtDuration(ca.t - g.time())}`;
-    put(statusS, facts);
-
-    const key = `${ap.engaged}|${nodes > 0}|${!!t}|${pose.docked}`;
-    if (key !== actKey) {
-      actKey = key;
-      flyBtn.update({ label: ap.engaged ? 'Disengage' : nodes > 0 ? 'Fly the plan' : 'Go to target' });
-      flyBtn.el.classList.toggle('tl-btn--danger', ap.engaged);
-      flyBtn.el.classList.toggle('tl-btn--primary', !ap.engaged);
-      plotBtn.update({ disabled: ap.engaged });
-      clearBtn.el.style.display = nodes > 0 && !ap.engaged ? '' : 'none';
-    }
-    cardTick?.();
-  }
-
-  function layout(): void {
-    const w = el.clientWidth, hh = el.clientHeight;
+    c.stroke();
+  };
+  const label = (c: CanvasRenderingContext2D, s: string, x: number, y: number, color: string): void => {
+    c.font = '600 11px -apple-system, system-ui, sans-serif';
+    c.lineWidth = 3;
+    c.strokeStyle = 'rgba(5,7,11,.85)';
+    c.strokeText(s, x, y);
+    c.fillStyle = color;
+    c.fillText(s, x, y);
+  };
+  const draw = (): void => {
+    if (!ctx) return;
+    const cw = Math.max(1, el.clientWidth);
+    const ch = Math.max(1, el.clientHeight);
     const d = Math.min(window.devicePixelRatio || 1, 2);
-    if (w !== W || hh !== H || d !== dpr) {
-      W = w; H = hh; dpr = d;
-      canvas.width = Math.max(1, Math.round(W * dpr));
-      canvas.height = Math.max(1, Math.round(H * dpr));
-      layoutAge = 99;
+    if (cw !== w || ch !== hgt || d !== dpr) {
+      w = cw;
+      hgt = ch;
+      dpr = d;
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(hgt * dpr);
+      needFit = needFit || mpp === 1e4;
     }
-    if (++layoutAge < 12) return;
-    layoutAge = 0;
-    const side = dock.offsetWidth < W * 0.7;
-    insetTop = top.offsetHeight;
-    insetRight = side ? dock.offsetWidth : 0;
-    insetBottom = side ? 0 : dock.offsetHeight;
-    insetLeft = parseFloat(getComputedStyle(top).paddingLeft) - 12 || 0;
-    zoom.style.top = `${insetTop + 10}px`;
-    zoom.style.right = side ? `${insetRight + 4}px` : '';
-  }
+    const pred = ses.prediction();
+    const fb = frameBody();
+    if (needFit) fit();
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, hgt);
+    if (!fb) return;
+    ctx.lineJoin = 'round';
+    const tgt = ses.target();
 
+    // worlds
+    for (const b of ses.bodies()) {
+      const x = sx(b.r.x - fb.r.x);
+      const y = sy(b.r.z - fb.r.z);
+      const rpx = b.def.radius / mpp;
+      if (x < -rpx - 80 || x > w + rpx + 80 || y < -rpx - 40 || y > hgt + rpx + 40) continue;
+      const star = b.def === ses.system.bodies[0];
+      const atm = b.def.atmosphere;
+      if (atm && rpx > 3) {
+        ctx.beginPath();
+        ctx.arc(x, y, (b.def.radius + atm.height) / mpp, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(111,227,255,.10)';
+        ctx.fill();
+      }
+      ctx.beginPath();
+      ctx.arc(x, y, Math.max(2.5, rpx), 0, Math.PI * 2);
+      ctx.fillStyle = star ? '#ffb46a' : '#27303c';
+      ctx.fill();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = tgt && tgt.id === b.id ? '#6fe3ff' : star ? '#ffd9a8' : '#5b6b7d';
+      ctx.stroke();
+      ctx.textAlign = 'center';
+      label(ctx, b.def.name, x, rpx > 40 ? y + 4 : y + Math.max(2.5, rpx) + 14, tgt && tgt.id === b.id ? '#6fe3ff' : '#9fb0c2');
+    }
+
+    // the target's path, then ours
+    if (pred.targetCount > 1) {
+      ctx.setLineDash([5, 5]);
+      ctx.lineWidth = 1.25;
+      ctx.strokeStyle = 'rgba(111,227,255,.7)';
+      line(ctx, pred.targetPoints, pred.targetCount);
+      ctx.setLineDash([]);
+    }
+    if (pred.count > 1) {
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#e9f2fb';
+      line(ctx, pred.points, pred.count);
+    }
+
+    // events
+    const sel = burnOf(selected);
+    ctx.textAlign = 'left';
+    for (const ev of pred.events) {
+      const x = sx(ev.r.x);
+      const y = sy(ev.r.z);
+      if (x < -20 || x > w + 20 || y < -20 || y > hgt + 20) continue;
+      const burn = ev.kind === 'burn';
+      const bad = ev.kind === 'impact' || ev.kind === 'atmosphere';
+      const color = burn ? '#ffb454' : bad ? '#ff5a4d' : ev.kind === 'closestApproach' ? '#6fe3ff' : '#8fe3a5';
+      const on = burn && sel && Math.abs(sel.t - ev.t) < 1;
+      ctx.beginPath();
+      ctx.arc(x, y, burn ? (on ? 9 : 6) : 4, 0, Math.PI * 2);
+      ctx.lineWidth = on ? 3 : 2;
+      ctx.strokeStyle = color;
+      ctx.stroke();
+      if (bad) {
+        ctx.beginPath();
+        ctx.moveTo(x - 4, y - 4);
+        ctx.lineTo(x + 4, y + 4);
+        ctx.moveTo(x + 4, y - 4);
+        ctx.lineTo(x - 4, y + 4);
+        ctx.stroke();
+      }
+      const val = burn ? `Δv ${fmtSpeed(ev.value)}` : ev.kind === 'impact' ? '' : fmtDistance(ev.value);
+      label(ctx, `${EVENT_LABEL[ev.kind]} ${val}`.trim(), x + 10, y - 8, color);
+    }
+
+    // craft: stations as diamonds, the ship as an arrow along its velocity
+    for (const c of ses.craft()) {
+      const x = sx(c.r.x - fb.r.x);
+      const y = sy(c.r.z - fb.r.z);
+      if (x < -40 || x > w + 40 || y < -40 || y > hgt + 40) continue;
+      if (c.isPlayer) {
+        const a = Math.atan2(c.v.z - fb.v.z, c.v.x - fb.v.x);
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.rotate(a);
+        ctx.beginPath();
+        ctx.moveTo(9, 0);
+        ctx.lineTo(-6, 5.5);
+        ctx.lineTo(-3, 0);
+        ctx.lineTo(-6, -5.5);
+        ctx.closePath();
+        ctx.fillStyle = '#ffffff';
+        ctx.fill();
+        ctx.restore();
+      } else {
+        const on = !!tgt && tgt.id === c.id;
+        ctx.beginPath();
+        ctx.moveTo(x, y - 5.5);
+        ctx.lineTo(x + 5.5, y);
+        ctx.lineTo(x, y + 5.5);
+        ctx.lineTo(x - 5.5, y);
+        ctx.closePath();
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = on ? '#6fe3ff' : '#9fb0c2';
+        ctx.stroke();
+        ctx.textAlign = 'left';
+        label(ctx, c.name, x + 9, y + 14, on ? '#6fe3ff' : '#9fb0c2');
+      }
+    }
+
+    // scale bar
+    const target = mpp * 90;
+    const pow = Math.pow(10, Math.floor(Math.log10(target)));
+    const nice = (target / pow >= 5 ? 5 : target / pow >= 2 ? 2 : 1) * pow;
+    const bx = Math.max(16, parseFloat(getComputedStyle(el).getPropertyValue('--gx-l')) || 16);
+    const by = Math.min(hgt / 2, 150);
+    ctx.beginPath();
+    ctx.moveTo(bx, by - 4);
+    ctx.lineTo(bx, by);
+    ctx.lineTo(bx + nice / mpp, by);
+    ctx.lineTo(bx + nice / mpp, by - 4);
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = '#7d8ea0';
+    ctx.stroke();
+    ctx.textAlign = 'left';
+    label(ctx, fmtDistance(nice), bx, by + 14, '#7d8ea0');
+  };
+
+  let acc = 1;
   return {
     el,
     show() {
-      el.hidden = false;
-      layoutAge = 99;
+      if (!el.isConnected) host.root.appendChild(el);
+      el.style.display = '';
       needFit = true;
-      focus = 'home';
-      panX = panZ = 0;
-      actKey = '';
-      this.update(0);
+      acc = 1;
     },
-    hide() { el.hidden = true; ptrs.clear(); pinch = null; },
-    update(dt: number) {
-      if (el.hidden) return;
-      ensureModel();
-      layout();
-      if (W < 2 || H < 2) return;
-      chrome();
-      if (needFit) { needFit = false; logS = logT = clampLog(fitLog(focus)); anim = false; chips?.update({ value: focus }); }
-      if (anim && !pinch) {
-        const k = 1 - Math.exp(-Math.min(dt, 0.1) * 9);
-        logS += (logT - logS) * k;
-        panX -= panX * k; panZ -= panZ * k;
-        if (Math.abs(logT - logS) < 0.002 && Math.hypot(panX, panZ) * Math.pow(2, logS) < 0.5) { logS = logT; panX = panZ = 0; anim = false; }
-      }
+    hide() {
+      el.style.display = 'none';
+      pts.clear();
+    },
+    update(dt) {
       draw();
+      acc += dt;
+      if (acc < 0.25) return;
+      acc = 0;
+      const fi = ses.flight();
+      const id = ses.prediction().frameBodyId;
+      const name = ses.system.bodies.find((b) => b.id === id)?.name ?? id;
+      const t = `${name} · ${fi.situation}`;
+      if (titleMain.textContent !== t) titleMain.textContent = t;
+      const wv = ses.warp();
+      const x = `×${fmtX(wv.achieved)}`;
+      if (wX.textContent !== x) wX.textContent = x;
+      wX.classList.toggle('is-fast', wv.achieved > 1.05);
+      updateEditor();
     },
-    dispose() { chips?.destroy(); el.remove(); },
+    dispose() {
+      el.remove();
+    },
   };
 }

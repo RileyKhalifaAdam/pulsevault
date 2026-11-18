@@ -1,4 +1,4 @@
-// Pause menu: resume, save, settings, how to play, quit. An overlay above whichever screen is showing.
+// Pause menu: resume, reset to the starting orbit, settings, how it works, performance overlay. An overlay above whichever screen is showing.
 import { h, icon, onTap, Button, SegmentedControl, Slider, Toggle, confirmDialog } from '../kit';
 import type { UiHost, UiScreen } from '../host';
 import { screenRoot, SETTING_KEYS, VERSION_LINE } from './shared';
@@ -11,18 +11,22 @@ export interface PauseMenu extends UiScreen {
 }
 
 const HELP = `
-<h3>The readouts</h3>
-<p><b>ALT</b> is height above the surface; <b>SPD</b> is speed around the world you orbit. <b>Ap</b> and <b>Pe</b> are the highest and lowest points of your orbit, each with the time until you reach it. <b>Δv</b> is how much speed change is left in the tanks — the only fuel gauge that matters.</p>
-<h3>Prograde and retrograde</h3>
-<p>In orbit you do not steer toward things; you change your speed and the orbit changes shape. Burn <i>prograde</i> (along your motion) and the far side of the orbit rises. Burn <i>retrograde</i> (against it) and the far side falls. Holding a marker with SAS keeps the nose on it while you work the throttle.</p>
-<h3>To Gloaming Lock by hand</h3>
-<p><b>1.</b> In Departures, set Gloaming Lock as your destination and launch. <b>2.</b> Open the map and tap <b>Plot course</b>: two burns appear on your path. <b>3.</b> Point prograde and, as the first countdown reaches zero, burn about 940 m/s until the node’s Δv reads zero. Your apoapsis now touches the Lock’s orbit at 5,200 km. <b>4.</b> Coast up — use time warp — and at apoapsis burn prograde again, about 820 m/s, to match the station’s speed. <b>5.</b> Close the last few kilometres gently.</p>
-<h3>With the flight computer</h3>
-<p>On the map, set the target and tap <b>Go to target</b>. The computer plans the transfer, flies both burns, and brings you in to dock. You may time-warp through the coast; it drops warp before each burn. Touch the stick or throttle at any time to take the ship back.</p>
-<h3>Docking</h3>
-<p>Within 50 km of a station and under 200 m/s relative speed, request docking. Traffic control assigns a berth and a tug draws you in. Purists can fly it themselves: arrive within 30 m of the berth under 3 m/s and the clamps catch you.</p>
+<h3>What this is</h3>
+<p>A physics sandbox. Your ship is a rigid body in low orbit of Wick, beside Chandler’s Wheel. It moves only because forces act on it: gravity from every world, your main drive, your thrusters, air, and contact.</p>
+<h3>The read-outs</h3>
+<p><b>ALT</b> is height above the surface, with your climb or sink rate under it. <b>SPEED</b> is speed relative to the world you are closest bound to. <b>APO</b> and <b>PERI</b> are the highest and lowest points of the orbit you are on right now, each with the time until you reach it. <b>PROP</b> shows propellant and <b>Δv</b>: how much speed change is left in the tanks. A warning line appears only when something is off: heat, hull, tumbling.</p>
+<h3>How thrust changes an orbit</h3>
+<p>You do not steer toward things. Burn <i>prograde</i> (along your motion, the green marker) and the opposite side of your orbit rises; burn <i>retrograde</i> (red marker) and it falls. Burn at periapsis to move the apoapsis, and at apoapsis to move the periapsis. Normal and anti-normal tilt the orbit; radial burns rotate it.</p>
+<h3>Holds</h3>
+<p>The <b>hold</b> button asks the attitude system to turn the ship with real torque and keep it pointed: prograde, retrograde, normal, radial, at the target, or along a planned burn. <b>Hold</b> alone stops the rotation. <b>Off</b> leaves the ship with whatever spin it has. Turning takes time; wait for the nose before you burn.</p>
+<h3>Time acceleration</h3>
+<p>The arrows speed time up. The world takes more or larger steps under the same laws, so the request is a wish: while you thrust, turn, touch something or fly through air it runs slower, and the HUD shows what you asked for, what you got, and why.</p>
+<h3>The map</h3>
+<p>The line is your predicted path, with apoapsis, periapsis, closest approach to the target, atmosphere entry and impact marked. Tap the path to plan a burn there, then set its prograde, normal and radial parts and slide it in time: the path shows what would happen. A plan flies nothing. Point the ship (hold: Burn) and work the throttle yourself.</p>
+<h3>Docking by latch</h3>
+<p>Match speed with the station first (target chip: relative speed near zero). Close in slowly. Near a port the docking chip shows how far you are off its axis, how far your nose is off, and your closing speed. Switch on <b>RCS</b>: the stick then pushes the ship sideways and up or down, and the two roll buttons push back and forward. Arrive slow and aligned and the latch closes by itself when the chip reads <b>Latch ready</b>. Arrive fast and you bounce, or break.</p>
 <h3>If it goes wrong</h3>
-<p>Dry tanks in a stable orbit? Call a fuel tender. Lost the ship? A replacement waits at your last station, for a price.</p>
+<p><b>Reset to starting orbit</b> puts you back beside the Wheel with full tanks.</p>
 `;
 
 export function createPauseMenu(host: UiHost): PauseMenu {
@@ -46,33 +50,33 @@ export function createPauseMenu(host: UiHost): PauseMenu {
     body.append(
       b('Resume', 'play', resume, 'primary'),
       h('div.tls-pause__grid', null,
-        b('Save now', 'check', () => { host.saveNow(); host.toast('Flight saved.', 'good'); }),
-        b('Settings', 'settings', () => api.open('settings')),
-        b('How to play', 'info', () => api.open('help')),
-        b('Quit to title', 'close', () => {
-          void confirmDialog({ title: 'Quit to title?', message: 'Your flight is saved first, exactly as it stands.', confirmLabel: 'Save and quit', cancelLabel: 'Stay', icon: 'warning' }, el)
+        b('Reset to starting orbit', 'undock', () => {
+          void confirmDialog({ title: 'Reset to the starting orbit?', message: 'The ship goes back beside Chandler’s Wheel with full tanks. Planned burns are cleared.', confirmLabel: 'Reset', cancelLabel: 'Keep flying', icon: 'warning' }, el)
             .then((yes) => {
               if (!yes) return;
-              host.saveNow();
               api.hide();
-              host.go('title');
+              host.reset();
+              api.onResume?.();
             });
-        })),
+        }),
+        b('Settings', 'settings', () => api.open('settings')),
+        b('How it works', 'info', () => api.open('help')),
+        b(`Perf overlay: ${host.perfVisible() ? "on" : "off"}`, 'check', () => { host.setPerfVisible(!host.perfVisible()); api.open('menu'); })),
       h('div.tls-pause__ver', { text: VERSION_LINE }),
     );
   }
 
   function settings(): void {
     const s = host.settings;
-    const q = s.get<string>(SETTING_KEYS.quality, 'high');
+    const q = s.get<string>(SETTING_KEYS.quality, 'auto');
     body.append(
       h('div.tl-label', { text: 'Graphics quality' }),
-      SegmentedControl<'low' | 'medium' | 'high'>({
-        items: [{ id: 'low', label: 'Low' }, { id: 'medium', label: 'Medium' }, { id: 'high', label: 'High' }],
-        value: q === 'low' || q === 'medium' ? q : 'high', block: true,
+      SegmentedControl<'auto' | 'low' | 'medium' | 'high'>({
+        items: [{ id: 'auto', label: 'Auto' }, { id: 'low', label: 'Low' }, { id: 'medium', label: 'Med' }, { id: 'high', label: 'High' }],
+        value: q === 'low' || q === 'medium' || q === 'high' ? q : 'auto', block: true,
         onChange: (v) => { s.set(SETTING_KEYS.quality, v); el.dataset.fx = v === 'low' ? 'lite' : 'full'; },
       }).el,
-      h('p.tl-small', { text: 'Low saves battery and keeps the frame rate up in Low Power Mode.' }),
+      h('p.tl-small', { text: 'Auto measures the frame time and lowers the resolution first, then the detail, to stay smooth. The resolution adapts at every setting.' }),
       Slider({
         label: 'Stick sensitivity', value: Math.min(2, Math.max(0.5, Number(s.get<number>(SETTING_KEYS.sensitivity, 1)) || 1)), min: 0.5, max: 2, step: 0.1, ticks: 15,
         format: (v) => `${v.toFixed(1)}×`, onChange: (v) => s.set(SETTING_KEYS.sensitivity, Math.round(v * 10) / 10),
@@ -89,7 +93,7 @@ export function createPauseMenu(host: UiHost): PauseMenu {
       body.scrollTop = 0;
       back.style.visibility = view === 'menu' ? 'hidden' : '';
       back.style.width = view === 'menu' ? '0' : '';
-      title.textContent = view === 'menu' ? 'Paused' : view === 'settings' ? 'Settings' : 'How to play';
+      title.textContent = view === 'menu' ? 'Paused' : view === 'settings' ? 'Settings' : 'How it works';
       if (view === 'menu') menu();
       else if (view === 'settings') settings();
       else body.appendChild(h('div.tls-help', { ref: (n) => { n.innerHTML = HELP; } }));

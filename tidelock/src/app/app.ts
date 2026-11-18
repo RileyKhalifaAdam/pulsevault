@@ -1,24 +1,27 @@
-// TIDELOCK app shell: boot, the UiHost, screen flow and the main loop.
+// TIDELOCK app shell: boot, the UiHost, screen flow, the main loop and its performance record.
 //
-//   title -> station (docked) -> flight <-> map -> station, driven by the game's docked / undocked events.
+//   title -> flight <-> map, with the pause menu and the perf overlay above. The client talks to the Session
+//   contract (src/game) and nothing else; the scene draws the world's state as the session reports it.
 //
-// URL parameters: q=low|medium|high|ultra (quality for this run), fresh=1 (ignore the saved game).
-import type { ShipVisualId } from '../core/types';
+// URL parameters: q=low|medium|high|ultra (pin the quality tier for this run), fresh=1 (ignore the saved flight),
+// perf=1 (open the perf overlay).
 import { createPipeline, type Quality, type RenderPipeline } from '../render/pipeline';
 import { createSceneManager, type SceneManager } from '../render/scene';
-import { addShip, addStationExtra, beginFrame, createSceneFrame, setDockingGuide } from '../render/frame';
-import { createGame, loadGame, type GameSim } from '../sim/game';
+import { addStationExtra, beginFrame, createSceneFrame, setDockingGuide } from '../render/frame';
+import { createSession, loadSession, type Session } from '../game';
 import { createRoot, Splash, ToastStack, type ToastStackApi } from '../ui/kit';
 import type { UiHost, UiScreen } from '../ui/host';
 import { createFlightScreen, type FlightScreen } from '../ui/hud/hud';
-import { createMapScreen, createPauseMenu, createStationScreen, createTitleScreen } from './screens';
+import { createMapScreen, createPauseMenu, createTitleScreen } from '../ui/screens';
+import { createPerfOverlay } from '../ui/perfOverlay';
+import { fmtSpeed } from '../core/units';
+import { PerfMonitor } from './perf';
 import { noteForReport, showFatal, showPlainMessage } from './errors';
 
 const SAVE_KEY = 'tidelock.save.v1';
 const SETTINGS_KEY = 'tidelock.settings.v1';
 const QUALITIES: Quality[] = ['low', 'medium', 'high', 'ultra'];
-const SHIP_VISUALS: string[] = ['wren', 'drover', 'magpie', 'shrike', 'albatross', 'caravel', 'halberd'];
-type ScreenName = 'title' | 'station' | 'flight' | 'map';
+type ScreenName = 'title' | 'flight' | 'map';
 
 // ------------------------------------------------------------------------------------------------ storage (guarded)
 
@@ -71,10 +74,23 @@ export async function boot(): Promise<void> {
     settingsData = {};
   }
   const asQuality = (v: unknown): Quality | null => (typeof v === 'string' && (QUALITIES as string[]).includes(v) ? (v as Quality) : null);
+  // Quality: the URL pins a tier; a tier chosen in settings pins it too; otherwise ('auto') start at a safe tier
+  // (medium on phones) and let the frame-time record move the resolution scale first, then the tier.
   const urlQuality = asQuality(params.get('q') ?? params.get('quality'));
-  let quality: Quality = urlQuality ?? asQuality(settingsData.quality) ?? 'medium';
-  if (settingsData.quality === undefined) settingsData.quality = quality; // screens read the effective tier
-  noteForReport(`quality ${quality}`);
+  const phone = (() => {
+    try {
+      return window.matchMedia('(pointer: coarse)').matches || /iPhone|iPad|Android|Mobile/i.test(navigator.userAgent);
+    } catch {
+      return true;
+    }
+  })();
+  const autoStart: Quality = phone ? 'medium' : 'high';
+  const chosen = asQuality(settingsData.quality);
+  let quality: Quality = urlQuality ?? chosen ?? autoStart;
+  if (settingsData.quality === undefined) settingsData.quality = 'auto';
+  const perf = new PerfMonitor(quality);
+  perf.autoTier = !urlQuality && !chosen;
+  noteForReport(`quality ${quality}${perf.autoTier ? ' (auto)' : ''}`);
 
   // ---------------------------------------------------------------------------------------------- canvas, pipeline, scene
   const canvas = document.createElement('canvas');
@@ -84,6 +100,7 @@ export async function boot(): Promise<void> {
   root.style.touchAction = 'none';
 
   const pipeline: RenderPipeline = createPipeline(canvas, { quality });
+  pipeline.setDynamicResolution(false, perf.scale); // the app's own controller drives the scale (perf.ts)
   const viewSize = (): { w: number; h: number } => {
     const w = Math.max(1, Math.round(document.documentElement.clientWidth || window.innerWidth));
     const hgt = Math.max(1, Math.round(document.documentElement.clientHeight || window.innerHeight));
@@ -130,13 +147,13 @@ export async function boot(): Promise<void> {
   document.addEventListener('dblclick', (e) => e.preventDefault());
   document.addEventListener('contextmenu', (e) => e.preventDefault());
 
-  // ---------------------------------------------------------------------------------------------- game + host
+  // ---------------------------------------------------------------------------------------------- session + host
   const fresh = params.get('fresh') === '1';
-  const readSave = (): GameSim | null => {
+  const readSave = (): Session | null => {
     const raw = lsGet(SAVE_KEY);
     if (!raw) return null;
     try {
-      return loadGame(raw);
+      return loadSession(raw);
     } catch {
       return null;
     }
@@ -145,14 +162,29 @@ export async function boot(): Promise<void> {
   let current: ScreenName | null = null;
   let pauseOpen = false;
   let sinceSave = 0;
-  let unbind: (() => void)[] = [];
   const screens = {} as Record<ScreenName, UiScreen>;
   let pause: UiScreen | null = null;
   const TONE = { info: 'ion', good: 'green', warn: 'ember', bad: 'red' } as const;
+  const session: Session = (fresh ? null : readSave()) ?? createSession({ seed: 1 });
+
+  const applyTier = (q: Quality): void => {
+    if (q === quality) return;
+    quality = q;
+    perf.tier = q;
+    root.dataset.fx = q === 'low' ? 'lite' : 'full';
+    perf.clear(8);
+    scene.setQuality(q).catch((err) => showFatal(err, 'quality'));
+  };
 
   const host: UiHost = {
-    game: (fresh ? null : readSave()) ?? createGame({ seed: 1 }),
+    session,
     root,
+    perf,
+    perfVisible: () => overlay.visible(),
+    setPerfVisible(on) {
+      overlay.setVisible(on);
+      host.settings.set('perfOverlay', on);
+    },
     go(name) {
       if (pauseOpen) {
         pauseOpen = false;
@@ -161,31 +193,22 @@ export async function boot(): Promise<void> {
       if (current === name) return;
       if (current) screens[current].hide();
       current = name;
+      perf.clear(1); // each screen's frames are their own record
       noteForReport(`screen ${name}`);
       const s = screens[name];
       s.show();
       if (!s.el.isConnected) root.appendChild(s.el);
     },
-    newGame() {
-      host.game = createGame({ seed: 1 });
-      bindGame();
-      current = current === 'station' ? null : current;
-      host.go(host.game.shipPose().docked ? 'station' : 'flight');
+    reset() {
+      session.reset();
       host.saveNow();
+      host.toast('Back in the starting orbit beside Chandler’s Wheel', 'good');
+      if (current !== 'flight') host.go('flight');
     },
-    continueGame() {
-      const g = readSave();
-      if (!g) return false;
-      host.game = g;
-      bindGame();
-      host.go(g.shipPose().docked ? 'station' : 'flight');
-      return true;
-    },
-    hasSave: () => !!lsGet(SAVE_KEY),
     saveNow() {
       sinceSave = 0;
       try {
-        lsSet(SAVE_KEY, host.game.save());
+        lsSet(SAVE_KEY, session.save());
       } catch (err) {
         noteForReport(`save failed: ${String(err)}`);
       }
@@ -205,13 +228,11 @@ export async function boot(): Promise<void> {
         } catch {
           /* ignore */
         }
-        if (key === 'quality') {
+        if (key === 'quality' && !urlQuality) {
           const q = asQuality(value);
-          if (q && q !== quality) {
-            quality = q;
-            root.dataset.fx = q === 'low' ? 'lite' : 'full';
-            scene.setQuality(q).catch((err) => showFatal(err, 'quality'));
-          }
+          perf.autoTier = !q;
+          perf.maxTier = q ?? autoStart;
+          applyTier(q ?? autoStart);
         }
       },
     },
@@ -226,38 +247,49 @@ export async function boot(): Promise<void> {
     },
   };
 
-  function bindGame(): void {
-    for (const off of unbind) off();
-    const ev = host.game.events;
-    unbind = [
-      ev.on('docked', () => {
-        host.saveNow();
-        host.go('station');
-      }),
-      ev.on('undocked', () => host.go('flight')),
-      ev.on('rebought', () => {
-        host.saveNow();
-        host.go(host.game.shipPose().docked ? 'station' : 'flight');
-      }),
-      ev.on('destroyed', (e) => {
-        host.toast(`Ship destroyed (${e.cause})`, 'bad');
-        if (current === 'map') host.go('flight');
-      }),
-      ev.on('toast', (e) => host.toast(e.message, e.kind === 'danger' ? 'bad' : e.kind)),
-      ev.on('fault', (e) => {
-        noteForReport(`fault ${e.where}: ${e.message}`);
-        host.toast(`Fault in ${e.where}: ${e.message}`, 'bad');
-      }),
-    ];
+  const craftName = (id: string): string => session.craft().find((c) => c.id === id)?.name ?? id;
+  session.events.on('docked', (e) => {
+    host.saveNow();
+    host.toast(`Latched to ${craftName(e.stationId)}`, 'good');
+  });
+  session.events.on('undocked', (e) => host.toast(`Released from ${craftName(e.stationId)}`, 'info'));
+  session.events.on('impact', (e) => host.toast(`Impact at ${fmtSpeed(e.speed)}`, 'warn'));
+  session.events.on('destroyed', (e) => host.toast(`Ship destroyed (${e.cause})`, 'bad'));
+  session.events.on('atmosphere', (e) => host.toast(e.entered ? 'Entering atmosphere' : 'Clear of the atmosphere', e.entered ? 'warn' : 'info'));
+
+  // device lines for the performance report
+  try {
+    const gl = pipeline.renderer.getContext();
+    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+    const gpu = String(ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER));
+    perf.device = [`user agent: ${navigator.userAgent}`, `screen ${screen.width}×${screen.height} · pixel ratio ${window.devicePixelRatio}`, `WebGL renderer: ${gpu || 'not exposed'}`];
+  } catch {
+    perf.device = [`user agent: ${navigator.userAgent}`, 'WebGL renderer: not exposed'];
   }
-  bindGame();
+  const overlay = createPerfOverlay(host, () => {
+    const st = pipeline.stats();
+    const w = session.warp();
+    return [`view ${lastW}×${lastH} css px · internal ${st.width}×${st.height}`, `time acceleration asked ×${w.requested} achieved ×${w.achieved.toFixed(1)}${w.limitedBy ? ` (${w.limitedBy})` : ''}`, `screen ${current ?? '-'} · sim time ${session.time().toFixed(0)} s`];
+  });
+  if (params.get('perf') === '1' || settingsData.perfOverlay === true) overlay.setVisible(true);
+  // three-finger tap toggles the overlay
+  let tap3 = 0;
+  document.addEventListener('touchstart', (e) => {
+    tap3 = e.touches.length === 3 ? performance.now() : e.touches.length > 3 ? 0 : tap3;
+  }, { passive: true });
+  document.addEventListener('touchend', (e) => {
+    if (tap3 && e.touches.length === 0) {
+      if (performance.now() - tap3 < 600) host.setPerfVisible(!overlay.visible());
+      tap3 = 0;
+    }
+  }, { passive: true });
 
   // ---------------------------------------------------------------------------------------------- loading
   const splash = Splash({ status: 'Charting the Tallow system', progress: 0, footer: 'Loading — this takes a few seconds' });
   root.appendChild(splash.el);
   bootEl?.remove();
   await new Promise((r) => requestAnimationFrame(() => r(null)));
-  await scene.setSystem(host.game.system, host.game.model, (f, label) => splash.update({ progress: f, status: label || 'Loading' }), { nearBodyId: host.game.shipPose().soiBodyId });
+  await scene.setSystem(session.system, (f, label) => splash.update({ progress: f, status: label || 'Loading' }), { nearBodyId: session.flight().primaryId });
   splash.update({ progress: 1, status: 'Ready' });
 
   // ---------------------------------------------------------------------------------------------- screens
@@ -270,13 +302,12 @@ export async function boot(): Promise<void> {
   const flight: FlightScreen = createFlightScreen(host, scene, { pause: openPause });
   screens.flight = flight;
   screens.title = createTitleScreen(host);
-  screens.station = createStationScreen(host);
   screens.map = createMapScreen(host);
   pause = createPauseMenu(host);
 
   // ---------------------------------------------------------------------------------------------- frame
   const frame = createSceneFrame();
-  let dockYaw = 0.6;
+  let titleYaw = 0.6;
   let lost = false;
   pipeline.onContextLost = () => {
     lost = true;
@@ -286,54 +317,40 @@ export async function boot(): Promise<void> {
       lost = false;
       lastW = lastH = 0;
       layout();
+      perf.clear(4);
     }, (err) => showFatal(err, 'context restore'));
   };
 
+  /** Refill the frame from the session: the world's bodies and craft as they are, plus the camera. */
   const fill = (dt: number): void => {
-    const game = host.game;
-    const pose = game.shipPose();
-    beginFrame(frame, game.time(), dt, game.warp().level);
-    const s = addShip(frame);
-    const shipId = game.player().shipId;
-    s.id = 'player';
-    s.visualId = (SHIP_VISUALS.includes(shipId) ? shipId : 'wren') as ShipVisualId;
-    s.seed = 7;
-    s.soiBodyId = pose.soiBodyId;
-    s.r.x = pose.r.x; s.r.y = pose.r.y; s.r.z = pose.r.z;
-    s.v.x = pose.v.x; s.v.y = pose.v.y; s.v.z = pose.v.z;
-    s.q.x = pose.q.x; s.q.y = pose.q.y; s.q.z = pose.q.z; s.q.w = pose.q.w;
-    s.throttle = pose.throttle;
-    s.rcs.x = pose.rcs.x; s.rcs.y = pose.rcs.y; s.rcs.z = pose.rcs.z;
-    s.heat = Math.min(1, Math.max(0, pose.heat));
-    s.damage = pose.destroyed ? 1 : 0;
-    s.isPlayer = true;
-    s.lightsOn = !pose.destroyed;
+    beginFrame(frame, session.time(), dt, session.warp().achieved);
+    frame.bodies = session.bodies();
+    frame.craft = session.craft();
+    const p = session.player();
     const cam = frame.camera;
-    cam.focusId = 'player';
+    cam.focusId = p.craftId;
     cam.lookAtId = null;
-    const d = game.dockingState();
-    if (pose.docked) {
-      // Dock camera: a slow turn around the berthed ship behind the station screen / title.
-      dockYaw += dt * 0.02;
+    frame.environment.reentry = session.flight().situation === 'atmosphere' ? Math.min(1, Math.max(0, p.heat * 1.2)) : 0;
+    const d = session.docking();
+    if (current === 'title' || current === null) {
+      // a slow turn around the ship behind the title
+      titleYaw += dt * 0.03;
       cam.mode = 'orbit';
-      cam.yaw = dockYaw;
+      cam.yaw = titleYaw;
       cam.pitch = 0.22;
       cam.distance = 2.2;
       setDockingGuide(frame, null);
-    } else {
-      const c = flight.controls.camera;
-      cam.yaw = c.yaw;
-      cam.pitch = c.pitch;
-      cam.distance = c.distance;
-      if (d.granted && d.stationId && d.portId) {
-        addStationExtra(frame, d.stationId, d.portId);
-        setDockingGuide(frame, d.stationId, d.portId);
-        cam.mode = 'chase';
-      } else {
-        setDockingGuide(frame, null);
-        cam.mode = 'chase';
-      }
+      return;
     }
+    const c = flight.controls.camera;
+    cam.mode = 'chase';
+    cam.yaw = c.yaw;
+    cam.pitch = c.pitch;
+    cam.distance = c.distance;
+    if (!p.dockedTo && d.stationId && d.portId) {
+      addStationExtra(frame, d.stationId, d.portId);
+      setDockingGuide(frame, d.stationId, d.portId);
+    } else setDockingGuide(frame, null);
   };
 
   let last = performance.now();
@@ -345,23 +362,46 @@ export async function boot(): Promise<void> {
       last = now;
       return;
     }
-    const dt = Math.min(0.1, Math.max(0, (now - last) / 1000));
+    const frameMs = now - last;
+    const dt = Math.min(0.1, Math.max(0, frameMs / 1000));
     last = now;
     try {
       if (pauseOpen && pause && pause.el.getClientRects().length === 0) pauseOpen = false;
       const running = current !== 'title' && current !== null && !pauseOpen;
+      let simMs = 0;
+      let steps = 0;
       if (running) {
-        host.game.step(dt);
+        const info = session.step(dt);
+        simMs = info.simMs;
+        steps = info.steps;
         sinceSave += dt;
         if (sinceSave >= 60) host.saveNow();
       }
       layout();
-      if (!lost) {
+      let renderMs = 0;
+      if (!lost && current !== 'map') {
+        const r0 = performance.now();
         fill(dt);
         scene.render(frame);
+        renderMs = performance.now() - r0;
       }
       if (current) screens[current].update(dt);
       if (pauseOpen) pause?.update(dt);
+      // the record, and the automatic quality it drives (not while baking, paused, or on the 2D map)
+      if (running && current === 'flight' && !lost && !scene.busy()) {
+        perf.record(frameMs, simMs, renderMs, steps);
+        const ch = perf.auto(dt);
+        if (ch) {
+          pipeline.setDynamicResolution(false, ch.scale);
+          if (ch.tier) applyTier(ch.tier);
+          noteForReport(`auto quality: ${perf.snapshot().note}`);
+        }
+      } else if (running && current === 'map') perf.record(frameMs, simMs, 0, steps);
+      if (overlay.visible()) {
+        const ss = scene.stats();
+        perf.setRender(ss.drawCalls, ss.triangles);
+        overlay.update(dt);
+      }
     } catch (err) {
       failed = true;
       cancelAnimationFrame(raf);
@@ -386,7 +426,8 @@ export async function boot(): Promise<void> {
   await splash.dismiss().catch(() => splash.destroy());
   const w = window as unknown as { __tidelock: unknown; __ready: boolean };
   w.__tidelock = {
-    get game() { return host.game; },
+    session,
+    perf,
     host,
     scene,
     pipeline,

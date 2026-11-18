@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Proves dist/tidelock-artifact.html (the fragment the Claude page viewer publishes): wraps it in a skeleton
 // like the host's, serves it, and loads it twice in iPhone 15 emulation — directly, and inside
-// <iframe sandbox="allow-scripts"> where localStorage throws. Each must reach the title, start a new flight,
-// show the station screen, launch and fly, with no page errors and no requests besides the page itself.
+// <iframe sandbox="allow-scripts"> where localStorage throws. Each must reach the title, enter the flight view
+// straight into orbit and keep flying, with no page errors and no requests besides the page itself.
 //   node e2e/artifact.cjs [--no-build]        screenshots: shots/artifact-direct.png, shots/artifact-iframe.png
 const { execSync } = require('node:child_process');
 const fs = require('node:fs');
@@ -67,13 +67,13 @@ async function tap(page, frame, sel, re, scope) {
 }
 const BTN = 'button, [role="button"], [role="tab"]';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const pump = (frame, n) => frame.evaluate((k) => { const g = window.__tidelock.game; for (let i = 0; i < k; i++) g.step(1 / 30); }, n);
+const pump = (frame, n) => frame.evaluate((k) => { const g = window.__tidelock.session; for (let i = 0; i < k; i++) g.step(1 / 30); }, n);
 const settle = (frame) => frame.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(null)))));
 const snap = (frame) => frame.evaluate(() => {
-  const t = window.__tidelock, g = t.game, d = g.dockedStation(), p = g.player(), w = g.warp(), a = g.autopilot();
-  return { screen: t.screen, docked: d ? d.id : null, dockedName: d ? d.name : null, time: g.time(), credits: p.credits, cargo: p.cargoUsed, target: (g.target() || {}).id || null,
-    warp: w.level, warpReq: w.requested, warpWhy: w.limitReason, ap: a.engaged, phase: a.phase, status: a.status, failed: a.failed,
-    faults: g.diagnostics().faults, errPanel: !!document.getElementById('tl-error'), alt: g.flightInfo().altitude };
+  const t = window.__tidelock, g = t.session, p = g.player(), w = g.warp(), f = g.flight();
+  return { screen: t.screen, docked: p.dockedTo, time: g.time(), target: (g.target() || {}).id || null, warp: w.achieved, warpReq: w.requested, warpWhy: w.limitedBy,
+    errPanel: !!document.getElementById('tl-error'), alt: f.altitude, apo: f.apoapsisAlt, peri: f.periapsisAlt, speed: f.speed, primary: f.primaryName, situation: f.situation,
+    throttle: p.throttle, hold: p.hold, dv: p.deltaV, hud: !!document.querySelector('[data-hud="main"]') && document.querySelector('[data-hud="main"]').getClientRects().length > 0 };
 });
 
 async function run() {
@@ -102,21 +102,19 @@ async function run() {
       await frame.waitForFunction(() => window.__ready === true, null, { timeout: 180000 });
       let s = await snap(frame);
       check(s.screen === 'title', `[${mode}] title screen is up (default quality: ${mode === 'direct'})`);
-      check(await tap(page, frame, BTN, /new flight/), `[${mode}] tapped New flight`);
+      check(await tap(page, frame, BTN, /^\s*enter/), `[${mode}] tapped Enter`);
       await sleep(1200);
       s = await snap(frame);
-      check(s.screen === 'station' && s.docked === 'tallow.st.chandlers-wheel', `[${mode}] station screen, docked at ${s.dockedName}`);
-      await settle(frame);
-      if (mode === 'iframe') await page.screenshot({ path: path.join(shots, `artifact-${mode}.png`) });
-      check(await tap(page, frame, BTN, /^\s*launch/), `[${mode}] tapped Launch`);
-      await sleep(800);
-      const t0 = (await snap(frame)).time;
+      check(s.screen === 'flight' && s.hud && !s.docked, `[${mode}] flight HUD is up, flying free around ${s.primary} (${s.situation})`);
+      const t0 = s.time;
       await pump(frame, 600);
       await settle(frame);
       s = await snap(frame);
-      if (mode === 'direct') { await sleep(1500); await settle(frame); await page.screenshot({ path: path.join(shots, `artifact-${mode}.png`) }); } // flight view at the default quality
-      check(s.screen === 'flight' && !s.docked && s.time > t0 + 5 && Number.isFinite(s.alt), `[${mode}] flying: screen=${s.screen}, sim +${(s.time - t0).toFixed(0)} s, altitude ${(s.alt / 1000).toFixed(0)} km`);
-      check(s.faults === 0 && !s.errPanel, `[${mode}] no sim faults, no error panel`);
+      await sleep(mode === 'direct' ? 1500 : 300);
+      await settle(frame);
+      await page.screenshot({ path: path.join(shots, `artifact-${mode}.png`) });
+      check(s.screen === 'flight' && s.time > t0 + 5 && Number.isFinite(s.alt), `[${mode}] flying: sim +${(s.time - t0).toFixed(0)} s, altitude ${(s.alt / 1000).toFixed(0)} km`);
+      check(!s.errPanel, `[${mode}] no error panel`);
     } catch (err) {
       fail.push(`[${mode}] ${String((err && err.stack) || err)}`);
     }

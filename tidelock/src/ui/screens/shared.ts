@@ -4,7 +4,7 @@ import type { UiHost } from '../host';
 
 /** Keys the pause menu writes through host.settings (the app reads them). */
 export const SETTING_KEYS = {
-  /** 'low' | 'medium' | 'high' (default 'high') */
+  /** 'auto' | 'low' | 'medium' | 'high' (default 'auto': the frame-time record picks) */
   quality: 'quality',
   /** 0.5 .. 2 (default 1) */
   sensitivity: 'stickSensitivity',
@@ -12,7 +12,7 @@ export const SETTING_KEYS = {
   invertPitch: 'invertPitch',
 } as const;
 
-export const VERSION_LINE = 'v0.1 · first flight · Tallow system';
+export const VERSION_LINE = 'v0.2 · physics sandbox · Tallow system';
 
 const STYLE_ID = 'tls-screen-styles';
 

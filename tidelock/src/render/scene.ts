@@ -927,10 +927,10 @@ class Manager implements SceneManager {
     }
     const stations = this.stations;
     for (let i = 0; i < stations.length; i++) stations[i].activePort = null;
-    const fc = frame.craft;
+    const craftList = frame.craft;
     frame.ships.length = 0;
-    for (let i = 0; i < fc.length; i++) {
-      const c = fc[i];
+    for (let i = 0; i < craftList.length; i++) {
+      const c = craftList[i];
       if (c.kind === 'station') {
         const st = this.stationIndex.get(c.id);
         if (!st) continue;
