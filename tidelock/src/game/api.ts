@@ -265,4 +265,57 @@ export interface Session {
   /** Put the player back in the starting orbit beside Chandler's Wheel with full tanks. */
   reset(): void;
   save(): string;
+
+  // ---- the pilot as a body inside the ship ---------------------------------------------------------------
+  /** 'helm': strapped into the pilot seat, flying. 'onFoot': a body moving inside the ship. */
+  mode(): PlayerMode;
+  crew(): CrewView;
+  /** The player ship's interior layout (src/data/interiors.ts), or null if it has none. */
+  interior(): import('../data/interiors').InteriorLayout | null;
+  /** Walking input: strafe and forward, each -1..1, relative to where the pilot looks. */
+  setWalk(c: { moveX?: number; moveZ?: number }): void;
+  /** Turn the head/body: yaw about the deck normal, pitch up/down, rad. */
+  addLook(dYaw: number, dPitch: number): void;
+  /** Magnetic boots: on = feet grip any deck within reach; off = float free. */
+  setBoots(on: boolean): void;
+  /** Jump from the deck, or push off whatever surface is within reach when floating, along the look direction. */
+  pushOff(): void;
+  /** Use the interactable currently in reach (CrewView.prompt). False when there is none. */
+  interact(): boolean;
+  /** Unstrap from the pilot seat (mode -> 'onFoot') — only allowed while the drive is off. */
+  leaveHelm(): boolean;
+  /** Stand up from the bunk or the table seat. */
+  standUp(): void;
+  cabinLights(): boolean;
+}
+
+export type PlayerMode = 'helm' | 'onFoot';
+
+/** What the pilot's body is doing. Positions are ship-local (forward -Z, up +Y, right +X), metres. */
+export interface CrewView {
+  mode: PlayerMode;
+  /** 'walking' on a deck in boots, 'floating' free, 'seated' at the helm or table, 'lying' in the bunk. */
+  posture: 'walking' | 'floating' | 'seated' | 'lying';
+  /** Feet position and eye position. */
+  pos: V3;
+  eye: V3;
+  /** Look direction: yaw about +Y (0 = facing -Z, positive = to the left) and pitch (positive = up), rad. */
+  yaw: number;
+  pitch: number;
+  /** Velocity relative to the ship, ship-local, m/s. */
+  vel: V3;
+  boots: boolean;
+  /** True when the boots have hold of a deck. */
+  gripped: boolean;
+  roomId: string;
+  roomName: string;
+  /**
+   * Acceleration the body feels in the ship's frame, ship-local, m/s²: zero in free fall, ~12 toward the
+   * stern (+Z) under full thrust, plus what the ship's rotation adds. This is what moves a loose body.
+   */
+  felt: V3;
+  /** The interactable in reach, if any. */
+  prompt: { id: string; kind: string; label: string } | null;
+  /** True while asleep in the bunk (time is being accelerated until woken). */
+  asleep: boolean;
 }
