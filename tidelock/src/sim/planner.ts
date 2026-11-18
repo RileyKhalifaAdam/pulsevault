@@ -1143,6 +1143,79 @@ export function planRendezvous(model: SystemModel, ship: TrajectoryStart, target
   });
 }
 
+/** Options of {@link planRendezvousCorrection}. */
+export interface RendezvousCorrectionOptions extends PlanOptions {
+  /** Sim time of the correction burn, s. Default: one lead time from now. */
+  t?: number;
+  /** Distance from the target at which the ship should end up, m. Default 1500. */
+  standoff?: number;
+}
+
+/**
+ * Mid-course correction of a rendezvous that is already under way: one burn (default: as soon as
+ * possible) that puts the ship back on a transfer reaching the target (`targetOrbit`, elements around
+ * `ship.bodyId`) at the sim time `arrivalTime`, plus the new velocity-match burn there. The arrival
+ * point is offset `standoff` metres short of the target along the approach path, as in
+ * {@link planRendezvous}. Replace the old 'match-velocity' node with the two returned here.
+ * Fails when the arrival is too close to correct, the transfer would dip below {@link safeRadius},
+ * or the ship leaves this sphere of influence first.
+ */
+export function planRendezvousCorrection(
+  model: SystemModel,
+  ship: TrajectoryStart,
+  targetOrbit: OrbitElements,
+  arrivalTime: number,
+  opts: RendezvousCorrectionOptions = {},
+): PlanResult {
+  return guarded(() => {
+    const s = settle(model, ship);
+    if (typeof s === 'string') return fail(s);
+    const { body, mu } = s;
+    const o = targetOrbit;
+    if (!o || !(o.a > 0 && o.a < Infinity && o.e >= 0 && o.e < 1) || !Number.isFinite(o.i + o.lan + o.argp + o.m0 + o.epoch)) return fail('The target is not on a closed orbit');
+    if (!Number.isFinite(arrivalTime)) return fail('Invalid arrival time');
+    const tc = Math.max(Number.isFinite(opts.t) ? (opts.t as number) : s.ship.t + leadOf(opts), s.ship.t);
+    const tof = arrivalTime - tc;
+    if (!(tof > 60)) return fail('Too close to the arrival to correct the course');
+    if (tc - s.ship.t >= s.stay || arrivalTime - s.ship.t >= s.stay) return fail(`Cannot correct: ${stayText(s)}`);
+    const standoff = clampN(Number.isFinite(opts.standoff) ? (opts.standoff as number) : 1500, 0, 1e5);
+    const dep = propagateStateTo(newState(), s.ship.sv, mu, tc - s.ship.t);
+    const arr = elementsToStateTo(newState(), o, mu, arrivalTime);
+    const lamOpts: LambertOptions = { prograde: true, preferredNormal: normalOf(dep) };
+    const rMin = Math.min(safeRadius(body), 0.999 * Math.min(s.info.periapsis, o.a * (1 - o.e)));
+    const rMax = body.soi < Infinity ? 0.95 * body.soi : Infinity;
+    let sol = lambert(dep.r, arr.r, tof, mu, lamOpts);
+    if (!sol) return fail('No transfer reaches the target at the planned time');
+    let aim: V3 = arr.r;
+    if (standoff > 0) {
+      const vrel = vsub(sol.v2, arr.v);
+      const vl = vlen(vrel);
+      const dir = vl > 1e-3 ? vscale(vrel, -1 / vl) : vnorm(arr.r);
+      const aim2 = vaddScaled(arr.r, dir, standoff);
+      const sol2 = lambert(dep.r, aim2, tof, mu, lamOpts);
+      if (sol2) {
+        sol = sol2;
+        aim = aim2;
+      }
+    }
+    if (!arcSafe(dep.r, sol.v1, aim, sol.v2, mu, rMin, rMax)) return fail(`The corrected transfer would pass too close to ${body.name}`);
+    const dv1 = vsub(sol.v1, dep.v);
+    const dv2 = vsub(arr.v, sol.v2);
+    const nodes: ManeuverNode[] = [];
+    if (vlen(dv1) > 1e-4) nodes.push(makeNode('correction', tc, body.id, dep, dv1));
+    nodes.push(makeNode('match-velocity', arrivalTime, body.id, { r: aim, v: sol.v2 }, dv2));
+    const plan = okPlan(
+      ship.t,
+      nodes,
+      arrivalTime,
+      `Correction burn in ${fmtDuration(tc - ship.t)}: Δv ${fmtSpeed(vlen(dv1))}, then match velocity (Δv ${fmtSpeed(vlen(dv2))})`,
+      [],
+    );
+    plan.rendezvous = { departureTime: tc, timeOfFlight: tof, distance: vlen(vsub(aim, arr.r)), relSpeed: 0 };
+    return plan;
+  });
+}
+
 // ===================================================================================== encounters and shooting
 
 /** How a predicted trajectory meets a target body, as residuals for the shooting method. */
@@ -2397,7 +2470,7 @@ export function estimateTravel(model: SystemModel, from: string | TrajectoryStar
         const h = orbitHohmann(A.mu, cur.r, goal.r);
         const vSlow = circ(A.mu, Math.max(cur.r, goal.r));
         const dPlane = planeDv(vSlow, cur.normal, goal.normal);
-        const dv = h.dv1 + Math.sqrt(h.dv2 * h.dv2 + dPlane * dPlane);
+        const dv = Math.abs(h.dv1) + Math.sqrt(h.dv2 * h.dv2 + dPlane * dPlane);
         const gPos = model.stationState(dst.id, tc).r;
         const wait = Math.abs(cur.r - goal.r) < 1e-3 * goal.r ? 0.5 * orbitalPeriod(A.mu, goal.r) : hohmannWait(A.mu, cur.pos, cur.r, gPos, goal.r, cur.normal, h.tof);
         legs.push({ from: A.id, to: dst.id, dv, wait, tof: h.tof });
