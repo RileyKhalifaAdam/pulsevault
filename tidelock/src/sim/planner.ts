@@ -670,7 +670,7 @@ export function planReturnToSafeOrbit(model: SystemModel, ship: TrajectoryStart,
     const r0 = vlen(s.ship.sv.r);
     const burnNowDt = Math.min(lead, r0 > rSafe && tGround < Infinity ? 0.5 * tGround : lead, s.stay < Infinity ? 0.5 * s.stay : lead);
 
-    if (!escaping && lowPe && info.timeToApoapsis >= lead && info.timeToApoapsis < tGround && info.timeToApoapsis < s.stay) {
+    if (!escaping && lowPe && info.apoapsis > rPark && info.timeToApoapsis >= lead && info.timeToApoapsis < tGround && info.timeToApoapsis < s.stay) {
       // Bound, and apoapsis comes before the ground: the classic periapsis raise.
       const sv = propagateStateTo(newState(), s.ship.sv, mu, info.timeToApoapsis);
       const r = vlen(sv.r);

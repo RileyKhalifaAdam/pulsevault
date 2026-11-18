@@ -503,6 +503,9 @@ export function BarChart(props: BarChartProps): Component<Pick<BarChartProps, 'v
     let max = Math.max(0, ...values);
     let min = Math.min(0, ...values);
     if (max - min < 1e-9) max = min + 1;
+    const bstep = niceStep((max - min) / 4);
+    max = Math.ceil(max / bstep - 1e-9) * bstep;
+    min = Math.floor(min / bstep + 1e-9) * bstep;
     ctx.font = `600 11px ${family}`;
     const showScale = props.scale !== false;
     const topText = fmt(max);
@@ -543,7 +546,8 @@ export function BarChart(props: BarChartProps): Component<Pick<BarChartProps, 'v
     ctx.textAlign = 'left';
     if (showScale) {
       ctx.fillText(topText, right + 10, top + 0.5);
-      ctx.fillText(min < 0 ? lowText : fmt(0), right + 10, min < 0 ? bottom : zero);
+      ctx.fillText(fmt(0), right + 10, zero);
+      if (min < 0 && bottom - zero > 14) ctx.fillText(lowText, right + 10, bottom);
     }
     if (props.labels) {
       ctx.textBaseline = 'alphabetic';

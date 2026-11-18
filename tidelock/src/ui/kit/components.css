@@ -76,7 +76,7 @@
 .tl-scroll--fade.tl-scroll--start { --tl-fade-a: transparent; }
 .tl-scroll--fade.tl-scroll--end { --tl-fade-b: transparent; }
 .tl-scroll--y.tl-scroll--fade { -webkit-mask-image: linear-gradient(180deg, var(--tl-fade-a), #000 20px, #000 calc(100% - 28px), var(--tl-fade-b)); mask-image: linear-gradient(180deg, var(--tl-fade-a), #000 20px, #000 calc(100% - 28px), var(--tl-fade-b)); }
-.tl-scroll--x.tl-scroll--fade { -webkit-mask-image: linear-gradient(90deg, var(--tl-fade-a), #000 20px, #000 calc(100% - 28px), var(--tl-fade-b)); mask-image: linear-gradient(90deg, var(--tl-fade-a), #000 20px, #000 calc(100% - 28px), var(--tl-fade-b)); }
+.tl-scroll--x.tl-scroll--fade { -webkit-mask-image: linear-gradient(90deg, var(--tl-fade-a), #000 24px, #000 calc(100% - 48px), var(--tl-fade-b)); mask-image: linear-gradient(90deg, var(--tl-fade-a), #000 24px, #000 calc(100% - 48px), var(--tl-fade-b)); }
 
 /* ================================================================== screen & header */
 .tl-screen {
@@ -224,7 +224,8 @@
 @keyframes tl-flash { 0% { filter: brightness(2.2); } 100% { filter: none; } }
 
 /* ================================================================== toggle */
-.tl-toggle { display: flex; align-items: center; gap: var(--tl-s4); min-height: var(--tl-hit); width: 100%; text-align: left; }
+.tl-toggle { display: flex; align-items: center; gap: var(--tl-s4); min-height: var(--tl-hit); width: 100%; padding-block: 8px; text-align: left; }
+.tl-toggle + .tl-toggle { border-top: 1px solid var(--tl-line); }
 .tl-toggle__text { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .tl-toggle__label { font-size: var(--tl-fs-15); letter-spacing: 0.02em; }
 .tl-toggle__hint { font-family: var(--tl-font-body); font-size: var(--tl-fs-12); font-weight: 400; color: var(--tl-dim); }
@@ -410,8 +411,7 @@
 .tl-influence__row { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto auto; align-items: center; column-gap: 8px; min-height: 30px; }
 .tl-influence__sw { width: 8px; height: 8px; background: var(--tl-c); }
 .tl-influence__name { font-size: var(--tl-fs-13); letter-spacing: 0.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.tl-influence__ctrl { flex: none; display: inline-flex; align-items: center; gap: 4px; font-size: var(--tl-fs-11); font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; color: var(--tl-text); }
-.tl-influence__ctrl::before { content: ''; border: 4px solid transparent; border-top-color: currentColor; border-bottom: 0; }
+.tl-influence__ctrl { flex: none; display: inline-flex; align-items: center; height: 18px; padding: 0 6px; margin-left: 4px; border: 1px solid var(--tl-line-3); font-size: var(--tl-fs-11); font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: var(--tl-dim); }
 .tl-influence__pct { font-size: var(--tl-fs-13); text-align: right; min-width: 44px; }
 .tl-influence__row .tl-delta { min-width: 44px; justify-content: flex-end; }
 
@@ -473,7 +473,7 @@
 @media (orientation: landscape) and (max-height: 520px) {
   .tl-toasts { left: auto; right: calc(var(--tl-safe-r) + var(--tl-s4)); top: calc(var(--tl-safe-t) + var(--tl-s4)); width: 330px; transform: none; }
 }
-.tl-toast { pointer-events: auto; position: relative; display: flex; align-items: flex-start; gap: 10px; padding: 10px var(--tl-s4) 10px 14px; background: var(--tl-glass-strong); border: 1px solid var(--tl-line-2); -webkit-backdrop-filter: blur(var(--tl-blur)); backdrop-filter: blur(var(--tl-blur)); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45); touch-action: pan-y; animation: tl-toast-in var(--tl-t3) var(--tl-ease) both; transition: opacity var(--tl-t2) var(--tl-ease), transform var(--tl-t2) var(--tl-ease); }
+.tl-toast { pointer-events: auto; position: relative; display: flex; align-items: flex-start; gap: 10px; padding: 10px var(--tl-s4) 10px 14px; background: rgba(8, 11, 16, 0.96); border: 1px solid var(--tl-line-2); -webkit-backdrop-filter: blur(var(--tl-blur)); backdrop-filter: blur(var(--tl-blur)); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45); touch-action: pan-y; animation: tl-toast-in var(--tl-t3) var(--tl-ease) both; transition: opacity var(--tl-t2) var(--tl-ease), transform var(--tl-t2) var(--tl-ease); }
 .tl-toast::before { content: ''; position: absolute; left: -1px; top: -1px; bottom: -1px; width: 2px; background: var(--tl-c); box-shadow: 0 0 10px var(--tl-c); }
 .tl-toast--out { opacity: 0; transform: translate3d(0, -8px, 0); }
 .tl-toast > svg { color: var(--tl-c); margin-top: 1px; }
