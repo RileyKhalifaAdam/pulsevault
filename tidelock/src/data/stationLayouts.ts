@@ -28,8 +28,13 @@ const cleanV = (a: V3): V3 => v(clean(a.x), clean(a.y), clean(a.z));
 export const PAD_ORDER: readonly PadSize[] = ['S', 'M', 'L'];
 export const padFits = (ship: PadSize, pad: PadSize): boolean => PAD_ORDER.indexOf(ship) <= PAD_ORDER.indexOf(pad);
 
-/** Radius, m, of the obstacle-free cylinder around a port's approach axis (covers the largest hull of that pad size). */
-export const PAD_CLEARANCE: Record<PadSize, number> = { S: 10, M: 20, L: 37 };
+/**
+ * Radius, m, of the obstacle-free cylinder around a port's approach axis. It covers the largest hull allowed
+ * on that pad as it really docks: most collars are dorsal, so a hull mates lying across the port axis and
+ * sweeps a disc of (hull radius + collar offset) — 33.4 m for the Drover on an M pad, 36.7 m for the
+ * Caravel's nose collar on an L pad.
+ */
+export const PAD_CLEARANCE: Record<PadSize, number> = { S: 11, M: 34, L: 38 };
 
 /** Guaranteed length of the straight approach corridor along a port's `dir`, m. */
 export const APPROACH_LENGTH = 320;
@@ -51,7 +56,7 @@ export interface BerthDims {
 }
 export const BERTHS: Record<PadSize, BerthDims> = {
   S: { standoff: 10, plate: 12, frame: 14, frameOut: 2.5, arm: 1.5, boom: 14 },
-  M: { standoff: 20, plate: 22, frame: 26, frameOut: 5, arm: 2.3, boom: 26 },
+  M: { standoff: 20, plate: 26, frame: 37, frameOut: 6, arm: 2.3, boom: 30 },
   L: { standoff: 22, plate: 30, frame: 43, frameOut: 9, arm: 3.2, boom: 44 },
 };
 
@@ -134,6 +139,9 @@ export const OUTPOST = {
   trussHalf: 72,
   /** half-length of the pressurised cross along X */
   habHalf: 30,
+  /** second pair of cans higher up the truss (seeded lengths stay inside this) */
+  canY: 32,
+  canHalf: 28,
   wingY: 54,
   wingReach: 66,
   radiatorY: -45,
@@ -152,7 +160,7 @@ export const DRYDOCK = {
   hullY1: 200,
   hullR: 40,
   /** yard office on the +X flank: centre x, y range, half-extent in x and z */
-  officeX: 172,
+  officeX: 192,
   officeY0: 300,
   officeY1: 480,
   officeHalfX: 38,
@@ -205,6 +213,27 @@ function torus(out: StationCollider[], R: number, y: number, tube: number, n: nu
     const a0 = (i / n) * Math.PI * 2;
     const a1 = ((i + 1) / n) * Math.PI * 2;
     out.push(capsule(Math.cos(a0) * R, y, -Math.sin(a0) * R, Math.cos(a1) * R, y, -Math.sin(a1) * R, tube));
+  }
+}
+
+/**
+ * Cover an axis-aligned box (centre c, half extents hx, hy, hz) with four capsules running along `axis`, one
+ * per quadrant of the cross-section. Conservative by a few metres on the side faces.
+ */
+function boxCapsules(out: StationCollider[], cx: number, cy: number, cz: number, hx: number, hy: number, hz: number, axis: 'x' | 'y' | 'z'): void {
+  const h = axis === 'x' ? hx : axis === 'y' ? hy : hz;
+  const p = axis === 'x' ? hy : hx;
+  const q = axis === 'z' ? hy : hz;
+  const r = Math.hypot(p, q) / 2;
+  const e = Math.max(0, h - r * 0.6);
+  for (const sp of [-0.5, 0.5]) {
+    for (const sq of [-0.5, 0.5]) {
+      const a = sp * p;
+      const b = sq * q;
+      if (axis === 'x') out.push(capsule(cx - e, cy + a, cz + b, cx + e, cy + a, cz + b, r));
+      else if (axis === 'y') out.push(capsule(cx + a, cy - e, cz + b, cx + a, cy + e, cz + b, r));
+      else out.push(capsule(cx + a, cy + b, cz - e, cx + a, cy + b, cz + e, r));
+    }
   }
 }
 
@@ -262,12 +291,14 @@ function spindle(): StationLayout {
   ];
   const c: StationCollider[] = [];
   c.push(capsule(0, -270, 0, 0, 274, 0, 26)); // spine, engine block and mast
-  c.push(capsule(-16, D.tierL[0], 0, 16, D.tierL[0], 0, 33));
-  c.push(capsule(0, D.tierM[0], -14, 0, D.tierM[0], 14, 25));
-  c.push(capsule(-10, D.tierS[0], 0, 10, D.tierS[0], 0, 17));
-  // drums: swept volume as two hexagonal loops of fat capsules
-  torus(c, 55, (D.drumY0 + D.drumY1) / 2, 45, 6);
-  torus(c, 55, -(D.drumY0 + D.drumY1) / 2, 45, 6);
+  boxCapsules(c, 0, D.tierL[0], 0, D.tierL[1], D.tierL[3], D.tierL[2], 'x');
+  boxCapsules(c, 0, D.tierM[0], 0, D.tierM[2], D.tierM[3], D.tierM[1], 'z');
+  boxCapsules(c, 0, D.tierS[0], 0, D.tierS[1], D.tierS[3], D.tierS[2], 'x');
+  // drums: swept volume as two stacked loops of capsules each
+  for (const s of [1, -1]) {
+    torus(c, 72, s * 38, 24, 12);
+    torus(c, 72, s * 82, 24, 12);
+  }
   // container racks
   for (let k = 0; k < D.racks; k++) {
     const d = radial((k * Math.PI * 2) / D.racks);
@@ -321,6 +352,7 @@ function outpost(): StationLayout {
   const c: StationCollider[] = [
     capsule(0, -D.trussHalf + 6, 0, 0, D.trussHalf - 6, 0, 6),
     capsule(-D.habHalf, 0, 0, D.habHalf, 0, 0, 8),
+    capsule(-D.canHalf, D.canY, 0, D.canHalf, D.canY, 0, 7.5),
     capsule(10, D.wingY, 0, D.wingReach - 8, D.wingY, 0, 9),
     capsule(-10, D.wingY, 0, -D.wingReach + 8, D.wingY, 0, 9),
     capsule(8, D.radiatorY, 0, 32, D.radiatorY, 0, 7),
@@ -369,7 +401,7 @@ function citadel(): StationLayout {
     radialPort('H4', 'M', deckR, 0, 315 * DEG),
   ];
   const c: StationCollider[] = [];
-  c.push(capsule(0, -70, 0, 0, 70, 0, D.keepR + 2));
+  c.push(capsule(0, -96, 0, 0, 96, 0, D.keepR + 9));
   for (const s of [1, -1]) c.push(capsule(0, s * 176, 0, 0, s * (D.mastY - 10), 0, 10));
   for (let k = 0; k < 4; k++) {
     const d = radial((k * Math.PI) / 2);

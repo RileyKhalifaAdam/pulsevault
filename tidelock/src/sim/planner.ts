@@ -113,6 +113,8 @@ export interface PlanOk {
     peakDecel: number;
     /** Sim time of atmosphere entry, s. */
     entryTime: number;
+    /** Estimated prograde Δv at the first apoapsis after the pass to lift the periapsis to {@link safeRadius}, m/s. */
+    raiseDv: number;
   };
 }
 
@@ -1963,4 +1965,526 @@ export function planCorrection(
     plan.encounter = { bodyId: T.id, periapsisRadius: e.rp, periapsisTime: e.tPeri, inclination: e.inc };
     return plan;
   });
+}
+
+// ===================================================================================== aerocapture
+
+/** Options of {@link planAerocapture}. */
+export interface AerocaptureOptions extends PlanOptions {
+  /** Highest acceptable apoapsis radius after the pass, m from the centre. Default half the SOI radius (50 body radii for a body without one). */
+  maxApoapsis?: number;
+  /** Fraction of the vessel's heat capacity the pass may use, 0..1. Default 0.85. */
+  heatMargin?: number;
+}
+
+/** Outcome of one simulated atmospheric pass (see simulatePass). */
+interface PassOutcome {
+  /** 'exit' = came back out above the atmosphere top; 'impact' = hit the surface; 'stuck' = still inside after the time limit. */
+  kind: 'exit' | 'impact' | 'stuck';
+  /** Highest stored heat during the pass, heat units (J-equivalent). */
+  heatPeak: number;
+  /** Apoapsis / periapsis radius of the conic after the pass (exit only; apoapsis Infinity when unbound), m. */
+  apo: number;
+  peri: number;
+  /** Speed lost to drag (vacuum speed at the exit radius minus actual), m/s. */
+  dvShed: number;
+  /** Peak drag deceleration, m/s². */
+  peakDecel: number;
+  /** Duration of the pass, s. */
+  duration: number;
+}
+
+/**
+ * Fly one pass through the atmosphere of `body` on the conic with specific energy `eps` (J/kg) and
+ * vacuum periapsis `rp` (m), from the top of the atmosphere until the ship leaves it again, hits the
+ * surface or a time limit runs out. Same laws as physics.ts: gravity of the body, drag
+ * ½·ρ·v²·dragArea against the (non-rotating) atmosphere, heating `aeroHeatingPower` against
+ * `heatDissipation`. RK4 in the orbit plane with steps that shrink where density and drag change fast.
+ */
+function simulatePass(body: BodyDef, eps: number, rp: number, stats: Vessel['stats'], mass: number, heat0: number): PassOutcome {
+  const mu = body.mu;
+  const atm = body.atmosphere;
+  const R = body.radius;
+  const out: PassOutcome = { kind: 'stuck', heatPeak: heat0, apo: 0, peri: 0, dvShed: 0, peakDecel: 0, duration: 0 };
+  if (!atm || !(mass > 0)) return out;
+  const rTop = R + atm.height;
+  const H = Math.max(1, atm.scaleHeight);
+  const h = rp * Math.sqrt(Math.max(0, 2 * (eps + mu / rp)));
+  const vTop = Math.sqrt(Math.max(0, 2 * (eps + mu / rTop)));
+  const vt0 = h / rTop;
+  let x = rTop;
+  let y = 0;
+  let vx = -Math.sqrt(Math.max(0, vTop * vTop - vt0 * vt0));
+  let vy = vt0;
+  const kD = (0.5 * Math.max(0, stats.dragArea)) / mass;
+  let heat = heat0;
+  const diss = Math.max(0, stats.heatDissipation);
+  let ax = 0;
+  let ay = 0;
+  let aD = 0;
+  const acc = (px: number, py: number, qx: number, qy: number): void => {
+    const r2 = px * px + py * py;
+    const r = Math.sqrt(r2);
+    const g = -mu / (r2 * r);
+    const rho = atmosphereDensity(body, r - R);
+    const v = Math.sqrt(qx * qx + qy * qy);
+    const d = kD * rho * v;
+    aD = d * v;
+    ax = g * px - d * qx;
+    ay = g * py - d * qy;
+  };
+  let t = 0;
+  const tMax = 6 * 3600;
+  let wasInside = false;
+  for (let step = 0; step < 40000 && t < tMax; step++) {
+    const r = Math.sqrt(x * x + y * y);
+    const v = Math.sqrt(vx * vx + vy * vy);
+    const vr = (x * vx + y * vy) / r;
+    if (r < R) {
+      out.kind = 'impact';
+      out.duration = t;
+      return out;
+    }
+    if (r < rTop) wasInside = true;
+    else if (wasInside && vr > 0) break;
+    acc(x, y, vx, vy);
+    const rho = atmosphereDensity(body, r - R);
+    if (aD > out.peakDecel) out.peakDecel = aD;
+    // Step: resolve the density gradient along the radial motion and the drag time scale.
+    let dt = Math.min(2, (0.04 * H) / Math.max(Math.abs(vr), 1), aD > 0 ? (0.02 * v) / aD : 2);
+    if (dt < 0.005) dt = 0.005;
+    // RK4.
+    const a1x = ax;
+    const a1y = ay;
+    const hh = 0.5 * dt;
+    acc(x + vx * hh, y + vy * hh, vx + a1x * hh, vy + a1y * hh);
+    const a2x = ax;
+    const a2y = ay;
+    const v2x = vx + a1x * hh;
+    const v2y = vy + a1y * hh;
+    acc(x + v2x * hh, y + v2y * hh, vx + a2x * hh, vy + a2y * hh);
+    const a3x = ax;
+    const a3y = ay;
+    const v3x = vx + a2x * hh;
+    const v3y = vy + a2y * hh;
+    acc(x + v3x * dt, y + v3y * dt, vx + a3x * dt, vy + a3y * dt);
+    const a4x = ax;
+    const a4y = ay;
+    const v4x = vx + a3x * dt;
+    const v4y = vy + a3y * dt;
+    x += (dt / 6) * (vx + 2 * v2x + 2 * v3x + v4x);
+    y += (dt / 6) * (vy + 2 * v2y + 2 * v3y + v4y);
+    vx += (dt / 6) * (a1x + 2 * a2x + 2 * a3x + a4x);
+    vy += (dt / 6) * (a1y + 2 * a2y + 2 * a3y + a4y);
+    // Heat (trapezoidal in the heating power).
+    const r1 = Math.sqrt(x * x + y * y);
+    const p0 = aeroHeatingPower(stats, rho, v);
+    const p1 = aeroHeatingPower(stats, atmosphereDensity(body, r1 - R), Math.sqrt(vx * vx + vy * vy));
+    heat += (0.5 * (p0 + p1) - diss) * dt;
+    if (heat < 0) heat = 0;
+    if (heat > out.heatPeak) out.heatPeak = heat;
+    t += dt;
+  }
+  out.duration = t;
+  const r = Math.sqrt(x * x + y * y);
+  if (!(r >= rTop) || !wasInside) return out;
+  out.kind = 'exit';
+  const v2 = vx * vx + vy * vy;
+  const e2 = 0.5 * v2 - mu / r;
+  const hz = x * vy - y * vx;
+  const p = (hz * hz) / mu;
+  const e = Math.sqrt(Math.max(0, 1 + (2 * e2 * hz * hz) / (mu * mu)));
+  out.peri = p / (1 + e);
+  out.apo = e < 1 ? p / (1 - e) : Infinity;
+  out.dvShed = Math.sqrt(Math.max(0, 2 * (eps + mu / r))) - Math.sqrt(v2);
+  return out;
+}
+
+/**
+ * Aerocapture: the vacuum-periapsis radius at `bodyId` (which must have an atmosphere) for which one
+ * pass through the atmosphere sheds enough speed to end bound (apoapsis below `maxApoapsis`) without
+ * the vessel's stored heat exceeding `heatMargin` of its heat capacity. `vessel` is the ship as the
+ * physics module holds it and `t` the sim time (s) of its state; it must be inside the body's SOI or
+ * on a predicted course into it.
+ *
+ * Each candidate pass is integrated with the physics.ts atmosphere laws (gravity, drag, heating and
+ * radiative dissipation; the atmosphere is non-rotating, as in physics.ts). The corridor between the
+ * shallowest periapsis that still captures and the deepest that neither overheats nor fails to come
+ * back out is found by bisection, and the middle of it is recommended. If the current trajectory
+ * misses that periapsis, the plan holds one correction node found by {@link planCorrection}.
+ * `aerocapture` in the result describes the pass; after it, raise the periapsis out of the
+ * atmosphere at the first apoapsis (`raiseDv` m/s, to be re-planned once the pass is flown).
+ * Returns {ok: false} when no corridor exists (too hot, or not enough air to slow down).
+ */
+export function planAerocapture(model: SystemModel, vessel: Vessel, bodyId: string, t: number, opts: AerocaptureOptions = {}): PlanResult {
+  return guarded(() => {
+    if (!vessel || !vessel.stats || !Number.isFinite(t)) return fail('Invalid vessel');
+    if (typeof bodyId !== 'string' || !model.hasBody(bodyId)) return fail('Unknown target body');
+    const B = model.body(bodyId);
+    const atm = B.atmosphere;
+    if (!atm || !(atm.height > 0) || !(atm.surfaceDensity > 0)) return fail(`${B.name} has no atmosphere to brake in`);
+    if (!model.hasBody(vessel.soiBodyId)) return fail('Unknown reference body');
+    const ship = shipFromVessel(vessel, t);
+    if (!finiteState(ship.sv)) return fail('Invalid vessel state');
+    // The arrival conic inside B's SOI.
+    const pred = predictTrajectory(model, ship, { maxPatches: 6, maxDuration: 200 * DAY, searchPeriods: 1, stopAtAtmosphere: false });
+    const arr = pred.find((p) => p.bodyId === B.id);
+    if (!arr) return fail(`The current trajectory does not reach ${B.name}`);
+    const infoA = orbitInfo(arr.svStart, B.mu, arr.tStart);
+    const eps = infoA.energy;
+    const mass = totalMass(vessel);
+    const cap = Math.max(1, vessel.stats.heatCapacity);
+    const margin = clampN(Number.isFinite(opts.heatMargin) ? (opts.heatMargin as number) : 0.85, 0.05, 1);
+    const heatLimit = margin * cap;
+    const heat0 = Math.max(0, Number.isFinite(vessel.heat) ? vessel.heat : 0);
+    if (heat0 >= heatLimit) return fail('The hull is already too hot for an atmospheric pass');
+    const rTop = B.radius + atm.height;
+    const hasSoi = B.soi < Infinity;
+    let maxApo = Number.isFinite(opts.maxApoapsis) && (opts.maxApoapsis as number) > rTop ? (opts.maxApoapsis as number) : hasSoi ? 0.5 * B.soi : 50 * B.radius;
+    if (hasSoi) maxApo = Math.min(maxApo, 0.9 * B.soi);
+    if (infoA.closed && infoA.apoapsis <= maxApo && infoA.periapsis > rTop) return fail('Already captured: no aerocapture needed');
+    const captures = (o: PassOutcome): boolean => o.kind !== 'exit' || o.apo <= maxApo;
+    const bad = (o: PassOutcome): boolean => o.kind !== 'exit' || o.heatPeak > heatLimit;
+    const sim = (rp: number): PassOutcome => simulatePass(B, eps, rp, vessel.stats, mass, heat0);
+    const rLo = B.radius + 1;
+    const rHi = rTop - 1;
+    // 1. Shallow edge: the highest periapsis that still captures (deeper passes shed more).
+    if (!captures(sim(rLo))) return fail(`Even a grazing pass through the atmosphere of ${B.name} cannot shed enough speed`);
+    let shallow: number;
+    if (captures(sim(rHi))) shallow = rHi;
+    else {
+      let a = rLo;
+      let b = rHi;
+      for (let i = 0; i < 40 && b - a > 1; i++) {
+        const m = 0.5 * (a + b);
+        if (captures(sim(m))) a = m;
+        else b = m;
+      }
+      shallow = a;
+    }
+    // 2. Deep edge: the lowest periapsis that comes out without overheating.
+    const atShallow = sim(shallow);
+    if (bad(atShallow)) {
+      return fail(atShallow.kind === 'exit' ? `A pass deep enough to capture at ${B.name} would overheat the hull` : `A pass deep enough to capture at ${B.name} would not come back out`);
+    }
+    let deep: number;
+    if (!bad(sim(rLo))) deep = rLo;
+    else {
+      let a = rLo;
+      let b = shallow;
+      for (let i = 0; i < 40 && b - a > 1; i++) {
+        const m = 0.5 * (a + b);
+        if (bad(sim(m))) a = m;
+        else b = m;
+      }
+      deep = b;
+    }
+    const width = shallow - deep;
+    const rpRec = deep + 0.5 * width;
+    const pass = sim(rpRec);
+    if (bad(pass) || !captures(pass)) return fail(`No safe aerocapture corridor at ${B.name}`);
+    const warnings: string[] = [];
+    if (width < 2000) warnings.push(`The corridor is only ${fmtDistance(width)} wide: fly the approach precisely`);
+    // Correction burn toward the recommended periapsis if the current pass misses it.
+    const nodes: ManeuverNode[] = [];
+    const tol = Math.max(200, 0.15 * width);
+    if (Math.abs(arr.periapsisRadius - rpRec) > tol) {
+      const corr = planCorrection(model, ship, [], B.id, rpRec, { leadTime: opts.leadTime });
+      if (corr.ok) for (const n of corr.nodes) nodes.push(n);
+      else warnings.push(`Bring the periapsis to ${altText(B, rpRec)} before arrival: ${corr.reason}`);
+    }
+    // Entry time on the (corrected) arrival conic.
+    const pr2 = predictWithNodes(model, ship, nodes, { maxPatches: 6, maxDuration: 200 * DAY, searchPeriods: 1, stopAtAtmosphere: false });
+    let entryTime = arr.tStart;
+    for (const p of pr2.patches) {
+      if (p.bodyId !== B.id || p.tEnd < (nodes.length ? nodes[nodes.length - 1].t : -Infinity)) continue;
+      const dtIn = timeToRadius(p.svStart, B.mu, rTop, 'inward');
+      if (dtIn < Infinity) entryTime = p.tStart + dtIn;
+      break;
+    }
+    const rSafe = safeRadius(B);
+    const raiseDv =
+      pass.apo < Infinity && pass.apo > rSafe
+        ? Math.sqrt(B.mu * (2 / pass.apo - 2 / (pass.apo + rSafe))) - Math.sqrt(B.mu * (2 / pass.apo - 2 / (pass.apo + pass.peri)))
+        : 0;
+    if (pass.apo < rSafe) warnings.push('The orbit after the pass stays low: raise it at once');
+    warnings.push(`After the pass, raise the periapsis at apoapsis (about ${fmtSpeed(raiseDv)})`);
+    const plan = okPlan(
+      ship.t,
+      nodes,
+      entryTime + pass.duration,
+      `Aerocapture at ${B.name}: periapsis ${altText(B, rpRec)} (corridor ${altText(B, deep)}–${altText(B, shallow)}), sheds ${fmtSpeed(pass.dvShed)}, peak heat ${Math.round((100 * pass.heatPeak) / cap)} %` +
+        (nodes.length ? `; correction Δv ${fmtSpeed(nodeDvMagnitude(nodes[0]))}` : ''),
+      warnings,
+    );
+    plan.aerocapture = {
+      periapsisRadius: rpRec,
+      periapsisAltitude: rpRec - B.radius,
+      corridor: { shallow: shallow - B.radius, deep: deep - B.radius },
+      peakHeatFraction: pass.heatPeak / cap,
+      exitApoapsis: pass.apo,
+      dvShed: pass.dvShed,
+      peakDecel: pass.peakDecel,
+      entryTime,
+      raiseDv,
+    };
+    return plan;
+  });
+}
+
+// ===================================================================================== stations
+
+/** Bodies from `id` up to the primary, `id` first. */
+function chainOf(model: SystemModel, id: string): string[] {
+  const out: string[] = [];
+  let cur: BodyDef | null = model.body(id);
+  while (cur) {
+    out.push(cur.id);
+    cur = model.parent(cur.id);
+  }
+  return out;
+}
+
+/** Next body to head for on the way from SOI body `from` to `to` (same as `to` for a single hop), or null if from === to. */
+function nextHop(model: SystemModel, from: string, to: string): { hop: string; kind: 'down' | 'up' | 'sibling' } | null {
+  if (from === to) return null;
+  const cf = chainOf(model, from);
+  const ct = chainOf(model, to);
+  const lca = ct.find((b) => cf.includes(b)) as string;
+  if (lca === from) return { hop: ct[ct.indexOf(lca) - 1], kind: 'down' };
+  const pf = cf[1];
+  if (pf === lca) return lca === to ? { hop: to, kind: 'up' } : { hop: ct[ct.indexOf(lca) - 1], kind: 'sibling' };
+  return { hop: pf, kind: 'up' };
+}
+
+/** Options of {@link planToStation}. */
+export interface ToStationOptions extends RendezvousOptions {
+  /** See {@link TransferOptions.window}. */
+  window?: 'now' | 'best';
+}
+
+/**
+ * Top-level convenience: plan the next leg of a trip to `station`.
+ *
+ *  - Station around the ship's SOI body: {@link planRendezvous}; `phases` is empty.
+ *  - Station around another body: {@link planTransferToBody} toward it with the periapsis at the
+ *    station's orbital radius and the arrival in the station's orbital plane, captured into a
+ *    circular orbit there; `phases` = ['rendezvous'].
+ *  - Station more than one hop away (e.g. a moon of another planet): the first hop only — to the
+ *    body on the way, captured low (or near the orbit of the next body) — and `phases` lists what
+ *    remains ('transfer' = another call of this function, which also captures; then 'rendezvous').
+ */
+export function planToStation(model: SystemModel, ship: TrajectoryStart, station: StationDef | string, opts: ToStationOptions = {}): PlanResult {
+  return guarded(() => {
+    const st = typeof station === 'string' ? model.station(station) : station;
+    if (!st || !st.orbit || !model.hasBody(st.parentBodyId)) return fail('Unknown station');
+    const s = settle(model, ship);
+    if (typeof s === 'string') return fail(s);
+    const here = s.body.id;
+    const hop = nextHop(model, here, st.parentBodyId);
+    if (!hop) {
+      const r = planRendezvous(model, s.ship, st.orbit, opts);
+      if (r.ok) {
+        r.phases = [];
+        r.summary = `${st.name}: ${r.summary}`;
+      }
+      return r;
+    }
+    const T = model.body(hop.hop);
+    const final = T.id === st.parentBodyId;
+    const nSt = orbitNormalFromElements(st.orbit);
+    let rp: number;
+    let planeNormal: V3 | undefined;
+    if (final) {
+      rp = Math.max(st.orbit.a * (1 - st.orbit.e), T.radius + 1);
+      planeNormal = nSt;
+    } else {
+      // Intermediate body: park where the next leg starts cheaply.
+      const nxt = nextHop(model, T.id, st.parentBodyId);
+      const child = nxt && nxt.kind === 'down' ? model.body(nxt.hop) : null;
+      const low = safeRadius(T) + 0.05 * T.radius;
+      rp = child && child.orbit ? Math.max(low, 0.5 * Math.abs(child.orbit.a)) : low;
+      if (hop.kind === 'up') {
+        const A = s.body;
+        const rA = A.orbit ? Math.abs(A.orbit.a) : rp;
+        if (Math.abs(rp - rA) < 2 * A.soi) rp = Math.max(low, rA - 3 * A.soi);
+      }
+    }
+    const r = planTransferToBody(model, s.ship, T.id, { periapsisRadius: rp, planeNormal, leadTime: opts.leadTime, window: opts.window });
+    if (!r.ok) return r;
+    const captured = r.nodes.length > 1;
+    r.phases = final ? (captured ? ['rendezvous'] : ['capture', 'rendezvous']) : captured ? ['transfer', 'rendezvous'] : ['capture', 'transfer', 'rendezvous'];
+    r.summary = `${st.name}: ${r.summary}`;
+    return r;
+  });
+}
+
+// ===================================================================================== rough travel estimates
+
+/** Result of {@link estimateTravel}. */
+export type TravelEstimate =
+  | {
+      ok: true;
+      /** Rough total Δv, m/s (impulsive, Hohmann-class transfers; plane changes included). */
+      dv: number;
+      /** Rough trip time from `t`, s, including the wait for each transfer window. */
+      duration: number;
+      /** One entry per hop. */
+      legs: { from: string; to: string; dv: number; wait: number; tof: number }[];
+      summary: string;
+    }
+  | { ok: false; reason: string };
+
+/** Radius, speed, unit normal and absolute-frame-free position of a circular-ish orbiter about `bodyId` at time t. */
+interface Parking {
+  bodyId: string;
+  r: number;
+  normal: V3;
+  /** Current position relative to the body (for phasing). */
+  pos: V3;
+}
+
+/** Wait (s) until the phase angle between two co-planar circular orbits is right for a Hohmann transfer from r1 to r2 taking `tof`. */
+function hohmannWait(mu: number, pos1: V3, r1: number, pos2: V3, r2: number, normal: V3, tof: number): number {
+  const n1 = Math.sqrt(mu / (r1 * r1 * r1));
+  const n2 = Math.sqrt(mu / (r2 * r2 * r2));
+  const dn = n1 - n2;
+  if (!(Math.abs(dn) > 1e-15)) return 0;
+  const want = PI - n2 * tof;
+  const p1 = vnorm(vsub(pos1, vscale(normal, vdot(pos1, normal))));
+  const p2 = vnorm(vsub(pos2, vscale(normal, vdot(pos2, normal))));
+  const cur = Math.atan2(vdot(vcross(p1, p2), normal), vdot(p1, p2));
+  // phase(t) = cur - dn·t; want phase = want (mod 2π).
+  const dt = dn > 0 ? wrapTau(cur - want) / dn : wrapTau(want - cur) / -dn;
+  return Number.isFinite(dt) && dt >= 0 ? dt : 0;
+}
+
+/**
+ * Fast rough estimate of the Δv and time of a trip to a station, for mission deadlines and trade
+ * planning: no Lambert search and no refinement, just Hohmann-class patched conics between circular
+ * orbits along the chain of bodies (escape / capture burns from v∞, plane changes at the slow end,
+ * and the wait for each transfer window from the current phases). `from` is a station id (the ship
+ * docked there) or a ship state; `t` the sim time, s. Typically good to 10–30 % against the real
+ * planners; never throws.
+ */
+export function estimateTravel(model: SystemModel, from: string | TrajectoryStart, toStationId: string, t: number): TravelEstimate {
+  try {
+    if (!Number.isFinite(t)) return { ok: false, reason: 'Invalid time' };
+    const dst = model.station(toStationId);
+    let start: Parking;
+    if (typeof from === 'string') {
+      const st = model.station(from);
+      const sv = model.stationState(st.id, t);
+      start = { bodyId: st.parentBodyId, r: vlen(sv.r), normal: normalOf(sv), pos: sv.r };
+    } else {
+      const s = settle(model, from);
+      if (typeof s === 'string') return { ok: false, reason: s };
+      const r = s.info.closed ? s.info.a : vlen(s.ship.sv.r);
+      start = { bodyId: s.body.id, r: Math.max(r, s.body.radius), normal: normalOf(s.ship.sv), pos: s.ship.sv.r };
+    }
+    const dsv = model.stationState(dst.id, t);
+    const goal: Parking = { bodyId: dst.parentBodyId, r: vlen(dsv.r), normal: normalOf(dsv), pos: dsv.r };
+    const legs: { from: string; to: string; dv: number; wait: number; tof: number }[] = [];
+    let cur = start;
+    let tc = t;
+    const circ = (mu: number, r: number): number => Math.sqrt(mu / r);
+    const planeDv = (v: number, n1: V3, n2: V3): number => 2 * v * Math.sin(0.5 * Math.atan2(vlen(vcross(n1, n2)), vdot(n1, n2)));
+    for (let guard = 0; guard < 8; guard++) {
+      const hop = nextHop(model, cur.bodyId, goal.bodyId);
+      const A = model.body(cur.bodyId);
+      if (!hop) {
+        // Same body: Hohmann between the radii, plane change at the higher (slower) end, wait for phasing.
+        const h = orbitHohmann(A.mu, cur.r, goal.r);
+        const vSlow = circ(A.mu, Math.max(cur.r, goal.r));
+        const dPlane = planeDv(vSlow, cur.normal, goal.normal);
+        const dv = h.dv1 + Math.sqrt(h.dv2 * h.dv2 + dPlane * dPlane);
+        const gPos = model.stationState(dst.id, tc).r;
+        const wait = Math.abs(cur.r - goal.r) < 1e-3 * goal.r ? 0.5 * orbitalPeriod(A.mu, goal.r) : hohmannWait(A.mu, cur.pos, cur.r, gPos, goal.r, cur.normal, h.tof);
+        legs.push({ from: A.id, to: dst.id, dv, wait, tof: h.tof });
+        tc += wait + h.tof;
+        break;
+      }
+      const T = model.body(hop.hop);
+      const final = T.id === goal.bodyId;
+      const rArr = final ? goal.r : safeRadius(T) + 0.05 * T.radius;
+      if (hop.kind === 'down') {
+        // Planet -> moon: Hohmann in A's frame to the moon's orbit, capture at the moon.
+        const aT = Math.abs(T.orbit ? T.orbit.a : cur.r);
+        const h = orbitHohmann(A.mu, cur.r, aT);
+        const vInf = Math.abs(h.dv2);
+        const cap = Math.sqrt(vInf * vInf + (2 * T.mu) / rArr) - circ(T.mu, rArr);
+        const nT = T.orbit ? orbitNormalFromElements(T.orbit) : cur.normal;
+        const dPlane = planeDv(circ(A.mu, Math.max(cur.r, aT)), cur.normal, nT);
+        const tPos = model.bodyState(T.id, tc).r;
+        const wait = hohmannWait(A.mu, cur.pos, cur.r, tPos, aT, cur.normal, h.tof);
+        legs.push({ from: A.id, to: T.id, dv: Math.abs(h.dv1) + cap + dPlane, wait, tof: h.tof });
+        tc += wait + h.tof;
+        cur = { bodyId: T.id, r: rArr, normal: final ? goal.normal : nT, pos: { x: rArr, y: 0, z: 0 } };
+        if (final) {
+          cur.pos = model.stationState(dst.id, tc).r;
+          break;
+        }
+        continue;
+      }
+      const C = hop.kind === 'up' ? T : (model.parent(A.id) as BodyDef);
+      const aA = Math.abs(A.orbit ? A.orbit.a : 0);
+      if (hop.kind === 'up') {
+        // Moon -> parent: escape to an orbit around the parent with its far apsis at rArr, then circularise.
+        const h = orbitHohmann(C.mu, aA, rArr);
+        const vInf = Math.abs(h.dv1);
+        const esc = Math.sqrt(vInf * vInf + (2 * A.mu) / cur.r) - circ(A.mu, cur.r);
+        legs.push({ from: A.id, to: C.id, dv: esc + Math.abs(h.dv2), wait: 0.5 * orbitalPeriod(A.mu, cur.r), tof: h.tof });
+        tc += 0.5 * orbitalPeriod(A.mu, cur.r) + h.tof;
+        cur = { bodyId: C.id, r: rArr, normal: A.orbit ? orbitNormalFromElements(A.orbit) : cur.normal, pos: model.bodyState(A.id, tc).r };
+        continue; // if the station is around C, the next round is the same-body leg
+      }
+      // Sibling: Hohmann between the two bodies' orbits in C's frame, escape and capture from v∞.
+      const aT = Math.abs(T.orbit ? T.orbit.a : aA);
+      const h = orbitHohmann(C.mu, aA, aT);
+      const esc = Math.sqrt(h.dv1 * h.dv1 + (2 * A.mu) / cur.r) - circ(A.mu, cur.r);
+      const cap = Math.sqrt(h.dv2 * h.dv2 + (2 * T.mu) / rArr) - circ(T.mu, rArr);
+      const nA = A.orbit ? orbitNormalFromElements(A.orbit) : cur.normal;
+      const nT = T.orbit ? orbitNormalFromElements(T.orbit) : nA;
+      const dPlane = planeDv(circ(C.mu, Math.max(aA, aT)), nA, nT);
+      const wait = hohmannWait(C.mu, model.bodyState(A.id, tc).r, aA, model.bodyState(T.id, tc).r, aT, nA, h.tof);
+      legs.push({ from: A.id, to: T.id, dv: esc + cap + dPlane, wait, tof: h.tof });
+      tc += wait + h.tof;
+      cur = { bodyId: T.id, r: rArr, normal: final ? goal.normal : nT, pos: { x: rArr, y: 0, z: 0 } };
+      if (final) {
+        cur.pos = model.stationState(dst.id, tc).r;
+        break;
+      }
+    }
+    // Arrived around the station's body: if not already on its orbit, a final in-body rendezvous estimate.
+    const last = legs[legs.length - 1];
+    if (!last || last.to !== dst.id) {
+      const A = model.body(cur.bodyId);
+      if (cur.bodyId === goal.bodyId && Math.abs(cur.r - goal.r) > 1e-3 * goal.r) {
+        const h = orbitHohmann(A.mu, cur.r, goal.r);
+        legs.push({ from: A.id, to: dst.id, dv: h.dvTotal, wait: 0.5 * orbitalPeriod(A.mu, Math.max(cur.r, goal.r)), tof: h.tof });
+        tc += 0.5 * orbitalPeriod(A.mu, Math.max(cur.r, goal.r)) + h.tof;
+      } else {
+        const ph = 0.5 * orbitalPeriod(A.mu, goal.r);
+        legs.push({ from: A.id, to: dst.id, dv: 0.02 * circ(A.mu, goal.r), wait: ph, tof: ph });
+        tc += 2 * ph;
+      }
+    }
+    let dv = 0;
+    for (const l of legs) dv += l.dv;
+    const duration = tc - t;
+    if (!Number.isFinite(dv) || !Number.isFinite(duration)) return { ok: false, reason: 'No estimate possible' };
+    return { ok: true, dv, duration, legs, summary: `About ${fmtSpeed(dv)} and ${fmtDuration(duration)} to ${dst.name}` };
+  } catch (e) {
+    return { ok: false, reason: e instanceof Error ? e.message : 'No estimate possible' };
+  }
+}
+
+/** Hohmann numbers between circular radii (thin wrapper so a zero radius cannot produce NaN). */
+function orbitHohmann(mu: number, r1: number, r2: number): { dv1: number; dv2: number; dvTotal: number; tof: number } {
+  const a = Math.max(r1, 1);
+  const b = Math.max(r2, 1);
+  const aT = 0.5 * (a + b);
+  const dv1 = Math.sqrt(mu * (2 / a - 1 / aT)) - Math.sqrt(mu / a);
+  const dv2 = Math.sqrt(mu / b) - Math.sqrt(mu * (2 / b - 1 / aT));
+  return { dv1, dv2, dvTotal: Math.abs(dv1) + Math.abs(dv2), tof: PI * Math.sqrt((aT * aT * aT) / mu) };
 }

@@ -411,7 +411,7 @@
 .tl-influence__row { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto auto; align-items: center; column-gap: 8px; min-height: 30px; }
 .tl-influence__sw { width: 8px; height: 8px; background: var(--tl-c); }
 .tl-influence__name { font-size: var(--tl-fs-13); letter-spacing: 0.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.tl-influence__ctrl { flex: none; display: inline-flex; align-items: center; height: 18px; padding: 0 6px; margin-left: 4px; border: 1px solid var(--tl-line-3); font-size: var(--tl-fs-11); font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: var(--tl-dim); }
+.tl-influence__ctrl { flex: none; display: inline-flex; align-items: center; height: 17px; padding: 0 4px; margin-left: 2px; border: 1px solid var(--tl-line-3); font-size: var(--tl-fs-11); font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--tl-dim); }
 .tl-influence__pct { font-size: var(--tl-fs-13); text-align: right; min-width: 44px; }
 .tl-influence__row .tl-delta { min-width: 44px; justify-content: flex-end; }
 
