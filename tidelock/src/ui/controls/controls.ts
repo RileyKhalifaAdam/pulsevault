@@ -2,7 +2,7 @@
 // cut button, the SAS selector and the camera gestures. True multi-touch: every control tracks its own pointer.
 // The HUD (src/ui/hud/hud.ts) places the elements and owns the CSS; this module owns the behaviour.
 import type { UiHost } from '../host';
-import type { SasMode } from '../../sim/physics';
+import type { HoldMode } from '../../game';
 import { clamp, h, icon, onTap, type IconName } from '../kit';
 
 export interface ControlHooks {
@@ -20,6 +20,9 @@ export interface FlightControls {
   /** SAS button and its drawer (the drawer is placed by the HUD above the button row). */
   sas: HTMLElement;
   sasDrawer: HTMLElement;
+  /** RCS translate-mode toggle (stick = sideways / up-down, roll buttons = back / forward). */
+  rcs: HTMLElement;
+  readonly rcsOn: boolean;
   /** Camera offsets for SceneFrame.camera. */
   camera: { yaw: number; pitch: number; distance: number };
   update(dt: number): void;
@@ -27,7 +30,7 @@ export interface FlightControls {
   dispose(): void;
 }
 
-export const SAS_MODES: { mode: SasMode; label: string; short: string; icon: IconName }[] = [
+export const SAS_MODES: { mode: HoldMode; label: string; short: string; icon: IconName }[] = [
   { mode: 'stability', label: 'Hold', short: 'HOLD', icon: 'sas' },
   { mode: 'prograde', label: 'Prograde', short: 'PRO', icon: 'prograde' },
   { mode: 'retrograde', label: 'Retrograde', short: 'RETRO', icon: 'retrograde' },
@@ -36,7 +39,9 @@ export const SAS_MODES: { mode: SasMode; label: string; short: string; icon: Ico
   { mode: 'radialOut', label: 'Radial out', short: 'RAD+', icon: 'radialOut' },
   { mode: 'radialIn', label: 'Radial in', short: 'RAD-', icon: 'radialIn' },
   { mode: 'target', label: 'Target', short: 'TGT', icon: 'target' },
-  { mode: 'maneuver', label: 'Manoeuvre', short: 'MNV', icon: 'node' },
+  { mode: 'antiTarget', label: 'Anti-target', short: 'ATGT', icon: 'target' },
+  { mode: 'burn', label: 'Burn', short: 'BURN', icon: 'node' },
+  { mode: 'off', label: 'Off', short: 'OFF', icon: 'sas' },
 ];
 
 const STICK_R = 54;
@@ -166,6 +171,18 @@ export function createFlightControls(host: UiHost, hooks: ControlHooks): FlightC
     return b;
   };
   const roll = h('div.hud-roll', null, rollBtn(-1, 'Roll left'), rollBtn(1, 'Roll right'));
+  // RCS translate mode (for docking): the stick pushes the ship sideways / up-down, the roll buttons back / forward.
+  let rcsOn = false;
+  const rcs = h('button.hud-btn.hud-btn--rcs', { attrs: { type: 'button', 'aria-label': 'RCS translate mode', 'aria-pressed': 'false' }, text: 'RCS' });
+  const setRcs = (on: boolean): void => {
+    rcsOn = on;
+    rcs.classList.toggle('is-on', on);
+    rcs.setAttribute('aria-pressed', on ? 'true' : 'false');
+    stick.classList.toggle('is-rcs', on);
+    host.session.setControls({ pitch: 0, yaw: 0, roll: 0, translate: { x: 0, y: 0, z: 0 } });
+    lp = ly = lr = ltx = lty = ltz = 0;
+  };
+  onTap(rcs, () => setRcs(!rcsOn));
 
   // ------------------------------------------------------------------ throttle
   const fill = h('div.hud-thr-fill');
@@ -179,10 +196,8 @@ export function createFlightControls(host: UiHost, hooks: ControlHooks): FlightC
   let thrShown = -1;
   const sendThrottle = (v: number): void => {
     v = clamp(v, 0, 1);
-    // The sim treats a throttle value as player input only when it differs from the last one sent.
-    if (v === thrSent) host.game.setControls({ throttle: v > 0.5 ? v - 0.002 : v + 0.002 });
     thrSent = v;
-    host.game.setControls({ throttle: v });
+    host.session.setControls({ throttle: v });
   };
   const thrFromEvent = (e: PointerEvent): void => {
     const r = track.getBoundingClientRect();
@@ -231,12 +246,11 @@ export function createFlightControls(host: UiHost, hooks: ControlHooks): FlightC
   const sas = h('div.hud-sas', null, sasBtn);
   const sasDrawer = h('div.hud-sas-drawer.hud-plate');
   sasDrawer.hidden = true;
-  const sasCells = new Map<SasMode, HTMLElement>();
+  const sasCells = new Map<HoldMode, HTMLElement>();
   for (const m of SAS_MODES) {
     const cell = h('button.hud-sas-cell', { attrs: { type: 'button' } }, icon(m.icon, 22), h('span', { text: m.label }));
     onTap(cell, () => {
-      const r = host.game.setSas(m.mode);
-      if (!r.ok) host.toast(r.reason, 'warn');
+      host.session.setHold(m.mode);
       sasDrawer.hidden = true;
     });
     sasCells.set(m.mode, cell);
@@ -245,8 +259,8 @@ export function createFlightControls(host: UiHost, hooks: ControlHooks): FlightC
   onTap(sasBtn, () => {
     sasDrawer.hidden = !sasDrawer.hidden;
   });
-  let sasShown: SasMode | '' = '';
-  const showSas = (mode: SasMode): void => {
+  let sasShown: HoldMode | '' = '';
+  const showSas = (mode: HoldMode): void => {
     if (mode === sasShown) return;
     sasShown = mode;
     const def = SAS_MODES.find((m) => m.mode === mode);
@@ -272,8 +286,8 @@ export function createFlightControls(host: UiHost, hooks: ControlHooks): FlightC
     else if (e.code === 'KeyX') sendThrottle(0);
     else if (e.code === 'KeyZ') sendThrottle(1);
     else if (e.code === 'KeyT') {
-      const i = SAS_MODES.findIndex((m) => m.mode === host.game.flightInfo().sasMode);
-      host.game.setSas(SAS_MODES[(i + 1) % SAS_MODES.length].mode);
+      const i = SAS_MODES.findIndex((m) => m.mode === host.session.player().hold);
+      host.session.setHold(SAS_MODES[(i + 1) % SAS_MODES.length].mode);
     }
   };
   const onKeyUp = (e: KeyboardEvent): void => {
@@ -288,6 +302,10 @@ export function createFlightControls(host: UiHost, hooks: ControlHooks): FlightC
   let lp = 0;
   let ly = 0;
   let lr = 0;
+  let ltx = 0;
+  let lty = 0;
+  let ltz = 0;
+  const tr = { x: 0, y: 0, z: 0 };
   const shape = (v: number, gain: number): number => clamp(Math.sign(v) * Math.pow(Math.abs(v), 1.6) * gain, -1, 1);
   const axis = (neg: string, pos: string): number => (keys.has(pos) ? 1 : 0) - (keys.has(neg) ? 1 : 0);
 
@@ -298,9 +316,13 @@ export function createFlightControls(host: UiHost, hooks: ControlHooks): FlightC
     throttle,
     sas,
     sasDrawer,
+    rcs,
+    get rcsOn() {
+      return rcsOn;
+    },
     camera,
     update(dt) {
-      const game = host.game;
+      const game = host.session;
       const gain = clamp(Number(host.settings.get('stickSensitivity', 1)) || 1, 0.3, 2);
       const inv = host.settings.get('invertPitch', false) ? -1 : 1;
       // Stick pulled back (down the screen) = nose up, like a flight stick; W = nose down.
@@ -310,20 +332,41 @@ export function createFlightControls(host: UiHost, hooks: ControlHooks): FlightC
       p = clamp(p, -1, 1);
       y = clamp(y, -1, 1);
       r = clamp(r, -1, 1);
+      // Translation: IJKL + H/N on a keyboard; in RCS mode the stick and the roll buttons translate instead of turning.
+      let tx = axis('KeyJ', 'KeyL');
+      let ty = axis('KeyK', 'KeyI');
+      let tz = axis('KeyH', 'KeyN');
+      if (rcsOn) {
+        tx += clamp(sx * 1.4, -1, 1);
+        ty += clamp(-sy * 1.4, -1, 1);
+        tz += -rollTouch;
+        p = axis('KeyW', 'KeyS');
+        y = axis('KeyA', 'KeyD');
+        r = axis('KeyQ', 'KeyE');
+      }
+      tx = clamp(tx, -1, 1);
+      ty = clamp(ty, -1, 1);
+      tz = clamp(tz, -1, 1);
+      if (tx !== ltx || ty !== lty || tz !== ltz) {
+        ltx = tr.x = tx;
+        lty = tr.y = ty;
+        ltz = tr.z = tz;
+        game.setControls({ translate: tr });
+      }
       if (p !== lp || y !== ly || r !== lr) {
         lp = p;
         ly = y;
         lr = r;
         game.setControls({ pitch: p, yaw: y, roll: r });
       }
-      const fi = game.flightInfo();
+      const fi = game.player();
       const kt = (keys.has('ShiftLeft') || keys.has('ShiftRight') ? 1 : 0) - (keys.has('ControlLeft') || keys.has('ControlRight') ? 1 : 0);
       if (kt !== 0) {
         const v = clamp(fi.throttle + kt * dt * 0.7, 0, 1);
         sendThrottle(v);
         showThrottle(v);
       } else if (thrDrag < 0) showThrottle(fi.throttle);
-      showSas(fi.sasMode);
+      showSas(fi.hold);
     },
     setActive(on) {
       active = on;
@@ -333,9 +376,10 @@ export function createFlightControls(host: UiHost, hooks: ControlHooks): FlightC
         cam.clear();
         rollTouch = 0;
         sasDrawer.hidden = true;
+        if (rcsOn) setRcs(false);
         if (lp !== 0 || ly !== 0 || lr !== 0) {
           lp = ly = lr = 0;
-          host.game.setControls({ pitch: 0, yaw: 0, roll: 0 });
+          host.session.setControls({ pitch: 0, yaw: 0, roll: 0 });
         }
       }
     },

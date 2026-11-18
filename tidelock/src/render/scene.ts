@@ -24,7 +24,6 @@
 
 import * as THREE from 'three';
 import type { BodyDef, MiningSiteDef, Quat, StateVector, StationDef, StationLayout, SystemDef, V3 } from '../core/types';
-import type { SystemModel } from '../sim/orbit';
 import { newColliderContact, stationAttitude, stationContact } from '../sim/physics';
 import { SHIP_LAYOUTS } from '../data/shipLayouts';
 import { BERTHS, STATION_LAYOUTS } from '../data/stationLayouts';
@@ -36,7 +35,7 @@ import { createShipVisual, type ShipVisual } from './space/ships';
 import { createStationVisual, type StationVisual } from './space/stations';
 import { EffectsManager, createEnginePlumes, createStrobes, type EnginePlume, type Strobes } from './space/effects';
 import { createCameraRig, type CameraEnv, type CameraFocus, type CameraPose } from './camera';
-import { playerShip, type FrameShip, type SceneFrame } from './frame';
+import { addShip, playerShip, type FrameShip, type SceneFrame } from './frame';
 
 // ------------------------------------------------------------------------------------------------ API
 
@@ -87,7 +86,7 @@ export interface SceneManager {
    * Build the visuals of a system (sky, star, worlds, stations), disposing the previous one. Long bakes
    * yield to the event loop between steps; `onProgress` gets 0..1 and a label for a loading bar.
    */
-  setSystem(system: SystemDef, model: SystemModel, onProgress?: (fraction: number, label: string) => void, opts?: SetSystemOptions): Promise<void>;
+  setSystem(system: SystemDef, onProgress?: (fraction: number, label: string) => void, opts?: SetSystemOptions): Promise<void>;
   /** Update everything from the frame and draw it through the pipeline. */
   render(frame: SceneFrame): void;
   /** Screen position of a reference as of the last rendered frame. Returns `out` (or a shared object). */
@@ -406,7 +405,6 @@ class Manager implements SceneManager {
   private readonly rig = createCameraRig();
 
   private system: SystemDef | null = null;
-  private model: SystemModel | null = null;
   private generation = 0;
   private loading = false;
   private nearBodyId: string | undefined;
@@ -503,12 +501,11 @@ class Manager implements SceneManager {
 
   // ---------------------------------------------------------------------------------------------- build
 
-  async setSystem(system: SystemDef, model: SystemModel, onProgress?: (fraction: number, label: string) => void, opts: SetSystemOptions = {}): Promise<void> {
+  async setSystem(system: SystemDef, onProgress?: (fraction: number, label: string) => void, opts: SetSystemOptions = {}): Promise<void> {
     const gen = ++this.generation;
     this.loading = true;
     this.disposeSystem();
     this.system = system;
-    this.model = model;
     this.nearBodyId = opts.nearBodyId;
     const renderer = this.pipeline.renderer;
     const q = this.quality;
@@ -597,7 +594,8 @@ class Manager implements SceneManager {
       this.stations.push(entry);
       this.stationIndex.set(def.id, entry);
     }
-    for (const def of system.miningSites) {
+    // Mining sites are not part of the physical world yet: none are drawn.
+    for (const def of [] as MiningSiteDef[]) {
       const entry: SiteEntry = { def, abs: v3(), rel: v3(), dist: 1e12 };
       this.sites.push(entry);
       this.siteIndex.set(def.id, entry);
@@ -623,7 +621,7 @@ class Manager implements SceneManager {
   }
 
   async rebuild(): Promise<void> {
-    if (this.system && this.model) await this.setSystem(this.system, this.model, undefined, { nearBodyId: this.nearBodyId });
+    if (this.system) await this.setSystem(this.system, undefined, { nearBodyId: this.nearBodyId });
   }
 
   busy(): boolean {
@@ -692,7 +690,6 @@ class Manager implements SceneManager {
     this.markers.geo.dispose();
     (this.markers.mesh.material as THREE.Material).dispose();
     this.system = null;
-    this.model = null;
   }
 
   // ---------------------------------------------------------------------------------------------- helpers
@@ -891,10 +888,9 @@ class Manager implements SceneManager {
 
   render(frame: SceneFrame): void {
     const pipeline = this.pipeline;
-    const model = this.model;
     const dt = clamp(Number.isFinite(frame.dt) ? frame.dt : 0, 0, 0.1);
     if (this.disposed) return;
-    if (!model || this.loading || !this.primary) {
+    if (this.loading || !this.primary) {
       // nothing to show yet: keep the canvas black rather than stale
       if (!this.loading) pipeline.render([], dt);
       return;
@@ -915,42 +911,77 @@ class Manager implements SceneManager {
     this.cssH = cssH;
     const aspect = cssW / cssH;
 
-    // ---- absolute positions: worlds, stations, sites, ships
+    // ---- absolute positions straight from the world: bodies, station craft, ship craft (barycentric doubles)
     const bodies = this.bodies;
-    for (let i = 0; i < bodies.length; i++) model.bodyAbsPosition(bodies[i].def.id, t, bodies[i].abs);
+    const fb = frame.bodies;
+    for (let i = 0; i < fb.length; i++) {
+      const e = this.bodyIndex.get(fb[i].id);
+      if (!e) continue;
+      const r = fb[i].r;
+      e.abs.x = r.x;
+      e.abs.y = r.y;
+      e.abs.z = r.z;
+      // the body visual spins by time / period: hand it the time that gives the world's spin angle
+      const period = Math.abs(e.def.rotationPeriod) > 1 ? e.def.rotationPeriod : 86400;
+      e.ctx.time = (fb[i].spinAngle / (2 * Math.PI)) * period;
+    }
     const stations = this.stations;
-    for (let i = 0; i < stations.length; i++) {
-      const st = stations[i];
-      model.stationAbsState(st.def.id, t, sv);
-      st.abs.x = sv.r.x;
-      st.abs.y = sv.r.y;
-      st.abs.z = sv.r.z;
-      st.vel.x = sv.v.x;
-      st.vel.y = sv.v.y;
-      st.vel.z = sv.v.z;
-      st.activePort = null;
+    for (let i = 0; i < stations.length; i++) stations[i].activePort = null;
+    const fc = frame.craft;
+    frame.ships.length = 0;
+    for (let i = 0; i < fc.length; i++) {
+      const c = fc[i];
+      if (c.kind === 'station') {
+        const st = this.stationIndex.get(c.id);
+        if (!st) continue;
+        st.abs.x = c.r.x;
+        st.abs.y = c.r.y;
+        st.abs.z = c.r.z;
+        st.vel.x = c.v.x;
+        st.vel.y = c.v.y;
+        st.vel.z = c.v.z;
+        st.q.x = c.q.x;
+        st.q.y = c.q.y;
+        st.q.z = c.q.z;
+        st.q.w = c.q.w;
+      } else if (c.kind === 'ship' && c.shipVisual) {
+        const s = addShip(frame);
+        s.id = c.id;
+        s.visualId = c.shipVisual;
+        s.seed = c.visualSeed;
+        s.r.x = c.r.x;
+        s.r.y = c.r.y;
+        s.r.z = c.r.z;
+        s.v.x = c.v.x;
+        s.v.y = c.v.y;
+        s.v.z = c.v.z;
+        s.q.x = c.q.x;
+        s.q.y = c.q.y;
+        s.q.z = c.q.z;
+        s.q.w = c.q.w;
+        s.throttle = c.throttle;
+        s.rcs.x = c.rcs.x;
+        s.rcs.y = c.rcs.y;
+        s.rcs.z = c.rcs.z;
+        s.heat = c.heat < 0 ? 0 : c.heat > 1 ? 1 : c.heat;
+        s.damage = c.hull >= 1 ? 0 : c.hull <= 0 ? 1 : 1 - c.hull;
+        s.isPlayer = c.isPlayer;
+        s.lightsOn = c.hull > 0;
+      }
     }
     for (let i = 0; i < frame.stationExtras.length; i++) {
       const st = this.stationIndex.get(frame.stationExtras[i].stationId);
       if (st) st.activePort = frame.stationExtras[i].activePortId;
     }
     const sites = this.sites;
-    for (let i = 0; i < sites.length; i++) {
-      model.siteAbsState(sites[i].def.id, t, sv);
-      sites[i].abs.x = sv.r.x;
-      sites[i].abs.y = sv.r.y;
-      sites[i].abs.z = sv.r.z;
-    }
     const player = playerShip(frame);
     let playerEntry: ShipEntry | null = null;
     for (let i = 0; i < frame.ships.length; i++) {
       const s = frame.ships[i];
-      const soi = this.bodyIndex.get(s.soiBodyId);
-      if (!soi) continue;
       const e = this.ensureShip(s);
-      e.abs.x = soi.abs.x + s.r.x;
-      e.abs.y = soi.abs.y + s.r.y;
-      e.abs.z = soi.abs.z + s.r.z;
+      e.abs.x = s.r.x;
+      e.abs.y = s.r.y;
+      e.abs.z = s.r.z;
       e.q.x = s.q.x;
       e.q.y = s.q.y;
       e.q.z = s.q.z;
@@ -965,10 +996,9 @@ class Manager implements SceneManager {
       e.ctx.damage = s.damage;
       if (s === player) {
         playerEntry = e;
-        model.bodyAbsState(s.soiBodyId, t, sv);
-        this.playerVel.x = sv.v.x + s.v.x;
-        this.playerVel.y = sv.v.y + s.v.y;
-        this.playerVel.z = sv.v.z + s.v.z;
+        this.playerVel.x = s.v.x;
+        this.playerVel.y = s.v.y;
+        this.playerVel.z = s.v.z;
       }
     }
     this.hasPlayer = playerEntry !== null;
@@ -1214,7 +1244,6 @@ class Manager implements SceneManager {
       b.sunDir.set(sx / ds, sy / ds, sz / ds);
       b.light = starIntensityAt(ds, lum) * this.starVisibility(b.abs.x, b.abs.y, b.abs.z, b, R * 0.5);
       b.ctx.starIntensity = b.light;
-      b.ctx.time = t;
       b.ctx.pixelRadius = b.radiusPx * pr;
       (b.visual as BodyVisual).update(b.ctx);
 

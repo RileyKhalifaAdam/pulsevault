@@ -13,13 +13,13 @@
 //   frame.camera.mode = 'chase'; frame.camera.focusId = 'player';
 //   scene.render(frame);
 //
-// What is NOT here: positions of bodies, stations and mining sites. The scene manager computes them from the
-// SystemModel at `frame.time`, so they can never disagree with the simulation's rails.
-//
-// Conventions (docs/ARCHITECTURE.md): SI units; a ship's `r`, `v` are relative to the centre of `soiBodyId`
-// in non-rotating system axes; `q` maps ship-local (forward -Z, up +Y, right +X) to world.
+// The world comes from the session: `frame.bodies = session.bodies()` and `frame.craft = session.craft()`
+// (system-barycentric doubles, attitude quaternions, spin angles). The scene owns no simulation: it draws those
+// states, subtracting in doubles before converting to floats. `frame.ships` is filled by the scene itself from
+// the craft of kind 'ship' (a FrameShip's `r`, `v` are barycentric; `soiBodyId` is unused).
 
 import type { Quat, RGB, ShipVisualId, V3 } from '../core/types';
+import type { BodyView, CraftView } from '../game/api';
 
 export type CameraMode = 'chase' | 'orbit' | 'cockpit' | 'dock' | 'flyby';
 
@@ -112,6 +112,9 @@ export interface SceneFrame {
   dt: number;
   /** Time-warp multiplier in effect (1 = real time). */
   warp: number;
+  /** The world this frame: assign the session's views (not copied, read during render only). */
+  bodies: readonly BodyView[];
+  craft: readonly CraftView[];
   ships: FrameShip[];
   stationExtras: FrameStationExtra[];
   camera: FrameCamera;
@@ -143,6 +146,8 @@ export function createSceneFrame(): SceneFrame {
     time: 0,
     dt: 0,
     warp: 1,
+    bodies: [],
+    craft: [],
     ships: [],
     stationExtras: [],
     camera: { mode: 'chase', focusId: '', yaw: 0, pitch: 0, distance: 1, lookAtId: null },
