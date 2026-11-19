@@ -164,6 +164,13 @@ function downscale(src: Source, size: number): Source {
   return cur;
 }
 
+/** Decode one pack image at `size` (box-downscaled when smaller than stored). Rejects on failure. */
+export async function decodePhotoImage(data: PhotoImageData, size: number): Promise<Source> {
+  return decode(data, size);
+}
+export { closeSource as closePhotoSource, makeCanvas as makePhotoCanvas };
+export type PhotoSource = Source;
+
 async function decode(data: PhotoImageData, size: number): Promise<Source> {
   const full = await decodeFull(data.jpeg);
   return full.width > size ? downscale(full, size) : full;

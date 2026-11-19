@@ -8,7 +8,12 @@
 //   node tools/fit-hull-colliders.mjs --seed --write  replace a compound by an automatic box decomposition
 //                                                    (--max-parts 16); keep hand-made ones for hulls you care about
 //   node tools/fit-hull-colliders.mjs --slices        also print the mesh's extents per 1 m slice along Z
-//   --tol 0.3   allowed protrusion (m)      --vox 0.15   voxel size (m, grows for big hulls)
+//   node tools/fit-hull-colliders.mjs --gaps     also measure the gaps: hull surface farther than --gap-tol from the
+//                                                    compound (worst place, share of the surface beyond it)
+//   node tools/fit-hull-colliders.mjs --ascii    print top / side silhouettes (# hull only, @ both, + compound only)
+//   --close 0.3   flood the outside with a ball of this radius (open tubes and bells read as solid)
+//   --section -12,4.5   print cross-sections at these z (with --gaps)
+//   --tol 0.3   allowed protrusion (m)      --vox 0.15   voxel size (m, grows for big hulls)   --gap-tol 0.3 (m)
 //
 // Method: the hull triangles are rasterised into a voxel grid, the outside is flood-filled from the border and
 // everything not reached is "solid" (hull volume). Coverage = solid voxels inside the compound / solid voxels.
@@ -118,10 +123,42 @@ function voxelise(mod, id, parts) {
       mark(s * ax + u * bx + w * cx, s * ay + u * by + w * cy, s * az + u * bz + w * cz);
     }
   }
-  // Flood the outside from the border (6-connected).
+  // Flood the outside from the border (6-connected). With --close R the flood is made by a ball of radius R: open
+  // shells (pod tubes, nozzle throats) whose mouths are narrower than 2R count as solid, as a body hitting them feels.
   const q = new Int32Array(N);
   let qh = 0, qt = 0;
-  const push = (i) => { if (grid[i] === 0) { grid[i] = 2; q[qt++] = i; } };
+  const CLOSE = Number(opt('--close', '0'));
+  let deep = null;
+  if (CLOSE > 0) {
+    deep = new Float32Array(N).fill(1e9);
+    const sq = new Int32Array(N), ss = new Int32Array(N).fill(-1);
+    let h = 0, t = 0;
+    for (let c = 0; c < N; c++) if (grid[c] === 1) { deep[c] = 0; ss[c] = c; sq[t++] = c; }
+    while (h < t) {
+      const c = sq[h++], i = c % nx, j = ((c / nx) | 0) % ny, k = (c / (nx * ny)) | 0, s0 = ss[c];
+      const si = s0 % nx, sj = ((s0 / nx) | 0) % ny, sk = (s0 / (nx * ny)) | 0;
+      for (const d of [i > 0 ? c - 1 : -1, i < nx - 1 ? c + 1 : -1, j > 0 ? c - nx : -1, j < ny - 1 ? c + nx : -1, k > 0 ? c - nx * ny : -1, k < nz - 1 ? c + nx * ny : -1]) {
+        if (d < 0) continue;
+        const di = d % nx, dj = ((d / nx) | 0) % ny, dk = (d / (nx * ny)) | 0, dd = Math.hypot(di - si, dj - sj, dk - sk) * vox;
+        if (dd < deep[d] - 1e-6) { if (ss[d] < 0) sq[t++] = d; deep[d] = dd; ss[d] = s0; }
+      }
+    }
+  }
+  if (CLOSE > 0) {
+    // ... and the mouths of the engine bells are closed: the bell's volume (exit radius, two radii deep) is hull.
+    const L = mod.SHIP_LAYOUTS[id];
+    for (const e of L ? L.engines : []) {
+      for (let k = 0; k < nz; k++) {
+        const z = lo[2] + (k + 0.5) * vox;
+        if (z < e.pos.z - 2 * e.radius || z > e.pos.z) continue;
+        for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+          const x = lo[0] + (i + 0.5) * vox, y = lo[1] + (j + 0.5) * vox;
+          if ((x - e.pos.x) ** 2 + (y - e.pos.y) ** 2 <= e.radius * e.radius && grid[i + nx * (j + ny * k)] === 0) grid[i + nx * (j + ny * k)] = 1;
+        }
+      }
+    }
+  }
+  const push = (i) => { if (grid[i] === 0 && (!deep || deep[i] > CLOSE)) { grid[i] = 2; q[qt++] = i; } };
   for (let k = 0; k < nz; k++) for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++)
     if (i === 0 || j === 0 || k === 0 || i === nx - 1 || j === ny - 1 || k === nz - 1) push(i + nx * (j + ny * k));
   while (qh < qt) {
@@ -129,6 +166,22 @@ function voxelise(mod, id, parts) {
     if (i > 0) push(c - 1); if (i < nx - 1) push(c + 1);
     if (j > 0) push(c - nx); if (j < ny - 1) push(c + nx);
     if (k > 0) push(c - nx * ny); if (k < nz - 1) push(c + nx * ny);
+  }
+  if (deep) {
+    // Dilate the ball-reachable outside back by R (the ball's own sweep): every free voxel within R of it is outside.
+    const sq = new Int32Array(N), ss = new Int32Array(N).fill(-1), dd0 = new Float32Array(N).fill(1e9);
+    let h = 0, t = 0;
+    for (let c = 0; c < N; c++) if (grid[c] === 2) { ss[c] = c; dd0[c] = 0; sq[t++] = c; }
+    while (h < t) {
+      const c = sq[h++], i = c % nx, j = ((c / nx) | 0) % ny, k = (c / (nx * ny)) | 0, s0 = ss[c];
+      const si = s0 % nx, sj = ((s0 / nx) | 0) % ny, sk = (s0 / (nx * ny)) | 0;
+      for (const d of [i > 0 ? c - 1 : -1, i < nx - 1 ? c + 1 : -1, j > 0 ? c - nx : -1, j < ny - 1 ? c + nx : -1, k > 0 ? c - nx * ny : -1, k < nz - 1 ? c + nx * ny : -1]) {
+        if (d < 0 || grid[d] !== 0) continue;
+        const di = d % nx, dj = ((d / nx) | 0) % ny, dk = (d / (nx * ny)) | 0, dd = Math.hypot(di - si, dj - sj, dk - sk) * vox;
+        if (dd <= CLOSE && dd < dd0[d] - 1e-6) { if (ss[d] < 0) sq[t++] = d; dd0[d] = dd; ss[d] = s0; }
+      }
+    }
+    for (let c = 0; c < N; c++) if (grid[c] === 0 && ss[c] >= 0) grid[c] = 2;
   }
   // Distance to the nearest solid voxel (BFS carrying the nearest site; 6-connected, near-Euclidean).
   const site = new Int32Array(N).fill(-1), dist = new Float32Array(N).fill(1e9);
@@ -190,9 +243,91 @@ function interiorSamples(mod, id) {
     const b = r.box, st = 0.25;
     for (let x = b.min.x; x <= b.max.x + 1e-9; x += Math.max(st, (b.max.x - b.min.x) / 8))
       for (let y = b.min.y; y <= b.max.y + 1e-9; y += Math.max(st, (b.max.y - b.min.y) / 4))
-        for (let z = b.min.z; z <= b.max.z + 1e-9; z += Math.max(st, (b.max.z - b.min.z) / 8)) pts.push([x, y, z]);
+        for (let z = b.min.z; z <= b.max.z + 1e-9; z += Math.max(st, (b.max.z - b.min.z) / 8)) { const q = [x, y, z]; q.room = r.id; pts.push(q); }
   }
   return pts;
+}
+
+/** Gaps: distance from each uncovered hull-surface voxel (solid, next to outside) to the nearest compound voxel. */
+function gaps(V, parts) {
+  const { vox, lo, nx, ny, nz, grid } = V, N = nx * ny * nz, sxy = nx * ny;
+  const inC = new Uint8Array(N), pt = [0, 0, 0];
+  for (let k = 0; k < nz; k++) for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    pt[0] = lo[0] + (i + 0.5) * vox; pt[1] = lo[1] + (j + 0.5) * vox; pt[2] = lo[2] + (k + 0.5) * vox;
+    if (inCompound(pt, parts)) inC[i + nx * j + sxy * k] = 1;
+  }
+  // BFS from compound voxels carrying the nearest site (as for the protrusion distance).
+  const site = new Int32Array(N).fill(-1), dist = new Float32Array(N).fill(1e9), q = new Int32Array(N);
+  let qh = 0, qt = 0;
+  for (let c = 0; c < N; c++) if (inC[c]) { site[c] = c; dist[c] = 0; q[qt++] = c; }
+  const co = (c) => [c % nx, ((c / nx) | 0) % ny, (c / sxy) | 0];
+  while (qh < qt) {
+    const c = q[qh++], [i, j, k] = co(c), [si, sj, sk] = co(site[c]);
+    const nb = [i > 0 ? c - 1 : -1, i < nx - 1 ? c + 1 : -1, j > 0 ? c - nx : -1, j < ny - 1 ? c + nx : -1, k > 0 ? c - sxy : -1, k < nz - 1 ? c + sxy : -1];
+    for (const d of nb) {
+      if (d < 0) continue;
+      const [di, dj, dk] = co(d), dd = Math.hypot(di - si, dj - sj, dk - sk) * vox;
+      if (dd < dist[d] - 1e-6) { if (site[d] < 0) q[qt++] = d; dist[d] = dd; site[d] = site[c]; }
+    }
+  }
+  let surf = 0, over = 0, worst = 0, at = [0, 0, 0];
+  const cand = [];
+  const GT = Number(opt('--gap-tol', '0.3'));
+  for (let k = 1; k < nz - 1; k++) for (let j = 1; j < ny - 1; j++) for (let i = 1; i < nx - 1; i++) {
+    const c = i + nx * j + sxy * k;
+    if (grid[c] === 2) continue;
+    if (grid[c - 1] !== 2 && grid[c + 1] !== 2 && grid[c - nx] !== 2 && grid[c + nx] !== 2 && grid[c - sxy] !== 2 && grid[c + sxy] !== 2) continue;
+    surf++;
+    const d = dist[c];
+    if (d > GT) over++;
+    if (d > worst) { worst = d; at = [lo[0] + (i + 0.5) * vox, lo[1] + (j + 0.5) * vox, lo[2] + (k + 0.5) * vox]; }
+    if (d > GT) cand.push([d, lo[0] + (i + 0.5) * vox, lo[1] + (j + 0.5) * vox, lo[2] + (k + 0.5) * vox]);
+  }
+  // The worst places, at least 1.5 m apart.
+  cand.sort((a, b) => b[0] - a[0]);
+  const top = [];
+  for (const c of cand) { if (top.length >= 10) break; if (top.every((t) => Math.hypot(t[1] - c[1], t[2] - c[2], t[3] - c[3]) > 1.5)) top.push(c); }
+  return { worst, at, share: over / Math.max(1, surf), inC, top };
+}
+
+function ascii(V, inC) {
+  const { vox, lo, nx, ny, nz, grid } = V, sxy = nx * ny, st = Math.max(1, Math.round(0.3 / vox));
+  const ch = (h, c) => (h && c ? '@' : h ? '#' : c ? '+' : '.');
+  console.log(`  top view (rows z from nose, columns x, cell ${(st * vox).toFixed(2)} m):`);
+  for (let k = 0; k < nz; k += st) {
+    let row = '';
+    for (let i = 0; i < nx; i += st) {
+      let h = false, c = false;
+      for (let kk = k; kk < Math.min(nz, k + st); kk++) for (let ii = i; ii < Math.min(nx, i + st); ii++) for (let j = 0; j < ny; j++) {
+        const v = ii + nx * j + sxy * kk; if (grid[v] !== 2) h = true; if (inC[v]) c = true;
+      }
+      row += ch(h, c);
+    }
+    console.log(`  ${(lo[2] + (k + 0.5 * st) * vox).toFixed(1).padStart(6)} ${row}`);
+  }
+  console.log('  side view (rows y from top, columns z from nose):');
+  for (let j = ny - 1; j >= 0; j -= st) {
+    let row = '';
+    for (let k = 0; k < nz; k += st) {
+      let h = false, c = false;
+      for (let jj = Math.max(0, j - st + 1); jj <= j; jj++) for (let kk = k; kk < Math.min(nz, k + st); kk++) for (let i = 0; i < nx; i++) {
+        const v = i + nx * jj + sxy * kk; if (grid[v] !== 2) h = true; if (inC[v]) c = true;
+      }
+      row += ch(h, c);
+    }
+    console.log(`  ${(lo[1] + (j + 0.5) * vox).toFixed(1).padStart(6)} ${row}`);
+  }
+}
+
+function section(V, inC, z) {
+  const { vox, lo, nx, ny, nz, grid } = V, sxy = nx * ny, k = Math.floor((z - lo[2]) / vox);
+  if (k < 0 || k >= nz) return;
+  console.log(`  section z ${z} (rows y from top, columns x, cell ${vox.toFixed(2)} m, x from ${lo[0].toFixed(2)}):`);
+  for (let j = ny - 1; j >= 0; j--) {
+    let row = '';
+    for (let i = 0; i < nx; i++) { const v = i + nx * j + sxy * k, h = grid[v] !== 2, c = inC[v]; row += h && c ? '@' : h ? '#' : c ? '+' : '.'; }
+    if (/[#@+]/.test(row)) console.log(`  ${(lo[1] + (j + 0.5) * vox).toFixed(2).padStart(6)} ${row}`);
+  }
 }
 
 // ------------------------------------------------------------------------------------------------ fitting
@@ -426,6 +561,20 @@ for (const id of ids) {
     const moves = fitParts(V, parts, interior);
     m = measure(V, parts, interior);
     show(`fit (${moves} moves)`, m);
+  }
+  if (has('--gaps') || has('--ascii')) {
+    const g = gaps(V, parts);
+    console.log(`  gaps: worst ${g.worst.toFixed(2)} m at (${g.at.map((v) => v.toFixed(2)).join(', ')}), ${(g.share * 100).toFixed(1)}% of the hull surface farther than ${opt('--gap-tol', '0.3')} m from the compound`);
+    for (const t of g.top) console.log(`    gap ${t[0].toFixed(2)} m at (${t[1].toFixed(2)}, ${t[2].toFixed(2)}, ${t[3].toFixed(2)})`);
+    if (m.interiorOut) {
+      const out = interior.filter((q) => !inCompound(q, parts)), b0 = [0, 1, 2].map((k) => Math.min(...out.map((q) => q[k]))), b1 = [0, 1, 2].map((k) => Math.max(...out.map((q) => q[k])));
+      const byRoom = {};
+      for (const q of out) { const b = (byRoom[q.room] ??= [[1e9, 1e9, 1e9], [-1e9, -1e9, -1e9], 0]); for (let k = 0; k < 3; k++) { b[0][k] = Math.min(b[0][k], q[k]); b[1][k] = Math.max(b[1][k], q[k]); } b[2]++; }
+      for (const [rid, b] of Object.entries(byRoom)) console.log(`    room ${rid}: ${b[2]} samples outside, x ${b[0][0].toFixed(2)}..${b[1][0].toFixed(2)} y ${b[0][1].toFixed(2)}..${b[1][1].toFixed(2)} z ${b[0][2].toFixed(2)}..${b[1][2].toFixed(2)}`);
+      console.log(`    interior samples outside within x ${b0[0].toFixed(2)}..${b1[0].toFixed(2)} y ${b0[1].toFixed(2)}..${b1[1].toFixed(2)} z ${b0[2].toFixed(2)}..${b1[2].toFixed(2)}`);
+    }
+    if (has('--ascii')) ascii(V, g.inC);
+    for (const zs of opt('--section', '').split(',').filter(Boolean)) section(V, g.inC, Number(zs));
   }
   if (has('--parts')) parts.forEach((p, i) => console.log(`    ${p.name.padEnd(14)} protrusion ${m.partMax[i].toFixed(2)} m  ${partLine(p)}`));
   worst = Math.max(worst, m.maxProtrusion);
