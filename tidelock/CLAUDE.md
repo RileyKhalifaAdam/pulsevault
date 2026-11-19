@@ -55,6 +55,11 @@ console on that phone, and it cannot be tested on a real device before the owner
 - Mobile first: portrait and landscape, safe-area insets, touch targets ≥ 44 pt, no hover-only behaviour.
 - Performance budget is for an iPhone 15: no per-frame allocations in hot paths, instancing for repeats,
   bake expensive procedural textures once.
+- **The owner's rule for frame rate:** when something makes the frame rate bad, do not reach for cutting it first.
+  Go back to first principles: what does the physics actually require, at what rate, at what precision, for which
+  bodies — and build the most efficient method that delivers it (multi-rate steps, sleeping, analytic solutions,
+  precomputation, caching, LOD, moving work off the critical path, cheaper data layouts). Measure before and after.
+  Only when the efficient form still does not fit does it get scaled back, and then say so plainly.
 - Original IP only: never borrow names, ships, factions, logos or UI layouts from existing games.
 - When several agents work at once: edit only the files you own, do not run git commands that change the
   repository (no commit, checkout, stash, reset), and do not edit `src/core/types.ts` unless told to — report
