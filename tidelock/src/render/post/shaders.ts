@@ -34,8 +34,11 @@ uniform vec2 uStep;
 uniform vec4 uCurve;   // threshold, threshold - knee, 2 * knee, 0.25 / knee
 uniform float uClamp;
 uniform float uExposure;
+uniform highp sampler2D tAdapt;  // 1x1: log2 of the auto exposure (see ADAPT_FRAG)
+uniform float uAutoMix;          // 0 = manual uExposure, 1 = auto exposure
 in vec2 vUv;
 out vec4 outColor;
+float gExpo;
 
 vec3 tap(float x, float y) {
   vec3 c = texture(tSrc, vUv + vec2(x, y) * uStep).rgb;
@@ -44,12 +47,13 @@ vec3 tap(float x, float y) {
   if (isnan(s) || isinf(s) || !(s >= 0.0)) c = vec3(0.0);
   // Exposed values: what blooms is what ends up brighter than display white, at any exposure.
   // The ceiling is applied to the max channel — a per-channel clamp would turn a bright orange yellow.
-  c = max(c * uExposure, vec3(0.0));
+  c = max(c * gExpo, vec3(0.0));
   return c * min(1.0, uClamp / max(max(c.r, max(c.g, c.b)), 1e-4));
 }
 float maxc(vec3 c) { return max(c.r, max(c.g, c.b)); }
 
 void main() {
+  gExpo = uAutoMix > 0.5 ? exp2(texture(tAdapt, vec2(0.5)).r) : uExposure;
   vec3 a = tap(-2.0,  2.0), b = tap(0.0,  2.0), c = tap(2.0,  2.0);
   vec3 d = tap(-2.0,  0.0), e = tap(0.0,  0.0), f = tap(2.0,  0.0);
   vec3 g = tap(-2.0, -2.0), h = tap(0.0, -2.0), i = tap(2.0, -2.0);
@@ -177,6 +181,8 @@ uniform vec3 uShadowTint;
 uniform vec3 uHighTint;
 uniform vec4 uFx;           // jump, damage, heat, flash
 uniform vec4 uGrain;        // amount, cell size px, frame seed, unused
+uniform highp sampler2D tAdapt; // 1x1: log2 of the auto exposure
+uniform float uAutoMix;         // 0 = manual exposure (uTone.x), 1 = auto
 in vec2 vUv;
 out vec4 outColor;
 
@@ -334,7 +340,8 @@ void main() {
   vec3 bloom = texture(tBloom, uv).rgb;
 #endif
   // The bloom chain was built from exposed values (see the prefilter), the scene taps were not.
-  col = col * uTone.x + bloom * uTone.y;
+  float expo = uAutoMix > 0.5 ? exp2(texture(tAdapt, vec2(0.5)).r) : uTone.x;
+  col = col * expo + bloom * uTone.y;
 
   // ---- natural (cos^4-like) vignette over the image circle, scene-referred effect light
   float vig = 1.0 / (1.0 + rv2 * uLens.x);
@@ -497,5 +504,69 @@ void main() {
   }
 
   outColor = vec4(filmGrain(rgb, gl_FragCoord.xy, uGrain), 1.0);
+}
+`;
+
+// ---------------------------------------------------------------------------------------------- auto exposure
+
+/**
+ * Metering, step 1: HDR scene -> 128x128 of (weighted log2 luminance, weight). Four bilinear taps per texel;
+ * centre-weighted (the edges count 40 %), luminance clamped both ways (see below).
+ */
+export const LUM_FRAG = /* glsl */ `
+precision highp float;
+uniform highp sampler2D tSrc;
+uniform vec2 uStep;
+in vec2 vUv;
+out vec4 outColor;
+float lumAt(vec2 o) {
+  vec3 c = texture(tSrc, vUv + o * uStep).rgb;
+  float s = c.r + c.g + c.b;
+  if (isnan(s) || isinf(s) || !(s >= 0.0)) c = vec3(0.0);
+  return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+void main() {
+  float l = 0.25 * (lumAt(vec2(-1.0, -1.0)) + lumAt(vec2(1.0, -1.0)) + lumAt(vec2(-1.0, 1.0)) + lumAt(vec2(1.0, 1.0)));
+  // Floor at 1/16: black space and unlit corners must not open the exposure up until whatever is lit
+  // (a sun-lit world in the window, a sun patch) burns out — a camera's highlight-weighted meter does the same.
+  float ll = clamp(log2(max(l, 1e-5)), -4.0, 4.0);
+  vec2 d = vUv - 0.5;
+  float w = 1.0 - 0.6 * clamp(dot(d, d) * 4.0, 0.0, 1.0);
+  outColor = vec4(ll * w, w, 0.0, 1.0);
+}
+`;
+
+/** Metering, step 2: 4:1 box reduction (four bilinear taps, each the mean of a 2x2 block). */
+export const REDUCE_FRAG = /* glsl */ `
+precision highp float;
+uniform highp sampler2D tSrc;
+uniform vec2 uStep;  // one source texel
+in vec2 vUv;
+out vec4 outColor;
+void main() {
+  outColor = 0.25 * (texture(tSrc, vUv + vec2(-1.0, -1.0) * uStep) + texture(tSrc, vUv + vec2(1.0, -1.0) * uStep)
+                   + texture(tSrc, vUv + vec2(-1.0, 1.0) * uStep) + texture(tSrc, vUv + vec2(1.0, 1.0) * uStep));
+}
+`;
+
+/**
+ * Metering, step 3 (1x1): the exposure that maps the mean log luminance to the key value, clamped, plus the
+ * compensation, adapted from the previous frame's value in log space (faster when stopping down, like an eye).
+ * R = log2 exposure in use, G = the metered mean log2 luminance.
+ */
+export const ADAPT_FRAG = /* glsl */ `
+precision highp float;
+uniform highp sampler2D tSrc;   // 2x2 reduction: (sum log * w, sum w)
+uniform highp sampler2D tPrev;  // last frame's result
+uniform vec4 uAdapt;            // log2 key, min log2 exposure, max log2 exposure, compensation EV
+uniform vec4 uRate;             // blend when stopping down, when opening up, reset (1 = start from uRate.w), start log2 exposure
+out vec4 outColor;
+void main() {
+  vec4 s = texture(tSrc, vec2(0.5));
+  float avgLog = s.r / max(s.g, 1e-4);
+  float target = clamp(uAdapt.x - avgLog, uAdapt.y, uAdapt.z) + uAdapt.w;
+  float prev = uRate.z > 0.5 ? uRate.w : texture(tPrev, vec2(0.5)).r;
+  float k = target < prev ? uRate.x : uRate.y;
+  outColor = vec4(mix(prev, target, k), avgLog, 0.0, 1.0);
 }
 `;

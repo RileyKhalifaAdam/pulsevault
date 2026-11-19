@@ -5,6 +5,11 @@
 //     ──► composite: sharpen · chromatic aberration · effects · exposure · bloom · vignette ·
 //                    hue-preserving filmic tone map · split-tone grade · sRGB · dither (· grain)
 //     ──► FXAA + grain (only on the tiers without MSAA) ──► canvas
+//   auto exposure (optional, GPU only, no read-back): scene ──► 128² log-luminance ──► 32² ──► 8² ──► 2²
+//     ──► 1x1 adapted log2 exposure (ping-pong, ~1 s) read by the bloom prefilter and the composite
+//
+// Tiers come from src/app/perf.ts (TIER_SETTINGS): MSAA 4x on high / ultra, 2x on medium, FXAA on low
+// (and wherever multisampled half-float targets are refused).
 //
 // A lean chain of full-screen-triangle passes instead of EffectComposer: no ping-pong copies, no
 // per-pass buffer allocation, and the one colour-space conversion is ours. Everything is linear
@@ -22,9 +27,13 @@
 // target, and resolved exactly once per frame after the last layer.
 
 import * as THREE from 'three';
+import { TIER_SETTINGS } from '../app/perf';
 import { detectGpu, type GpuInfo } from './post/detect';
 import { DynamicResolution } from './post/dynres';
 import {
+  ADAPT_FRAG,
+  LUM_FRAG,
+  REDUCE_FRAG,
   BLOOM_DOWN_FRAG,
   BLOOM_PREFILTER_FRAG,
   BLOOM_UP_FRAG,
@@ -74,6 +83,16 @@ export interface GradeParams {
   bloomScatter?: number;
 }
 
+export interface AutoExposureOptions {
+  /** Mean scene luminance that maps to the key value: exposure = key / mean. Default 0.16. */
+  key?: number;
+  /** Exposure limits in stops (EV of the multiplier, log2). Defaults -3 / +3. */
+  minEv?: number;
+  maxEv?: number;
+  /** Bias in stops added after metering. Default 0. */
+  compensation?: number;
+}
+
 export interface PipelineStats {
   /** Scene draw calls / triangles of the last frame (post passes excluded). */
   drawCalls: number;
@@ -94,6 +113,8 @@ export interface PipelineStats {
   outputHeight: number;
   /** MSAA samples in use (0 = FXAA path). */
   msaa: number;
+  /** Auto exposure in use (GPU metered). */
+  autoExposure: boolean;
   /** Full-screen post passes drawn last frame. */
   postPasses: number;
   /** Bytes of GPU memory held by the pipeline's targets (estimate). */
@@ -123,6 +144,11 @@ export interface RenderPipeline {
   setQuality(q: Quality): void;
   /** Exposure in stops (EV). 0 = sun-lit white diffuse (1.0) lands just under display white (0.76 linear). */
   setExposure(ev: number): void;
+  /**
+   * Physically based auto exposure from the mean log luminance of the frame (metered and adapted on the GPU,
+   * ~1 s, clamped). While on, setExposure is ignored for the image; it starts from the current manual value.
+   */
+  setAutoExposure(enabled: boolean, opts?: AutoExposureOptions): void;
   /** Fraction of the light above the bloom threshold that is scattered into the halo. Default 0.15; 0 = off. */
   setBloom(strength: number): void;
   setGrade(params: GradeParams): void;
@@ -152,12 +178,12 @@ interface Tier {
   maxBloomLevels: number;
 }
 
-const TIERS: Record<Quality, Tier> = {
-  low: { dpr: 1.0, msaa: 0, chroma: false, sharpen: false, bloomHQ: false, maxBloomLevels: 5 },
-  medium: { dpr: 1.5, msaa: 0, chroma: true, sharpen: false, bloomHQ: true, maxBloomLevels: 6 },
-  high: { dpr: 2.0, msaa: 4, chroma: true, sharpen: true, bloomHQ: true, maxBloomLevels: 6 },
-  ultra: { dpr: 2.5, msaa: 4, chroma: true, sharpen: true, bloomHQ: true, maxBloomLevels: 6 },
+const tierOf = (q: Quality): Tier => {
+  const t = TIER_SETTINGS[q];
+  return { dpr: t.dpr, msaa: t.msaa, chroma: t.chroma, sharpen: t.sharpen, bloomHQ: t.bloomHQ, maxBloomLevels: t.bloomLevels };
 };
+const TIERS: Record<Quality, Tier> = { low: tierOf('low'), medium: tierOf('medium'), high: tierOf('high'), ultra: tierOf('ultra') };
+const LUM_SIZES = [128, 32, 8, 2];
 
 const MIN_SCALE = 0.6;
 const BLOOM_CLAMP = 64;
@@ -258,6 +284,26 @@ class Pipeline implements RenderPipeline {
   private readonly upMat: THREE.RawShaderMaterial;
   private readonly compositeMat: THREE.RawShaderMaterial;
   private readonly fxaaMat: THREE.RawShaderMaterial;
+  private readonly lumMat: THREE.RawShaderMaterial;
+  private readonly reduceMat: THREE.RawShaderMaterial;
+  private readonly adaptMat: THREE.RawShaderMaterial;
+
+  // auto exposure
+  private readonly lumRT: THREE.WebGLRenderTarget[] = [];
+  private readonly adaptRT: THREE.WebGLRenderTarget[] = [];
+  private adaptIdx = 0;
+  private auto = false;
+  private autoReset = true;
+  private readonly uLumSrc: Uniform<THREE.Texture | null> = { value: null };
+  private readonly uLumStep: Uniform<THREE.Vector2> = { value: new THREE.Vector2() };
+  private readonly uRedSrc: Uniform<THREE.Texture | null> = { value: null };
+  private readonly uRedStep: Uniform<THREE.Vector2> = { value: new THREE.Vector2() };
+  private readonly uAdaptSrc: Uniform<THREE.Texture | null> = { value: null };
+  private readonly uAdaptPrev: Uniform<THREE.Texture | null> = { value: null };
+  private readonly uAdapt: Uniform<THREE.Vector4> = { value: new THREE.Vector4(Math.log2(0.16), -3, 3, 0) };
+  private readonly uRate: Uniform<THREE.Vector4> = { value: new THREE.Vector4(0.05, 0.02, 1, 0) };
+  private readonly uAdaptTex: Uniform<THREE.Texture | null> = { value: null };
+  private readonly uAutoMix: Uniform<number> = { value: 0 };
 
   // uniforms (shared objects, mutated in place — nothing is allocated per frame)
   private readonly uPreSrc: Uniform<THREE.Texture | null> = { value: null };
@@ -361,6 +407,8 @@ class Pipeline implements RenderPipeline {
       uCurve: this.uCurve,
       uClamp: { value: BLOOM_CLAMP },
       uExposure: this.uExposure,
+      tAdapt: this.uAdaptTex,
+      uAutoMix: this.uAutoMix,
     });
     this.downMat = passMaterial(BLOOM_DOWN_FRAG, { tSrc: this.uDownSrc, uStep: this.uDownStep });
     this.upMat = passMaterial(
@@ -387,7 +435,25 @@ class Pipeline implements RenderPipeline {
       uHighTint: this.uHighTint,
       uFx: this.uFx,
       uGrain: this.uGrain,
+      tAdapt: this.uAdaptTex,
+      uAutoMix: this.uAutoMix,
     });
+    this.lumMat = passMaterial(LUM_FRAG, { tSrc: this.uLumSrc, uStep: this.uLumStep });
+    this.reduceMat = passMaterial(REDUCE_FRAG, { tSrc: this.uRedSrc, uStep: this.uRedStep });
+    this.adaptMat = passMaterial(ADAPT_FRAG, { tSrc: this.uAdaptSrc, tPrev: this.uAdaptPrev, uAdapt: this.uAdapt, uRate: this.uRate });
+    // the metering chain: tiny half-float targets (log luminance is signed: never on the 8-bit fallback)
+    for (const n of LUM_SIZES) {
+      const rt = colorTarget(this.hdrType, false);
+      rt.setSize(n, n);
+      this.lumRT.push(rt);
+    }
+    for (let i = 0; i < 2; i++) {
+      const rt = colorTarget(this.hdrType, false);
+      rt.texture.minFilter = rt.texture.magFilter = THREE.NearestFilter;
+      rt.setSize(1, 1);
+      this.adaptRT.push(rt);
+    }
+    this.uAdaptTex.value = this.adaptRT[0].texture;
     this.fxaaMat = passMaterial(FXAA_FRAG, { tSrc: this.uLdr, uTexel: this.uLdrTexel, uGrain: this.uGrain });
 
     this.fsMesh = new THREE.Mesh(this.fsGeometry, this.compositeMat);
@@ -408,6 +474,7 @@ class Pipeline implements RenderPipeline {
       outputWidth: 1,
       outputHeight: 1,
       msaa: 0,
+      autoExposure: false,
       postPasses: 0,
       targetBytes: 0,
       gpuName: this.gpu.renderer,
@@ -422,8 +489,13 @@ class Pipeline implements RenderPipeline {
     const w = canvas.clientWidth || (typeof window !== 'undefined' ? window.innerWidth : 0) || canvas.width || 1;
     const h = canvas.clientHeight || (typeof window !== 'undefined' ? window.innerHeight : 0) || canvas.height || 1;
     this.resize(w, h, typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1);
-    // Warm-up: one empty frame compiles every program of the chain now rather than on the first real frame.
+    // Warm-up: one empty frame compiles every program of the chain (metering included) now rather than on
+    // the first real frame: iOS stalls on a first-use compile.
+    this.auto = this.hdrType === THREE.HalfFloatType;
     this.render(NO_LAYERS, 0);
+    this.auto = false;
+    this.autoReset = true;
+    this.uAutoMix.value = 0;
     this.lastFrameAt = -1;
   }
 
@@ -645,6 +717,20 @@ class Pipeline implements RenderPipeline {
     this.uTone.value.x = this.uExposure.value = Math.pow(2, this.exposureEv);
   }
 
+  setAutoExposure(enabled: boolean, opts?: AutoExposureOptions): void {
+    const on = enabled && this.hdrType === THREE.HalfFloatType;
+    if (on && !this.auto) this.autoReset = true;
+    this.auto = on;
+    this.uAutoMix.value = on ? 1 : 0;
+    if (opts) {
+      const a = this.uAdapt.value;
+      if (opts.key !== undefined && opts.key > 0) a.x = Math.log2(opts.key);
+      if (opts.minEv !== undefined) a.y = opts.minEv;
+      if (opts.maxEv !== undefined) a.z = opts.maxEv;
+      if (opts.compensation !== undefined) a.w = opts.compensation;
+    }
+  }
+
   setBloom(strength: number): void {
     this.bloomStrength = Number.isFinite(strength) ? Math.max(0, strength) : 0;
     this.uTone.value.y = this.bloomStrength;
@@ -732,9 +818,37 @@ class Pipeline implements RenderPipeline {
     st.drawCalls = r.info.render.calls;
     st.triangles = r.info.render.triangles;
     const sceneTex = msaa ? this.resolveMsaa() : this.sceneRT.texture;
+    let passes = 0;
+
+    // ---- auto exposure: meter this frame, adapt from the last (all on the GPU, no read-back)
+    if (this.auto) {
+      const lum = this.lumRT;
+      this.uLumSrc.value = sceneTex;
+      this.uLumStep.value.set(0.25 / LUM_SIZES[0], 0.25 / LUM_SIZES[0]);
+      this.pass(this.lumMat, lum[0], true);
+      for (let i = 1; i < lum.length; i++) {
+        this.uRedSrc.value = lum[i - 1].texture;
+        this.uRedStep.value.set(1 / LUM_SIZES[i - 1], 1 / LUM_SIZES[i - 1]);
+        this.pass(this.reduceMat, lum[i], true);
+      }
+      const prev = this.adaptRT[this.adaptIdx];
+      const next = this.adaptRT[1 - this.adaptIdx];
+      const step = dt > 0 && dt < 0.5 ? dt : 1 / 60;
+      const rate = this.uRate.value;
+      rate.x = 1 - Math.exp(-step / 0.45); // stopping down (into the light) is quicker
+      rate.y = 1 - Math.exp(-step / 1.1); // opening up (into the dark) takes about a second
+      rate.z = this.autoReset ? 1 : 0;
+      rate.w = this.exposureEv;
+      this.autoReset = false;
+      this.uAdaptSrc.value = lum[lum.length - 1].texture;
+      this.uAdaptPrev.value = prev.texture;
+      this.pass(this.adaptMat, next, true);
+      this.adaptIdx = 1 - this.adaptIdx;
+      this.uAdaptTex.value = next.texture;
+      passes += lum.length + 1;
+    }
 
     // ---- bloom
-    let passes = 0;
     const n = this.bloomLevels;
     const bloom = this.bloomRT;
     if (this.bloomStrength > 0) {
@@ -752,7 +866,7 @@ class Pipeline implements RenderPipeline {
         this.uScatter.value = i === 0 ? this.scatter0 : this.scatter;
         this.pass(this.upMat, bloom[i], false); // blends over the level already there
       }
-      passes = 2 * n - 1;
+      passes += 2 * n - 1;
     }
 
     // ---- composite (+ FXAA)
@@ -823,6 +937,7 @@ class Pipeline implements RenderPipeline {
     st.outputWidth = this.outW;
     st.outputHeight = this.outH;
     st.msaa = this.msaa;
+    st.autoExposure = this.auto;
     st.targetBytes = this.targetBytes();
     return st;
   }
@@ -856,6 +971,7 @@ class Pipeline implements RenderPipeline {
     this.allocSceneTarget();
     this.dyn.reset();
     this.lastFrameAt = -1;
+    this.autoReset = true;
     this.onContextRestored?.();
   };
 
@@ -876,6 +992,11 @@ class Pipeline implements RenderPipeline {
     this.upMat.dispose();
     this.compositeMat.dispose();
     this.fxaaMat.dispose();
+    this.lumMat.dispose();
+    this.reduceMat.dispose();
+    this.adaptMat.dispose();
+    for (const rt of this.lumRT) rt.dispose();
+    for (const rt of this.adaptRT) rt.dispose();
     this.fsGeometry.dispose();
     this.renderer.dispose();
   }

@@ -11,7 +11,7 @@ import { COCKPITS, type CockpitLayout, type DeviceDef, type DeviceRole } from '.
 import { INTERIORS, type InteriorLayout } from '../data/interiors';
 import { SHIP_LAYOUTS } from '../data/shipLayouts';
 import { START_STATION_ID, START_SYSTEM_ID } from '../data/systems/layout';
-import { computeStats, defaultLoadout } from '../sim/ships';
+import { computeStats, defaultLoadout, SHIPS } from '../sim/ships';
 import { generateGalaxy, getSystem } from '../sim/universe';
 import {
   addCraft, advance, attitudeError, craftInertia, createPrediction, createWorld, dockingStatus, drainEvents, ephemerisOf, findCraft,
@@ -31,7 +31,7 @@ import type {
 export const PLAYER_ID = 'player';
 /** Time-acceleration ladder. */
 export const WARP_LADDER: readonly number[] = [1, 2, 5, 10, 50, 100, 1000, 1e4, 1e5, 1e6];
-/** The start: this far clear of the station's bounding sphere, ahead of it in the same orbit, m. */
+/** The start: the ship's own bounding sphere this far clear of the station's, ahead of it in the same orbit, m. */
 export const START_CLEARANCE = 200;
 
 const SAVE_VERSION = 3;
@@ -148,13 +148,13 @@ function buildWorld(system: SystemDef): World {
   const hl = Math.hypot(hx, hy, hz);
   hx /= hl; hy /= hl; hz /= hl;
   const rl = Math.hypot(r.x, r.y, r.z);
-  const d = st.radius + START_CLEARANCE;
+  const d = st.radius + layout.radius + START_CLEARANCE;
   const th = 2 * Math.asin(d / (2 * rl)), c = Math.cos(th), s = Math.sin(th);
   // r and v are perpendicular to h: Rodrigues reduces to a·cos + (h × a)·sin.
   const turn = (a: V3): V3 => ({ x: a.x * c + (hy * a.z - hz * a.y) * s, y: a.y * c + (hz * a.x - hx * a.z) * s, z: a.z * c + (hx * a.y - hy * a.x) * s });
   const pr = turn(r), pv = turn(v);
   const q = qLook({ x: r.x - pr.x, y: r.y - pr.y, z: r.z - pr.z }, { x: hx, y: hy, z: hz });
-  const ship = addCraft(world, shipDef(PLAYER_ID, 'Wren', computeStats(defaultLoadout('wren')), layout, { primaryId: world.bodies[st.primary].id, r: pr, v: pv, q }));
+  const ship = addCraft(world, shipDef(PLAYER_ID, 'Wren', computeStats(defaultLoadout('wren')), layout, { primaryId: world.bodies[st.primary].id, r: pr, v: pv, q, pad: SHIPS.wren.pad }));
   ship.visualSeed = 7;
   return world;
 }
@@ -1217,9 +1217,18 @@ class WorldSession implements Session {
       ex = e.x; ey = e.y; ez = e.z; my = b.seat === '' ? b.pos.y + CREW_COM : e.y - 0.45;
     }
     // from the side the control faces (not through a bulkhead), within arm's length of the eye or the body's middle
-    const p = def.pos, n = def.normal, dx = ex - p.x, dz = ez - p.z, dy = ey - p.y, dm = my - p.y;
+    const p = def.pos, n = def.normal;
+    let px = p.x, py = p.y, pz = p.z, lim = ARM_REACH + def.radius;
+    if (def.kind === 'rest' && def.halfWidth !== undefined && def.halfHeight !== undefined) {
+      // a bed or a sofa is touched anywhere on its surface: the nearest point of its rectangle, within arm's length
+      const u = def.up, rx = u.y * n.z - u.z * n.y, ry = u.z * n.x - u.x * n.z, rz = u.x * n.y - u.y * n.x;
+      const ox = ex - p.x, oy = my - p.y, oz = ez - p.z;
+      const a = clamp(ox * rx + oy * ry + oz * rz, -def.halfWidth, def.halfWidth), c = clamp(ox * u.x + oy * u.y + oz * u.z, -def.halfHeight, def.halfHeight);
+      px += rx * a + u.x * c; py += ry * a + u.y * c; pz += rz * a + u.z * c;
+      lim = ARM_REACH;
+    }
+    const dx = ex - px, dz = ez - pz, dy = ey - py, dm = my - py;
     if (dx * n.x + dy * n.y + dz * n.z < -0.25) return false;
-    const lim = ARM_REACH + def.radius;
     return dx * dx + dz * dz + Math.min(dy * dy, dm * dm) <= lim * lim;
   }
   private litOf(i: number): boolean {

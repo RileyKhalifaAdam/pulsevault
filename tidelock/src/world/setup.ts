@@ -139,7 +139,7 @@ export function shipDef(
   name: string,
   stats: VesselStats,
   layout: { id?: string; length: number; width: number; height: number; radius: number; dockingPort?: { pos: V3; dir: V3 } } | null,
-  where: { primaryId: string; r: V3; v: V3; q?: Quat },
+  where: { primaryId: string; r: V3; v: V3; q?: Quat; pad?: PadSize },
 ): CraftDef {
   return {
     id,

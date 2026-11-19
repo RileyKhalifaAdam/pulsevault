@@ -164,7 +164,7 @@ describe('hulls', () => {
     expect(Object.keys(SHIPS).sort()).toEqual([...ALL_SHIPS].sort());
     expect([...SHIP_IDS].sort()).toEqual([...ALL_SHIPS].sort());
     expect(SHIP_IDS[0]).toBe('wren');
-    const lengths: Record<ShipVisualId, number> = { wren: 16, drover: 38, magpie: 26, shrike: 15, albatross: 34, caravel: 72, halberd: 44 };
+    const lengths: Record<ShipVisualId, number> = { wren: 32, drover: 38, magpie: 26, shrike: 15, albatross: 34, caravel: 72, halberd: 44 };
     const roles: Record<ShipVisualId, string> = { wren: 'courier', drover: 'hauler', magpie: 'miner', shrike: 'fighter', albatross: 'explorer', caravel: 'freighter', halberd: 'gunship' };
     for (const id of ALL_SHIPS) {
       const s = SHIPS[id];
@@ -184,7 +184,7 @@ describe('hulls', () => {
     expect(SHIPS.wren.price).toBeLessThan(45000);
     for (const id of ['caravel', 'halberd'] as const) expect(SHIPS[id].price >= 1e6 && SHIPS[id].price <= 3e6).toBe(true);
     for (const id of ALL_SHIPS) if (id !== 'caravel' && id !== 'halberd') expect(SHIPS[id].price).toBeLessThan(1e6);
-    expect(SHIPS.wren.pad).toBe('S');
+    expect(SHIPS.wren.pad).toBe('M'); // the 32 m Wren needs a medium pad
     expect(SHIPS.caravel.pad).toBe('L');
   });
 
@@ -287,9 +287,9 @@ describe('default loadouts', () => {
     expect(wren.computerTier).toBe(3);
     expect(wren.hasDockingComputer).toBe(true);
     expect(wren.cargoCapacity).toBeGreaterThanOrEqual(6);
-    // Sized like the reference ship of sim/physics.ts (5e9 J, 5e6 W).
-    expect(wren.heatCapacity > 4e9 && wren.heatCapacity < 6e9).toBe(true);
-    expect(wren.heatDissipation > 4e6 && wren.heatDissipation < 6e6).toBe(true);
+    // Sized like two of the reference ship of sim/physics.ts (5e9 J, 5e6 W): the 32 m Wren has twice the old mass.
+    expect(wren.heatCapacity > 9e9 && wren.heatCapacity < 1.1e10).toBe(true);
+    expect(wren.heatDissipation > 1.0e7 && wren.heatDissipation < 1.3e7).toBe(true);
     const magpie = stock('magpie');
     expect(magpie.hasMiningLaser && magpie.hasRefinery).toBe(true);
     const alb = stock('albatross');
@@ -299,9 +299,9 @@ describe('default loadouts', () => {
     expect(stock('shrike').maxAngularAccel).toBeGreaterThan(stock('wren').maxAngularAccel);
   });
 
-  it('jump ranges: starter about 7 ly, the Albatross best, about 16 ly at most', () => {
+  it('jump ranges: starter about 8 ly, the Albatross best, about 16 ly at most', () => {
     const wren = stock('wren').jumpRange;
-    expect(wren >= 6.5 && wren <= 7.5).toBe(true);
+    expect(wren >= 7.5 && wren <= 8.5).toBe(true);
     const alb = stock('albatross').jumpRange;
     for (const id of ALL_SHIPS) if (id !== 'albatross') expect(stock(id).jumpRange, id).toBeLessThan(alb);
     // Best achievable by swapping the jump drive on any stock hull.
@@ -351,7 +351,7 @@ describe('rocket-equation helpers', () => {
 
   it('jump cost is propellant per light-year inside the range and impossible beyond it', () => {
     const s = stock('wren');
-    expect(s.jumpFuelPerLy).toBeCloseTo((14 * s.dryMass) / 1000, 9);
+    expect(s.jumpFuelPerLy).toBeCloseTo((13 * s.dryMass) / 1000, 9);
     expect(jumpCost(s, 4)).toBeCloseTo(4 * s.jumpFuelPerLy, 9);
     expect(jumpCost(s, s.jumpRange)).toBeCloseTo(s.jumpRange * s.jumpFuelPerLy, 9);
     expect(jumpCost(s, s.jumpRange + 0.01)).toBe(Infinity);
@@ -371,7 +371,7 @@ describe('rocket-equation helpers', () => {
     const rated = MODULES.jmp_lr_1.stats;
     expect(s.dryMass).toBeGreaterThan(rated.jumpRatedMass!);
     expect(s.jumpRange).toBeCloseTo(rated.jumpRange! * Math.sqrt(rated.jumpRatedMass! / s.dryMass), 9);
-    expect(s.jumpRange).toBeGreaterThan(stock('wren').jumpRange);
+    expect(s.jumpRange).toBeGreaterThan(computeStats(withModule(defaultLoadout('wren'), i, 'jmp_std_1')).jumpRange);
     const warn = validateLoadout(lr);
     expect(warn.map((p) => p.code)).toEqual(['jump-overmass']);
     expect(warn[0].severity).toBe('warning');
@@ -411,13 +411,16 @@ describe('fit rules and validation', () => {
     expect(wrongType[0].message).toContain('armour');
 
     const tooBig = withModule(base, eng, 'eng_torch_2');
-    expect(codes(tooBig)).toEqual(['slot-size', 'no-engine']);
+    expect(codes(tooBig)).toEqual(['slot-size']);
     expect(validateLoadout(tooBig)[0].message).toMatch(/too small.*Tradewind Mk II/);
     expect(isLoadoutValid(tooBig)).toBe(false);
-    // A module that does not fit contributes nothing, not even mass.
-    expect(computeStats(tooBig).mainThrust).toBe(0);
+    // A module that does not fit contributes nothing, not even mass: only the other drive pod pushes.
+    expect(computeStats(tooBig).mainThrust).toBe(MODULES.eng_torch_1.stats.thrust);
     expect(computeStats(tooBig).dryMass).toBe(stock('wren').dryMass - MODULES.eng_torch_1.mass);
     expect(fittedModules(tooBig)[eng]).toBeNull();
+    const noDrive = withModule(tooBig, slotOf('wren', 'engine', 1), 'eng_torch_2');
+    expect(codes(noDrive)).toEqual(['slot-size', 'slot-size', 'no-engine']);
+    expect(computeStats(noDrive).mainThrust).toBe(0);
 
     expect(codes(withModule(base, slotOf('wren', 'scanner'), 'warp_coil_9'))).toEqual(['unknown-module']);
     const twoDocks = withModule(base, slotOf('wren', 'utility', 1), 'utl_dock');
@@ -450,14 +453,18 @@ describe('fit rules and validation', () => {
 
   it('enforces the power budget', () => {
     const base = defaultLoadout('wren');
-    const pulse = withModule(base, slotOf('wren', 'engine'), 'eng_pulse_1');
-    const p = validateLoadout(pulse);
+    // The 32 m Wren runs two reactors; with one pulled the rest of the ship draws more than one supplies.
+    const half = withModule(base, slotOf('wren', 'reactor', 1), null);
+    const p = validateLoadout(half);
     expect(p.map((x) => x.code)).toEqual(['power']);
     expect(p[0].severity).toBe('error');
-    expect(p[0].message).toBe('Power budget exceeded: modules draw 14.5 MW, the reactor supplies 14.0 MW.');
-    // Either a bigger reactor or shedding a load fixes it: a real choice.
-    expect(codes(withModule(pulse, slotOf('wren', 'reactor'), 'rct_hi_1'))).toEqual([]);
-    expect(codes(withModule(pulse, slotOf('wren', 'weapon'), null))).toEqual([]);
+    expect(p[0].message).toBe('Power budget exceeded: modules draw 19.0 MW, the reactor supplies 14.0 MW.');
+    // Either a bigger reactor or shedding loads fixes it: a real choice.
+    expect(codes(withModule(half, slotOf('wren', 'reactor', 1), 'rct_hi_1'))).toEqual([]);
+    expect(codes(withModule(withModule(half, slotOf('wren', 'engine', 1), null), slotOf('wren', 'weapon'), null))).toEqual([]); // one drive pod, guns off
+    // Two reactors carry twin pulse drives.
+    const pulse = withModule(withModule(base, slotOf('wren', 'engine'), 'eng_pulse_1'), slotOf('wren', 'engine', 1), 'eng_pulse_1');
+    expect(codes(pulse)).toEqual([]);
     // The Shrike is at the edge: a bigger shield does not fit its budget as sold.
     expect(codes(withModule(defaultLoadout('shrike'), slotOf('shrike', 'shield'), 'shd_std_2'))).toEqual(['power']);
   });
@@ -465,13 +472,15 @@ describe('fit rules and validation', () => {
   it('upgrades change the ship the way their stats say', () => {
     const base = defaultLoadout('wren');
     const s0 = computeStats(base);
-    const cruise = computeStats(withModule(base, slotOf('wren', 'engine'), 'eng_cruise_1'));
+    // Both drive pods take the same engine.
+    const drives = (m: string): Loadout => withModule(withModule(base, slotOf('wren', 'engine'), m), slotOf('wren', 'engine', 1), m);
+    const cruise = computeStats(drives('eng_cruise_1'));
     expect(deltaV(cruise)).toBeGreaterThan(deltaV(s0) * 1.3);
     expect(accel(cruise)).toBeLessThan(accel(s0) * 0.6);
-    const chem = computeStats(withModule(base, slotOf('wren', 'engine'), 'eng_chem_1'));
+    const chem = computeStats(drives('eng_chem_1'));
     expect(accel(chem)).toBeGreaterThan(accel(s0) * 3);
     expect(deltaV(chem)).toBeLessThan(deltaV(s0) * 0.2);
-    const bladder = computeStats(withModule(base, slotOf('wren', 'cargo'), 'cargo_fuel_1'));
+    const bladder = computeStats(withModule(base, slotOf('wren', 'cargo'), 'cargo_fuel_2'));
     expect(bladder.cargoCapacity).toBe(0);
     expect(deltaV(bladder)).toBeGreaterThan(deltaV(s0) + 4000);
     const plated = computeStats(withModule(base, slotOf('wren', 'armor'), 'arm_plate_1'));

@@ -392,14 +392,14 @@ async function run() {
       check(s.mode === 'onFoot' && s.stick, `tapped the harness again: on foot (posture=${s.posture}), walk stick back`);
       await h.lookTo(0, 0);
       const stick = { x: 100, y: 640 };
-      await h.walkTo(stick, 0, -3.1);
+      await h.walkTo(stick, 0, -12.2); // behind the seats, facing the console
 
       // ---- touch roles on foot: the left thumb walks, the right finger looks, and nothing zooms
       await h.lookTo(0, 0);
       s = await st(f);
       const a0 = s;
       await h.down(1, 100, 640);
-      await h.slide(1, 100, 700, 4); // back, through the door into the cabin
+      await h.slide(1, 100, 700, 4); // back, toward the companionway door
       await h.down(2, 300, 250);
       await h.slide(2, 230, 250, 6);
       await pump(f, 24);
@@ -460,20 +460,25 @@ async function run() {
       check(s.zoom === 1, `pinched back in: zoom x${s.zoom}`);
       for (let i = 0; i < 20; i++) { await settle(f); if ((await st(f)).speed < 0.02) break; }
 
-      // ---- the cabin bulkhead beside the cockpit door, from where the owner's picture was taken
+      // ---- through the companionway: the lounge's forward bulkhead with the LIGHTS switch beside the door
       await h.lookTo(0, 0);
-      await h.walkTo(stick, 0, -2.0);
-      await h.walkTo(stick, -0.25, -1.45);
-      await h.aimAt({ x: -0.85, y: 0.05, z: -2.6 });
+      await h.walkTo(stick, 0, -12.2);
+      await h.walkTo(stick, 0, -11.0);
+      await h.walkTo(stick, 0, -9.6);
+      await h.walkTo(stick, -0.9, -9.4);
+      await h.aimAt({ x: -1.1, y: 0.2, z: -10.4 });
       await shot('fix-1-bulkhead');
+      // ---- aft down the lounge and the corridor into the port cabin, beside the bed
       await h.lookTo(0, 0);
-      await h.walkTo(stick, 0, -2.0);
-      await h.walkTo(stick, 0, 1.4);
-      await h.walkTo(stick, 0, 3.05);
-      const d = await h.walkTo(stick, 0.72, 3.05, 0.1);
+      await h.walkTo(stick, 0, -9.0);
+      await h.walkTo(stick, 0, -5.4);
+      await h.walkTo(stick, 0, -3.0);
+      await h.walkTo(stick, 0, -1.6);
+      await h.walkTo(stick, -1.65, -1.6);
+      const d = await h.walkTo(stick, -1.7, -3.4, 0.1);
       s = await st(f);
-      check(d < 0.2 && s.room === 'bunks', `walked aft with the left thumb to the bunk room (${s.room}, ${d.toFixed(2)} m from the bunk side)`);
-      await h.aimAt({ x: 1.27, y: -0.2, z: 3.25 });
+      check(d < 0.2 && s.room === 'cabin-port', `walked aft with the left thumb to the port cabin (${s.room}, ${d.toFixed(2)} m from the bedside)`);
+      await h.aimAt({ x: -2.6, y: -0.45, z: -3.4 });
       await settle(f);
       map = await pickMap(f);
       check(!!map.bunk, `the bunk is under a finger (${map.bunk ? `${map.bunk.w}x${map.bunk.h} px` : 'not found'})`);

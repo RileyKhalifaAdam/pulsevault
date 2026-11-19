@@ -16,7 +16,7 @@
 //                 limit is the fastest spin the ship can still arrest within a small stopping angle.
 //   heat          capacity = HULL_HEAT_CAPACITY · dryMass (+ heat sinks); rejection = HULL_RADIATION ·
 //                 dragArea (+ radiators, − reactor thermal load). Sized against physics.ts: a stock Wren
-//                 behaves like its 5e9 J / 5e6 W reference ship.
+//                 behaves like twice its 5e9 J / 5e6 W reference ship (the 32 m Wren is two of the old one).
 //   jump drive    range = rated range · min(1, √(ratedMass / dryMass)); propellant per light-year scales
 //                 with the dry mass being moved. Heavy fits jump shorter.
 //   A module only counts while it sits in a slot of its own type and of its size or larger.
@@ -545,20 +545,28 @@ function hull(
  * sizes, same order).
  */
 export const SHIPS: Record<ShipVisualId, ShipDef> = {
-  wren: hull('wren', 'Wren', 'Corvane', 'courier', 38000, 12000, 800, 'S', 24, 16,
-    'Corvane\'s CD-7 is the Reach\'s default courier: a compact lifting body with twin drive pods that aerobrakes willingly and docks almost anywhere. Cheap to run, easy to fly and never quite big enough for the job it is doing.',
+  // The 32 m Wren is the 16 m one scaled by two in mass: twin drive pods (two engine slots), two RCS packs, two
+  // reactors, two tanks and two radiators, so full-throttle and RCS acceleration, Δv and heat per tonne are those
+  // of the old courier. Length and drag area follow the hull (32 x 19 x 6.6 m); inertia follows mass and length.
+  wren: hull('wren', 'Wren', 'Corvane', 'courier', 38000, 24200, 800, 'M', 80, 32,
+    'Corvane\'s Wren is the Reach\'s default courier: a 32-metre lifting body with twin drive pods, two cabins, a lounge and a cargo bay that aerobrakes willingly and fits any medium pad. Cheap to run, easy to fly and as much a home as a ship.',
     [
       ['engine', 1, 'eng_torch_1'],
+      ['engine', 1, 'eng_torch_1'],
+      ['rcs', 1, 'rcs_std_1'],
       ['rcs', 1, 'rcs_std_1'],
       ['reactor', 1, 'rct_std_1'],
+      ['reactor', 1, 'rct_std_1'],
       ['tank', 2, 'tank_std_2'],
-      ['cargo', 1, 'cargo_rack_1'],
+      ['tank', 2, 'tank_std_2'],
+      ['cargo', 2, 'cargo_rack_2'],
       ['shield', 1, 'shd_std_1'],
       ['armor', 1, null],
       ['weapon', 1, 'wpn_pulse_1'],
       ['weapon', 1, null],
       ['radiator', 1, 'rad_std_1'],
-      ['jump', 1, 'jmp_std_1'],
+      ['radiator', 1, 'rad_std_1'],
+      ['jump', 2, 'jmp_std_2'],
       ['computer', 1, 'cmp_3'],
       ['scanner', 1, 'scn_nav_1'],
       ['utility', 1, 'utl_dock'],

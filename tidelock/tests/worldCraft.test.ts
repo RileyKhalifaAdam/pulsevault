@@ -198,8 +198,9 @@ describe('contact', () => {
     expect(hit).toBeDefined();
     const p1 = mom();
     const n = sub(ship.rel, st.rel), nl = len(n);
-    expect(nl).toBeGreaterThan(49.4);
-    expect(nl).toBeLessThan(49.6);
+    const touch = 40 + SHIP_LAYOUTS.wren.radius; // rock sphere + the Wren's bounding sphere
+    expect(nl).toBeGreaterThan(touch - 0.1);
+    expect(nl).toBeLessThan(touch + 0.1);
     const vnBefore = (-3 * n.x) / nl;
     const dv = sub(ship.relV, st.relV), vnAfter = (dv.x * n.x + dv.y * n.y + dv.z * n.z) / nl;
     console.log(`impact: normal speed ${vnBefore.toFixed(3)} -> ${vnAfter.toFixed(3)} m/s, momentum error ${(len(sub(p1, p0)) / (3 * m)).toExponential(2)}, KE ${k0.toFixed(0)} -> ${ke().toFixed(0)} J, hull ${ship.hull.toFixed(4)}`);
@@ -226,7 +227,7 @@ describe('contact', () => {
     const b = w.bodies.find((x) => x.id === TAPER)!;
     const up = v3(Math.cos(0.4), 0, -Math.sin(0.4));
     const place = (h: number): { r: V3; v: V3 } => {
-      const rr = b.radius + 0.35 * 9.5 + h, r = v3(up.x * rr, up.y * rr, up.z * rr), wv = b.spinRate, n = b.spinAxis;
+      const rr = b.radius + 0.35 * SHIP_LAYOUTS.wren.radius + h, r = v3(up.x * rr, up.y * rr, up.z * rr), wv = b.spinRate, n = b.spinAxis;
       return { r, v: v3(wv * (n.y * r.z - n.z * r.y), wv * (n.z * r.x - n.x * r.z), wv * (n.x * r.y - n.y * r.x)) };
     };
     const p = place(3);
@@ -247,7 +248,7 @@ describe('contact', () => {
     const fr = flightReadout(w, 'player');
     expect(fr.situation).toBe('landed');
     expect(fr.surfaceSpeed).toBeLessThan(1e-6);
-    expect(Math.abs(fr.altitude - 0.35 * 9.5)).toBeLessThan(1e-3);
+    expect(Math.abs(fr.altitude - 0.35 * SHIP_LAYOUTS.wren.radius)).toBeLessThan(1e-3);
     expect(len(sub(ship.rel, before))).toBeGreaterThan(1000); // carried round by the spin
     ship.throttle = 1;
     for (let i = 0; i < 300; i++) advance(w, 1 / 60);

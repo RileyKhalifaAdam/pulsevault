@@ -16,10 +16,10 @@ import { clamp1, qRotInv } from './math';
 import { craftMass, type Craft, type World } from './state';
 
 /**
- * Collision radius of the body about its long axis, m. A person sidles through a gap far narrower than their
- * shoulders; the Wren's bunk-room aisle is 0.45 m wide, so the hard radius is the half-depth of a turned body.
+ * Collision radius of the body about its long axis, m: about half a person's shoulder depth-to-width. The
+ * narrowest passages of the 32 m Wren are its 1.0 m doorways, which leave a hand's breadth either side.
  */
-export const CREW_RADIUS = 0.18;
+export const CREW_RADIUS = 0.28;
 export const CREW_HEIGHT = 1.75;
 export const CREW_EYE = 1.62;
 /** Height of the body's centre of mass above the feet, m. */

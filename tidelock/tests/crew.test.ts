@@ -51,7 +51,13 @@ function walk(s: CrewState, m: ShipMotion, points: [number, number][], hz: numbe
     expect(t, `waypoint ${x},${z} reached (at ${s.pos.x.toFixed(2)},${s.pos.z.toFixed(2)})`).toBeLessThan(20 * hz);
   }
 }
-const ROUTE: [number, number][] = [[0, -3.2], [0, -2.0], [0, 1.6], [0, 3.05], [0.73, 3.05]];
+/** Deck plan routes (src/data/interiors.ts): cockpit -> companionway -> lounge -> corridor -> port cabin, beside the bed. */
+const TO_CABIN: [number, number][] = [[0, -12.2], [0, -11.0], [0, -9.0], [0, -5.4], [0, -3.0], [0, -1.6], [-1.65, -1.6], [-1.65, -3.3]];
+/** ... then back into the corridor, the suit room, the cargo bay and engineering. */
+const ONWARD: [number, string][] = [[0, ''], [0, ''], [1.6, 'suitroom'], [0, ''], [0, ''], [0, 'cargo'], [0, 'engineering']];
+const ONWARD_PTS: [number, number][] = [[-1.65, -1.6], [0, -1.6], [1.6, 0], [0, 0], [0, 2.5], [0, 5.0], [0, 11.2]];
+const LOUNGE_AFT = -4.6;
+const COCKPIT_AFT = -11.6;
 
 describe('the pilot as a body in the ship', () => {
   it('free fall: nothing is felt, a floating body keeps its velocity, and a gripped one stays put', () => {
@@ -63,15 +69,15 @@ describe('the pilot as a body in the ship', () => {
     run(s, m, STILL, 5, 60);
     expect(s.gripped).toBe(true);
     expect(s.pos).toEqual(L.spawn.pos);
-    // loose in the cabin, drifting aft and to starboard
+    // loose in the lounge, drifting aft and to starboard
     s.boots = false;
-    s.pos = v3(-0.4, -0.5, -2.0);
+    s.pos = v3(-0.4, -0.5, -8.0);
     s.vel = v3(0.1, 0, 0.3);
     run(s, m, STILL, 3, 60);
     expect(s.posture).toBe('floating');
     expect(s.vel).toEqual(v3(0.1, 0, 0.3));
     expect(s.pos.x).toBeCloseTo(-0.1, 9);
-    expect(s.pos.z).toBeCloseTo(-1.1, 9);
+    expect(s.pos.z).toBeCloseTo(-7.1, 9);
   });
 
   it('full throttle: the felt acceleration is the ship\'s, toward the stern, and a loose body ends against the aft bulkhead', () => {
@@ -90,9 +96,9 @@ describe('the pilot as a body in the ship', () => {
       s.boots = false;
       s.pos.y += 0.1;
       run(s, m, STILL, 4, hz);
-      expect(room(s)).toBe('cockpit');
-      expect(s.pos.z).toBeGreaterThan(-2.6 - CREW_RADIUS - 0.03);
-      expect(s.pos.z).toBeLessThan(-2.6 - CREW_RADIUS + 1e-6);
+      expect(room(s)).toBe('cockpit'); // against the cockpit's aft bulkhead, beside the door
+      expect(s.pos.z).toBeGreaterThan(COCKPIT_AFT - CREW_RADIUS - 0.03);
+      expect(s.pos.z).toBeLessThan(COCKPIT_AFT - CREW_RADIUS + 1e-6);
       expect(len(s.vel)).toBeLessThan(0.3);
     }
   });
@@ -109,18 +115,18 @@ describe('the pilot as a body in the ship', () => {
     run(s, m, STILL, 3, 60);
     expect(s.gripped).toBe(true);
     expect(s.pos).toEqual(L.spawn.pos);
-    // without boots the same push carries the body to the port wall
+    // without boots the same push carries the body to port, against the side console
     const loose = createCrew(L, ship.id);
     loose.boots = false;
     run(loose, m, STILL, 6, 60);
-    expect(loose.pos.x).toBeLessThan(-0.9);
+    expect(loose.pos.x).toBeCloseTo(-1.25 + CREW_RADIUS, 2);
     // main drive: the boots let go and the body goes aft
     ship.rcs.x = 0;
     ship.throttle = 1;
     craftMotion(w, ship, m);
     run(s, m, STILL, 2, 60);
     expect(s.gripped).toBe(false);
-    expect(s.pos.z).toBeGreaterThan(-3.0);
+    expect(s.pos.z).toBeGreaterThan(L.spawn.pos.z + 0.5);
     // drive off: the boots take hold again where the body lies
     ship.throttle = 0;
     craftMotion(w, ship, m);
@@ -128,26 +134,39 @@ describe('the pilot as a body in the ship', () => {
     expect(s.gripped).toBe(true);
   });
 
-  it('walks in boots from the spawn point through the cockpit door, the cabin and the corridor into the bunk room', () => {
+  it('walks in boots from the helm through the companionway, lounge and corridor to the port-cabin bed, then the suit room, cargo bay and engineering', () => {
     const { w, ship } = orbit();
     const m = craftMotion(w, ship, createShipMotion());
     for (const hz of [60, 20]) {
       const s = createCrew(L, ship.id);
-      walk(s, m, ROUTE, hz);
-      expect(room(s)).toBe('bunks');
+      const seen: string[] = [];
+      for (const pt of TO_CABIN) {
+        walk(s, m, [pt], hz);
+        if (seen[seen.length - 1] !== room(s)) seen.push(room(s));
+      }
+      expect(seen).toEqual(['cockpit', 'vestibule', 'lounge', 'corridor', 'cabin-port']);
+      s.yaw = Math.PI / 2; // turn to port, toward the bed
       expect(findPrompt(s, L)?.kind).toBe('bunk');
       sitCrew(s, L, 'bunk');
       expect(s.posture).toBe('lying');
       standCrew(s);
-      expect(room(s)).toBe('bunks');
+      expect(room(s)).toBe('cabin-port');
+      s.yaw = 0;
+      ONWARD_PTS.forEach((pt, i) => {
+        walk(s, m, [pt], hz);
+        if (ONWARD[i][1]) expect(room(s), `waypoint ${i}`).toBe(ONWARD[i][1]);
+      });
+      expect(room(s)).toBe('engineering');
     }
-    // straight at a wall beside the door: it stops the body; the door frame lets it through and slides it in
+    // straight at the cockpit's aft bulkhead beside the door: it stops the body; the door frame slides it through
     const s = createCrew(L, ship.id);
+    s.pos.x = -0.9; s.pos.z = -12.2;
     run(s, m, { moveX: 0, moveZ: -1 }, 4, 60);
     expect(room(s)).toBe('cockpit');
+    expect(s.pos.z).toBeCloseTo(COCKPIT_AFT - 0.02 - CREW_RADIUS, 2);
     s.pos.x = -0.35;
-    run(s, m, { moveX: 0, moveZ: -1 }, 1.2, 60);
-    expect(room(s)).toBe('cabin');
+    run(s, m, { moveX: 0, moveZ: -1 }, 0.8, 60);
+    expect(room(s)).toBe('vestibule');
     expect(s.yaw).toBe(0);
     expect(findPrompt(createCrew(L, ship.id), L)?.kind).toBe('helm');
   });
@@ -179,18 +198,17 @@ describe('the pilot as a body in the ship', () => {
     run(s, spin, STILL, 20, 20);
   });
 
-  it('pushing off floats across the cabin and bounces off the far bulkhead', () => {
+  it('pushing off floats across the lounge and bounces off its aft bulkhead', () => {
     const m = createShipMotion();
     const s = createCrew(L, 'player');
-    s.pos = v3(0, -0.75, -2.2);
+    s.pos = v3(-1.5, -0.75, -9.5);
     s.boots = false;
     s.yaw = Math.PI; // facing aft
     stepCrew(s, L, m, STILL, 1 / 60);
     expect(s.posture).toBe('floating');
     expect(pushOffCrew(s, L)).toBe(true);
     expect(s.vel.z).toBeCloseTo(1.2, 9);
-    s.pos.x = 1.2; // aim past the door, at the bulkhead
-    s.pos.z = 0.6;
+    s.pos.z = -7.0; // beside the corridor door, aimed at the bulkhead
     let bounced = false, zMax = -9;
     for (let i = 0; i < 60 * 4 && !bounced; i++) {
       run(s, m, STILL, 1 / 60, 60);
@@ -198,9 +216,9 @@ describe('the pilot as a body in the ship', () => {
       bounced = s.vel.z < 0;
     }
     expect(bounced).toBe(true);
-    expect(zMax).toBeGreaterThan(1.9 - CREW_RADIUS - 0.05);
+    expect(zMax).toBeGreaterThan(LOUNGE_AFT - CREW_RADIUS - 0.05);
     expect(s.vel.z).toBeCloseTo(-1.2 * 0.3, 6);
-    expect(room(s)).toBe('cabin');
+    expect(room(s)).toBe('lounge');
     // a jump in boots: up to the overhead, back to the deck, gripped again
     const j = createCrew(L, 'player');
     expect(pushOffCrew(j, L)).toBe(true);
@@ -208,7 +226,7 @@ describe('the pilot as a body in the ship', () => {
     expect(j.gripped).toBe(false);
     run(j, m, STILL, 3, 60);
     expect(j.gripped).toBe(true);
-    expect(j.pos.y).toBe(-0.75);
+    expect(j.pos.y).toBe(L.spawn.pos.y);
   });
 
   it('nothing tunnels: a body thrown hard in every direction stays inside at 60 Hz and at 20 Hz', () => {
@@ -230,7 +248,7 @@ describe('the pilot as a body in the ship', () => {
     const m = createShipMotion();
     m.w.z = 0.3;
     const s = createCrew(L, 'player');
-    walk(s, m, [[0, -3.2], [0, -2.0]], 60);
+    walk(s, m, [[0, -12.2], [0, -11.0]], 60);
     s.boots = false;
     pushOffCrew(s, L);
     run(s, m, STILL, 1.5, 60);

@@ -14,7 +14,7 @@ import { DOCK_ANGLE, DOCK_DISTANCE, DOCK_SPEED, qRotInv } from '../src/world';
 
 const STATS = computeStats(defaultLoadout('wren'));
 const WHEEL_RADIUS = STATION_LAYOUTS.ringHabitat.radius;
-const START_DISTANCE = WHEEL_RADIUS + START_CLEARANCE;
+const START_DISTANCE = WHEEL_RADIUS + SHIP_LAYOUTS.wren.radius + START_CLEARANCE;
 const FREE = { budgetMs: 1e9 }; // no CPU limit: these tests are about the motion
 
 const run = (s: Session, seconds: number, dt = 1 / 60): void => {
@@ -52,7 +52,7 @@ describe('session on the physical world', () => {
     expect(s.craft().some((c) => c.id === START_STATION_ID && c.kind === 'station')).toBe(true);
     expect(s.system.stations.map((x) => x.id).sort()).toEqual(s.craft().filter((c) => c.kind === 'station').map((c) => c.id).sort());
     expect(Math.abs(d.distance - START_DISTANCE)).toBeLessThan(0.01);
-    expect(d.distance - WHEEL_RADIUS).toBeCloseTo(200, 1);
+    expect(d.distance - WHEEL_RADIUS - SHIP_LAYOUTS.wren.radius).toBeCloseTo(200, 1); // hull clear of the Wheel's sphere
     // Same orbit, a little ahead: no closing speed; in inertial axes the pair turns about each other once per orbit.
     expect(Math.abs(s.target()!.closing)).toBeLessThan(1e-3);
     expect(d.relSpeed).toBeCloseTo(((2 * Math.PI) / s.flight().period) * d.distance, 3);
@@ -200,6 +200,8 @@ describe('session on the physical world', () => {
     expect(last.relSpeed).toBeLessThan(DOCK_SPEED);
     expect(dockedAt.stationId).toBe(START_STATION_ID);
     expect(STATION_LAYOUTS.ringHabitat.ports.some((p) => p.id === dockedAt.portId)).toBe(true);
+    // the 32 m Wren needs a medium pad: it latched at an M or L port, never at a small one
+    expect(STATION_LAYOUTS.ringHabitat.ports.find((p) => p.id === dockedAt.portId)!.size).not.toBe('S');
     expect(s.player().dockedTo).toBe(START_STATION_ID);
     expect(s.flight().situation).toBe('docked');
     expect(me(s).dockedTo).toBe(START_STATION_ID);
@@ -503,17 +505,23 @@ describe('the pilot, hands on the physical controls', () => {
     tap(s, 'harness');
     expect(s.mode()).toBe('onFoot');
     expect(s.crew().pos).toEqual(s.interior()!.spawn.pos);
-    // the bench and the bunk are far away; the light switch too
+    // the sofa and the bed are far away; the light switch too
     for (const role of ['bunk', 'tableSeat', 'cabinLights']) expect(dev(s, role).reachable, role).toBe(false);
     expect(s.tapDevice(idOf(s, 'bunk'))).toBe(false);
-    walkTo(s, [[0, -3.2], [0, -2.0], [-0.35, -2.15]]);
-    expect(s.crew().roomName).toBe('Cabin');
+    // aft through the companionway: the switch faces into the lounge, so it is out of reach from the companionway
+    walkTo(s, [[0, -12.2], [0, -11.0]]);
+    expect(s.crew().roomName).toBe('Companionway');
+    expect(dev(s, 'cabinLights').reachable).toBe(false);
+    walkTo(s, [[0, -9.9], [-1.1, -9.9]]);
+    expect(s.crew().roomName).toBe('Lounge');
+    expect(dev(s, 'cabinLights').reachable).toBe(true);
     expect(s.cabinLights()).toBe(true);
     tap(s, 'cabinLights');
     expect(s.cabinLights()).toBe(false);
     expect(dev(s, 'cabinLights').lit).toBe(false);
-    // the bench by the window: tap to sit, any walk input stands up
-    walkTo(s, [[0.45, -2.0]]);
+    // the sofa under the big window: tap to sit, any walk input stands up
+    walkTo(s, [[1.4, -9.0]]);
+    expect(dev(s, 'bunk').reachable).toBe(false);
     tap(s, 'tableSeat');
     expect(s.crew().posture).toBe('seated');
     expect(s.crew().eye).toEqual(s.interior()!.tableEye);
@@ -522,9 +530,13 @@ describe('the pilot, hands on the physical controls', () => {
     s.setWalk({ moveX: 0, moveZ: 0 });
     run(s, 0.5);
     expect(s.crew().posture).toBe('walking');
-    // to the bunk
-    walkTo(s, [[0, -2.0], [0, 1.6], [0, 3.05], [0.73, 3.05]]);
-    expect(s.crew().roomId).toBe('bunks');
+    // down the corridor to the bed in the port cabin
+    walkTo(s, [[0, -9.0], [0, -5.4], [0, -3.0], [0, -1.6]]);
+    expect(s.crew().roomId).toBe('corridor');
+    expect(dev(s, 'bunk').reachable).toBe(false);
+    walkTo(s, [[-1.65, -1.6], [-1.65, -3.3]]);
+    expect(s.crew().roomId).toBe('cabin-port');
+    expect(s.crew().roomName).toBe('Port cabin');
     tap(s, 'bunk');
     let c = s.crew();
     expect(c.posture).toBe('lying');
@@ -563,7 +575,7 @@ describe('the pilot, hands on the physical controls', () => {
     s.setWalk({ moveX: 0, moveZ: 0 });
     run(s, 0.5);
     expect(s.crew().posture).toBe('walking');
-    walkTo(s, [[0, 3.05], [0, 1.6], [0, -2.0], [0, -3.2], [-0.5, -3.25]]);
+    walkTo(s, [[-1.65, -1.6], [0, -1.6], [0, -5.4], [0, -9.0], [0, -11.0], [0, -12.2], [-0.55, -12.6]]);
     tap(s, 'harness');
     expect(s.mode()).toBe('helm');
     s.reset();

@@ -19,6 +19,14 @@
 //   * sky        the sky's prefiltered environment for reflections, with the star's lobe kept in step.
 //   * exposure   metered from the light on the focus and the sun-lit worlds in view, adapted over about a
 //                second through the pipeline (opens up in shadow and deep space, stops down over a bright world).
+//                Inside the ship the pipeline's GPU auto exposure (mean log luminance) takes over.
+//
+// Inside the player's ship (src/render/probes.ts): the interior is drawn by room (portal culling through the
+// door openings), lit by the real star through the window openings with a shadow map fitted to the rooms in
+// view, by planetshine (high / ultra), and reflects box-projected per-room probes. The player's own hull is
+// drawn in every camera mode: from inside, the interior pass (depth cleared, opaque closed shell) covers it
+// everywhere but the window openings, so the nose, wings and engine pods show only through the glass. The
+// hull reflects a live capture of the sky and the worlds (medium and up).
 //
 // The module allocates nothing per frame; the only heavy work is in setSystem (bakes and station geometry).
 
@@ -37,10 +45,12 @@ import { EffectsManager, createEnginePlumes, createStrobes, type EnginePlume, ty
 import { createCameraRig, type CameraEnv, type CameraFocus, type CameraPose } from './camera';
 import { addShip, playerShip, type FrameShip, type SceneFrame } from './frame';
 import { INTERIORS, type InteriorLayout } from '../data/interiors';
-import { createInteriorVisual, type InteriorUpdate, type InteriorVisual } from './space/interior';
+import { createInteriorVisual, type InteriorOptions, type InteriorUpdate, type InteriorVisual } from './space/interior';
 import { COCKPITS, type CockpitLayout } from '../data/cockpit';
 import type { DeviceView } from '../game/api';
 import { createCockpitVisual, type CockpitPick, type CockpitUpdate, type CockpitVisual } from './space/cockpit';
+import { InteriorLighting, OutsideEnvironment, textureBytesOf, type InteriorLightingFrame } from './probes';
+import { TIER_SETTINGS, renderInfo } from '../app/perf';
 
 // ------------------------------------------------------------------------------------------------ API
 
@@ -77,12 +87,19 @@ export interface SceneStats {
   interior: { drawCalls: number; triangles: number } | null;
   /** The physical controls and screens drawn with the interior (also counted in the frame totals). */
   cockpit: { drawCalls: number; triangles: number } | null;
+  /** Interior lighting: rooms drawn, shadow-map and probe-capture draws (included in the totals), memory. */
+  lighting: { rooms: number; roomsTotal: number; room: string; drawCalls: number; probeBytes: number; shadowBytes: number; pending: number } | null;
+  /** Estimated GPU texture memory: interior + cockpit + player hull + lighting, and the pipeline's targets, bytes. */
+  textureBytes: number;
+  targetBytes: number;
 }
 
 export interface SceneManagerOptions {
   quality: Quality;
   /** Override for the sky bake only (the sky is the longest bake; harnesses lower it). */
   skyQuality?: Quality;
+  /** Builds the player ship's interior (default: space/interior.ts). Harnesses substitute stand-ins. */
+  interiorFactory?: (layout: InteriorLayout, opts: InteriorOptions) => InteriorVisual;
 }
 
 export interface SetSystemOptions {
@@ -410,6 +427,7 @@ const tick = (): Promise<void> =>
 class Manager implements SceneManager {
   private quality: Quality;
   private readonly skyQuality: Quality | undefined;
+  private readonly interiorFactory: (layout: InteriorLayout, opts: InteriorOptions) => InteriorVisual;
   private readonly farScene = new THREE.Scene();
   private readonly nearScene = new THREE.Scene();
   private readonly farCam = new THREE.PerspectiveCamera(50, 1, 0.05, 600);
@@ -418,7 +436,27 @@ class Manager implements SceneManager {
   private readonly insideScene = new THREE.Scene();
   private readonly insideCam = new THREE.PerspectiveCamera(60, 1, 0.05, 80);
   private layersInside: RenderLayer[] = [];
-  private interior: { shipId: string; visualId: string; visual: InteriorVisual; cockpit: CockpitVisual | null } | null = null;
+  private interior: { shipId: string; visualId: string; visual: InteriorVisual; cockpit: CockpitVisual | null; lighting: InteriorLighting } | null = null;
+  /** The Wren's interior built (and its programs compiled, probes captured) while loading, adopted by ensureInterior. */
+  private prebuilt: { visualId: string; visual: InteriorVisual; cockpit: CockpitVisual | null; lighting: InteriorLighting } | null = null;
+  /** Hulls built while loading so their programs exist before the first frame (kept, never drawn). */
+  private warmShips: ShipVisual[] = [];
+  private outsideEnv: OutsideEnvironment | null = null;
+  private readonly envHide: THREE.Object3D[] = [];
+  private hullTexBytes = -1;
+  private extraCalls = 0;
+  private extraTris = 0;
+  private readonly lightFrame: InteriorLightingFrame = {
+    eye: { x: 0, y: 0, z: 0 },
+    sunDir: new THREE.Vector3(0, 1, 0),
+    sunColor: new THREE.Color(0, 0, 0),
+    sunIntensity: 0,
+    shineDir: new THREE.Vector3(0, -1, 0),
+    shineColor: new THREE.Color(0, 0, 0),
+    shineIntensity: 0,
+    lights: true,
+    dt: 0,
+  };
   private readonly cockpitCtx: CockpitUpdate = { devices: [], time: 0, lights: true, gain: 1, instruments: null };
   /** Ship pose relative to the camera of the last interior frame, for pickDevice. */
   private pickValid = false;
@@ -506,7 +544,8 @@ class Manager implements SceneManager {
   private readonly tv2 = new THREE.Vector3();
   private readonly projOut: Projection = { x: 0, y: 0, visible: false, behind: false, distance: 0, radiusPx: 0, occluded: false };
   private readonly pickOut: Projection = { x: 0, y: 0, visible: false, behind: false, distance: 0, radiusPx: 0, occluded: false };
-  private readonly statsOut: SceneStats = { drawCalls: 0, triangles: 0, interior: null, cockpit: null };
+  private readonly statsOut: SceneStats = { drawCalls: 0, triangles: 0, interior: null, cockpit: null, lighting: null, textureBytes: 0, targetBytes: 0 };
+  private readonly lightingStats = { rooms: 0, roomsTotal: 0, room: '', drawCalls: 0, probeBytes: 0, shadowBytes: 0, pending: 0 };
   private readonly focus: CameraFocus = { id: '', kind: 'ship', radius: 10, q: { x: 0, y: 0, z: 0, w: 1 }, chaseDistance: 34, chaseHeight: 8, cockpit: v3(), throttle: 0 };
   private readonly dockEnv = { pos: v3(), dir: v3(), up: v3() };
   private readonly lookEnv = v3();
@@ -520,6 +559,7 @@ class Manager implements SceneManager {
   ) {
     this.quality = opts.quality;
     this.skyQuality = opts.skyQuality;
+    this.interiorFactory = opts.interiorFactory ?? createInteriorVisual;
     this.pose = this.rig.pose;
     this.nearScene.add(this.key, this.key.target, this.shine, this.shine.target, this.ambient);
     this.farScene.add(this.markers.mesh);
@@ -529,6 +569,12 @@ class Manager implements SceneManager {
     ];
     this.layersInside = [...this.layers, { scene: this.insideScene, camera: this.insideCam, clearDepth: true }];
     this.camEnv.collide = this.collideCamera;
+    // Shadows: only the interior's sun and planetshine cast them. Their maps are rendered by the interior
+    // lighting before the pipeline binds its HDR target (never from inside a layer's render).
+    const sm = pipeline.renderer.shadowMap;
+    sm.enabled = true;
+    sm.type = THREE.PCFSoftShadowMap;
+    sm.autoUpdate = false;
   }
 
   get camera(): Readonly<CameraPose> {
@@ -549,7 +595,7 @@ class Manager implements SceneManager {
     this.nearBodyId = opts.nearBodyId;
     const renderer = this.pipeline.renderer;
     const q = this.quality;
-    const total = 2 + system.bodies.length + system.stations.length;
+    const total = 3 + system.bodies.length + system.stations.length;
     let done = 0;
     const step = async (label: string): Promise<boolean> => {
       onProgress?.(Math.min(1, done / total), label);
@@ -644,6 +690,23 @@ class Manager implements SceneManager {
     if (!(await step('Lighting'))) return;
     this.glare = createStarGlare(q);
     this.nearScene.add(this.glare.object3d);
+    for (const b of this.bodies) if (b.star) this.envHide.push(b.star.object3d);
+    const envSize = TIER_SETTINGS[q].envProbe;
+    if (envSize > 0) {
+      this.outsideEnv = new OutsideEnvironment(renderer, envSize, 4);
+      this.nearScene.environment = this.outsideEnv.texture;
+    }
+    // the player's ship and its interior, built and compiled now (iOS stalls on a first-use compile)
+    if (!(await step('Fitting out the ship'))) return;
+    this.prebuildInterior('wren');
+    const warm = createShipVisual('wren', { quality: q });
+    this.warmShips.push(warm);
+    this.nearScene.add(warm.object3d);
+    warm.object3d.position.set(0, 0, -40);
+    this.nearCam.position.set(0, 0, 0);
+    this.nearCam.updateMatrixWorld();
+    renderer.compile(this.nearScene, this.nearCam);
+    warm.object3d.removeFromParent();
     this.fx = new EffectsManager({ quality: q });
     this.nearScene.add(this.fx.object3d);
     this.rig.cut();
@@ -681,11 +744,38 @@ class Manager implements SceneManager {
     this.statsOut.interior = iv ? { drawCalls: iv.drawCalls, triangles: iv.triangles } : null;
     const ck = this.interior?.cockpit;
     this.statsOut.cockpit = ck ? { drawCalls: ck.drawCalls, triangles: ck.triangles } : null;
+    this.statsOut.drawCalls += this.extraCalls;
+    this.statsOut.triangles += this.extraTris;
+    const li = this.interior?.lighting;
+    if (li) {
+      const ls = this.lightingStats;
+      ls.rooms = li.stats.rooms;
+      ls.roomsTotal = li.stats.roomsTotal;
+      ls.room = li.stats.room;
+      ls.drawCalls = li.stats.drawCalls;
+      ls.probeBytes = li.stats.probeBytes;
+      ls.shadowBytes = li.stats.shadowBytes;
+      ls.pending = li.stats.pending;
+      this.statsOut.lighting = ls;
+    } else this.statsOut.lighting = null;
+    this.statsOut.textureBytes = this.textureBytes();
+    this.statsOut.targetBytes = s.targetBytes;
     return this.statsOut;
+  }
+
+  /** Estimated GPU bytes of the textures of the interior, cockpit, player hull and their lighting. */
+  private textureBytes(): number {
+    const it = this.interior ?? this.prebuilt;
+    let b = 0;
+    if (it) b += it.lighting.stats.textureBytes + it.lighting.stats.probeBytes + it.lighting.stats.shadowBytes;
+    if (this.hullTexBytes > 0) b += this.hullTexBytes;
+    if (this.outsideEnv) b += this.outsideEnv.bytes;
+    return b;
   }
 
   private disposeShip(e: ShipEntry): void {
     if (this.interior && this.interior.shipId === e.id) {
+      this.interior.lighting.dispose();
       this.interior.cockpit?.dispose();
       this.interior.visual.dispose();
       this.interior = null;
@@ -697,25 +787,59 @@ class Manager implements SceneManager {
     e.group.removeFromParent();
   }
 
-  /** The interior of a ship that has one (built once, when the player's ship first appears), or null. */
+  /** Build an interior, its cockpit and its lighting (rooms, sun, probes) into the inside scene; compiles and captures. */
+  private buildInterior(visualId: string): { visualId: string; visual: InteriorVisual; cockpit: CockpitVisual | null; lighting: InteriorLighting } | null {
+    const layout = (INTERIORS as Record<string, InteriorLayout | undefined>)[visualId];
+    if (!layout) return null;
+    const visual = this.interiorFactory(layout, { quality: this.quality });
+    this.insideScene.add(visual.object3d);
+    // the physical controls and console screens ride with the interior (same ship-local axes, same pass)
+    const cl = (COCKPITS as Record<string, CockpitLayout | undefined>)[visualId];
+    const cockpit = cl ? createCockpitVisual(cl, { quality: this.quality }) : null;
+    if (cockpit) {
+      if (typeof cockpit.object3d.userData.room !== 'string') cockpit.object3d.userData.room = 'cockpit';
+      visual.object3d.add(cockpit.object3d);
+    }
+    const lighting = new InteriorLighting(this.pipeline.renderer, this.insideScene, visual.object3d, layout, this.quality);
+    lighting.attach();
+    // compile every program (shadow variants included) and capture the probes now, from the helm
+    visual.object3d.visible = true;
+    visual.object3d.position.set(0, 0, 0);
+    visual.object3d.quaternion.set(0, 0, 0, 1);
+    const ic = this.insideCam;
+    ic.position.set(layout.helmEye.x, layout.helmEye.y, layout.helmEye.z);
+    ic.quaternion.set(0, 0, 0, 1);
+    ic.updateMatrixWorld();
+    lighting.hideDuringCapture = this.glare?.object3d ?? null;
+    lighting.warmUp(ic);
+    ic.position.set(0, 0, 0);
+    ic.updateMatrixWorld();
+    visual.object3d.visible = false;
+    return { visualId, visual, cockpit, lighting };
+  }
+
+  private prebuildInterior(visualId: string): void {
+    if (this.prebuilt && this.prebuilt.visualId === visualId) return;
+    if (this.interior && this.interior.visualId === visualId) return;
+    this.prebuilt = this.buildInterior(visualId);
+  }
+
+  /** The interior of a ship that has one (built while loading, or when the player's ship first appears), or null. */
   private ensureInterior(e: ShipEntry): InteriorVisual | null {
     const cur = this.interior;
     if (cur && cur.shipId === e.id && cur.visualId === e.visualId) return cur.visual;
-    const layout = (INTERIORS as Record<string, InteriorLayout | undefined>)[e.visualId];
-    if (!layout) return null;
     if (cur) {
+      cur.lighting.dispose();
       cur.cockpit?.dispose();
       cur.visual.dispose();
+      this.interior = null;
     }
-    const visual = createInteriorVisual(layout, { quality: this.quality });
-    visual.object3d.visible = false;
-    this.insideScene.add(visual.object3d);
-    // the physical controls and console screens ride with the interior (same ship-local axes, same pass)
-    const cl = (COCKPITS as Record<string, CockpitLayout | undefined>)[e.visualId];
-    const cockpit = cl ? createCockpitVisual(cl, { quality: this.quality }) : null;
-    if (cockpit) visual.object3d.add(cockpit.object3d);
-    this.interior = { shipId: e.id, visualId: e.visualId, visual, cockpit };
-    return visual;
+    let built = this.prebuilt && this.prebuilt.visualId === e.visualId ? this.prebuilt : null;
+    if (built) this.prebuilt = null;
+    else built = this.buildInterior(e.visualId);
+    if (!built) return null;
+    this.interior = { shipId: e.id, ...built };
+    return built.visual;
   }
 
   private disposeSystem(): void {
@@ -734,6 +858,21 @@ class Manager implements SceneManager {
     this.stationIndex.clear();
     this.siteIndex.clear();
     this.primary = null;
+    if (this.prebuilt) {
+      this.prebuilt.lighting.dispose();
+      this.prebuilt.cockpit?.dispose();
+      this.prebuilt.visual.dispose();
+      this.prebuilt = null;
+    }
+    for (const w of this.warmShips) w.dispose();
+    this.warmShips.length = 0;
+    this.envHide.length = 0;
+    this.hullTexBytes = -1;
+    if (this.outsideEnv) {
+      this.nearScene.environment = null;
+      this.outsideEnv.dispose();
+      this.outsideEnv = null;
+    }
     if (this.glare) {
       this.glare.object3d.removeFromParent();
       this.glare.dispose();
@@ -745,7 +884,7 @@ class Manager implements SceneManager {
       this.fx = null;
     }
     if (this.sky) {
-      this.nearScene.environment = null;
+      if (this.nearScene.environment === this.sky.envMap) this.nearScene.environment = null;
       this.sky.object3d.removeFromParent();
       this.sky.dispose();
       this.sky = null;
@@ -1419,7 +1558,8 @@ class Manager implements SceneManager {
       const e = this.shipList[i];
       if (e.lastSeen !== frameNo) continue;
       const inRange = e.dist < FAR_PLANE * 0.95;
-      const hidden = pose.hideFocus && e === focusShip;
+      // the player's own hull is drawn in every camera mode (from inside it shows through the windows only)
+      const hidden = false;
       e.group.visible = inRange;
       e.visual.object3d.visible = !hidden;
       if (!inRange) {
@@ -1527,6 +1667,8 @@ class Manager implements SceneManager {
     }
 
     // ---- star glare: hidden by worlds, and by any hull between the lens and the star
+    const insideNow = pose.mode === 'interior' && pose.hideFocus && focusShip !== null;
+    if (this.hullTexBytes < 0 && playerEntry) this.hullTexBytes = textureBytesOf(playerEntry.visual.object3d);
     const sdx = star.rel.x / star.dist;
     const sdy = star.rel.y / star.dist;
     const sdz = star.rel.z / star.dist;
@@ -1554,14 +1696,24 @@ class Manager implements SceneManager {
       for (let i = 0; i < this.shipList.length && glareVis > 0; i++) {
         const e = this.shipList[i];
         if (e.lastSeen !== frameNo || !e.visual.object3d.visible || e.dist > FAR_PLANE) continue;
+        if (insideNow && e === focusShip) continue; // from inside: the window test below
         const along = e.rel.x * sdx + e.rel.y * sdy + e.rel.z * sdz;
         if (along <= 0) continue;
         const perp = Math.sqrt(Math.max(0, e.dist * e.dist - along * along));
         glareVis *= smooth(e.radius * 0.25, e.radius * 0.6, perp);
       }
     }
+    const li = this.interior?.lighting;
+    if (insideNow && focusShip && li && glareVis > 0) {
+      // the star seen through a window opening of a drawn room; the frames cut it off softly
+      const dl = unrotTo(this.tc, focusShip.q, sdx, sdy, sdz);
+      glareVis *= li.starThroughWindow(frame.camera.eye ?? this.lightFrame.eye, dl, Math.asin(Math.min(1, star.def.radius / star.dist)));
+    }
     this.glareVis += (glareVis - this.glareVis) * (this.evInit ? 1 - Math.exp(-dt / 0.08) : 1);
     if (this.glare) {
+      // drawn last, over everything: in the interior pass when inside (the interior would hide it otherwise)
+      const host = insideNow ? this.insideScene : this.nearScene;
+      if (this.glare.object3d.parent !== host) host.add(this.glare.object3d);
       const dv = unrotTo(this.ta, cq, sdx, sdy, sdz);
       this.tv.set(dv.x, dv.y, dv.z);
       this.glareCtx.starDirView = this.tv;
@@ -1583,6 +1735,9 @@ class Manager implements SceneManager {
       this.evInit = true;
     } else this.ev += (evWant - this.ev) * (1 - Math.exp(-dt / (evWant < this.ev ? 0.6 : 1.4)));
     pipeline.setExposure(this.ev);
+    // inside: the image meters itself (mean log luminance on the GPU), so a sun patch, a dark cabin and a
+    // bright world filling the window all expose like a camera would
+    pipeline.setAutoExposure(insideNow, AUTO_EXPOSURE);
     if (this.sky) {
       this.sky.update({ exposure: Math.pow(2, -0.55 * this.ev) });
       // keep the star's lobe in the reflection environment in step with the key light
@@ -1609,7 +1764,14 @@ class Manager implements SceneManager {
     // ---- inside the player's ship: the interior in its own pass over the outside world, lit by itself, so
     // the star does not shine through the bulkheads and the window openings show what is really out there
     let layers = this.layers;
-    const inside = pose.mode === 'interior' && pose.hideFocus && focusShip !== null;
+    const inside = insideNow;
+    this.extraCalls = 0;
+    this.extraTris = 0;
+    // the hull's live environment: one face of the outside every few frames (before the HDR target is bound)
+    if (this.outsideEnv) {
+      this.outsideEnv.update(this.farScene, this.envHide, this.outsideEnv.captures === 0);
+      this.extraCalls += this.outsideEnv.drawCalls;
+    }
     const host = inside ? focusShip : playerEntry;
     const interior = host ? this.ensureInterior(host) : null;
     this.pickValid = false;
@@ -1641,6 +1803,26 @@ class Manager implements SceneManager {
         c.windowColor.g = this.shine.color.g * sh + c.sunColor.g * 0.1;
         c.windowColor.b = this.shine.color.b * sh + c.sunColor.b * 0.1;
         interior.update(c);
+        if (li) {
+          ic.position.set(0, 0, 0);
+          ic.updateMatrixWorld();
+          const lf = this.lightFrame;
+          lf.eye.x = c.eye.x;
+          lf.eye.y = c.eye.y;
+          lf.eye.z = c.eye.z;
+          lf.sunDir.copy(this.sunDirFocus);
+          lf.sunColor.copy(this.keyColor);
+          lf.sunIntensity = this.key.intensity;
+          lf.shineDir.copy(this.shine.position);
+          if (lf.shineDir.lengthSq() > 1e-12) lf.shineDir.normalize();
+          lf.shineColor.copy(this.shine.color);
+          lf.shineIntensity = this.shine.intensity;
+          lf.lights = c.lights;
+          lf.dt = dt;
+          li.update(lf, ic);
+          this.extraCalls += li.stats.drawCalls;
+          this.extraTris += li.stats.triangles;
+        }
         const cockpit = this.interior?.cockpit;
         if (cockpit) {
           const k = this.cockpitCtx;
@@ -1663,6 +1845,29 @@ class Manager implements SceneManager {
       }
     }
     pipeline.render(layers, dt);
+    this.publishInfo(inside);
+  }
+
+  /** Numbers for the perf overlay and the performance report (src/app/perf.ts). */
+  private publishInfo(inside: boolean): void {
+    const ps = this.pipeline.stats();
+    const t = TIER_SETTINGS[this.quality];
+    const ri = renderInfo;
+    ri.tier = this.quality;
+    ri.msaa = ps.msaa;
+    const li = this.interior?.lighting;
+    ri.shadow = t.shadow;
+    ri.shineShadow = li?.shine ? t.shineShadow : 0;
+    ri.probe = t.probe;
+    ri.envProbe = this.outsideEnv ? t.envProbe : 0;
+    ri.drawCalls = ps.drawCalls + this.extraCalls;
+    ri.triangles = ps.triangles + this.extraTris;
+    ri.textureBytes = this.textureBytes();
+    ri.targetBytes = ps.targetBytes;
+    ri.rooms = inside && li ? li.stats.rooms : 0;
+    ri.roomsTotal = inside && li ? li.stats.roomsTotal : 0;
+    ri.room = inside && li ? li.stats.room : '';
+    ri.exposure = ps.autoExposure ? 'auto' : this.ev.toFixed(2);
   }
 
   private readonly dockPort: { pos: V3; dir: V3; up: V3 } = { pos: v3(), dir: v3(), up: v3() };
@@ -1809,6 +2014,8 @@ class Manager implements SceneManager {
  * render() before that only clears the canvas.
  */
 const NO_DEVICES: readonly DeviceView[] = [];
+/** Inside the ship: key 0.16 on the mean log luminance, -2.5..+3 stops. */
+const AUTO_EXPOSURE = { key: 0.16, minEv: -2.5, maxEv: 3, compensation: 0 };
 
 export function createSceneManager(pipeline: RenderPipeline, opts: SceneManagerOptions): SceneManager {
   return new Manager(pipeline, opts);

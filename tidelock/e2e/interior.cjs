@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // End-to-end check of living aboard the Wren, in iPhone 15 emulation (software GL, low quality), driven by real
 // touches (CDP touch events -> the page's pointer handlers):
-// title -> Enter -> at the helm -> cockpit view and back -> LEAVE SEAT -> walk with the stick through the door into
-// the cabin -> look by dragging -> walk and look with two fingers at once -> cabin lights off/on -> boots off, push
-// off (floating), boots on -> walk to the bunk room, lie down, sleep an hour, wake, stand up -> walk back, take the
-// helm, burn: the body is pressed aft, the seat stays locked, the orbit changes. One landscape pass.
+// title -> Enter -> at the helm -> cockpit view and back -> LEAVE SEAT -> walk with the stick through the
+// companionway into the lounge -> look by dragging -> walk and look with two fingers at once -> cabin lights off/on
+// (switch on the lounge's forward wall) -> boots off, push off (floating), boots on -> down the corridor into the port
+// cabin, lie on the bed, sleep an hour, wake, stand up -> walk back, take the helm, burn: the body is pressed aft, the seat stays locked, the orbit changes. One landscape pass.
 //   node e2e/interior.cjs [--no-build]      screenshots: shots/live-*.png (at most 10)
 const { execSync } = require('node:child_process');
 const fs = require('node:fs');
@@ -153,11 +153,12 @@ async function run() {
       await shot('03-left-seat');
 
       const h = await hands(page, { x: 105, y: 560 }, { x: 295, y: 420 });
-      // walk through the door into the cabin
-      let d = await h.walkTo(0, -3.1);
-      d = await h.walkTo(0, -2.0);
+      // walk aft through the companionway into the lounge
+      let d = await h.walkTo(0, -12.2);
+      d = await h.walkTo(0, -11.0);
+      d = await h.walkTo(0, -9.6);
       c = await crew(f);
-      check(c.room === 'cabin' && d < 0.2, `walked with the stick through the door: now in the ${c.room} at (${c.x.toFixed(2)}, ${c.z.toFixed(2)})`);
+      check(c.room === 'lounge' && d < 0.2, `walked with the stick through the companionway: now in the ${c.room} at (${c.x.toFixed(2)}, ${c.z.toFixed(2)})`);
 
       // look by dragging: right = look right (yaw falls), up = look up
       const a = c;
@@ -169,9 +170,9 @@ async function run() {
       const wl = await h.walkAndLook();
       check(wl.moved > 0.2 && Math.abs(wl.turned) > 0.1, `two fingers at once: walked ${wl.moved.toFixed(2)} m while turning ${wl.turned.toFixed(2)} rad`);
 
-      // the light switch by the cockpit door
-      d = await h.walkTo(-0.35, -2.25, 0.1);
-      check(await h.lookTo(-2.13, -0.08), 'turned to face the table and its window');
+      // the light switch on the lounge's forward wall, beside the companionway door
+      d = await h.walkTo(-1.1, -9.8, 0.1);
+      check(await h.lookTo(0, -0.08), 'turned to face the light switch');
       c = await crew(f);
       const actText = () => f.evaluate(() => { const e = document.querySelector('.foot-act'); return e && !e.hidden ? e.innerText.replace(/\s+/g, ' ').trim() : ''; });
       let label = await actText();
@@ -184,8 +185,8 @@ async function run() {
         const ix = qw * x + qy * z - qz * y, iy = qw * y + qz * x - qx * z, iz = qw * z + qx * y - qy * x, iw = -qx * x - qy * y - qz * z;
         return [ix * qw + iw * -qx + iy * -qz - iz * -qy, iy * qw + iw * -qy + iz * -qx - ix * -qz, iz * qw + iw * -qz + ix * -qy - iy * -qx].map((n) => n.toFixed(2)).join(', ');
       });
-      console.log(`     (the primary is toward ship-local [${wick}]; +x is the table window's side)`);
-      await shot('04-cabin');
+      console.log(`     (the primary is toward ship-local [${wick}]; +x is the lounge window's side)`);
+      await shot('04-lounge');
       check(await tap(page, f, BTN, /lights off/), 'tapped the light switch');
       await sleep(300); await settle(f);
       c = await crew(f);
@@ -200,7 +201,7 @@ async function run() {
 
       // boots off: floating; push off; boots on
       await h.lookTo(Math.PI, 0.1);
-      await h.walkTo(0, -1.7);
+      await h.walkTo(0, -8.6);
       check(await tap(page, f, BTN, /magnetic boots/), 'tapped BOOTS (off)');
       await settle(f); await pump(f, 6);
       c = await crew(f);
@@ -210,22 +211,25 @@ async function run() {
       const p0 = await crew(f);
       await pump(f, 24);
       c = await crew(f);
-      check(c.posture === 'floating' && p0.speed > 0.8 && c.z - p0.z > 0.4, `pushed off and drifting aft: ${p0.speed.toFixed(2)} m/s, ${(c.z - p0.z).toFixed(2)} m in 0.8 s, feet ${(c.y + 0.75).toFixed(2)} m off the deck`);
+      check(c.posture === 'floating' && p0.speed > 0.8 && c.z - p0.z > 0.4, `pushed off and drifting aft: ${p0.speed.toFixed(2)} m/s, ${(c.z - p0.z).toFixed(2)} m in 0.8 s, feet ${(c.y + 1.0).toFixed(2)} m off the deck`);
       await shot('06-floating');
       check(await tap(page, f, BTN, /magnetic boots/), 'tapped BOOTS (on)');
       let grip = false;
       for (let i = 0; i < 40 && !grip; i++) { await pump(f, 6); c = await crew(f); grip = c.gripped && c.posture === 'walking'; }
       check(grip && c.boots, `boots on: gripping the deck again in the ${c.room} at (${c.x.toFixed(2)}, ${c.z.toFixed(2)}), posture ${c.posture}`);
 
-      // to the bunk room, lie down, sleep an hour
-      if (c.room === 'cabin') { await h.walkTo(0, 1.4); }
-      await h.walkTo(0, 3.05);
+      // down the corridor to the port cabin, lie on the bed, sleep an hour
+      if (c.room === 'lounge') { await h.walkTo(0, -5.4); }
+      await h.walkTo(0, -3.0);
+      await h.walkTo(0, -1.6);
       c = await crew(f);
       check(c.room === 'corridor', `in the ${c.room}`);
-      d = await h.walkTo(0.72, 3.05, 0.08);
+      await h.walkTo(-1.65, -1.6);
+      d = await h.walkTo(-1.7, -3.4, 0.08);
+      await h.lookTo(Math.PI / 2, -0.3); // to port, toward the bed
       c = await crew(f);
       label = await actText();
-      check(c.room === 'bunks' && c.prompt === 'bunk' && /lie down/i.test(label), `in the ${c.room} (${d.toFixed(2)} m off the spot); action button: "${label}"`);
+      check(c.room === 'cabin-port' && c.prompt === 'bunk' && /lie down/i.test(label), `in the ${c.room} (${d.toFixed(2)} m off the spot); action button: "${label}"`);
       check(await tap(page, f, BTN, /lie down/), 'tapped Lie down');
       await settle(f); await pump(f, 4); await settle(f);
       c = await crew(f);
@@ -246,14 +250,16 @@ async function run() {
       check(await tap(page, f, BTN, /stand up/), 'tapped STAND UP');
       grip = false;
       for (let i = 0; i < 20 && !grip; i++) { await pump(f, 6); c = await crew(f); grip = c.gripped; }
-      check(grip && c.posture === 'walking' && c.room === 'bunks', `standing beside the bunk, boots gripping (${c.posture}, ${c.room})`);
+      check(grip && c.posture === 'walking' && c.room === 'cabin-port', `standing beside the bed, boots gripping (${c.posture}, ${c.room})`);
 
-      // back to the helm
-      await h.walkTo(0, 3.05);
-      await h.walkTo(0, 1.4);
-      await h.walkTo(0, -2.0);
-      await h.walkTo(0, -3.05);
-      d = await h.walkTo(-0.55, -3.3, 0.1);
+      // back to the helm: corridor, lounge, companionway, cockpit
+      await h.walkTo(-1.65, -1.6);
+      await h.walkTo(0, -1.6);
+      await h.walkTo(0, -5.4);
+      await h.walkTo(0, -9.0);
+      await h.walkTo(0, -11.0);
+      await h.walkTo(0, -12.2);
+      d = await h.walkTo(-0.55, -12.6, 0.1);
       await h.lookTo(0, 0);
       c = await crew(f);
       label = await actText();
@@ -328,13 +334,14 @@ async function run() {
       check(await tap(page, f, BTN, /leave seat/), '[landscape] tapped LEAVE SEAT');
       await sleep(500); await settle(f); await pump(f, 20);
       const h = await hands(page, { x: 150, y: 230 }, { x: 500, y: 150 });
-      await h.walkTo(0, -3.1);
-      await h.walkTo(0, -2.2);
-      await h.lookTo(Math.PI - 0.25, -0.12);
+      await h.walkTo(0, -12.2);
+      await h.walkTo(0, -11.0);
+      await h.walkTo(0, -9.6);
+      await h.lookTo(-Math.PI / 2 + 0.25, -0.12); // toward the sofa and the big starboard window
       const c = await crew(f);
       ov = await overlaps(f);
-      check(c.room === 'cabin' && c.cam === 'interior' && ov.length === 0, `[landscape] walked into the ${c.room}; controls do not overlap${ov.length ? ': ' + ov.join('; ') : ''}`);
-      await shot('10-l-cabin');
+      check(c.room === 'lounge' && c.cam === 'interior' && ov.length === 0, `[landscape] walked into the ${c.room}; controls do not overlap${ov.length ? ': ' + ov.join('; ') : ''}`);
+      await shot('10-l-lounge');
     } catch (err) {
       fail.push(`[landscape] ${String((err && err.stack) || err)}`);
     }
