@@ -65,7 +65,7 @@ export interface FrameCamera {
   /**
    * chase   behind and above the focus ship, following its attitude with a spring lag
    * orbit   free look around the focus (ship, station or body) in a steady, north-up frame
-   * cockpit the pilot's eye point of the focus ship (the hull is hidden)
+   * cockpit the pilot's eye point of the focus ship (its own hull is drawn: every camera mode shows it)
    * dock    behind the focus ship looking down the approach axis of `environment.dockingGuide`
    *         (falls back to chase without a guide)
    * flyby   a drifting external camera the ship passes by

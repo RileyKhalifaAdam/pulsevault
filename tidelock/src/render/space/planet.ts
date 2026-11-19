@@ -99,7 +99,8 @@ interface Tier {
 const TIERS: Record<Quality, Tier> = {
   low: { levels: [256], cloudMax: 256, steps: 6, detail: 1 },
   medium: { levels: [256, 512], cloudMax: 512, steps: 8, detail: 2 },
-  high: { levels: [256, 512, 1024], cloudMax: 512, steps: 10, detail: 2 },
+  // high: what the windows show of the world below is the backdrop of the whole interior — finer clouds and air
+  high: { levels: [256, 512, 1024], cloudMax: 1024, steps: 12, detail: 2 },
   ultra: { levels: [512, 1024], cloudMax: 1024, steps: 14, detail: 2 },
 };
 const MAX_STEPS = 16;

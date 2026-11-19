@@ -243,7 +243,8 @@ export class InteriorLighting {
   private queue = 0; // faces left: probe = floor((total - queue) / 6)
   private queueStart = 0;
   private settle = 0;
-  private lastLights: boolean | null = null;
+  /** The probes were captured with the cabin lights on (warmUp); a frame with them off recaptures. */
+  private lastLights: boolean | null = true;
   private patchOk = false;
 
   // per-frame scratch
@@ -711,22 +712,24 @@ export class InteriorLighting {
     this.root.getWorldQuaternion(q).invert();
     const s = sun ? this.tv.copy(sun).applyQuaternion(q) : null;
     const p = shine ? this.tv2.copy(shine).applyQuaternion(q) : null;
-    for (const room of this.rooms) {
+    for (let i = 0; i < this.rooms.length; i++) {
+      const room = this.rooms[i];
       if (room.casters.length === 0) continue;
       let open = false;
       if (room.visible && !room.far)
-        for (const n of room.windows) {
+        for (let k = 0; k < room.windows.length; k++) {
+          const n = room.windows[k];
           if (s && n.x * s.x + n.y * s.y + n.z * s.z > 0.02) open = true;
           if (p && n.x * p.x + n.y * p.y + n.z * p.z > 0.02) open = true;
         }
-      for (const m of room.casters) m.castShadow = open;
+      for (let k = 0; k < room.casters.length; k++) room.casters[k].castShadow = open;
     }
   }
 
   /** Portal culling from the camera's room through the door boxes; sets node visibility. */
   private cullRooms(eye: V3, camera: THREE.PerspectiveCamera): void {
     const rooms = this.rooms;
-    for (const rm of rooms) rm.visible = false;
+    for (let i = 0; i < rooms.length; i++) rooms[i].visible = false;
     let start = -1;
     let start2 = -1;
     for (let i = 0; i < rooms.length; i++) {
@@ -747,7 +750,7 @@ export class InteriorLighting {
       }
     }
     if (start < 0) {
-      for (const rm of rooms) rm.visible = true;
+      for (let i = 0; i < rooms.length; i++) rooms[i].visible = true;
       this.stats.room = '';
     } else {
       this.stats.room = rooms[start].id;
@@ -756,9 +759,10 @@ export class InteriorLighting {
       if (start2 >= 0) this.visit(start2, -1, -1, 1, -1, 1, 0, camera);
     }
     let n = 0;
-    for (const rm of rooms) {
+    for (let i = 0; i < rooms.length; i++) {
+      const rm = rooms[i];
       if (rm.visible) n++;
-      for (const node of rm.nodes) node.visible = rm.visible;
+      for (let k = 0; k < rm.nodes.length; k++) rm.nodes[k].visible = rm.visible;
     }
     this.visibleCount = n;
     this.stats.rooms = n;
@@ -772,7 +776,9 @@ export class InteriorLighting {
     room.far = room.visible ? room.far && small : small;
     room.visible = true;
     if (depth > 8) return;
-    for (const [di, other] of room.links) {
+    for (let li = 0; li < room.links.length; li++) {
+      const di = room.links[li][0];
+      const other = room.links[li][1];
       if (other === from) continue;
       if (!this.portalRect(this.layout.doors[di].box, camera)) continue;
       const nx0 = Math.max(x0, this.rect[0]);
@@ -830,7 +836,8 @@ export class InteriorLighting {
   private visibleBox(): Box {
     const out = this.visBox;
     let first = true;
-    for (const r of this.rooms) {
+    for (let i = 0; i < this.rooms.length; i++) {
+      const r = this.rooms[i];
       if (!r.visible) continue;
       if (first) {
         out.min.x = r.box.min.x;

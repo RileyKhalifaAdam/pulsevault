@@ -1850,6 +1850,7 @@ class Manager implements SceneManager {
 
   /** Numbers for the perf overlay and the performance report (src/app/perf.ts). */
   private publishInfo(inside: boolean): void {
+    if (this.frameNo % 15 !== 0) return; // a few times a second is plenty (and no string per frame)
     const ps = this.pipeline.stats();
     const t = TIER_SETTINGS[this.quality];
     const ri = renderInfo;
