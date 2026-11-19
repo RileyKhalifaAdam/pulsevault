@@ -20,6 +20,8 @@
 import * as THREE from 'three';
 import type { RGB } from '../../core/types';
 import { CH_DECAL, CH_FLARE, CH_GLASS, CH_GLOW, CH_HULL, DECAL_COLS, DECAL_GLYPHS, DECAL_ICONS, DECAL_ROWS, type DecalIcon } from './geo';
+import { PHOTO_GLSL, photoConstsGlsl } from './surfaces';
+import { acquirePhotoDetail, releasePhotoDetail, type PhotoDetail } from './photo/detail';
 
 export type HullQuality = 'low' | 'medium' | 'high' | 'ultra';
 
@@ -950,6 +952,10 @@ mat3 hullTBN(vec3 eyePos, vec3 N, vec2 st) {
 
 // Replaces <map_fragment>: everything the finish needs is computed once here.
 const HULL_FRAG_MAIN = /* glsl */ `
+#ifdef HULL_PHOTO
+vec2 hUvDx = dFdx(vHullUv);
+vec2 hUvDy = dFdy(vHullUv);
+#endif
 float hLayer = floor(vSurf.x * 255.0 + 0.5);
 int hLi = int(clamp(hLayer, 0.0, 7.0));
 vec4 hTex = texture(uHullTex, vec3(vHullUv * HULL_SCALE[hLi], hLayer));
@@ -981,8 +987,34 @@ float hMicN = hLi <= 1 ? 1.0 : (hLi == 3 || hLi == 4 ? 0.45 : 0.25);
 hRough += (0.5 - hMic.b) * 0.3;
 hAlbedo *= 0.95 + 0.1 * hMic.b;
 #endif
-// grime: seams, cavities, streaks, and wherever the baked AO says dirt would collect
+// photo-scanned detail (hero hull, photo/detail.ts): painted livery -> hullPaint, drive-throat metal -> nozzle,
+// bare metal -> brushed / gunmetal; colour x photo/mean, roughness offset, whiteout normal (HULL_FRAG_NORMAL)
+float hPk = 0.0;
+vec4 hPhAlb = vec4(1.0);
+vec4 hPhLin = vec4(0.5, 0.5, 1.0, 0.5);
+vec4 hPB = vec4(1.0);
+#ifdef HULL_PHOTO
+{
+  vec4 hPA = vec4(0.0);
+  if (vFx.y > 0.004) { hPA = PH_A_nozzle; hPB = PH_B_nozzle; hPk = 0.8; }
+  else if (hSlot > 0.5 && hLi <= 1) { hPA = PH_A_hullPaint; hPB = PH_B_hullPaint; hPk = 1.0; }
+  else if (hLi == 3 && dot(hAlbedo, vec3(0.333)) > 0.25) { hPA = PH_A_brushed; hPB = PH_B_brushed; hPk = 0.7; }
+  else if (hLi == 3) { hPA = PH_A_gunmetal; hPB = PH_B_gunmetal; hPk = 0.8; }
+  hPk *= uPhOn;
+  if (hPk > 0.0) {
+    hPhAlb = phAlbedo(hPA.x, vHullUv * hPA.zw, hUvDx * hPA.zw, hUvDy * hPA.zw);
+    hPhLin = phLinear(hPA.y, vHullUv * hPA.zw, hUvDx * hPA.zw, hUvDy * hPA.zw);
+    hAlbedo *= mix(vec3(1.0), clamp(hPhAlb.rgb * hPB.rgb, 0.0, 3.0), hPk);
+    hRough += hPk * (hPhLin.a - hPB.w);
+  }
+}
+#endif
+// grime: seams, cavities, streaks, and wherever the baked AO says dirt would collect; clear-coated livery paint
+// (slots 1 and 3) is kept clean: grime there is a faint film, not a grey wash over the white armour
 float hGrime = vFx.z * clamp(hCav * 0.95 + 0.5 * hMac.g * hMac.a + (1.0 - hAO) * 0.6, 0.0, 1.0);
+#ifndef HULL_STATION
+if (abs(hSlot - 1.0) < 0.5 || hSlot > 2.5) hGrime *= 0.45;
+#endif
 hAlbedo *= 1.0 - 0.72 * hGrime;
 hRough += 0.3 * hGrime;
 // paint worn to bare metal along plate edges and in chipped patches
@@ -998,6 +1030,10 @@ hRough = mix(hRough, 0.92, hScorch);
 hMetal *= 1.0 - 0.7 * hScorch;
 // cavity darkening also under direct light (there are no shadow maps)
 hAlbedo *= mix(1.0, hAO, 0.55);
+#ifndef HULL_STATION
+// white armour paint stays an off-white paint (albedo 0.65-0.75), whatever the tone noise multiplied in
+if (abs(hSlot - 1.0) < 0.5 && hWear < 0.5) hAlbedo = clamp(hAlbedo, vec3(0.0), vec3(0.78)) * mix(1.0, 1.08, hAO);
+#endif
 hRough = clamp(hRough, 0.07, 1.0);
 #ifndef HULL_STATION
 // heat tint: metal next to the drive throats oxidises from straw through bronze and violet to blue
@@ -1034,6 +1070,7 @@ const HULL_FRAG_NORMAL = /* glsl */ `
 #ifdef HULL_STATION
   hN.xy += (hBig.rg * 2.0 - 1.0) * (HULL_NRM[hLi] * 0.85);
 #endif
+  hN.xy += (hPhLin.rg * 2.0 - 1.0) * hPk;
   hN.z = sqrt(max(0.04, 1.0 - dot(hN.xy, hN.xy)));
   normal = normalize(hullTBN(-vViewPosition, normal, vHullUv) * hN);
 }
@@ -1041,7 +1078,7 @@ const HULL_FRAG_NORMAL = /* glsl */ `
 
 const HULL_FRAG_AO = /* glsl */ `
 {
-  float hOcc = hAO * (1.0 - 0.5 * hCav);
+  float hOcc = hAO * (1.0 - 0.5 * hCav) * mix(1.0, hPhLin.b, hPk);
   reflectedLight.indirectDiffuse *= hOcc;
   reflectedLight.indirectSpecular *= mix(1.0, hOcc * hOcc, 0.85);
   reflectedLight.directSpecular *= mix(1.0, hAO, 0.6);
@@ -1266,6 +1303,8 @@ export function createHullMaterials(opts: HullMaterialOptions): HullMaterials {
   const hero = station ? undefined : opts.hero;
   const coat = !!hero?.clearcoat;
   const micro = hero ? acquireMicro(opts.quality, opts.seed ?? 1) : null;
+  // the hero hull shares the photo-scanned detail of the interior (one set of arrays for the whole ship)
+  const photo: PhotoDetail | null = hero && typeof document !== 'undefined' ? acquirePhotoDetail(opts.quality) : null;
   const uMicro = { value: micro ? micro.tex : null };
 
   const hull: THREE.MeshStandardMaterial = coat
@@ -1277,13 +1316,18 @@ export function createHullMaterials(opts: HullMaterialOptions): HullMaterials {
     const d: Record<string, string> = { ...(withDefines.defines ?? {}) };
     if (station) d.HULL_STATION = '';
     if (micro) d.HULL_MICRO = '';
+    if (photo) d.HULL_PHOTO = '';
     withDefines.defines = d;
   }
-  hull.onBeforeCompile = (shader) => {
+  hull.onBeforeCompile = (shader, renderer) => {
     Object.assign(shader.uniforms, { uHullTex: U.uHullTex, uLivery: U.uLivery, uHeat: U.uHeat, uThrottle: U.uThrottle, uDamage: U.uDamage, uFlood: U.uFlood, uHullMicro: uMicro });
+    if (photo) {
+      photo.noteRenderer(renderer);
+      Object.assign(shader.uniforms, photo.uniforms);
+    }
     shader.vertexShader = shader.vertexShader.replace('#include <common>', `#include <common>\n${ATTR_VERT_PARS}`).replace('#include <begin_vertex>', `#include <begin_vertex>\n${ATTR_VERT}`);
     shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', `#include <common>\n${HULL_FRAG_PARS}`)
+      .replace('#include <common>', `#include <common>\n${HULL_FRAG_PARS}${photo ? `\n${PHOTO_GLSL}\n${photoConstsGlsl()}` : ''}`)
       .replace('#include <map_fragment>', HULL_FRAG_MAIN)
       .replace('#include <roughnessmap_fragment>', 'float roughnessFactor = hRough;')
       .replace('#include <metalnessmap_fragment>', 'float metalnessFactor = hMetal;')
@@ -1292,7 +1336,7 @@ export function createHullMaterials(opts: HullMaterialOptions): HullMaterials {
       .replace('#include <aomap_fragment>', HULL_FRAG_AO);
     if (coat) shader.fragmentShader = shader.fragmentShader.replace('material.clearcoat = clearcoat;', 'material.clearcoat = clearcoat * hCoat;');
   };
-  hull.customProgramCacheKey = () => (station ? 'tidelock-hull-3-station' : `tidelock-hull-3${micro ? '-micro' : ''}${coat ? '-coat' : ''}`);
+  hull.customProgramCacheKey = () => (station ? 'tidelock-hull-4-station' : `tidelock-hull-4${micro ? '-micro' : ''}${coat ? '-coat' : ''}${photo ? '-ph' : ''}`);
 
   const glass = new THREE.MeshPhysicalMaterial({
     color: new THREE.Color(0.016, 0.022, 0.03),
@@ -1392,6 +1436,7 @@ export function createHullMaterials(opts: HullMaterialOptions): HullMaterials {
       for (const m of byChannel) m.dispose();
       releaseTextures(key);
       if (micro) releaseMicro(micro.key);
+      if (photo) releasePhotoDetail(photo);
     },
   };
 }

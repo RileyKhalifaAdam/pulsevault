@@ -467,30 +467,139 @@ const BUMP = /* glsl */ `
   normal = normalize(abs(det) * normal - grad);
 }
 `;
+// photo detail: pick the set by the surface (paint -> whitePanel, bright metal -> brushed, dark metal -> gunmetal,
+// rough grain -> rubber, smooth grain -> leather, weave -> fabric), project on the dominant axis of the cockpit
+// position (metres), fade out where the axis changes so the switch never shows a seam
+const PH_TOP = /* glsl */ `
+  vec3 ckAN = abs(normalize(vONrm));
+  float ckMx = max(ckAN.x, max(ckAN.y, ckAN.z));
+  vec2 ckM = ckAN.x >= ckMx ? vLoc.zy : (ckAN.y >= ckMx ? vLoc.xz : vLoc.xy);
+  vec2 ckMdx = dFdx(ckM);
+  vec2 ckMdy = dFdy(ckM);
+  float ckPhW = 0.0;
+  vec4 ckPhAlb = vec4(1.0);
+  vec4 ckPhLin = vec4(0.5, 0.5, 1.0, 0.5);
+  vec4 ckPA = vec4(0.0);
+  vec4 ckPB = vec4(1.0);
+#ifdef CK_PHOTO
+  {
+    int kind = int(vPbr.z + 0.5);
+    float lum = dot(vColor.rgb, vec3(0.2126, 0.7152, 0.0722));
+    float k = 0.0;
+    if (kind == 1) { ckPA = PH_A_whitePanel; ckPB = PH_B_whitePanel; k = 1.0; }
+    else if (kind == 2 && lum > 0.22) { ckPA = PH_A_brushed; ckPB = PH_B_brushed; k = 0.8; }
+    else if (kind == 2) { ckPA = PH_A_gunmetal; ckPB = PH_B_gunmetal; k = 1.0; }
+    else if (kind == 3 && vPbr.x > 0.68) { ckPA = PH_A_tread; ckPB = PH_B_tread; k = 1.0; }
+    else if (kind == 3) { ckPA = PH_A_leather; ckPB = PH_B_leather; k = 1.0; }
+    else if (kind == 4) { ckPA = PH_A_fabric; ckPB = PH_B_fabric; k = 1.0; }
+    ckPhW = k * uPhOn * smoothstep(0.64, 0.74, ckMx);
+    if (ckPhW > 0.0) {
+      vec2 sc = ckPA.zw;
+      ckPhAlb = phAlbedo(ckPA.x, ckM * sc, ckMdx * sc, ckMdy * sc);
+      ckPhLin = phLinear(ckPA.y, ckM * sc, ckMdx * sc, ckMdy * sc);
+    }
+  }
+#endif
+`;
+const PH_COLOR = /* glsl */ `
+#ifdef CK_PHOTO
+  if (ckPhW > 0.0) diffuseColor.rgb = min(diffuseColor.rgb * mix(vec3(1.0), clamp(ckPhAlb.rgb * ckPB.rgb, 0.0, 3.0), ckPhW), vec3(0.9));
+#endif
+`;
+const PH_NORMAL = /* glsl */ `
+#ifdef CK_PHOTO
+  if (ckPhW > 0.0) {
+    vec3 q0 = dFdx(-vViewPosition);
+    vec3 q1 = dFdy(-vViewPosition);
+    vec2 st0 = ckMdx;
+    vec2 st1 = ckMdy;
+    vec3 q1p = cross(q1, normal);
+    vec3 q0p = cross(normal, q0);
+    vec3 T = q1p * st0.x + q0p * st1.x;
+    vec3 Bt = q1p * st0.y + q0p * st1.y;
+    float det = max(dot(T, T), dot(Bt, Bt));
+    float sc = det == 0.0 ? 0.0 : inversesqrt(det);
+    vec3 pn = phNormal(ckPhLin, ckPhW);
+    normal = normalize(mat3(T * sc, Bt * sc, normal) * pn);
+  }
+#endif
+`;
 const AO = /* glsl */ `
 {
   float ckAo = vPbr.w * mix(0.5, 1.0, smoothstep(-1.0, -0.2, vLoc.y));
+#ifdef CK_PHOTO
+  ckAo *= mix(1.0, ckPhLin.b, ckPhW);
+#endif
   reflectedLight.indirectDiffuse *= ckAo;
   reflectedLight.indirectSpecular *= mix(1.0, ckAo, 0.7);
 }
 `;
-function hardwareMaterial(map: THREE.Texture, detail: boolean): THREE.MeshStandardMaterial {
+function hardwareMaterial(map: THREE.Texture, detail: boolean, photo: PhotoDetail | null): THREE.MeshStandardMaterial {
   const m = new THREE.MeshStandardMaterial({ vertexColors: true, map, roughness: 0.5, metalness: 0 });
-  if (detail) (m as unknown as { defines: Record<string, string> }).defines = { CK_DETAIL: '' };
-  m.onBeforeCompile = (sh) => {
+  const defs: Record<string, string> = {};
+  if (detail) defs.CK_DETAIL = '';
+  if (photo) defs.CK_PHOTO = '';
+  (m as unknown as { defines: Record<string, string> }).defines = defs;
+  m.onBeforeCompile = (sh, renderer) => {
+    if (photo) {
+      photo.noteRenderer(renderer);
+      Object.assign(sh.uniforms, photo.uniforms);
+    }
     sh.vertexShader = sh.vertexShader
-      .replace('#include <common>', '#include <common>\nattribute vec4 pbr;\nvarying vec4 vPbr;\nvarying vec3 vLoc;')
-      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvPbr = pbr;\nvLoc = position;');
+      .replace('#include <common>', '#include <common>\nattribute vec4 pbr;\nvarying vec4 vPbr;\nvarying vec3 vLoc;\nvarying vec3 vONrm;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvPbr = pbr;\nvLoc = position;\nvONrm = objectNormal;');
     sh.fragmentShader = sh.fragmentShader
-      .replace('#include <common>', `#include <common>\n${NOISE}`)
-      .replace('#include <color_fragment>', `#include <color_fragment>\n${DETAIL}`)
-      .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = clamp(vPbr.x + ckRough, 0.04, 1.0);')
+      .replace('#include <common>', `#include <common>\n${NOISE}\nvarying vec3 vONrm;\n${photo ? `${PHOTO_GLSL}\n${photoConstsGlsl()}` : 'const float uPhOn = 0.0;'}`)
+      .replace('void main() {', `void main() {\n${PH_TOP}`)
+      .replace('#include <color_fragment>', `#include <color_fragment>\n${PH_COLOR}\n${DETAIL}`)
+      .replace(
+        '#include <roughnessmap_fragment>',
+        '#include <roughnessmap_fragment>\nroughnessFactor = clamp(vPbr.x + ckRough + ckPhW * (ckPhLin.a - ckPB.w), 0.04, 1.0);',
+      )
       .replace('#include <metalnessmap_fragment>', '#include <metalnessmap_fragment>\nmetalnessFactor = vPbr.y;')
-      .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>\n${BUMP}`)
+      .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>\n${BUMP}\n${PH_NORMAL}`)
       .replace('#include <aomap_fragment>', `#include <aomap_fragment>\n${AO}`);
   };
-  m.customProgramCacheKey = () => (detail ? 'tidelock-cockpit-hw-d' : 'tidelock-cockpit-hw');
+  m.customProgramCacheKey = () => `tidelock-cockpit-hw-2${detail ? '-d' : ''}${photo ? '-ph' : ''}`;
   return m;
+}
+
+/** The ray tracer's record of a cockpit hardware mesh (surfaces.ts header): area-weighted means of the vertex PBR. */
+function cockpitRtRecord(geo: THREE.BufferGeometry, photo: PhotoDetail | null): Record<string, unknown> {
+  const pos = geo.getAttribute('position') as THREE.BufferAttribute;
+  const col = geo.getAttribute('color') as THREE.BufferAttribute | undefined;
+  const pbr = geo.getAttribute('pbr') as THREE.BufferAttribute | undefined;
+  const idx = geo.getIndex();
+  const acc = [0, 0, 0, 0, 0];
+  let area = 0;
+  if (idx && col && pbr) {
+    const a = new THREE.Vector3();
+    const b = new THREE.Vector3();
+    const c = new THREE.Vector3();
+    for (let i = 0; i < idx.count; i += 3) {
+      const i0 = idx.getX(i);
+      a.fromBufferAttribute(pos, i0);
+      b.fromBufferAttribute(pos, idx.getX(i + 1));
+      c.fromBufferAttribute(pos, idx.getX(i + 2));
+      const ar = b.sub(a).cross(c.sub(a)).length() * 0.5;
+      if (!(ar > 0)) continue;
+      acc[0] += ar * col.getX(i0);
+      acc[1] += ar * col.getY(i0);
+      acc[2] += ar * col.getZ(i0);
+      acc[3] += ar * pbr.getX(i0);
+      acc[4] += ar * pbr.getY(i0);
+      area += ar;
+    }
+  }
+  const k = area > 0 ? 1 / area : 0;
+  return {
+    albedo: area > 0 ? [acc[0] * k, acc[1] * k, acc[2] * k] : [0.3, 0.3, 0.3],
+    roughness: area > 0 ? acc[3] * k : 0.5,
+    metalness: area > 0 ? acc[4] * k : 0,
+    tiles: null,
+    perVertex: 'color+pbr',
+    demodulate: { map: null, photo: photo ? photo.uniforms : null, projection: 'dominant axis of position (m), see cockpit.ts PH_TOP' },
+  };
 }
 
 /** Black glass over a display: reflective, slightly anti-glare, the picture as emission with a pixel grid that
@@ -1404,7 +1513,8 @@ export function createCockpitVisual(layout: CockpitLayout, opts: { quality: Qual
   const ringOn = [-1, -1];
 
   // ---- materials and meshes
-  const hwMat = hardwareMaterial(decals.tex, !lo);
+  const photo = typeof document !== 'undefined' ? acquirePhotoDetail(q) : null;
+  const hwMat = hardwareMaterial(decals.tex, !lo, photo);
   const emMat = new THREE.MeshBasicMaterial({ vertexColors: true, map: atlas.tex, blending: THREE.AdditiveBlending, transparent: true, depthWrite: false, side: THREE.DoubleSide, toneMapped: false });
   const root = new THREE.Group();
   root.name = 'cockpit';
@@ -1423,6 +1533,9 @@ export function createCockpitVisual(layout: CockpitLayout, opts: { quality: Qual
     mesh.receiveShadow = shadow;
     mesh.renderOrder = order;
     if (dynamic) mesh.frustumCulled = false;
+    if (mat === hwMat) mesh.userData.rt = cockpitRtRecord(geo, photo);
+    else if (mat === emMat) mesh.userData.rt = { albedo: [0, 0, 0], roughness: 1, metalness: 0, tiles: null, perVertex: null, demodulate: null, emissive: true };
+    else mesh.userData.rt = { albedo: [0.0015, 0.0018, 0.002], roughness: 0.13, metalness: 0, tiles: null, perVertex: null, demodulate: null, screen: true };
     root.add(mesh);
     drawCalls++;
     triangles += g.idx.length / 3;
@@ -1752,6 +1865,7 @@ export function createCockpitVisual(layout: CockpitLayout, opts: { quality: Qual
       for (const s of screens) s.tex.dispose();
       auxTex?.dispose();
       hologram?.dispose();
+      if (photo) releasePhotoDetail(photo);
       root.removeFromParent();
     },
     drawCalls,

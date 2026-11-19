@@ -6,6 +6,8 @@ import { SHIP_LAYOUTS } from '../src/data/shipLayouts';
 import { STATION_LAYOUTS } from '../src/data/stationLayouts';
 import { computeStats, defaultLoadout } from '../src/sim/ships';
 import { generateGalaxy, getSystem } from '../src/sim/universe';
+import { START_STATION_ID } from '../src/data/systems/layout';
+import { compoundSupport, hullCompound } from '../src/world/compound';
 import {
   addCraft, advance, circularState, craftInertia, craftMass, createWorld, dockingStatus, DOCK_DISTANCE, drainEvents, flightReadout,
   holdTorque, loadWorld, pointingError, RESTITUTION, saveWorld, shipDef, undock, type Craft, type World, type WorldEvent,
@@ -31,6 +33,9 @@ function deepSpace(): World {
   return createWorld(system, { stations: false });
 }
 const FAR = v3(0, 4e12, 0);
+const WREN_HULL = hullCompound('wren')!;
+/** How far the Wren's hull reaches from its centre along the unit ship-local direction d. */
+const reach = (d: V3): number => compoundSupport(WREN_HULL, d.x, d.y, d.z);
 
 describe('craft translation', () => {
   it('holds a 420 km orbit of Wick for 30 days, and for a year at large steps', () => {
@@ -187,7 +192,9 @@ describe('contact', () => {
   it('an impact conserves momentum and loses energy by its restitution', () => {
     const w = deepSpace();
     const st = rock(w);
-    const ship = wren(w, STAR, v3(FAR.x + 62, FAR.y + 14, FAR.z), v3(-3, 0, 0));
+    // Belly-first onto the top of the rock, the contact straight under the centre of mass, with a sideways slide.
+    const belly = reach(v3(0, -1, 0));
+    const ship = wren(w, STAR, v3(FAR.x, FAR.y + 40 + belly + 0.5, FAR.z), v3(1, -3, 0));
     const m = craftMass(ship), M = craftMass(st);
     // Barycentric (inertial) momentum of the pair, taken the frame before and the frame after the hit.
     const mom = (): V3 => v3(m * ship.v.x + M * st.v.x, m * ship.v.y + M * st.v.y, m * ship.v.z + M * st.v.z);
@@ -197,19 +204,70 @@ describe('contact', () => {
     for (let i = 0; i < 600 && !hit; i++) { p0 = mom(); advance(w, 1 / 60); hit = drainEvents(w).find((x) => x.type === 'impact'); }
     expect(hit).toBeDefined();
     const p1 = mom();
-    const n = sub(ship.rel, st.rel), nl = len(n);
-    const touch = 40 + SHIP_LAYOUTS.wren.radius; // rock sphere + the Wren's bounding sphere
-    expect(nl).toBeGreaterThan(touch - 0.1);
-    expect(nl).toBeLessThan(touch + 0.1);
-    const vnBefore = (-3 * n.x) / nl;
-    const dv = sub(ship.relV, st.relV), vnAfter = (dv.x * n.x + dv.y * n.y + dv.z * n.z) / nl;
-    console.log(`impact: normal speed ${vnBefore.toFixed(3)} -> ${vnAfter.toFixed(3)} m/s, momentum error ${(len(sub(p1, p0)) / (3 * m)).toExponential(2)}, KE ${k0.toFixed(0)} -> ${ke().toFixed(0)} J, hull ${ship.hull.toFixed(4)}`);
+    const n = sub(ship.rel, st.rel);
+    expect(n.y).toBeGreaterThan(40 + belly - 0.1); // the belly on the rock, not the bounding sphere
+    expect(n.y).toBeLessThan(40 + belly + 0.1);
+    const vnAfter = ship.relV.y - st.relV.y;
+    console.log(`impact: normal speed -3 -> ${vnAfter.toFixed(3)} m/s, momentum error ${(len(sub(p1, p0)) / (3 * m)).toExponential(2)}, KE ${k0.toFixed(0)} -> ${ke().toFixed(0)} J, hull ${ship.hull.toFixed(4)}`);
     expect(len(sub(p1, p0)) / (3 * m)).toBeLessThan(1e-6);
-    expect(vnAfter / -vnBefore).toBeCloseTo(RESTITUTION, 2);
+    expect(vnAfter / 3).toBeCloseTo(RESTITUTION, 2);
     expect(ke()).toBeLessThan(k0);
-    expect(len(ship.w)).toBeGreaterThan(0); // friction on an oblique hit spins the ship
+    expect(len(ship.w)).toBeGreaterThan(0); // friction on the slide spins the ship
     expect(ship.hull).toBeLessThan(1);
     expect(ship.hull).toBeGreaterThan(0.9);
+    expect(ship.destroyed).toBe(false);
+  });
+
+  it('rests against a station for 60 s without jitter, pressed on by its RCS', () => {
+    const w = deepSpace();
+    const st = addCraft(w, { id: 'rock', name: 'Rock', kind: 'station', dryMass: 1e10, radius: 40, colliders: [{ kind: 'sphere', a: v3(), radius: 40 }], primaryId: STAR, r: FAR, v: v3() });
+    const belly = reach(v3(0, -1, 0));
+    const ship = wren(w, STAR, v3(FAR.x, FAR.y + 40 + belly + 0.05, FAR.z), v3(0, -0.1, 0));
+    ship.rcs.y = -0.1; // a light push down onto the rock
+    const ev: WorldEvent[] = [];
+    let vMax = 0, hMin = Infinity, hMax = -Infinity, wMax = 0;
+    for (let i = 0; i < 60 * 65; i++) {
+      advance(w, 1 / 60);
+      ev.push(...drainEvents(w));
+      if (i < 60 * 5) continue;
+      const h = len(sub(ship.rel, st.rel));
+      vMax = Math.max(vMax, len(sub(ship.relV, st.relV)));
+      wMax = Math.max(wMax, len(ship.w));
+      hMin = Math.min(hMin, h); hMax = Math.max(hMax, h);
+    }
+    console.log(`resting 60 s on the rock: max |v| ${vMax.toExponential(2)} m/s, max |w| ${wMax.toExponential(2)} rad/s, height ${hMin.toFixed(4)}..${hMax.toFixed(4)} m`);
+    expect(vMax).toBeLessThan(1e-3);
+    expect(wMax).toBeLessThan(1e-4);
+    expect(hMax - hMin).toBeLessThan(2e-3);
+    expect(hMin).toBeGreaterThan(40 + belly - 0.03);
+    expect(ev.filter((x) => x.type === 'impact').length).toBe(0);
+    expect(ship.hull).toBeGreaterThan(0.9999);
+  });
+
+  it("a Wren wing-tip strike on Chandler's Wheel turns the ship toward the struck side", () => {
+    const w = createWorld(system);
+    const st = w.craft.find((c) => c.id === START_STATION_ID)!;
+    // The hub (sphere of 68 m) at 45° latitude, where it stands proud of the axle; the ship moves nose-first past it
+    // with the hub just off its starboard wing tip (ship-local u: 14° ahead of the beam).
+    const uLocal = v3(0.97, 0, -0.243), ul = len(uLocal), u = v3(uLocal.x / ul, uLocal.y / ul, uLocal.z / ul);
+    const uWorld = qRotate(st.q, v3(Math.SQRT1_2, Math.SQRT1_2, 0));
+    const q = qFromTo(u, uWorld);
+    const d = 68 + reach(u) + 0.3;
+    const fwd = qRotate(q, v3(0, 0, -4));
+    const ship = addCraft(w, shipDef('player', 'Wren', stats, SHIP_LAYOUTS.wren, {
+      primaryId: w.bodies[st.primary].id, r: v3(st.rel.x - uWorld.x * d, st.rel.y - uWorld.y * d, st.rel.z - uWorld.z * d),
+      v: v3(st.relV.x + fwd.x, st.relV.y + fwd.y, st.relV.z + fwd.z), q,
+    }));
+    let hit: WorldEvent | undefined;
+    for (let i = 0; i < 600 && !hit; i++) { advance(w, 1 / 60); hit = drainEvents(w).find((x) => x.type === 'impact' && x.craftId === 'player'); }
+    expect(hit).toBeDefined();
+    for (let i = 0; i < 6; i++) advance(w, 1 / 60);
+    console.log(`wing-tip strike at ${hit && hit.type === 'impact' ? hit.speed.toFixed(2) : '?'} m/s: yaw rate ${ship.w.y.toExponential(2)} rad/s, roll ${ship.w.z.toExponential(2)}, pitch ${ship.w.x.toExponential(2)}, hull ${ship.hull.toFixed(5)}`);
+    expect(ship.w.y).toBeLessThan(-1e-4); // about +Y negative: the nose swings to starboard, toward the hub
+    expect(Math.abs(ship.w.y)).toBeGreaterThan(Math.abs(ship.w.x));
+    // pushed away from the hub (to port in ship axes)
+    const dv = qRotate({ x: -q.x, y: -q.y, z: -q.z, w: q.w }, sub(ship.relV, st.relV));
+    expect(dv.x).toBeLessThan(0);
     expect(ship.destroyed).toBe(false);
   });
 
@@ -226,13 +284,14 @@ describe('contact', () => {
     const w = createWorld(system, { stations: false });
     const b = w.bodies.find((x) => x.id === TAPER)!;
     const up = v3(Math.cos(0.4), 0, -Math.sin(0.4));
+    const tail = reach(v3(0, 0, 1)); // nose up: it stands on its engine pods
     const place = (h: number): { r: V3; v: V3 } => {
-      const rr = b.radius + 0.35 * SHIP_LAYOUTS.wren.radius + h, r = v3(up.x * rr, up.y * rr, up.z * rr), wv = b.spinRate, n = b.spinAxis;
+      const rr = b.radius + h, r = v3(up.x * rr, up.y * rr, up.z * rr), wv = b.spinRate, n = b.spinAxis;
       return { r, v: v3(wv * (n.y * r.z - n.z * r.y), wv * (n.z * r.x - n.x * r.z), wv * (n.x * r.y - n.y * r.x)) };
     };
-    const p = place(3);
+    const p = place(tail + 3);
     const ship = wren(w, TAPER, p.r, p.v, qFromTo(v3(0, 0, -1), up)); // nose up
-    const crasher = addCraft(w, { ...shipDef('crasher', 'Crasher', stats, SHIP_LAYOUTS.wren, { primaryId: TAPER, ...place(3000) }) });
+    const crasher = addCraft(w, { ...shipDef('crasher', 'Crasher', stats, SHIP_LAYOUTS.wren, { primaryId: TAPER, ...place(3000), q: qFromTo(v3(0, 1, 0), up) }) });
     const ev: WorldEvent[] = [];
     for (let i = 0; i < 400; i++) { advance(w, 0.5); ev.push(...drainEvents(w)); }
     expect(ship.landedOn).toBe(TAPER);
@@ -248,7 +307,7 @@ describe('contact', () => {
     const fr = flightReadout(w, 'player');
     expect(fr.situation).toBe('landed');
     expect(fr.surfaceSpeed).toBeLessThan(1e-6);
-    expect(Math.abs(fr.altitude - 0.35 * SHIP_LAYOUTS.wren.radius)).toBeLessThan(1e-3);
+    expect(Math.abs(fr.altitude - tail)).toBeLessThan(1e-3); // standing on the hull's lowest point, not a sphere
     expect(len(sub(ship.rel, before))).toBeGreaterThan(1000); // carried round by the spin
     ship.throttle = 1;
     for (let i = 0; i < 300; i++) advance(w, 1 / 60);
@@ -256,6 +315,27 @@ describe('contact', () => {
     expect(ship.landedOn).toBe(null);
     expect(ev.some((x) => x.type === 'liftoff')).toBe(true);
     expect(flightReadout(w, 'player').altitude).toBeGreaterThan(50);
+  });
+
+  it("a slow, level touchdown rests on the hull's belly", () => {
+    const w = createWorld(system, { stations: false });
+    const b = w.bodies.find((x) => x.id === TAPER)!;
+    const up = v3(Math.cos(1.1), 0, -Math.sin(1.1));
+    const belly = reach(v3(0, -1, 0));
+    const rr = b.radius + belly + 2, r = v3(up.x * rr, up.y * rr, up.z * rr), wv = b.spinRate, n = b.spinAxis;
+    const v = v3(wv * (n.y * r.z - n.z * r.y), wv * (n.z * r.x - n.x * r.z), wv * (n.x * r.y - n.y * r.x));
+    const ship = wren(w, TAPER, r, v, qFromTo(v3(0, 1, 0), up)); // level, belly down
+    const ev: WorldEvent[] = [];
+    for (let i = 0; i < 60 * 20 && ship.landedOn === null; i++) { advance(w, 1 / 60); ev.push(...drainEvents(w)); }
+    expect(ship.landedOn).toBe(TAPER);
+    expect(ship.destroyed).toBe(false);
+    expect(ev.some((x) => x.type === 'impact')).toBe(false);
+    advance(w, 60);
+    const fr = flightReadout(w, 'player');
+    console.log(`level touchdown: altitude ${fr.altitude.toFixed(4)} m (belly ${belly.toFixed(3)} m, bounding radius ${SHIP_LAYOUTS.wren.radius} m), hull ${ship.hull.toFixed(5)}`);
+    expect(fr.situation).toBe('landed');
+    expect(Math.abs(fr.altitude - belly)).toBeLessThan(1e-3);
+    expect(ship.hull).toBeGreaterThan(0.98); // a 2.2 m/s touchdown: the energy the impulses take out dents it a little
   });
 });
 
@@ -335,6 +415,30 @@ describe('docking', () => {
     expect(dockingStatus(s.w, 'player').portDistance).toBeCloseTo(latchedAt + 10, 3);
     expect(s.ship.dockedTo).toBe(null);
     expect(s.w.joints.length).toBe(0);
+  });
+});
+
+describe('docking on the Wheel', () => {
+  it("an armed, slow approach to a port of Chandler's Wheel closes the latch; the hull never touches", () => {
+    const w = createWorld(system);
+    const st = w.craft.find((c) => c.id === START_STATION_ID)!;
+    const collar = SHIP_LAYOUTS.wren.dockingPort;
+    const port = st.ports.find((p) => p.size !== 'S')!;
+    const pdir = qRotate(st.q, port.dir), ppos = qRotate(st.q, port.pos);
+    const q = qFromTo(collar.dir, v3(-pdir.x, -pdir.y, -pdir.z));
+    const off = qRotate(q, collar.pos), d = 12;
+    const ship = addCraft(w, shipDef('player', 'Wren', stats, SHIP_LAYOUTS.wren, {
+      primaryId: w.bodies[st.primary].id,
+      r: v3(st.rel.x + ppos.x + pdir.x * d - off.x, st.rel.y + ppos.y + pdir.y * d - off.y, st.rel.z + ppos.z + pdir.z * d - off.z),
+      v: v3(st.relV.x - pdir.x * 0.5, st.relV.y - pdir.y * 0.5, st.relV.z - pdir.z * 0.5), q, pad: 'S',
+    }));
+    ship.dockingArmed = true;
+    const ev: WorldEvent[] = [];
+    for (let i = 0; i < 60 * 40 && ship.dockedTo === null; i++) { advance(w, 1 / 60); ev.push(...drainEvents(w)); }
+    expect(ship.dockedTo).toBe(st.id);
+    expect(ev.some((x) => x.type === 'docked' && x.portId === port.id)).toBe(true);
+    expect(ev.filter((x) => x.type === 'impact').length).toBe(0);
+    expect(ship.hull).toBe(1);
   });
 });
 

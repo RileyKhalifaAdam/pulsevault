@@ -46,6 +46,8 @@ const mass = (c: Craft): number => c.dryMass + c.propellant;
 
 /** Solver parameters: the world's restitution and friction on the compound solver's defaults. */
 const PARAMS: ContactParams = { ...DEFAULT_CONTACT, restitution: RESTITUTION, friction: FRICTION };
+/** The touchdown solve: impulses only (the joint then places the hull on the ground exactly). */
+const TOUCHDOWN: ContactParams = { ...PARAMS, positionIterations: 0 };
 const CA = makeContactBody(), CB = makeContactBody();
 const RES = makeContactResult();
 const SCRATCH = new Manifold();
@@ -130,7 +132,7 @@ export function surfaceContact(world: World, c: Craft, t: number): void {
     planetBody(CB, ORIGIN, n, wr, ang);
     SCRATCH.clear();
     if (collidePlanet(k, CA, CB, b.radius, SCRATCH) > 0) {
-      solveManifold(SCRATCH, CA, CB, 0, PARAMS, RES);
+      solveManifold(SCRATCH, CA, CB, 0, TOUCHDOWN, RES);
       c.hull -= RES.energy / c.hullStrength;
     }
     if (!b.solid || speed > LAND_MAX_SPEED || c.hull <= 0) {
