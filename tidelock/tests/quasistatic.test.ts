@@ -5,8 +5,9 @@ import type { Quat, V3 } from '../src/core/types';
 import { createBodyMotion, type BodyMotion } from '../src/world/body';
 import { feltAt } from '../src/world/crew';
 import {
-  afterContact, anchorDrift, bodyEvent, createQsState, DRIFT_SLOP, dragK, dragStep, driftEval, driftToShip, loadQsState, MODE_CONTACT, MODE_DRIFT,
-  MODE_REST, NEVER, nextBodyEvent, Q, restMargin, saveQsState, scheduleDrift, serviceBodies, tryRest, WHY_CONTACT, type QsBody, type QsWorld,
+  afterContact, anchorDrift, bodyEvent, createQsState, crewQsHy, DRIFT_SLOP, dragK, dragStep, driftEval, driftToShip, loadQsState, makeQsWorld,
+  MODE_CONTACT, MODE_DRIFT, MODE_REST, NEVER, nextBodyEvent, Q, qsStats, restHoldsJump, restMargin, rotSteps, saveQsState, scheduleDrift,
+  serviceBodies, tryRest, WHY_CONTACT, type QsBody, type QsWorld,
 } from '../src/world/quasistatic';
 
 const v3 = (x = 0, y = 0, z = 0): V3 => ({ x, y, z });
@@ -318,4 +319,260 @@ describe('scheduler independence and cost', () => {
     expect(s).toBeGreaterThan(0);
     expect(pos).toBeLessThan(20);
   });
+});
+
+// ------------------------------------------------------------------------------------------------ review fixes (D1–D6, D10)
+
+/** Fine RK4 of a free body in the ship frame with cabin-air drag on the full air-relative velocity. */
+function rk4Ship(m: BodyMotion, k: number, s0: number[], T: number, n: number): number[] {
+  const F = v3();
+  const f = (y: number[]): number[] => {
+    feltAt(m, y[0], y[1], y[2], y[3], y[4], y[5], F);
+    const sp = Math.hypot(y[3], y[4], y[5]);
+    return [y[3], y[4], y[5], F.x - k * sp * y[3], F.y - k * sp * y[4], F.z - k * sp * y[5]];
+  };
+  let s = s0.slice();
+  const h = T / n;
+  for (let i = 0; i < n; i++) {
+    const k1 = f(s), k2 = f(s.map((y, j) => y + 0.5 * h * k1[j])), k3 = f(s.map((y, j) => y + 0.5 * h * k2[j])), k4 = f(s.map((y, j) => y + h * k3[j]));
+    s = s.map((y, j) => y + (h / 6) * (k1[j] + 2 * k2[j] + 2 * k3[j] + k4[j]));
+  }
+  return s;
+}
+
+describe('ship impulses reach drifting and resting bodies (D1)', () => {
+  it('a 2 m/s latch: a floating body keeps its inertial velocity (−Δv), the Δω part follows; CONTACT and selfJump', () => {
+    const w = world(3), m = motion();
+    const a = body(v3(0.5, 1.2, 0.3), v3()), c = body(v3(0, 1, 1), v3(0.1, 0, 0)), crew = body(v3(1, 1, 1), v3());
+    const B = [a, c, crew];
+    w.selfJump = Uint8Array.from([0, 0, 1]);
+    afterContact(a, 0, B, w, 0, m, ID, false, 0, 0, 0);
+    for (let t = 1; t < 10; t++) serviceBodies(B, w, t, m, ID);
+    expect(a.qs.mode).toBe(MODE_DRIFT);
+    // the latch: Δv = (0, 0, 2), Δω = (0, 0.1, 0); after it the ship turns at 0.1 rad/s
+    const dv = v3(0, 0, 2), dw = v3(0, 0.1, 0), m2 = motion(v3(), dw);
+    serviceBodies(B, w, 10, m2, ID, dv, dw);
+    const j = v3(-dv.x - (dw.y * a.p.z - dw.z * a.p.y), -dv.y - (dw.z * a.p.x - dw.x * a.p.z), -dv.z - (dw.x * a.p.y - dw.y * a.p.x));
+    for (const k of ['x', 'y', 'z'] as const) expect(a.v[k]).toBeCloseTo(j[k], 14);
+    expect(c.v.x).toBeCloseTo(0.1 + j.x + (dw.y * a.p.z) - (dw.y * c.p.z), 14); // CONTACT: v += −Δv − Δω×p at its own p
+    expect(c.v.z).toBeCloseTo(-2 - (dw.x * c.p.y - dw.y * c.p.x), 14);
+    expect(crew.v).toEqual(v3()); // selfJump: crew.ts applies it (boots / harness)
+    // 1 s later the floating body is 2 m aft in inertial terms: |x| from the CoM grows as the ship moves away
+    let t = 10;
+    const qAt = (tt: number): Quat => rotY(0.1 * (tt - 10) * Q);
+    while (t < 130) { t++; serviceBodies(B, w, t, m2, qAt(t)); if (a.qs.mode !== MODE_DRIFT) break; }
+    const X = v3(), V = v3();
+    driftEval(a.qs, t, 0, X, V);
+    expect(V.z).toBeCloseTo(-2, 12);
+    expect(X.z).toBeCloseTo(0.3 - 2 * (t - 10) * Q, 9);
+  });
+
+  it('a resting body: held inside the impulse cone, woken with the jump outside it', () => {
+    const w = world(1, 0.05, 0, 0.5), g1 = motion(v3(0, 9.81, 0)), g0 = motion();
+    const mk = (m: BodyMotion): QsBody => { const b = body(v3(0, 0.05, 0), v3()); expect(tryRest(b, 0.5, 0, m, 0, 1, 0)).toBe(true); return b; };
+    // zero g, a sideways 2 m/s jolt: nothing presses it to the deck → it slides off with the jump
+    let b = mk(g0);
+    serviceBodies([b], w, 1, g0, ID, v3(2, 0, 0), null);
+    expect(b.qs.mode).toBe(MODE_CONTACT); expect(b.v).toEqual(v3(-2, 0, 0));
+    // landed (1 g): friction passes μ·g·Q = 0.041 m/s per tick: 0.03 holds, 0.06 slips
+    b = mk(g1); serviceBodies([b], w, 1, g1, ID, v3(0.03, 0, 0), null); expect(b.qs.mode).toBe(MODE_REST);
+    b = mk(g1); serviceBodies([b], w, 1, g1, ID, v3(0.06, 0, 0), null); expect(b.qs.mode).toBe(MODE_CONTACT); expect(b.v.x).toBe(-0.06);
+    // the deck pushing up into it always holds; dropping away faster than g·Q lifts it
+    b = mk(g1); serviceBodies([b], w, 1, g1, ID, v3(0, 1, 0), null); expect(b.qs.mode).toBe(MODE_REST);
+    b = mk(g1); serviceBodies([b], w, 1, g1, ID, v3(0, -0.1, 0), null); expect(b.qs.mode).toBe(MODE_CONTACT);
+    expect(restHoldsJump(v3(0, -0.5, 0.2), v3(0, 1, 0), 0.5, -9.81, Q)).toBe(true); // |0.2| ≤ 0.5·(0.5 + 0.08)
+  });
+});
+
+describe('a change of the ship acceleration is taken on the interval it belongs to (D2)', () => {
+  it('12 m/s² ignition: drift agrees with the exact path at 1× and under a 60-tick quantum', () => {
+    const w = world(1), m0 = motion(), m1 = motion(v3(0, 0, 12));
+    // at 1×: the tick-10 mean is the first with thrust (the interval (9Q, 10Q])
+    const b = body(v3(0, 1.2, 0), v3()); const B = [b];
+    afterContact(b, 0, B, w, 0, m0, ID, false, 0, 0, 0);
+    for (let t = 1; t <= 70; t++) serviceBodies(B, w, t, t >= 10 ? m1 : m0, ID);
+    const T = 61 * Q;
+    expect(b.v.z).toBeCloseTo(-12 * T, 12); expect(b.p.z).toBeCloseTo(-6 * T * T, 12);
+    // warp-like: serviced at 0 and then once at 60 with the mean of (0, 60]
+    const c = body(v3(0, 1.2, 0), v3()); const C = [c];
+    afterContact(c, 0, C, w, 0, m0, ID, false, 0, 0, 0);
+    serviceBodies(C, w, 60, m1, ID);
+    expect(c.v.z).toBeCloseTo(-12 * 60 * Q, 12); expect(c.p.z).toBeCloseTo(-6 * (60 * Q) ** 2, 12);
+  });
+});
+
+describe('drag under a felt acceleration (D3)', () => {
+  const k = dragK(0.19, 0.45), A = 20;
+  const cases: [string, V3][] = [['from rest', v3()], ['thrown against the felt', v3(0, 0, 6)], ['faster than terminal', v3(0, 0, -14)]];
+  for (const [name, u] of cases) {
+    it(`pillow in a 20 m/s² aerobrake, ${name}: the 1-D closed form matches RK4`, () => {
+      const m = motion(v3(0, 0, A)), b = body(v3(0, 1.2, 0), u);
+      anchorDrift(b, 0, m, ID);
+      const p = v3(), v = v3();
+      for (const n of [12, 60, 180]) {
+        driftToShip(b.qs, n, k, ID, m.w, p, v);
+        const r = rk4Ship(m, k, [0, 1.2, 0, u.x, u.y, u.z], n * Q, 4000);
+        const ex = Math.hypot(p.x - r[0], p.y - r[1], p.z - r[2]), ev = Math.hypot(v.x - r[3], v.y - r[4], v.z - r[5]);
+        expect(ex).toBeLessThan(1e-9);
+        expect(ev).toBeLessThan(1e-9);
+      }
+    });
+  }
+
+  it('pillow aerobrake to the bulkhead (drift scheduler) agrees with RK4; thrown sideways the segments are capped', () => {
+    const m = motion(v3(0, 0, A)), w = world(1, 0.05, k);
+    for (const u of [v3(), v3(0.05, 0, -3), v3(0.8, 0.3, 0)]) {
+      const b = body(v3(0, 1.2, 0), u), B = [b];
+      afterContact(b, 0, B, w, 0, m, ID, false, 0, 0, 0);
+      let tick = 0, segs = 0, maxErr = 0;
+      while (b.qs.mode === MODE_DRIFT && tick < 1200) {
+        tick += nextBodyEvent(B, tick, 2048); serviceBodies(B, w, tick, m, ID); segs++;
+        const r = rk4Ship(m, k, [0, 1.2, 0, u.x, u.y, u.z], tick * Q, 400 + tick * 20);
+        maxErr = Math.max(maxErr, Math.hypot(b.p.x - r[0], b.p.y - r[1], b.p.z - r[2]));
+      }
+      const r = rk4Ship(m, k, [0, 1.2, 0, u.x, u.y, u.z], tick * Q, 20000);
+      // what CONTACT stepping would give instead: the contact solver's semi-implicit Euler at Q with dragStep
+      const e = body(v3(0, 1.2, 0), u), F = v3();
+      for (let t = 0; t < tick; t++) {
+        feltAt(m, e.p.x, e.p.y, e.p.z, e.v.x, e.v.y, e.v.z, F);
+        e.v.x += F.x * Q; e.v.y += F.y * Q; e.v.z += F.z * Q; dragStep(e.v, k, Q);
+        e.p.x += e.v.x * Q; e.p.y += e.v.y * Q; e.p.z += e.v.z * Q;
+      }
+      const eulerErr = Math.hypot(e.p.x - r[0], e.p.y - r[1], e.p.z - r[2]);
+      console.log(`[qs] pillow aerobrake u0 (${u.x}, ${u.y}, ${u.z}): ${segs} segments, hand-over tick ${tick}, v.z ${b.v.z.toFixed(3)} (RK4 ${r[5].toFixed(3)}, terminal ${Math.sqrt(A / k).toFixed(2)}), max |Δp| ${(maxErr * 1000).toFixed(3)} mm (Euler at Q: ${(eulerErr * 1000).toFixed(1)} mm)`);
+      expect(b.qs.mode).toBe(MODE_CONTACT);
+      expect(Math.abs(b.v.z - r[5])).toBeLessThan(u.x === 0 ? 1e-9 : 0.03);
+      expect(maxErr).toBeLessThan(u.x === 0 ? 1e-9 : 0.01);
+      if (u.x !== 0) expect(maxErr).toBeLessThan(eulerErr); // more accurate than the CONTACT path it replaces
+      expect(-b.v.z).toBeLessThan(Math.sqrt(A / k));
+    }
+  });
+});
+
+describe('re-anchor cheaply, re-schedule rarely, scan only nearby boxes (D4)', () => {
+  it('RCS means alternating 0.010 / 0.012 m/s²: one re-anchor per tick, almost no re-schedules', () => {
+    const w = makeQsWorld(ROOM, 6, 8, { k: new Float64Array(8).fill(dragK(0.006, 0.35)) });
+    const B: QsBody[] = [];
+    for (let i = 0; i < 8; i++) B.push(body(v3(-1 + 0.3 * i, 0.6 + 0.2 * i, -2 + 0.5 * i), v3(0.01, -0.005 * (i % 3), 0.004 * i)));
+    const ms = [motion(v3(0.010, 0, 0), v3(0, 0.002, 0)), motion(v3(0.012, 0, 0), v3(0, 0.002, 0))];
+    for (let i = 0; i < 8; i++) afterContact(B[i], i, B, w, 0, ms[0], ID, false, 0, 0, 0);
+    qsStats.reanchors = 0; qsStats.reschedules = 0;
+    for (let t = 1; t <= 600; t++) serviceBodies(B, w, t, ms[t & 1], rotY(0.002 * t * Q));
+    const drifting = B.filter((b) => b.qs.mode === MODE_DRIFT).length;
+    console.log(`[qs] RCS alternation, 8 bodies, 600 ticks: ${qsStats.reanchors} re-anchors, ${qsStats.reschedules} re-schedules, ${drifting} still drifting`);
+    expect(qsStats.reschedules).toBeLessThan(0.02 * qsStats.reanchors);
+  });
+
+  it('the static grid gives exactly the schedule of the full box scan', () => {
+    const boxes = new Float64Array(6 * 60);
+    let seed = 12345;
+    const rnd = (): number => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    for (let i = 0; i < 60; i++) {
+      const x = -6 + 12 * rnd(), y = -1 + 4 * rnd(), z = -8 + 16 * rnd(), sx = 0.05 + rnd(), sy = 0.05 + rnd(), sz = 0.05 + rnd();
+      boxes.set([x, y, z, x + sx, y + sy, z + sz], 6 * i);
+    }
+    const wg = makeQsWorld(boxes, 60, 1, { k: [dragK(0.19, 0.45)], hy: [0] }), wn: QsWorld = { ...wg, grid: undefined };
+    let same = 0;
+    for (let n = 0; n < 300; n++) {
+      const p = v3(-6 + 12 * rnd(), -1 + 4 * rnd(), -8 + 16 * rnd()), v = v3(rnd() - 0.5, rnd() - 0.5, rnd() - 0.5);
+      const m = motion(v3(0.3 * (rnd() - 0.5), 0, 0.3 * (rnd() - 0.5)), v3(0, 0.01 * rnd(), 0));
+      const a = body(p, v), b = body(p, v);
+      afterContact(a, 0, [a], wg, 0, m, ID, false, 0, 0, 0);
+      afterContact(b, 0, [b], wn, 0, m, ID, false, 0, 0, 0);
+      expect(a.qs.tickEnd).toBe(b.qs.tickEnd); expect(a.qs.mode).toBe(b.qs.mode);
+      if (a.qs.mode === MODE_DRIFT) same++;
+    }
+    expect(same).toBeGreaterThan(30);
+  });
+});
+
+/** Gap of an upright capsule (centre p, radius r, half segment hy along +Y) to the room's boxes. */
+function gapCapsule(p: V3, r: number, hy: number): number {
+  let g = Infinity;
+  for (let o = 0; o < ROOM.length; o += 6) {
+    const dx = Math.max(ROOM[o] - p.x, 0, p.x - ROOM[o + 3]), dz = Math.max(ROOM[o + 2] - p.z, 0, p.z - ROOM[o + 5]);
+    const dy = Math.max(ROOM[o + 1] - (p.y + hy), 0, (p.y - hy) - ROOM[o + 4]);
+    g = Math.min(g, Math.hypot(dx, dy, dz) - r);
+  }
+  return g;
+}
+
+describe('the crew drifts as its capsule (D6)', () => {
+  it('floating feet-first toward the deck: CONTACT takes over before the feet touch', () => {
+    const r = 0.28, hy = crewQsHy(1.75, 0.28);
+    const w: QsWorld = { ...world(1, r, dragK(0.6, 80), 0.7), hy: Float64Array.of(hy) };
+    // feet 0.25 m above the deck (crew.pos.y = 0.25): the capsule centre is 0.875 m above the feet
+    const b = body(v3(0, 0.25 + 0.875, 0.5), v3(0.05, -0.2, 0)), B = [b];
+    afterContact(b, 0, B, w, 0, motion(), ID, false, 0, 0, 0);
+    expect(b.qs.mode).toBe(MODE_DRIFT);
+    let tick = 0, minGap = Infinity;
+    const p = v3(), v = v3();
+    while (b.qs.mode === MODE_DRIFT && tick < 1200) {
+      const e = nextBodyEvent(B, tick, 2048);
+      for (let t = tick + 1; t <= tick + e; t++) { driftToShip(b.qs, t, w.k[0], ID, v3(), p, v); minGap = Math.min(minGap, gapCapsule(p, r, hy)); }
+      tick += e; serviceBodies(B, w, tick, motion(), ID);
+    }
+    expect(b.qs.mode).toBe(MODE_CONTACT);
+    expect(minGap).toBeGreaterThanOrEqual(-DRIFT_SLOP - 1e-12);
+    expect(b.p.y - 0.875).toBeLessThan(0.02); // the feet are at the deck when it hands over
+    expect(b.p.y - 0.875).toBeGreaterThan(-DRIFT_SLOP);
+  });
+});
+
+// rotation: torque-free in inertial space (constant L)
+function rk4Rot(q0: Quat, L: V3, I: number[], T: number, n: number): Quat {
+  const rv = (q: number[], x: number, y: number, z: number): number[] => {
+    const [qx, qy, qz, qw] = q, tx = 2 * (qy * z - qz * y), ty = 2 * (qz * x - qx * z), tz = 2 * (qx * y - qy * x);
+    return [x + qw * tx + (qy * tz - qz * ty), y + qw * ty + (qz * tx - qx * tz), z + qw * tz + (qx * ty - qy * tx)];
+  };
+  const om = (q: number[]): number[] => { const b = rv([-q[0], -q[1], -q[2], q[3]], L.x, L.y, L.z); return rv(q, b[0] / I[0], b[1] / I[1], b[2] / I[2]); };
+  const f = (q: number[]): number[] => {
+    const [wx, wy, wz] = om(q), [x, y, z, w] = q;
+    return [0.5 * (w * wx + wy * z - wz * y), 0.5 * (w * wy + wz * x - wx * z), 0.5 * (w * wz + wx * y - wy * x), 0.5 * (-wx * x - wy * y - wz * z)];
+  };
+  let q = [q0.x, q0.y, q0.z, q0.w];
+  const h = T / n;
+  for (let i = 0; i < n; i++) {
+    const k1 = f(q), k2 = f(q.map((y, j) => y + 0.5 * h * k1[j])), k3 = f(q.map((y, j) => y + 0.5 * h * k2[j])), k4 = f(q.map((y, j) => y + h * k3[j]));
+    q = q.map((y, j) => y + (h / 6) * (k1[j] + 2 * k2[j] + 2 * k3[j] + k4[j]));
+    const l = Math.hypot(...q); q = q.map((y) => y / l);
+  }
+  return { x: q[0], y: q[1], z: q[2], w: q[3] };
+}
+/** Rotation angle between two attitudes: 2·asin |vec(a⁻¹b)| (accurate near 0). */
+const qdist = (a: Quat, b: Quat): number => {
+  const x = a.w * b.x - a.x * b.w - a.y * b.z + a.z * b.y, y = a.w * b.y + a.x * b.z - a.y * b.w - a.z * b.x, z = a.w * b.z - a.x * b.y + a.y * b.x - a.z * b.w;
+  return 2 * Math.asin(Math.min(1, Math.hypot(x, y, z)));
+};
+const qmulT = (a: Quat, b: Quat): Quat => ({
+  x: a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, y: a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+  z: a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, w: a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+});
+
+describe('drifting rotation (D10)', () => {
+  const q0: Quat = (() => { const a = 0.7, s = Math.sin(a / 2) / Math.sqrt(3); return { x: s, y: -s, z: s, w: Math.cos(a / 2) }; })();
+  for (const [name, I, tol] of [['isotropic', [0.02, 0.02, 0.02], 1e-10], ['axisymmetric (mug-like)', [0.004, 0.0025, 0.004], 1e-10], ['triaxial (book)', [0.002, 0.006, 0.0075], 1e-4]] as const) {
+    it(`${name}: matches RK4 of the torque-free motion after 20 s in a turning ship; independent of evaluation pattern`, () => {
+      const W = v3(0, 0.05, 0), m = motion(v3(), W), qAt = (t: number): Quat => rotY(0.05 * t * Q);
+      const w = makeQsWorld(new Float64Array(0), 0, 1, { I: [...I] });
+      const mk = (): QsBody => ({ p: v3(0, 1, 0), v: v3(), q: { ...q0 }, w: v3(1.1, -0.4, 2.3), qs: createQsState() });
+      const a = mk(), b = mk();
+      afterContact(a, 0, [a], w, 0, m, qAt(0), false, 0, 0, 0);
+      afterContact(b, 0, [b], w, 0, m, qAt(0), false, 0, 0, 0);
+      const N = 20 * 120;
+      for (let t = 1; t <= N; t++) serviceBodies([a], w, t, m, qAt(t)); // every tick (1×)
+      for (let t = 0; t < N;) { t = Math.min(N, t + Math.min(997, nextBodyEvent([b], t, 2048))); serviceBodies([b], w, t, m, qAt(t)); } // warp quanta
+      expect(JSON.stringify([a.q, a.w, a.qs])).toBe(JSON.stringify([b.q, b.w, b.qs]));
+      // reference: inertial ω₀ = q·(w + W), L = R I Rᵀ ω₀ (here q = ID at t = 0)
+      const w0 = v3(1.1 + W.x, -0.4 + W.y, 2.3 + W.z);
+      const conj = { x: -q0.x, y: -q0.y, z: -q0.z, w: q0.w };
+      const toB = qmulT(qmulT(conj, { x: w0.x, y: w0.y, z: w0.z, w: 0 }), q0);
+      const Lb = qmulT(qmulT(q0, { x: toB.x * I[0], y: toB.y * I[1], z: toB.z * I[2], w: 0 }), conj);
+      const ref = rk4Rot(q0, v3(Lb.x, Lb.y, Lb.z), [...I], N * Q, 200000);
+      const got = qmulT(qAt(N), a.q!); // ship → inertial
+      const err = qdist(got, ref);
+      console.log(`[qs] ${name}: attitude error after 20 s ${err.toExponential(2)} rad; rotation steps per 1e4×-frame (20000 ticks) ${rotSteps([a], 20000)}`);
+      expect(err).toBeLessThan(tol);
+    });
+  }
 });

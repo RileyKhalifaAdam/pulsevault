@@ -154,7 +154,7 @@ const NS_FETCH = 0.02;
 const GLOSSY_FRACTION = 0.5; // share of pixels below the reflection roughness cut (for the estimate)
 const IPHONE_W = 393 * 2;
 const IPHONE_H = 852 * 2;
-const REFL_MAX_ROUGH = 0.32;
+const REFL_MAX_ROUGH = 0.5; // the brief: traced reflections replace the probes on everything smoother than 0.5
 
 const tri = new Float32Array([-1, -1, 0, 3, -1, 0, -1, 3, 0]);
 

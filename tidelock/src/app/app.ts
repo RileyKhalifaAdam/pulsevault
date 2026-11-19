@@ -108,7 +108,7 @@ export async function boot(): Promise<void> {
   const rtChoice: RtTier = urlRt ?? asRt(settingsData.rt) ?? RT_DEFAULT;
   if (settingsData.rt === undefined) settingsData.rt = rtChoice;
   const rtGov = new RtGovernor(rtChoice);
-  perf.budgetMs = frameBudgetFor(rtChoice);
+  perf.budgetMs = frameBudgetFor('off'); // 33 ms only while traced frames are drawn (the frame loop)
   noteForReport(`ray tracing ${rtChoice}`);
 
   // ---------------------------------------------------------------------------------------------- canvas, pipeline, scene
@@ -522,9 +522,15 @@ export async function boot(): Promise<void> {
           noteForReport(`auto quality: ${perf.snapshot().note}`);
           rtGov.settle(4);
         }
-        // the ray-tracing governor, twice a second
+        // the ray-tracing governor, twice a second — only while the tracer actually draws (inside the ship): the
+        // 33 ms budget and any step-down belong to traced frames; outside, the 60 fps budget applies
+        const rtDrawing = renderInfo.rt !== 'off' && renderInfo.rt !== 'building';
+        perf.budgetMs = frameBudgetFor(rtDrawing ? rtGov.tier : 'off');
         rtAcc += dt;
-        if (rtAcc >= 0.5) {
+        if (!rtDrawing) {
+          rtGov.settle(1);
+          rtAcc = 0;
+        } else if (rtAcc >= 0.5) {
           const next = rtGov.update(rtAcc, perf.p95(), perf.samples);
           rtAcc = 0;
           if (next) applyRt(next, `governor: ${rtGov.note}`);

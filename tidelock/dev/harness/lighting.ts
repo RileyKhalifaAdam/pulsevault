@@ -381,6 +381,55 @@ async function main(): Promise<void> {
     fill(1 / 30);
     scene.render(frame);
   }
+  // suns=x,y,z;x,y,z;...  one load, several star directions (ship-local), tiled into one picture (per=N frames
+  // each; pair=1 renders every direction with RT off, then on, side by side; labels name each tile)
+  const sunsP = params.get('suns');
+  if (sunsP) {
+    const list = sunsP.split(';').map((s) => s.split(',').map(Number));
+    const pair = num('pair', 0) === 1;
+    const per = num('per', 16);
+    const tiles: { c: HTMLCanvasElement; label: string }[] = [];
+    for (const d of list) {
+      for (const on of pair ? [false, true] : [true]) {
+        sunL.x = d[0];
+        sunL.y = d[1];
+        sunL.z = d[2];
+        scene.setRayTracing(on ? rtTier : 'off');
+        for (let i = 0; i < per; i++) {
+          if (i % 4 === 3) await new Promise((r) => setTimeout(r, 0));
+          fill(1 / 30);
+          scene.render(frame);
+        }
+        const c2 = document.createElement('canvas');
+        c2.width = canvas.width;
+        c2.height = canvas.height;
+        c2.getContext('2d')?.drawImage(canvas, 0, 0); // same task as the render: the drawing buffer is still there
+        tiles.push({ c: c2, label: `sun ${d.join(',')} · RT ${on ? rtTier : 'off'}` });
+      }
+    }
+    const cols = pair ? 2 : Math.ceil(Math.sqrt(tiles.length));
+    const rows = Math.ceil(tiles.length / cols);
+    const grid = document.createElement('canvas');
+    grid.width = canvas.width;
+    grid.height = canvas.height;
+    grid.style.cssText = canvas.style.cssText;
+    const g = grid.getContext('2d') as CanvasRenderingContext2D;
+    g.fillStyle = '#000';
+    g.fillRect(0, 0, grid.width, grid.height);
+    const tw = grid.width / cols;
+    const th = grid.height / rows;
+    const s = Math.min(tw / canvas.width, th / canvas.height);
+    tiles.forEach((t, i) => {
+      const x = (i % cols) * tw;
+      const y = Math.floor(i / cols) * th;
+      g.drawImage(t.c, x, y, canvas.width * s, canvas.height * s);
+      g.fillStyle = '#ffd34d';
+      g.font = `${Math.max(9, Math.round(grid.width / 50))}px monospace`;
+      g.fillText(t.label, x + 4, y + th - 6);
+    });
+    document.body.appendChild(grid);
+    info.style.visibility = 'hidden';
+  }
   const st = scene.stats();
   const ps = pipeline.stats();
   const li = st.lighting;

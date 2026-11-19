@@ -7,17 +7,21 @@
 //   using the tick's means from W1-B's `consumeLedger(c, mean)` (the session calls it once per tick). Landed:
 //     landedProperAccel(b.mu, c.rel, b.spinAxis, b.spinRate, c.q, out.a)   (adds Ω×(Ω×r), item 8)
 //   and always localVertical(c.rel, b.mu, c.q, out.rhat) → out.n2 (item 9; give ShipMotion `rhat`, `n2`).
-// - props.ts `stepProps` (start of the tick, before the sub-steps): for every loose awake/drifting body
-//     applyShipJump(b.v, b.w, b.p, mean.dv, mean.dw)          (v_rel += −Δv − Δω×r, ω_rel −= Δω)
-//   and delete the global wake on |Δa| > WAKE_DA / |Δω| > WAKE_DW / α²r² (quasistatic.ts decides waking).
+// - props.ts `stepProps`: the ship impulse goes to every loose body through quasistatic.ts serviceBodies(…,
+//   mean.dv, mean.dw) (CONTACT: v_rel += −Δv − Δω×r, ω_rel −= Δω — applyShipJump; DRIFT: inertial v −= q·Δv;
+//   REST: the impulse cone). Do not call applyShipJump on top of it. Delete the global wake on |Δa| > WAKE_DA /
+//   |Δω| > WAKE_DW / α²r² (quasistatic.ts decides waking).
 // - crew.ts `stepCrew` while gripped: shipJumpAt(crewCoM, dv, dw, J); bootImpulse(80, J, deckN, ΣbootMagnet(gap),
 //   feltNormal, Q, dvOut) → crew.vel += dvOut, slip / lift ends the grip (emit 'bootOff'). Walking: replace
-//   BOOT_HOLD / BOOT_PULL / BOOT_SNAP / WALK_ACCEL with bootMagnet, bootContact, bootTraction, legForce,
-//   gaitSpeedCap; FootBody (stepFoot) + gaitPhase / gaitEye give the on-foot eye offset.
+//   BOOT_HOLD / BOOT_PULL / BOOT_SNAP / WALK_ACCEL with bootMagnet, bootContact(gap, vn, 80, 2) (catches only
+//   approaching soles, or soles that cannot climb out of the magnet well), bootTraction, legForce, gaitSpeedCap.
+//   On foot each tick: stepFoot(fb, aBody); leanTick(fb, felt, dir, leanClearance(…, LEAN_MAX_STAND), Q);
+//   CrewView.eyeOffset = clampEyeOffset(boxes, n, eye, footEyeOffset(fb, dir, gaitEye(…), out)).
 // - session.ts helm (seated) each tick: shipJumpAt(helmSeatPoint, dv, dw, J); add J to body.v; then
-//     stepHelmBody(body, HELM_DEF, felt at the seat (crew.ts feltAt, v = 0), leanDir, leanMax, h)
+//     stepHarnessBody(body, HELM_DEF, felt at the seat (crew.ts feltAt, v = 0), leanDir, leanMax, h)
 //   with h = Q at 1× (4 exact sub-steps inside) and the quantum under warp (closed-form equilibrium when
-//   h > QS_DT). CrewView.eyeOffset = helmEyeOffset(body, leanDir, out) + neckEyeDelta(yaw, pitch, out2).
+//   h > QS_DT). CrewView.eyeOffset = clampEyeOffset(boxes, n, helmEye, helmEyeOffset(body, leanDir, out))
+//   + neckEyeDelta(yaw, pitch, out2): the head sphere never passes through glass, lean or head lag.
 //   Bunk / table: the same with BUNK_DEF (asleep ⇒ the quantum is ≫ QS_DT ⇒ harnessEquilibrium; never a spring
 //   at h ≈ 83 ms).
 // - app/input.ts pinch: leanT = pinchLean(leanAtPinchStart, scale, maxLean) (replaces the 1..3 zoom);
@@ -25,6 +29,9 @@
 //   leanMax = leanClearance(compiledBoxes, n, eye, leanDir, LEAN_MAX_HELM | LEAN_MAX_STAND) so the head
 //   sphere (r 0.10 m) never passes through glass.
 // - Save: saveHarnessBody / loadHarnessBody, saveFootBody / loadFootBody (loader defaults for old saves).
+// - Plan W1-C item 2 says "8–10 cm on the head" for a 2 m/s capture; its own parameters (head ω 2π·2 Hz, ζ 0.6,
+//   harness ζ 0.3) give a head lag of 7.95 cm for a rigid stop but 10–11 cm with the harness rebound, and
+//   12–14 cm head-to-seat. Kept at the plan's parameters; the owner decides (tests/body.test.ts proves the split).
 //
 // Transcendentals: only at module load (coefficients) and in rare off-tick paths, through the m* wrappers
 // below; wave 1 moves them into src/world/math.ts with the rest of the wrappers (§1.1 rule 6).
@@ -276,14 +283,22 @@ export const SOLE_NONE = 0;
 export const SOLE_CATCH = 1;
 export const SOLE_BOUNCE = 2;
 
+/** Work (J) to pull `boots` magnets from sole gap g to infinity: ∫ F₀/(1 + x/g₀)² dx = F₀g₀/(1 + g/g₀) each. */
+export const bootWell = (gap: number, boots = 2): number => (boots * BOOT_F0 * BOOT_G0) / (1 + (gap > 0 ? gap : 0) / BOOT_G0);
+
 /**
- * Soles meeting a deck: gap (m) and vn = normal velocity (m/s, < 0 approaching). They catch when gap < 2 mm and
- * the approach is ≤ 0.5 m/s; a faster arrival at contact bounces with restitution 0.3 (bounceVn gives the new vn).
+ * Soles meeting a deck: gap (m) and vn = normal velocity (m/s, < 0 approaching, > 0 leaving). They catch when
+ * gap < 2 mm and they approach at ≤ 0.5 m/s, or when they leave too slowly to climb out of the magnet well
+ * (½ m vn² < bootWell: 80 kg on two boots escapes above 0.22 m/s). A faster arrival at contact bounces with
+ * restitution 0.3 (bounceVn gives the new vn); a jump or push-off is never caught.
  */
-export function bootContact(gap: number, vn: number): number {
+export function bootContact(gap: number, vn: number, m: number = TORSO_MASS, boots = 2): number {
   if (gap >= BOOT_CATCH_GAP) return SOLE_NONE;
-  if (-vn <= BOOT_CATCH_VN) return SOLE_CATCH;
-  return gap <= 0 ? SOLE_BOUNCE : SOLE_NONE;
+  if (vn <= 0) {
+    if (-vn <= BOOT_CATCH_VN) return SOLE_CATCH;
+    return gap <= 0 ? SOLE_BOUNCE : SOLE_NONE;
+  }
+  return 0.5 * m * vn * vn < bootWell(gap, boots) ? SOLE_CATCH : SOLE_NONE;
 }
 export const bounceVn = (vn: number): number => (vn < 0 ? -BOOT_RESTITUTION * vn : vn);
 
@@ -305,8 +320,15 @@ export const gaitSpeedCap = (fnInto: number): number => (fnInto < 0.3 * G0 ? SPE
 
 // ------------------------------------------------------------------------------------------------ knee, gait, head lag on foot
 
-/** Knee compression (m, + = sinking), its rate, gait phase (rad, 0..4π) and the walking head's lag on the body. */
-export interface FootBody {
+/** Torso lean (m along the lean direction), its rate and the target the pinch set: shared by both bodies. */
+export interface LeanState {
+  lean: number;
+  leanV: number;
+  leanT: number;
+}
+
+/** Knee compression (m, + = sinking), its rate, gait phase (rad, 0..4π), the walking head's lag on the body, lean. */
+export interface FootBody extends LeanState {
   kx: number;
   kv: number;
   phase: number;
@@ -314,7 +336,7 @@ export interface FootBody {
   hv: V3;
 }
 
-export const createFootBody = (): FootBody => ({ kx: 0, kv: 0, phase: 0, hx: { x: 0, y: 0, z: 0 }, hv: { x: 0, y: 0, z: 0 } });
+export const createFootBody = (): FootBody => ({ kx: 0, kv: 0, phase: 0, hx: { x: 0, y: 0, z: 0 }, hv: { x: 0, y: 0, z: 0 }, lean: 0, leanV: 0, leanT: 0 });
 
 /** Free motion with linear damping β over h: [e^{−βh}, (1 − e^{−βh})/β] (ZOH forcing handled by the caller). */
 const BRACE_E = mexp(-BRACE_BETA * HS);
@@ -353,6 +375,20 @@ export function stepFoot(fb: FootBody, aBody: V3): void {
 export function settleFoot(fb: FootBody): void {
   fb.kx = 0; fb.kv = 0;
   fb.hx.x = fb.hx.y = fb.hx.z = 0; fb.hv.x = fb.hv.y = fb.hv.z = 0;
+}
+
+/**
+ * CrewView.eyeOffset on foot (craft axes, deck up = +Y): knee sink, head lag, the gait bob (gaitEye's out: x
+ * lateral, y vertical, given in the deck frame with lateral = dir × up) and the lean along dir with its eye drop.
+ */
+export function footEyeOffset(fb: FootBody, dir: V3 | null, gait: V3 | null, out: V3): V3 {
+  const l = fb.lean, dx = dir ? dir.x : 0, dz = dir ? dir.z : 0;
+  const gl = gait ? gait.x : 0, gv = gait ? gait.y : 0;
+  // lateral = dir × up = (−dz, 0, dx) for up = +Y
+  out.x = fb.hx.x + l * dx - gl * dz;
+  out.y = fb.hx.y - fb.kx + gv - leanDrop(l);
+  out.z = fb.hx.z + l * dz + gl * dx;
+  return out;
 }
 
 /** Advance the gait phase by one step h at speed (m/s); cadence scales with speed relative to SPEED_WALK. */
@@ -452,16 +488,12 @@ export const BUNK_DEF: HarnessDef = makeHarnessDef(TORSO_MASS, [
 ]);
 
 /** Torso displacement from its seated neutral point and velocity (craft axes), head lag, lean. Plain JSON. */
-export interface HarnessBody {
+export interface HarnessBody extends LeanState {
   x: V3;
   v: V3;
   /** Head relative to the torso, m and m/s. */
   hx: V3;
   hv: V3;
-  /** Lean (m along the lean direction), its rate, and the target the pinch set. */
-  lean: number;
-  leanV: number;
-  leanT: number;
 }
 
 export const createHarnessBody = (): HarnessBody => ({
@@ -499,6 +531,11 @@ export function harnessEquilibrium(b: HarnessBody, def: HarnessDef, f: V3, dir: 
   b.x.x = AX[0]; b.x.y = AX[1]; b.x.z = AX[2];
   b.v.x = b.v.y = b.v.z = 0;
   b.hx.x = b.hx.y = b.hx.z = 0; b.hv.x = b.hv.y = b.hv.z = 0;
+  leanEquilibrium(b, f, dir, leanMax);
+}
+
+/** Lean at rest under a steady felt f: the target unless the muscles cannot hold it (it sags to a stop). */
+export function leanEquilibrium(b: LeanState, f: V3, dir: V3 | null, leanMax: number): void {
   const lim = leanMax > 0 ? leanMax : 0;
   const t = b.leanT < 0 ? 0 : b.leanT > lim ? lim : b.leanT;
   const fd = dir ? f.x * dir.x + f.y * dir.y + f.z * dir.z : 0;
@@ -548,16 +585,16 @@ export function stepHarnessBody(b: HarnessBody, def: HarnessDef, f: V3, dir: V3 
   b.x.x = AX[0]; b.x.y = AX[1]; b.x.z = AX[2];
   b.v.x = ftz(AV[0]); b.v.y = ftz(AV[1]); b.v.z = ftz(AV[2]);
   ftz3(b.hx); ftz3(b.hv);
-  leanStep(b, f, dir, leanMax, h, h === Q ? PHI_LEAN : null);
+  leanSub(b, f, dir, leanMax, h, h === Q ? PHI_LEAN : leanRt(h / SUBSTEPS));
 }
 
-const PHI_RT = new Float64Array(8);
+const PHI_RT = new Float64Array(4);
 let rtHeadH = 0;
 
 function headLagSub(hx: V3, hv: V3, ax: number, ay: number, az: number, hs: number, P: Float64Array | null): void {
   let H = P;
   if (!H) {
-    if (rtHeadH !== hs) { oscTransition(PHI_RT, 0, HEAD_OMEGA, HEAD_ZETA, hs); oscTransition(PHI_RT, 4, LEAN_OMEGA, 1, hs); rtHeadH = hs; }
+    if (rtHeadH !== hs) { oscTransition(PHI_RT, 0, HEAD_OMEGA, HEAD_ZETA, hs); rtHeadH = hs; }
     H = PHI_RT;
   }
   const w2 = HEAD_OMEGA * HEAD_OMEGA, ex = -ax / w2, ey = -ay / w2, ez = -az / w2;
@@ -569,16 +606,33 @@ function headLagSub(hx: V3, hv: V3, ax: number, ay: number, az: number, hs: numb
   hx.z = ez + H[0] * y + H[1] * v; hv.z = H[2] * y + H[3] * v;
 }
 
+const PHI_LRT = new Float64Array(4);
+let rtLeanH = 0;
+function leanRt(hs: number): Float64Array {
+  if (rtLeanH !== hs) { oscTransition(PHI_LRT, 0, LEAN_OMEGA, 1, hs); rtLeanH = hs; }
+  return PHI_LRT;
+}
+
 /**
- * Lean: a force-limited PD (ω = 6 rad/s, ζ = 1) with the felt load fed forward (the muscles know their weight).
+ * Lean of either body (harnessed: leanMax ≤ LEAN_MAX_HELM; on foot: ≤ LEAN_MAX_STAND), one step h: a force-limited
+ * PD (ω = 6 rad/s, ζ = 1) with the felt load fed forward, 4 exact sub-steps (h = Q: precomputed; h ≤ QS_DT:
+ * computed once for that h; h > QS_DT: the equilibrium). f = felt at the body, dir = unit lean direction.
+ */
+export function leanTick(b: LeanState, f: V3, dir: V3 | null, leanMax: number, h: number): void {
+  if (!(h > 0)) return;
+  if (h > QS_DT) { leanEquilibrium(b, f, dir, leanMax); return; }
+  leanSub(b, f, dir, leanMax, h, h === Q ? PHI_LEAN : leanRt(h / SUBSTEPS));
+}
+
+/**
  * Unsaturated, the error is exactly critically damped; saturated, the motion is exactly ballistic. Hard stops at
  * 0 and leanMax.
  */
-function leanStep(b: HarnessBody, f: V3, dir: V3 | null, leanMax: number, h: number, P: Float64Array | null): void {
+function leanSub(b: LeanState, f: V3, dir: V3 | null, leanMax: number, h: number, L: Float64Array): void {
   const lim = leanMax > 0 ? leanMax : 0;
   const t = b.leanT < 0 ? 0 : b.leanT > lim ? lim : b.leanT;
   const fd = dir ? f.x * dir.x + f.y * dir.y + f.z * dir.z : 0;
-  const hs = h / SUBSTEPS, L = P ?? PHI_RT, o = P ? 0 : 4;
+  const hs = h / SUBSTEPS, o = 0;
   const w2 = LEAN_OMEGA * LEAN_OMEGA, amax = LEAN_FMAX / LEAN_MASS;
   let x = b.lean, v = b.leanV;
   for (let i = 0; i < SUBSTEPS; i++) {
@@ -683,8 +737,9 @@ export function pinchLean(leanAtStart: number, scale: number, maxLean: number): 
 
 /**
  * How far the head sphere (radius r, centre at eye) can travel along dir before touching a box (boxes as
- * minX, minY, minZ, maxX, maxY, maxZ — crew.ts' compiled boxes), capped at maxLean. Boxes the head already
- * overlaps do not block (it can always lean out of them). Minkowski slab test, slightly conservative at edges.
+ * minX, minY, minZ, maxX, maxY, maxZ — crew.ts' compiled boxes), capped at maxLean. Minkowski slab test, slightly
+ * conservative at edges. A box the head already overlaps blocks any motion further into it (along the face of
+ * least penetration: 0 when dir points inward), and lets it move out.
  */
 export function leanClearance(boxes: Float64Array, n: number, eye: V3, dir: V3, maxLean: number, r: number = HEAD_RADIUS): number {
   let best = maxLean;
@@ -702,11 +757,38 @@ export function leanClearance(boxes: Float64Array, n: number, eye: V3, dir: V3, 
       if (tb < t1) t1 = tb;
       if (t0 > t1) miss = true;
     }
-    if (miss || inside || t1 < 0) continue;
+    if (inside && !miss) {
+      // least-penetration face of the r-expanded box: its outward normal is the way out
+      let pen = Infinity, into = 0;
+      for (let a = 0; a < 3; a++) {
+        const p = a === 0 ? ex : a === 1 ? ey : ez, d = a === 0 ? dx : a === 1 ? dy : dz;
+        const lo = p - (boxes[k + a] - r), hi = boxes[k + 3 + a] + r - p;
+        if (lo < pen) { pen = lo; into = d; } // outward normal −e_a: moving in iff d > 0
+        if (hi < pen) { pen = hi; into = -d; } // outward normal +e_a: moving in iff d < 0
+      }
+      if (into > 0) return 0;
+      continue;
+    }
+    if (miss || t1 < 0) continue;
     const t = t0 - 1e-4;
     if (t < best) best = t < 0 ? 0 : t;
   }
   return best;
+}
+
+const CE_DIR: V3 = { x: 0, y: 0, z: 0 };
+
+/**
+ * Clamp a whole eye offset (torso + head lag + lean + gait, craft axes) so that the head sphere moving from the
+ * neutral eye along it never enters a box: off is scaled to the clearance along its direction (in place).
+ */
+export function clampEyeOffset(boxes: Float64Array, n: number, eye: V3, off: V3, r: number = HEAD_RADIUS): V3 {
+  const l = Math.sqrt(off.x * off.x + off.y * off.y + off.z * off.z);
+  if (!(l > 0)) return off;
+  CE_DIR.x = off.x / l; CE_DIR.y = off.y / l; CE_DIR.z = off.z / l;
+  const t = leanClearance(boxes, n, eye, CE_DIR, l, r);
+  if (t < l) { const s = t > 0 ? t / l : 0; off.x *= s; off.y *= s; off.z *= s; }
+  return off;
 }
 
 // ------------------------------------------------------------------------------------------------ save / load
@@ -728,10 +810,13 @@ export function loadHarnessBody(data: unknown): HarnessBody {
 }
 
 export function saveFootBody(b: FootBody): FootBody {
-  return { kx: b.kx, kv: b.kv, phase: b.phase, hx: { ...b.hx }, hv: { ...b.hv } };
+  return { kx: b.kx, kv: b.kv, phase: b.phase, hx: { ...b.hx }, hv: { ...b.hv }, lean: b.lean, leanV: b.leanV, leanT: b.leanT };
 }
 
 export function loadFootBody(data: unknown): FootBody {
   const o = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
-  return { kx: num(o.kx, 0), kv: num(o.kv, 0), phase: num(o.phase, 0), hx: v3o(o.hx), hv: v3o(o.hv) };
+  return {
+    kx: num(o.kx, 0), kv: num(o.kv, 0), phase: num(o.phase, 0), hx: v3o(o.hx), hv: v3o(o.hv),
+    lean: num(o.lean, 0), leanV: num(o.leanV, 0), leanT: num(o.leanT, 0),
+  };
 }

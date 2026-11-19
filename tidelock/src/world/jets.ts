@@ -2,43 +2,69 @@
 // blowdown pool, the main-drive spool with ignition delay and minimum-throttle hysteresis, jet damping, the
 // settled-hold wake time, the Flight Assist line-of-sight test and the applied-force ledger.
 //
-// Pure, deterministic and allocation-free on every per-step path (preallocated outputs, typed arrays). The only
-// allocating functions are the load-time builders (buildJetTable, jetsFromLayout, saveJetState/loadJetState).
+// Pure, deterministic and allocation-free on every per-step path. Per-step entry points take NO scalar double
+// arguments and return no doubles: a double passed to (or returned from) a call TurboFan does not inline is boxed
+// on the heap (measured: 124 scavenges per 8e6 calls with inlining off, 0 with the value in a typed array). The
+// per-step scalars travel in one per-craft Float64Array `inp` (makeStepIn, slots IN_*); results go into ThrustOut
+// / typed arrays. The allocating functions are the load-time builders (buildJetTable, jetsFromLayout, engineDef,
+// saveJetState/loadJetState).
 //
 // WIRING (wave 1; nothing here is called yet):
-//   * setup.ts addCraft/shipDef: `c.jets = jetsFromLayout(layout.rcs, RCS_AXIS_THRUST, RCS_VE0)` (after the 4 Z jets
-//     of the test's WREN_JETS are added to every hull in shipLayouts.ts); `c.engines = layout.engines.map(e =>
-//     engineDef(e.pos, com, 400e3, 34e3))`; `c.jetTable = buildJetTable(c.jets, com)` — rebuilt at load, never saved.
-//     `c.maxTorque` is replaced by `torqueAuthority(c.jetTable, rcsBlowdown(c.rcsPropellant), out)`; control.ts'
-//     holdTorque keeps its signature and simply receives that authority (hold gains follow it).
-//   * dynamics.ts integrateCraft, replacing the lumped `mdot`/`lx,ly,lz` block and rotateCraft's
-//     `clamp1(c.torque.x) * c.maxTorque.x` torque: per step, `cmd = [rcs.x, rcs.y, rcs.z, torque.x, torque.y,
-//     torque.z]` (already −1..1); `jetsStep(T, cmd, enabled = !landed && !docked && !destroyed, c.rcsPropellant,
-//     c.w, comX, comY, comZ, duty, out)` gives the ACTUAL craft-axes force/torque and ṁ_rcs; `engineUpdate(...)`
-//     per engine gives the exact step-mean thrust (dt first cut by `engineEventTime` like tank-empty), then
-//     `applyEngines(...)` adds their force/torque/ṁ_main/jet damping to the same `out`. qRot(out.f*) → inertial
-//     force; out.t* is the rotation torque. Each pool burns its own ṁ (rcsPropellant / propellant).
-//     `ledgerAdd(c, ...)` once per step with the step-mean proper force/torque in craft axes (drag: rk4Mean of the
-//     stage forces, rotated with qRotInv); `jetEdgeMasks(c.jetDuty, duty, edges)` → emitEvent(jetOn/jetOff);
-//     then copy `duty` into `c.jetDuty`. `consumeLedger(c, out)` in dynamics.ts = `consumeLedgerInto(c, out)`.
-//   * contact.ts hooks: `ledgerImpulse(c, J, r, m, I)` for every contact / latch capture / undock spring.
-//   * control.ts / session.ts settled hold: at settle `c.holdWakeT = t + holdWakeTimeVec(err, wRel, alphaB, db)`
-//     (replaces LOOSE_WARP / WAKE_ANGLE_LOOSE / SUSPEND_WARP); Flight Assist uses `faMainDrive` for the
-//     0.18/0.12 main-drive hysteresis; session.ts assistRef keeps a candidate only if
-//     `assistVisible(c.r, ref.r, FA_RANGE, world.bodies)` (replaces the bare distance test).
-//   * world.ts save/load (W1-A migrate): `saveJetState(c)` / `loadJetState(raw, nJets, nEngines, cap)` for the
-//     contract fields jetDuty, engineThrust, engineTimer, rcsPropellant(+Capacity), fAcc, tauAcc, accT,
-//     dvImpulse, dwImpulse, holdWakeT (+∞ is saved as null: JSON has no Infinity).
-//   * sim/ships.ts: rcsExhaustVelocity 2400 → RCS_VE0; propellant split 22.5 t LH2 + RCS_CAPACITY hydrazine.
-//   * shipLayouts.ts: the plan's nose Z jets at (±1.0, 0, −14.8) sit INSIDE the front window (w-front: centre
-//     (0, 0.35, −15.0), 3.0 × 1.2 m, i.e. x ±1.5, y −0.25..0.95) and inside the cockpit volume (z to −15.0). Move
-//     them outboard of the glass, e.g. (±2.2, −0.3, −14.6) on the cheeks; the table re-solves for any position.
+//   * setup.ts addCraft / shipDef (once per craft, at construction AND at load; nothing here is saved):
+//       c.jets    = jetsFromLayout(layout.rcs, stats.rcsThrust, stats.rcsExhaustVelocity)   // fitted RCS pack
+//       c.engines = layout.engines.map(e => engineDef(e.pos, com, stats.mainThrust / layout.engines.length,
+//                                                     stats.exhaustVelocity))              // fitted drive
+//       c.jetTable = buildJetTable(c.jets, com, { rcsCapacity: c.rcsPropellantCapacity })  // the tank follows the
+//       capacity (V_t = cap·B/((B−1)·ρ), p/p₀ = 1/(B − (B−1)·m/cap)); c.jetIn = makeStepIn() (scratch).
+//       The §1.4 field `jetTable: Float64Array` is c.jetTable.table; keep the JetTable object beside it.
+//       c.maxTorque is NOT computed here any more (no load-time snapshot: see control.ts below).
+//       If buildJetTable(...).deadCols has a torque bit (6..11), the hull cannot make that torque: log it (dev).
+//   * dynamics.ts integrateCraft, replacing the lumped mdot / lx,ly,lz block and rotateCraft's
+//     `clamp1(c.torque.x) * c.maxTorque.x`. Per step, fill the input once:
+//       inp = c.jetIn; inp[IN_H] = h; inp[IN_RCS] = c.rcsPropellant; inp[IN_WX..WZ] = c.w; inp[IN_CX..CZ] = com;
+//       inp[IN_THROTTLE] = c.throttle; inp[IN_M] = mass; inp[IN_IX..IZ] = craftInertia;
+//       engineCutStep(c.engineTimer, n, inp)   // cuts inp[IN_H] at an ignition-delay end (like tank-empty)
+//       cmd[0..2] = c.rcs; cmd[3..5] = the torque command (see control.ts below)
+//       jetsStep(T, cmd, !landed && !docked && !destroyed, inp, duty, o)   // clears o, writes ACTUAL F/τ/ṁ_rcs
+//       for each engine i: engineUpdate(c.engines[i], c.engineThrust, c.engineTimer, i,
+//                                       c.propellant > 0 && !docked && !destroyed, inp, mean)
+//       applyEngines(c.engines, mean, inp, o)   // adds main F/τ/ṁ_main and jet damping
+//     qRot(o.f*) → inertial force; o.t* is the rotation torque. c.rcsPropellant −= o.mdotRcs·h; c.propellant −=
+//     o.mdotMain·h. Powered (Q steps, no coasting warp) iff o.mdotRcs > 0 || engineActive(thrust, timer, n): the
+//     shut-down spool tail ends at F_s = 0 EXACTLY, at t = τ_down·ln(F_s/ε), ε = 1e-6·F_max (no denormal tail).
+//     Ledger, once per step: add the drag step mean (rk4MeanV of the stage forces, rotated to craft axes) into
+//     o.f*, then ledgerAdd(c, o, inp); jetEdgeMasks(c.jetDuty, duty, n, edges) → emitEvent(jetOn/jetOff); copy
+//     duty into c.jetDuty. consumeLedger(c, out) = consumeLedgerInto(c, out). airStep(c.air, rel, relV, ωBody).
+//   * control.ts holdTorque keeps its signature but is fed FRESH authority every 60 Hz control tick:
+//       torqueAuthority(T, inp, c.maxTorque)  // the current pool's pressure; never a load-time snapshot
+//     and its `alpha = Math.min(ax, ay, az)` becomes `holdAlpha(maxTorque, inertia, S); alpha = S[0]` (min over the axes
+//     that HAVE authority: one dead axis must not freeze the other two). Its −1..1 output is normalised by the
+//     smaller of ±; convert it for the jets with holdCmdToJets(T, tq, cmd) (scales to each signed column, so the
+//     stronger direction does not over-deliver). Stick input goes straight to cmd[3..5].
+//   * session.ts Flight Assist: a_rcs per axis = forceAuthority(T, inp, fa).x / m (not c.rcsThrust / m: the Wren's
+//     pure Fy is 46 kN, not 68); faMainDrive for the 0.18/0.12 main-drive hysteresis; assistRef keeps a candidate
+//     only if assistVisible(c.r, ref.r, FA_RANGE, world.bodies). Settled hold: at settle
+//     c.holdWakeT = t + holdWakeTimeVec(err, wRel, alphaB, db) (replaces LOOSE_WARP / WAKE_ANGLE_LOOSE /
+//     SUSPEND_WARP).
+//   * contact.ts hooks: ledgerImpulse(c, J, r, inp) for every contact / latch capture / undock spring. LANDED, the
+//     jets are off but the engines run (they fire against the ground; W2-C pushes through the contact): in the
+//     landed branch call engineUpdate/applyEngines with inp[IN_H] = dt, then aUp = (o.f · up)/m, burn =
+//     o.mdotMain·dt and c.load from o instead of c.mainThrust·throttle. Otherwise lift-off would wait for a
+//     0.5 s ignition delay that only starts after lift-off and the craft would fall back.
+//   * world.ts save/load (W1-A migrate): saveJetState(c) / loadJetState(raw, nJets, nEngines, c's capacity).
+//   * sim/ships.ts: the Tern's rcsExhaustVelocity 2400 → RCS_VE0; the Wren's 24 t splits 22.5 t LH2 + 1.5 t N2H4.
+//   * shipLayouts.ts (checked against HULL_COLLIDERS in tests/jets.test.ts: on the skin, 15° plume cone clear for
+//     6 m): Wren Z jets at (±2.8, −0.1, −14.45) exhaust −Z (the plan's (±1.0, 0, −14.8) is inside the windscreen)
+//     and (±7.2, −0.6, 11.0) exhaust +Z (the plan's (±6.0, −0.2, 13.0) plume hits the pod stern). Albatross:
+//     +Y at (±14.5, 0.34, 9.775) and −Y at (±14.5, −0.26, 9.775) on the wing tips (today it has NO roll authority).
+//     The other five hulls still need their ±Z jets (deadCols ±Fz today). Existing plumes that touch the hull: the
+//     Wren's tail X jets (6.0, −0.2, 11) into wing-trail, the Magpie's (3.7, −0.3, 6.8) (the test prints them).
+//   * world/math.ts: take expPair (in-place typed-slot exp/expm1) as the §1.1.6 wrapper for this file.
 //
 // Conventions: SI; craft axes (forward −Z, up +Y, right +X); JetDef.dir and EngineDef.dir are EXHAUST
 // directions (the force on the ship is −dir); `com` is the centre of mass in craft axes (origin today).
 
 import type { Quat, V3 } from '../core/types';
-import { qRotInv } from './math';
 
 // =============================================================================================== constants
 
@@ -48,13 +74,12 @@ export const Q = 1 / 120;
 export const N_AXES = 6;
 export const N_COLS = 12;
 
-/** RCS thrust per translation axis, N (shared out equally among the jets with that exhaust direction). */
+/** The Wren's RCS thrust per translation axis, N (shared out equally among the jets with that exhaust direction). */
 export const RCS_AXIS_THRUST = 68e3;
-/** Hydrazine monopropellant: exhaust velocity at full tank pressure (Isp 229 s), density, pool, tank. */
+/** Hydrazine monopropellant: exhaust velocity at full tank pressure (Isp 229 s), density, the Wren's pool. */
 export const RCS_VE0 = 2250;
 export const RCS_DENSITY = 1004;
 export const RCS_CAPACITY = 1500;
-export const RCS_TANK_VOLUME = 2.24;
 /** Blowdown ratio B = p(full)/p(empty) = V_t / V_u0. */
 export const RCS_BLOWDOWN = 3;
 
@@ -70,14 +95,26 @@ export const ENGINE_MIN_THROTTLE = 0.15;
 export const ENGINE_OFF_THROTTLE = 0.10;
 /** engineTimer value of an engine that is not lit. */
 export const ENGINE_UNLIT = -1;
+/** The shut-down tail ends (F_s = 0 exactly) when the decaying thrust reaches this fraction of F_max. */
+export const ENGINE_TAIL_EPS = 1e-6;
 
 /** Flight Assist uses the main drive above this fraction of a_main and releases it below the second. */
 export const FA_MAIN_ON = 0.18;
 export const FA_MAIN_OFF = 0.12;
 
-// Transcendental wrappers (SIMULATION §1.1.6): move into world/math.ts when wave 1 wires this file.
-const exp = (x: number): number => Math.exp(x);
-const expm1 = (x: number): number => Math.expm1(x);
+/** Slots of the per-step input array (makeStepIn). IN_P is written by the functions here (tank p/p₀). */
+export const IN_H = 0, IN_RCS = 1, IN_WX = 2, IN_WY = 3, IN_WZ = 4, IN_CX = 5, IN_CY = 6, IN_CZ = 7;
+export const IN_THROTTLE = 8, IN_M = 9, IN_IX = 10, IN_IY = 11, IN_IZ = 12, IN_P = 13, IN_LEN = 14;
+
+// Transcendental wrapper (SIMULATION §1.1.6; move into world/math.ts when wave 1 wires this file, where an fdlibm
+// port can replace the body). It works IN PLACE on a typed slot: io[k] ← e^x, io[k+1] ← e^x − 1 with x = io[k]. A
+// wrapper taking and returning doubles is boxed whenever TurboFan's inlining budget runs out at one of its call
+// sites (measured: exp/expm1 inlined at only 1 of 4 sites in the bundled step loop, 45 scavenges per 8e6 spool steps).
+function expPair(io: Float64Array, k: number): void {
+  const x = io[k];
+  io[k] = Math.exp(x);
+  io[k + 1] = Math.expm1(x);
+}
 
 // =============================================================================================== types
 
@@ -101,7 +138,7 @@ export interface EngineDef {
   minThrottle: number;
 }
 
-/** The at-load jet data: packed geometry and the 12-column allocation table. Rebuilt at load, never saved. */
+/** The at-load jet data: packed geometry, the 12-column allocation table and the tank. Rebuilt at load, never saved. */
 export interface JetTable {
   n: number;
   /** Per jet, stride GEO: r (3), unit force direction −d (3), thrust F₀, 1/vₑ₀. */
@@ -112,8 +149,14 @@ export interface JetTable {
   authority: Float64Array;
   /** Per column, ṁ (kg/s at p = p₀) at the full command: the propellant price of that axis. */
   cost: Float64Array;
+  /** Bit k set: column k has zero authority (no jet combination makes that signed axis purely). */
+  deadCols: number;
   /** The CoM the table was built at (craft axes). */
   com: V3;
+  /** The RCS tank: capacity (kg) and blowdown ratio B; volume V_t = cap·B/((B−1)·ρ) (m³, for display). */
+  rcsCapacity: number;
+  blowdown: number;
+  tankVolume: number;
 }
 
 /** What a set of jets and engines actually applied over a step (craft axes). */
@@ -148,7 +191,17 @@ export interface LedgerMean {
   T: number;
 }
 
+/** Per forced step: air-relative velocity (inertial) and stagnation heat flux. The caller writes `rho` first. */
+export interface AirOut {
+  airVel: V3;
+  heatFlux: number;
+  /** Input: local air density, kg/m³. */
+  rho: number;
+}
+
 const GEO = 8;
+
+export const makeStepIn = (): Float64Array => { const a = new Float64Array(IN_LEN); a[IN_P] = 1; return a; };
 
 export function makeThrustOut(): ThrustOut {
   return { fx: 0, fy: 0, fz: 0, tx: 0, ty: 0, tz: 0, dx: 0, dy: 0, dz: 0, mdotRcs: 0, mdotMain: 0, pRatio: 1 };
@@ -166,9 +219,9 @@ export function clearThrustOut(o: ThrustOut): ThrustOut {
 const sgn = (x: number): number => (x > 1e-9 ? 1 : x < -1e-9 ? -1 : 0);
 
 /**
- * JetDefs from a layout's `rcs` list ({pos, dir}, dir = exhaust). Each translation axis gets `axisThrust` in each
- * sense, shared equally among the jets with the same exhaust direction (Wren: 34 kN per X and Z jet, 22.7 kN per
- * Y jet). Load time only.
+ * JetDefs from a layout's `rcs` list ({pos, dir}, dir = exhaust). Each translation axis gets `axisThrust` (the
+ * fitted pack's stats.rcsThrust) in each sense, shared equally among the jets with the same exhaust direction
+ * (Wren: 34 kN per X and Z jet, 22.7 kN per Y jet). `ve` is the pack's exhaust velocity. Load time only.
  */
 export function jetsFromLayout(rcs: readonly { pos: V3; dir: V3 }[], axisThrust = RCS_AXIS_THRUST, ve = RCS_VE0): JetDef[] {
   const key = (d: V3): string => `${sgn(d.x)},${sgn(d.y)},${sgn(d.z)}`;
@@ -187,7 +240,8 @@ export function jetsFromLayout(rcs: readonly { pos: V3; dir: V3 }[], axisThrust 
 
 /**
  * An engine whose exhaust is canted in pitch so its thrust line passes through `com` (the Wren's pods sit 0.2 m
- * below the CoM: a 0.73° cant). Yaw offsets cancel by the pair's symmetry and are not canted.
+ * below the CoM: a 0.73° cant). Yaw offsets cancel by the pair's symmetry and are not canted. `maxThrust` is this
+ * nozzle's share of the fitted drive (stats.mainThrust / engines), `ve` the drive's stats.exhaustVelocity.
  */
 export function engineDef(pos: V3, com: V3, maxThrust = ENGINE_THRUST, ve = ENGINE_VE): EngineDef {
   const dy = pos.y - com.y, dz = pos.z - com.z;
@@ -257,7 +311,7 @@ function iterate(L: Lp, allowed: Uint8Array): boolean {
 
 /**
  * min cᵀx subject to A x = b, x ≥ 0 (A is m × n row-major). Writes x; returns the optimal cost, or −1 when the
- * problem is infeasible. Two-phase dense tableau, Bland's rule, redundant rows tolerated.
+ * problem is infeasible. Two-phase dense tableau, Bland's rule, redundant rows tolerated. Load time only.
  */
 export function lpMinimize(m: number, n: number, A: ArrayLike<number>, b: ArrayLike<number>, c: ArrayLike<number>, allowed: Uint8Array, x: Float64Array): number {
   const L = makeLp(m, n);
@@ -301,13 +355,30 @@ export function lpMinimize(m: number, n: number, A: ArrayLike<number>, b: ArrayL
   return cost;
 }
 
+export interface JetTableOptions {
+  /** RCS pool capacity, kg (the craft's rcsPropellantCapacity): sizes the blowdown tank. */
+  rcsCapacity?: number;
+  /** Blowdown ratio B. */
+  blowdown?: number;
+  /** Propellant density, kg/m³ (only for the reported tank volume). */
+  density?: number;
+  /** Per jet thrust factor (wave 2's jetHealth); ≤ 0 removes the jet. */
+  thrustScale?: ArrayLike<number>;
+}
+
+/** Tank volume of a blowdown pool whose `capacity` fills it to the design ullage V_u0 = V_t/B. */
+export const rcsTankVolume = (capacity = RCS_CAPACITY, density = RCS_DENSITY, B = RCS_BLOWDOWN): number =>
+  (capacity * B) / ((B - 1) * density);
+
 /**
  * Build the jet table: for each of the 12 signed axes, the minimum-propellant duties that give a pure command
  * along that axis (all other force and torque components exactly zero), scaled so the column's largest duty is
- * 1. An axis no combination can produce purely gets a zero column and zero authority. `thrustScale` (optional,
- * per jet, e.g. wave 2's jetHealth) scales each jet; ≤ 0 removes it. Load time; deterministic.
+ * 1. An axis no combination can produce purely gets a zero column, zero authority and its bit in `deadCols`.
+ * Load time; deterministic.
  */
-export function buildJetTable(jets: readonly JetDef[], com: V3, thrustScale?: ArrayLike<number>): JetTable {
+export function buildJetTable(jets: readonly JetDef[], com: V3, opts: JetTableOptions = {}): JetTable {
+  const thrustScale = opts.thrustScale;
+  const rcsCapacity = opts.rcsCapacity ?? RCS_CAPACITY, blowdown = opts.blowdown ?? RCS_BLOWDOWN;
   const n = jets.length;
   const geo = new Float64Array(n * GEO);
   const A = new Float64Array(N_AXES * n); // physical: N and N·m per unit duty
@@ -349,10 +420,12 @@ export function buildJetTable(jets: readonly JetDef[], com: V3, thrustScale?: Ar
   const colCost = new Float64Array(N_COLS);
   const b = new Float64Array(N_AXES);
   const x = new Float64Array(n);
+  let deadCols = 0;
   for (let k = 0; k < N_COLS; k++) {
     const axis = k >> 1, sign = k & 1 ? -1 : 1;
     b.fill(0);
     b[axis] = sign;
+    deadCols |= 1 << k;
     if (fMax === 0 || lpMinimize(N_AXES, n, An, b, cn, allowed, x) < 0) continue;
     let um = 0;
     for (let j = 0; j < n; j++) if (x[j] > um) um = x[j];
@@ -367,35 +440,97 @@ export function buildJetTable(jets: readonly JetDef[], com: V3, thrustScale?: Ar
     }
     authority[k] = Math.abs(mag);
     colCost[k] = cc;
+    if (authority[k] > 0) deadCols &= ~(1 << k);
   }
-  return { n, geo, table, authority, cost: colCost, com: { x: com.x, y: com.y, z: com.z } };
+  return {
+    n, geo, table, authority, cost: colCost, deadCols, com: { x: com.x, y: com.y, z: com.z },
+    rcsCapacity, blowdown, tankVolume: rcsTankVolume(rcsCapacity, opts.density ?? RCS_DENSITY, blowdown),
+  };
 }
 
-/** The torque authority per axis (the smaller of ±), N·m, at the tank pressure ratio `pRatio`. Replaces maxTorque. */
-export function torqueAuthority(T: JetTable, pRatio: number, out: V3): V3 {
-  const a = T.authority;
-  out.x = Math.min(a[6], a[7]) * pRatio;
-  out.y = Math.min(a[8], a[9]) * pRatio;
-  out.z = Math.min(a[10], a[11]) * pRatio;
+// =============================================================================================== the blowdown pool
+
+/**
+ * Tank pressure ratio p/p₀ of an isothermal blowdown pool holding `m` kg of a `capacity` kg pool:
+ * p₀·V_u0/V_u with V_u = V_t − m/ρ and V_t = cap·B/((B−1)·ρ), i.e. p/p₀ = 1/(B − (B−1)·m/cap) (ρ cancels).
+ * m is clamped to [0, cap]: exactly 1 when full, exactly 1/B when empty, never above 1. For UI / tests; the
+ * per-step paths use the same formula through inp (no double return).
+ */
+export function rcsBlowdown(m: number, capacity = RCS_CAPACITY, B = RCS_BLOWDOWN): number {
+  if (!(capacity > 0)) return 1 / B;
+  const x = m >= capacity ? 1 : m > 0 ? m / capacity : 0;
+  return 1 / (B - (B - 1) * x);
+}
+
+/** inp[IN_P] = p/p₀ of the table's tank at inp[IN_RCS] kg (the formula of rcsBlowdown). */
+export function setPressure(T: JetTable, inp: Float64Array): void {
+  const m = inp[IN_RCS], cap = T.rcsCapacity, B = T.blowdown;
+  const x = !(cap > 0) ? 0 : m >= cap ? 1 : m > 0 ? m / cap : 0;
+  inp[IN_P] = 1 / (B - (B - 1) * x);
+}
+
+/** Exhaust-velocity factor at pressure ratio p/p₀: 0.97 + 0.03·p/p₀. */
+export const rcsVeFactor = (pRatio: number): number => 0.97 + 0.03 * pRatio;
+
+// =============================================================================================== authority
+
+/** The torque authority per axis (the smaller of ±), N·m, at the CURRENT pool inp[IN_RCS]. Feed holdTorque with it. */
+export function torqueAuthority(T: JetTable, inp: Float64Array, out: V3): V3 {
+  setPressure(T, inp);
+  const a = T.authority, p = inp[IN_P];
+  out.x = (a[6] < a[7] ? a[6] : a[7]) * p;
+  out.y = (a[8] < a[9] ? a[8] : a[9]) * p;
+  out.z = (a[10] < a[11] ? a[10] : a[11]) * p;
   return out;
 }
 
-/** The force authority per axis (the smaller of ±), N, at `pRatio`. */
-export function forceAuthority(T: JetTable, pRatio: number, out: V3): V3 {
-  const a = T.authority;
-  out.x = Math.min(a[0], a[1]) * pRatio;
-  out.y = Math.min(a[2], a[3]) * pRatio;
-  out.z = Math.min(a[4], a[5]) * pRatio;
+/** The force authority per axis (the smaller of ±), N, at the current pool. Flight Assist's a_rcs = this / m. */
+export function forceAuthority(T: JetTable, inp: Float64Array, out: V3): V3 {
+  setPressure(T, inp);
+  const a = T.authority, p = inp[IN_P];
+  out.x = (a[0] < a[1] ? a[0] : a[1]) * p;
+  out.y = (a[2] < a[3] ? a[2] : a[3]) * p;
+  out.z = (a[4] < a[5] ? a[4] : a[5]) * p;
   return out;
 }
 
-/** Torque in N·m → the normalised command (−1..1, before clamping) on the signed columns' own authorities. */
-export function torqueToCmd(T: JetTable, pRatio: number, tx: number, ty: number, tz: number, cmd: Float64Array): Float64Array {
+/**
+ * The hold's braking acceleration bound, written to out[0]: min over the axes WITH authority of authority/I
+ * (rad/s²); 0 if none.
+ * Replaces holdTorque's `Math.min(ax, ay, az)`, which a single dead axis (Albatross roll today) drives to 0 and so
+ * freezes the whole hold.
+ */
+export function holdAlpha(authority: V3, inertia: V3, out: Float64Array): void {
+  let a = Infinity;
+  if (authority.x > 0 && inertia.x > 0) { const v = authority.x / inertia.x; if (v < a) a = v; }
+  if (authority.y > 0 && inertia.y > 0) { const v = authority.y / inertia.y; if (v < a) a = v; }
+  if (authority.z > 0 && inertia.z > 0) { const v = authority.z / inertia.z; if (v < a) a = v; }
+  out[0] = a === Infinity ? 0 : a; // written, not returned: a returned double is boxed when the call is not inlined
+}
+
+/**
+ * holdTorque's −1..1 output (normalised by torqueAuthority, the smaller of ±) → jet torque commands cmd[3..5] on the
+ * signed columns: cmd = hold·min(a₊, a₋)/a_±, so the applied torque is exactly hold·authority whichever the sign.
+ */
+export function holdCmdToJets(T: JetTable, hold: V3, cmd: Float64Array): Float64Array {
   const a = T.authority;
-  const ax = a[tx < 0 ? 7 : 6] * pRatio, ay = a[ty < 0 ? 9 : 8] * pRatio, az = a[tz < 0 ? 11 : 10] * pRatio;
-  cmd[3] = ax > 0 ? tx / ax : 0;
-  cmd[4] = ay > 0 ? ty / ay : 0;
-  cmd[5] = az > 0 ? tz / az : 0;
+  for (let ax = 0; ax < 3; ax++) {
+    const h = ax === 0 ? hold.x : ax === 1 ? hold.y : hold.z;
+    const ap = a[6 + 2 * ax], an = a[7 + 2 * ax], mn = ap < an ? ap : an;
+    const as = h < 0 ? an : ap;
+    cmd[3 + ax] = as > 0 ? (h * mn) / as : 0;
+  }
+  return cmd;
+}
+
+/** A torque in N·m → the jet torque commands cmd[3..5] (before clamping) at the current pool. */
+export function torqueToCmd(T: JetTable, inp: Float64Array, tau: V3, cmd: Float64Array): Float64Array {
+  setPressure(T, inp);
+  const a = T.authority, p = inp[IN_P];
+  const ax = a[tau.x < 0 ? 7 : 6] * p, ay = a[tau.y < 0 ? 9 : 8] * p, az = a[tau.z < 0 ? 11 : 10] * p;
+  cmd[3] = ax > 0 ? tau.x / ax : 0;
+  cmd[4] = ay > 0 ? tau.y / ay : 0;
+  cmd[5] = az > 0 ? tau.z / az : 0;
   return cmd;
 }
 
@@ -405,8 +540,7 @@ export function torqueToCmd(T: JetTable, pRatio: number, tx: number, ty: number,
  * Duties for a 6-axis command (each −1..1, clamped): duty = Σ_k |cmd_k|·table[k±]. Saturation: when a duty would
  * exceed 1 the whole duty vector is scaled down by its largest duty (not clipped per jet), so the applied force and
  * torque keep the commanded DIRECTION and only lose magnitude. Per-jet clipping (the plan's first wording) turns a
- * saturated three-axis torque command into 11.3 kN of spurious translation (24% of the smallest force authority;
- * measured in tests/jets.test.ts), which would fail the plan's own "pure torque → |F| ≤ 1%" test and shove the crew and props.
+ * saturated three-axis torque command into 11.3 kN of spurious translation (measured in tests/jets.test.ts).
  */
 export function allocateJets(T: JetTable, cmd: ArrayLike<number>, duty: Float64Array): Float64Array {
   const n = T.n, tab = T.table;
@@ -425,19 +559,9 @@ export function allocateJets(T: JetTable, cmd: ArrayLike<number>, duty: Float64A
   return duty;
 }
 
-/** Tank pressure ratio p/p₀ of an isothermal blowdown pool holding `m` kg: p₀·V_u0/V_u, V_u = V_t − m/ρ. */
-export function rcsBlowdown(m: number, volume = RCS_TANK_VOLUME, density = RCS_DENSITY, ratio = RCS_BLOWDOWN): number {
-  const vu0 = volume / ratio;
-  let vu = volume - (m > 0 ? m : 0) / density;
-  if (vu < vu0 * 1e-3) vu = vu0 * 1e-3;
-  return vu0 / vu;
-}
-
-/** Exhaust-velocity factor at pressure ratio p/p₀: 0.97 + 0.03·p/p₀. */
-export const rcsVeFactor = (pRatio: number): number => 0.97 + 0.03 * pRatio;
-
 /**
  * Jet damping torque of one exhaust stream: −ṁ·(|ρ|²ω − (ρ·ω)ρ) = −ṁ|ρ|²ω⊥, ρ = r − com. Added into o.t* and o.d*.
+ * Reference form for tests; the per-step loops below inline the same expression.
  */
 export function addJetDamping(o: ThrustOut, mdot: number, rx: number, ry: number, rz: number, wx: number, wy: number, wz: number): void {
   if (mdot === 0) return;
@@ -448,13 +572,14 @@ export function addJetDamping(o: ThrustOut, mdot: number, rx: number, ry: number
 }
 
 /**
- * The force, torque (about `com`) and ṁ the jets actually apply at duties `duty` and pressure ratio `pRatio`
- * (F = F₀·p/p₀, vₑ = vₑ₀·(0.97 + 0.03·p/p₀)), plus jet damping at body rate w. ADDS into `o` (clear it first).
+ * The force, torque (about com = inp[IN_C*]) and ṁ the jets actually apply at duties `duty` and the pressure ratio
+ * inp[IN_P] (F = F₀·p/p₀, vₑ = vₑ₀·(0.97 + 0.03·p/p₀)), plus jet damping at body rate inp[IN_W*]. ADDS into `o`.
  */
-export function applyJets(T: JetTable, duty: Float64Array, pRatio: number, wx: number, wy: number, wz: number, cx: number, cy: number, cz: number, o: ThrustOut): ThrustOut {
+export function applyJets(T: JetTable, duty: Float64Array, inp: Float64Array, o: ThrustOut): ThrustOut {
   const n = T.n, g = T.geo;
-  const fScale = pRatio, mScale = pRatio / rcsVeFactor(pRatio);
-  let fx = 0, fy = 0, fz = 0, tx = 0, ty = 0, tz = 0, md = 0;
+  const p = inp[IN_P], mScale = p / (0.97 + 0.03 * p);
+  const wx = inp[IN_WX], wy = inp[IN_WY], wz = inp[IN_WZ], cx = inp[IN_CX], cy = inp[IN_CY], cz = inp[IN_CZ];
+  let fx = 0, fy = 0, fz = 0, tx = 0, ty = 0, tz = 0, md = 0, dx = 0, dy = 0, dz = 0;
   for (let j = 0; j < n; j++) {
     const u = duty[j];
     if (u === 0) continue;
@@ -466,27 +591,31 @@ export function applyJets(T: JetTable, duty: Float64Array, pRatio: number, wx: n
     tx += ry * az - rz * ay; ty += rz * ax - rx * az; tz += rx * ay - ry * ax;
     const mj = F * g[q + 7] * mScale;
     md += mj;
-    if (wx !== 0 || wy !== 0 || wz !== 0) addJetDamping(o, mj, rx, ry, rz, wx, wy, wz);
+    // jet damping −ṁ(|ρ|²ω − (ρ·ω)ρ)
+    const r2 = rx * rx + ry * ry + rz * rz, rw = rx * wx + ry * wy + rz * wz;
+    dx -= mj * (r2 * wx - rw * rx); dy -= mj * (r2 * wy - rw * ry); dz -= mj * (r2 * wz - rw * rz);
   }
-  o.fx += fx * fScale; o.fy += fy * fScale; o.fz += fz * fScale;
-  o.tx += tx * fScale; o.ty += ty * fScale; o.tz += tz * fScale;
+  o.fx += fx * p; o.fy += fy * p; o.fz += fz * p;
+  o.tx += tx * p + dx; o.ty += ty * p + dy; o.tz += tz * p + dz;
+  o.dx += dx; o.dy += dy; o.dz += dz;
   o.mdotRcs += md;
-  o.pRatio = pRatio;
+  o.pRatio = p;
   return o;
 }
 
 /**
- * One RCS step: allocate `cmd`, then compute what the jets actually do. Not `enabled` (landed, docked, destroyed)
- * or a dry pool → all duties 0 and nothing applied. Clears `o` first; ṁ_rcs is o.mdotRcs.
+ * One RCS step: tank pressure from inp[IN_RCS], allocate `cmd`, then what the jets actually do. Not `enabled`
+ * (landed, docked, destroyed) or a dry pool → all duties 0 and nothing applied. Clears `o` first.
  */
-export function jetsStep(T: JetTable, cmd: ArrayLike<number>, enabled: boolean, rcsPropellant: number, wx: number, wy: number, wz: number, cx: number, cy: number, cz: number, duty: Float64Array, o: ThrustOut): ThrustOut {
+export function jetsStep(T: JetTable, cmd: ArrayLike<number>, enabled: boolean, inp: Float64Array, duty: Float64Array, o: ThrustOut): ThrustOut {
   clearThrustOut(o);
-  if (!enabled || !(rcsPropellant > 0)) {
+  if (!enabled || !(inp[IN_RCS] > 0)) {
     for (let j = 0; j < T.n; j++) duty[j] = 0;
     return o;
   }
+  setPressure(T, inp);
   allocateJets(T, cmd, duty);
-  return applyJets(T, duty, rcsBlowdown(rcsPropellant), wx, wy, wz, cx, cy, cz, o);
+  return applyJets(T, duty, inp, o);
 }
 
 /** Edges between the last applied duties and the new ones, as bit masks over jets (≤ 31 jets). */
@@ -515,68 +644,88 @@ export function engineCommandThrust(d: EngineDef, lit: boolean, cmd: number): nu
   return c * d.maxThrust;
 }
 
-/** spool() results: [0] the step mean, [1] the end state (typed slots: returned or module-level doubles box). */
-const SM = new Float64Array(2);
-/** Exact first-order spool from F over h toward Fc (τ_up rising, τ_down falling; it never crosses Fc). */
-function spool(F: number, Fc: number, h: number, tauUp: number, tauDown: number): void {
-  if (h <= 0 || F === Fc) { SM[0] = F; SM[1] = F; return; }
-  const tau = Fc > F ? tauUp : tauDown;
+// spool() works in typed slots (no double arguments or returns): in SP_F, SP_FC, SP_H, SP_TU, SP_TD, SP_EPS; out
+// SP_MEAN, SP_END; SP_X(+1) is expPair's scratch.
+const SP = new Float64Array(12);
+const SP_F = 0, SP_FC = 1, SP_H = 2, SP_TU = 3, SP_TD = 4, SP_EPS = 5, SP_MEAN = 6, SP_END = 7, SP_X = 8, SP_T = 10, SP_H0 = 11;
+/**
+ * Exact first-order spool from F over h toward Fc (τ_up rising, τ_down falling; it never crosses Fc). Toward 0 the
+ * tail ends at F = 0 exactly when it reaches ε, at t_off = τ·ln(F/ε) (∫₀^t_off F e^(−t/τ) dt = τ(F − ε)): an
+ * exponential never reaches 0 in floating point and sticks at a denormal (9e-323 · e^(−Q/τ) rounds back to itself).
+ */
+function spool(): void {
+  const F = SP[SP_F], Fc = SP[SP_FC], h = SP[SP_H];
+  if (h <= 0 || F === Fc) { SP[SP_MEAN] = F; SP[SP_END] = F; return; }
+  const tau = Fc > F ? SP[SP_TU] : SP[SP_TD];
   const x = -h / tau;
-  const e = exp(x), om = -expm1(x); // e = e^(−h/τ), om = 1 − e (accurate for small h/τ)
-  const d = F - Fc;
-  SM[0] = Fc + d * (om / -x); // F̄ = F_c + (F − F_c)·(τ/h)(1 − e^(−h/τ))
-  SM[1] = Fc + d * e;
-}
-
-/**
- * Advance engine i through h with throttle command `cmd` (latched for the tick) and a non-empty pool `fuel`.
- * State: thrust[i] = F_s (N); timer[i] = ENGINE_UNLIT (−1) when unlit, the ignition delay still to run (> 0), or
- * 0 when burning. Exact at any h (an ignition delay ending inside the step splits it). Writes the exact step-mean
- * thrust F̄ (N) to mean[i]: force −F̄·dir, ṁ = F̄/vₑ. A dry pool is a flame-out: F_s = 0, unlit.
- * (Writes instead of returning: a returned double is a heap allocation when the call is not inlined.)
- */
-export function engineUpdate(d: EngineDef, thrust: number[], timer: number[], i: number, cmd: number, h: number, fuel: boolean, mean: { [k: number]: number }): void {
-  let t = timer[i];
-  if (!fuel) { thrust[i] = 0; timer[i] = ENGINE_UNLIT; mean[i] = 0; return; }
-  const wasLit = t >= 0;
-  const lit = engineLatch(wasLit, cmd, d.minThrottle);
-  if (!lit) t = ENGINE_UNLIT;
-  else if (!wasLit) t = d.delay;
-  const Fc = engineCommandThrust(d, lit, cmd);
-  const F0 = thrust[i];
-  if (t > 0) {
-    if (h < t && t - h > 1e-12) {
-      spool(F0, 0, h, d.tauUp, d.tauDown);
-      mean[i] = SM[0];
-      t -= h;
-    } else {
-      const h1 = t < h ? t : h, h2 = h - h1;
-      spool(F0, 0, h1, d.tauUp, d.tauDown);
-      const m1 = SM[0];
-      spool(SM[1], Fc, h2, d.tauUp, d.tauDown);
-      mean[i] = h > 0 ? (m1 * h1 + SM[0] * h2) / h : SM[1];
-      t = 0;
-    }
-  } else {
-    spool(F0, Fc, h, d.tauUp, d.tauDown);
-    mean[i] = SM[0];
+  SP[SP_X] = x; expPair(SP, SP_X);
+  const e = SP[SP_X], om = -SP[SP_X + 1]; // e = e^(−h/τ), om = 1 − e (accurate for small h/τ)
+  if (Fc === 0) {
+    // the tail ends inside this step iff F·e^(−h/τ) ≤ ε, i.e. h ≥ t_off = τ·ln(F/ε) (no log needed)
+    const eps = SP[SP_EPS];
+    if (F <= eps) { SP[SP_MEAN] = 0; SP[SP_END] = 0; return; }
+    if (F * e <= eps) { SP[SP_MEAN] = (tau * (F - eps)) / h; SP[SP_END] = 0; return; }
   }
-  thrust[i] = SM[1];
-  timer[i] = t;
-}
-
-/** The step-cutting helper: the time until the first ignition delay ends, if it ends inside h; else h. */
-export function engineEventTime(timer: ArrayLike<number>, n: number, h: number): number {
-  let dt = h;
-  for (let i = 0; i < n; i++) { const t = timer[i]; if (t > 0 && t < dt) dt = t; }
-  return dt;
+  const d = F - Fc;
+  SP[SP_MEAN] = Fc + d * (om / -x); // F̄ = F_c + (F − F_c)·(τ/h)(1 − e^(−h/τ))
+  SP[SP_END] = Fc + d * e;
 }
 
 /**
- * Add the engines' step-mean thrusts `mean[i]` (from engineUpdate) to `o`: force −F̄·dir, torque about com,
- * ṁ_main = ΣF̄/vₑ, jet damping at rate w.
+ * Advance engine i through h = inp[IN_H] with the throttle command inp[IN_THROTTLE] (latched for the tick).
+ * `enabled` = the main pool is not empty and the craft is not docked or destroyed (landed engines DO run).
+ * State: thrust[i] = F_s (N); timer[i] = ENGINE_UNLIT (−1) when unlit, the ignition delay still to run (> 0), or
+ * 0 when burning. Exact at any h (an ignition delay ending inside the step splits it; the shut-down tail ends
+ * exactly). Writes the exact step-mean thrust F̄ (N) to mean[i]: force −F̄·dir, ṁ = F̄/vₑ. Not enabled: F_s = 0, unlit.
  */
-export function applyEngines(defs: readonly EngineDef[], mean: ArrayLike<number>, wx: number, wy: number, wz: number, cx: number, cy: number, cz: number, o: ThrustOut): ThrustOut {
+export function engineUpdate(d: EngineDef, thrust: { [k: number]: number }, timer: { [k: number]: number }, i: number, enabled: boolean, inp: Float64Array, mean: { [k: number]: number }): void {
+  if (!enabled) { thrust[i] = 0; timer[i] = ENGINE_UNLIT; mean[i] = 0; return; }
+  // The timer and the delay segment live in typed slots, not in locals: a local that is 0 or −1 (Smi) on one path
+  // and a double on another became a boxed phi in the bundled loop (measured: ~3 HeapNumbers per ignition-delay step).
+  const h = inp[IN_H], cmd = inp[IN_THROTTLE], mt = d.minThrottle;
+  SP[SP_T] = timer[i];
+  const wasLit = SP[SP_T] >= 0;
+  // engineLatch and engineCommandThrust, inlined (no double arguments on the per-step path)
+  const lit = wasLit ? cmd >= ENGINE_OFF_THROTTLE : cmd >= mt;
+  if (!lit) SP[SP_T] = ENGINE_UNLIT;
+  else if (!wasLit) SP[SP_T] = d.delay;
+  const Fc = lit ? (cmd > 1 ? 1 : cmd < mt ? mt : cmd) * d.maxThrust : 0;
+  SP[SP_TU] = d.tauUp; SP[SP_TD] = d.tauDown; SP[SP_EPS] = ENGINE_TAIL_EPS * d.maxThrust;
+  // Segment 0: the part of the ignition delay inside this step (target 0); segment 1: the rest (target Fc). Both
+  // spool() calls run on EVERY update (a zero-length segment returns at once), so both call sites stay hot.
+  SP[SP_H0] = 0;
+  const t = SP[SP_T];
+  if (t > 0) {
+    if (h < t && t - h > 1e-12) { SP[SP_H0] = h; SP[SP_T] = t - h; } else { SP[SP_H0] = t < h ? t : h; SP[SP_T] = 0; }
+  }
+  const h0 = SP[SP_H0], h1 = h - h0;
+  SP[SP_F] = thrust[i]; SP[SP_FC] = 0; SP[SP_H] = h0; spool();
+  const m0 = SP[SP_MEAN];
+  SP[SP_F] = SP[SP_END]; SP[SP_FC] = Fc; SP[SP_H] = h1; spool();
+  mean[i] = h0 === 0 ? SP[SP_MEAN] : h1 === 0 ? m0 : (m0 * h0 + SP[SP_MEAN] * h1) / h;
+  thrust[i] = SP[SP_END];
+  timer[i] = SP[SP_T];
+}
+
+/** True while any engine is lit (incl. its ignition delay) or still spooling down: dynamics' "powered" test. */
+export function engineActive(thrust: ArrayLike<number>, timer: ArrayLike<number>, n: number): boolean {
+  for (let i = 0; i < n; i++) if (timer[i] >= 0 || thrust[i] > 0) return true;
+  return false;
+}
+
+/** The step-cutting helper: inp[IN_H] = min(inp[IN_H], the time until the first ignition delay ends). */
+export function engineCutStep(timer: ArrayLike<number>, n: number, inp: Float64Array): void {
+  let dt = inp[IN_H];
+  for (let i = 0; i < n; i++) { const t = timer[i]; if (t > 0 && t < dt) dt = t; }
+  inp[IN_H] = dt;
+}
+
+/**
+ * Add the engines' step-mean thrusts `mean[i]` (from engineUpdate) to `o`: force −F̄·dir, torque about com
+ * (inp[IN_C*]), ṁ_main = ΣF̄/vₑ, jet damping at rate inp[IN_W*].
+ */
+export function applyEngines(defs: readonly EngineDef[], mean: ArrayLike<number>, inp: Float64Array, o: ThrustOut): ThrustOut {
+  const wx = inp[IN_WX], wy = inp[IN_WY], wz = inp[IN_WZ], cx = inp[IN_CX], cy = inp[IN_CY], cz = inp[IN_CZ];
   for (let i = 0; i < defs.length; i++) {
     const F = mean[i];
     if (F === 0) continue;
@@ -587,7 +736,10 @@ export function applyEngines(defs: readonly EngineDef[], mean: ArrayLike<number>
     o.tx += ry * az - rz * ay; o.ty += rz * ax - rx * az; o.tz += rx * ay - ry * ax;
     const md = F / d.ve;
     o.mdotMain += md;
-    if (wx !== 0 || wy !== 0 || wz !== 0) addJetDamping(o, md, rx, ry, rz, wx, wy, wz);
+    const r2 = rx * rx + ry * ry + rz * rz, rw = rx * wx + ry * wy + rz * wz;
+    const dx = -md * (r2 * wx - rw * rx), dy = -md * (r2 * wy - rw * ry), dz = -md * (r2 * wz - rw * rz);
+    o.dx += dx; o.dy += dy; o.dz += dz;
+    o.tx += dx; o.ty += dy; o.tz += dz;
   }
   return o;
 }
@@ -597,7 +749,7 @@ export function faMainDrive(using: boolean, aReq: number, aMain: number): boolea
   return using ? aReq >= FA_MAIN_OFF * aMain : aReq > FA_MAIN_ON * aMain;
 }
 
-// =============================================================================================== settled hold
+// =============================================================================================== settled hold (at settle only)
 
 /**
  * First t > 0 at which θ₀ + ω·t + ½·α·t² reaches ±θ_db (symmetric deadband), +∞ if never. 0 if |θ₀| ≥ θ_db.
@@ -665,13 +817,14 @@ export interface LosBody {
  * True when the segment a → b clears every body's radius plus its atmosphere top. When an end point is inside a
  * body's atmosphere shell (flying in the air) only the solid radius blocks for that body.
  */
-export function lineOfSight(ax: number, ay: number, az: number, bx: number, by: number, bz: number, bodies: readonly LosBody[]): boolean {
-  const dx = bx - ax, dy = by - ay, dz = bz - az;
+export function lineOfSight(a: V3, b: V3, bodies: readonly LosBody[]): boolean {
+  const ax = a.x, ay = a.y, az = a.z;
+  const dx = b.x - ax, dy = b.y - ay, dz = b.z - az;
   const l2 = dx * dx + dy * dy + dz * dz;
   for (let i = 0; i < bodies.length; i++) {
     const B = bodies[i];
     const ox = ax - B.r.x, oy = ay - B.r.y, oz = az - B.r.z;
-    const px = bx - B.r.x, py = by - B.r.y, pz = bz - B.r.z;
+    const px = b.x - B.r.x, py = b.y - B.r.y, pz = b.z - B.r.z;
     let R = B.radius + (B.atmosphere ? B.atmosphere.height : 0);
     let R2 = R * R;
     if (ox * ox + oy * oy + oz * oz < R2 || px * px + py * py + pz * pz < R2) { R = B.radius; R2 = R * R; }
@@ -683,54 +836,76 @@ export function lineOfSight(ax: number, ay: number, az: number, bx: number, by: 
   return true;
 }
 
-/** A Flight Assist reference is usable only within `range` and in line of sight. */
+/** A Flight Assist reference is usable only within `range` (a constant, FA_RANGE) and in line of sight. */
 export function assistVisible(a: V3, b: V3, range: number, bodies: readonly LosBody[]): boolean {
   const dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
   if (dx * dx + dy * dy + dz * dz > range * range) return false;
-  return lineOfSight(a.x, a.y, a.z, b.x, b.y, b.z, bodies);
+  return lineOfSight(a, b, bodies);
 }
 
 // =============================================================================================== air (per forced step)
 
-/** u = v_rel − ω_body × r_rel (inertial axes): the air-relative velocity of a co-rotating atmosphere. */
-export function airVelocity(out: V3, rx: number, ry: number, rz: number, vx: number, vy: number, vz: number, spinAxis: V3, spinRate: number): V3 {
-  const ox = spinAxis.x * spinRate, oy = spinAxis.y * spinRate, oz = spinAxis.z * spinRate;
-  out.x = vx - (oy * rz - oz * ry);
-  out.y = vy - (oz * rx - ox * rz);
-  out.z = vz - (ox * ry - oy * rx);
+/**
+ * out.airVel = u = v_rel − Ω × r_rel (inertial axes; Ω the body's spin angular-velocity vector, rad/s) and
+ * out.heatFlux = Sutton–Graves 1.74e-4·√(ρ/R_n)·|u|³ with R_n = 1 m at ρ = out.rho (the caller writes it first).
+ */
+export function airStep(out: AirOut, r: V3, v: V3, omega: V3): AirOut {
+  const u = out.airVel;
+  u.x = v.x - (omega.y * r.z - omega.z * r.y);
+  u.y = v.y - (omega.z * r.x - omega.x * r.z);
+  u.z = v.z - (omega.x * r.y - omega.y * r.x);
+  const rho = out.rho;
+  if (rho > 0) { const s = Math.sqrt(u.x * u.x + u.y * u.y + u.z * u.z); out.heatFlux = 1.74e-4 * Math.sqrt(rho) * s * s * s; }
+  else out.heatFlux = 0;
   return out;
 }
 
-/** Sutton–Graves stagnation heat flux, W/m²: 1.74e-4·√(ρ/R_n)·u³. */
+/** Sutton–Graves stagnation heat flux, W/m²: 1.74e-4·√(ρ/R_n)·u³ (reference form; airStep is the per-step one). */
 export function suttonGraves(rho: number, u: number, rn = 1): number {
   return rho > 0 ? 1.74e-4 * Math.sqrt(rho / rn) * u * u * u : 0;
 }
 
 // =============================================================================================== the ledger
 
-/** The RK4-weighted mean of four stage values (k₁ + 2k₂ + 2k₃ + k₄)/6: the step-mean of a drag force. */
-export const rk4Mean = (k1: number, k2: number, k3: number, k4: number): number => (k1 + 2 * k2 + 2 * k3 + k4) / 6;
+/** out = (k₁ + 2k₂ + 2k₃ + k₄)/6: the step mean of a force sampled at the four RK4 stages (drag). */
+export function rk4MeanV(out: V3, k1: V3, k2: V3, k3: V3, k4: V3): V3 {
+  out.x = (k1.x + 2 * k2.x + 2 * k3.x + k4.x) / 6;
+  out.y = (k1.y + 2 * k2.y + 2 * k3.y + k4.y) / 6;
+  out.z = (k1.z + 2 * k2.z + 2 * k3.z + k4.z) / 6;
+  return out;
+}
 
-/** Add one step's mean proper force (N) and torque (N·m), both in CRAFT axes, over h. */
-export function ledgerAdd(L: Ledger, fx: number, fy: number, fz: number, tx: number, ty: number, tz: number, h: number): void {
-  L.fAcc.x += fx * h; L.fAcc.y += fy * h; L.fAcc.z += fz * h;
-  L.tauAcc.x += tx * h; L.tauAcc.y += ty * h; L.tauAcc.z += tz * h;
+/** Add one step's mean proper force (N) and torque (N·m), both CRAFT axes (s.f*, s.t*), over h = inp[IN_H]. */
+export function ledgerAdd(L: Ledger, s: { fx: number; fy: number; fz: number; tx: number; ty: number; tz: number }, inp: Float64Array): void {
+  const h = inp[IN_H];
+  L.fAcc.x += s.fx * h; L.fAcc.y += s.fy * h; L.fAcc.z += s.fz * h;
+  L.tauAcc.x += s.tx * h; L.tauAcc.y += s.ty * h; L.tauAcc.z += s.tz * h;
   L.accT += h;
 }
 
-const _lv = { x: 0, y: 0, z: 0 };
-/** Add a proper force given in INERTIAL axes (rotated into craft axes by q⁻¹), with a craft-axes torque. */
-export function ledgerAddInertial(L: Ledger, q: Quat, fx: number, fy: number, fz: number, tx: number, ty: number, tz: number, h: number): void {
-  qRotInv(_lv, q, fx, fy, fz);
-  ledgerAdd(L, _lv.x, _lv.y, _lv.z, tx, ty, tz, h);
+/**
+ * Add a proper force given in INERTIAL axes (rotated into craft axes by q⁻¹, the formula of math.ts qRotInv inlined
+ * so no doubles are passed) over inp[IN_H]; no time is added (ledgerAdd adds it once per step).
+ */
+export function ledgerAddInertialForce(L: Ledger, q: Quat, f: V3, inp: Float64Array): void {
+  const x = f.x, y = f.y, z = f.z, qx = -q.x, qy = -q.y, qz = -q.z, qw = q.w;
+  const tx = 2 * (qy * z - qz * y), ty = 2 * (qz * x - qx * z), tz = 2 * (qx * y - qy * x);
+  const h = inp[IN_H];
+  L.fAcc.x += (x + qw * tx + (qy * tz - qz * ty)) * h;
+  L.fAcc.y += (y + qw * ty + (qz * tx - qx * tz)) * h;
+  L.fAcc.z += (z + qw * tz + (qx * ty - qy * tx)) * h;
 }
 
-/** A contact / latch / undock impulse J (N·s) at r from the CoM, both craft axes: Δv += J/m, Δω += I⁻¹(r × J). */
-export function ledgerImpulse(L: Ledger, jx: number, jy: number, jz: number, rx: number, ry: number, rz: number, m: number, Ix: number, Iy: number, Iz: number): void {
-  L.dvImpulse.x += jx / m; L.dvImpulse.y += jy / m; L.dvImpulse.z += jz / m;
-  L.dwImpulse.x += (ry * jz - rz * jy) / Ix;
-  L.dwImpulse.y += (rz * jx - rx * jz) / Iy;
-  L.dwImpulse.z += (rx * jy - ry * jx) / Iz;
+/**
+ * A contact / latch / undock impulse J (N·s) at r from the CoM, both craft axes: Δv += J/m, Δω += I⁻¹(r × J), with
+ * m = inp[IN_M] and the principal inertia inp[IN_IX..IZ].
+ */
+export function ledgerImpulse(L: Ledger, J: V3, r: V3, inp: Float64Array): void {
+  const m = inp[IN_M];
+  L.dvImpulse.x += J.x / m; L.dvImpulse.y += J.y / m; L.dvImpulse.z += J.z / m;
+  L.dwImpulse.x += (r.y * J.z - r.z * J.y) / inp[IN_IX];
+  L.dwImpulse.y += (r.z * J.x - r.x * J.z) / inp[IN_IY];
+  L.dwImpulse.z += (r.x * J.y - r.y * J.x) / inp[IN_IZ];
 }
 
 export function makeLedgerMean(): LedgerMean {
@@ -782,25 +957,28 @@ const vec = (x: unknown): V3 => {
   const o = (x && typeof x === 'object' ? x : {}) as Record<string, unknown>;
   return { x: num(o.x, 0), y: num(o.y, 0), z: num(o.z, 0) };
 };
-const arr = (x: unknown, n: number, d: number): number[] => {
+const arr = (x: unknown, n: number, d: number, lo: number, hi: number): number[] => {
   const out: number[] = new Array(n);
   const a = Array.isArray(x) ? x : [];
-  for (let i = 0; i < n; i++) out[i] = num(a[i], d);
+  for (let i = 0; i < n; i++) { const v = num(a[i], d); out[i] = v < lo ? lo : v > hi ? hi : v; }
   return out;
 };
 
 /**
- * Read the saved fields with loader defaults: duties and thrusts 0, engines unlit, an old save's RCS pool full
- * (`rcsCapacity`), empty ledger, hold awake (+∞). Arrays are resized to the craft's current jet/engine counts.
+ * Read the saved fields with loader defaults: duties and thrusts 0, engines unlit, an old save's RCS pool full,
+ * empty ledger, hold awake (+∞). `rcsCapacity` is the craft's CURRENT capacity (from its fit): the pool is clamped
+ * to [0, capacity] (an edited, migrated or refitted save cannot overfill the blowdown tank). Arrays are resized
+ * to the craft's current jet/engine counts; duties are clamped to [0, 1], thrusts to ≥ 0, timers to ≥ −1.
  */
 export function loadJetState(raw: unknown, nJets: number, nEngines: number, rcsCapacity = RCS_CAPACITY): JetState {
   const o = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
-  const cap = num(o.rcsPropellantCapacity, rcsCapacity);
+  const cap = rcsCapacity > 0 ? rcsCapacity : 0;
+  const m = num(o.rcsPropellant, cap);
   return {
-    jetDuty: arr(o.jetDuty, nJets, 0),
-    engineThrust: arr(o.engineThrust, nEngines, 0),
-    engineTimer: arr(o.engineTimer, nEngines, ENGINE_UNLIT),
-    rcsPropellant: num(o.rcsPropellant, cap),
+    jetDuty: arr(o.jetDuty, nJets, 0, 0, 1),
+    engineThrust: arr(o.engineThrust, nEngines, 0, 0, Infinity),
+    engineTimer: arr(o.engineTimer, nEngines, ENGINE_UNLIT, ENGINE_UNLIT, Infinity),
+    rcsPropellant: m < 0 ? 0 : m > cap ? cap : m,
     rcsPropellantCapacity: cap,
     fAcc: vec(o.fAcc), tauAcc: vec(o.tauAcc), accT: num(o.accT, 0), dvImpulse: vec(o.dvImpulse), dwImpulse: vec(o.dwImpulse),
     holdWakeT: o.holdWakeT === null ? Infinity : num(o.holdWakeT, Infinity),

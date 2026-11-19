@@ -501,6 +501,7 @@ class Manager implements SceneManager {
   private readonly rtSun = { dirShip: new THREE.Vector3(0, 1, 0), color: new THREE.Color(0, 0, 0), angularRadius: 0.005, intensity: 0 };
   private readonly rtFrame: RtFrame = { camera: new THREE.PerspectiveCamera(), shipMatrixWorld: new THREE.Matrix4(), sun: this.rtSun, envMap: null, envIntensity: 1, lamps: 1, bakedGain: 1, time: 0, frame: 0, width: 1, height: 1, rooms: this.rtRooms };
   private readonly rtInfo: RayTracingInfo = { tier: 'off', active: false, building: false, rays: 0, msEstimate: 0, msGpu: -1, triangles: 0, bytes: 0, disabled: '', buildMs: 0 };
+  private readonly rtWarmCam = new THREE.PerspectiveCamera(70, 0.46, 0.05, 80);
   private texAge = 1e9;
   private texBytesCache = 0;
   private msaaCapped = false;
@@ -867,6 +868,7 @@ class Manager implements SceneManager {
         if (gen !== this.generation || this.disposed) return;
         this.rtBuiltFor = visual;
         this.rtError = '';
+        this.warmRayTracing(root);
       } catch (err) {
         this.rtError = err instanceof Error ? err.message : String(err);
       }
@@ -876,6 +878,50 @@ class Manager implements SceneManager {
       this.rtBuilding = null;
     });
     return this.rtBuilding;
+  }
+
+  /**
+   * One traced frame from the helm right after the build, still behind the loading bar: allocates the tracer's
+   * targets at the real size and makes the driver finish every pass's program on a real draw (compileAsync alone
+   * leaves the final link to the first draw on some drivers), so the first frame after the tap does not hitch.
+   * The history is thrown away afterwards.
+   */
+  private warmRayTracing(root: THREE.Object3D): void {
+    if (this.rtTier === 'off') return;
+    const id = (this.interior ?? this.prebuilt)?.visualId;
+    const layout = id ? (INTERIORS as Record<string, InteriorLayout | undefined>)[id] : undefined;
+    const cam = this.rtWarmCam;
+    const ps = this.pipeline.stats();
+    cam.aspect = Math.max(0.2, ps.width / Math.max(1, ps.height));
+    cam.updateProjectionMatrix();
+    cam.position.set(layout?.helmEye.x ?? 0, layout?.helmEye.y ?? 0.6, layout?.helmEye.z ?? 0);
+    cam.quaternion.identity();
+    cam.matrixAutoUpdate = false;
+    cam.updateMatrix();
+    cam.matrix.premultiply(root.matrixWorld); // the helm, in the ship wherever the ship is
+    cam.matrixWorldNeedsUpdate = true;
+    cam.updateMatrixWorld(true);
+    const f = this.rtFrame;
+    const prevCam = f.camera;
+    f.camera = cam;
+    f.shipMatrixWorld = root.matrixWorld;
+    this.rtSun.dirShip.set(0.3, 0.8, -0.5);
+    this.rtSun.color.setRGB(1, 1, 1);
+    this.rtSun.intensity = 1;
+    f.envMap = this.outsideEnv ? this.outsideEnv.cubeTexture : null;
+    f.width = Math.max(1, ps.width);
+    f.height = Math.max(1, ps.height);
+    this.rtRooms.length = 0;
+    const roomsPrev = f.rooms;
+    f.rooms = undefined;
+    try {
+      this.rt.render(f);
+    } finally {
+      f.rooms = roomsPrev;
+      f.camera = prevCam;
+      this.rt.skip();
+      this.rt.resetHistory();
+    }
   }
 
   /** A stand-alone mesh of the player hull's lowest level of detail (shared geometry), or null. */
