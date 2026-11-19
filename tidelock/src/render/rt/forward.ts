@@ -9,7 +9,7 @@
 //                its irradiance × the traced visibility. The shadow-mapped interior sun is off while this runs.
 //   bounce       irradiance += π × mean incoming sun-bounce radiance (three multiplies by diffuse / π, then the
 //                material's AO).
-//   reflections  on surfaces smoother than the trace's cut (their own per-pixel roughness), the traced radiance
+//   reflections  on surfaces smoother than the trace's cut (their per-vertex roughness, as traced), the traced radiance
 //                replaces the probe / environment radiance; three applies its own split-sum BRDF and specular
 //                occlusion. Rough surfaces keep the box-projected probes.
 //
@@ -153,7 +153,9 @@ if ( uRtOn > 0.5 ) {
   if ( uRtFx.y > 0.5 ) irradiance += PI * rtA.rgb;
 #endif
 #if defined( RE_IndirectSpecular )
-  if ( uRtFx.z > 0.5 ) radiance = mix( radiance, rtB.rgb, rtRK * ( 1.0 - smoothstep( uRtReflMax - 0.12, uRtReflMax, material.roughness ) ) );
+  // the switch follows the surface's own (per-vertex, smooth) roughness from the trace's G-buffer, never the
+  // per-pixel photo roughness: a texel-by-texel flip between two estimates of the radiance reads as a marbled stain
+  if ( uRtFx.z > 0.5 ) radiance = mix( radiance, rtB.rgb, rtRK );
 #endif
   if ( uRtFx.w > 1.5 ) {
     // debug views (RayTracer.debugView): 1 visibility, 2 bounce, 3 reflections, 4 reflection coverage

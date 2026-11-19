@@ -1070,7 +1070,11 @@ export class OutsideEnvironment {
   readonly bytes: number;
   private readonly renderer: THREE.WebGLRenderer;
   private readonly cube: THREE.WebGLCubeRenderTarget;
-  /** The raw capture (world axes, linear HDR, no mips): what a reflection ray leaving through a window sees. */
+  /**
+   * The raw capture (world axes, linear HDR) with a box-filtered mip chain: what a reflection ray leaving through a
+   * window sees. The ray tracer reads it at the mip of its GGX lobe's width, so a glossy surface's escaping rays
+   * see the outside already averaged over the lobe (one sample per pixel then carries no environment noise).
+   */
   get cubeTexture(): THREE.CubeTexture {
     return this.cube.texture;
   }
@@ -1087,7 +1091,7 @@ export class OutsideEnvironment {
   constructor(renderer: THREE.WebGLRenderer, size: number, every = 4) {
     this.renderer = renderer;
     this.every = Math.max(1, every);
-    this.cube = new THREE.WebGLCubeRenderTarget(size, { type: THREE.HalfFloatType, generateMipmaps: false, minFilter: THREE.LinearFilter, depthBuffer: true });
+    this.cube = new THREE.WebGLCubeRenderTarget(size, { type: THREE.HalfFloatType, generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter, depthBuffer: true });
     this.cam = new THREE.CubeCamera(0.05, 600, this.cube);
     this.cam.coordinateSystem = renderer.coordinateSystem;
     this.cam.updateCoordinateSystem();
@@ -1095,7 +1099,7 @@ export class OutsideEnvironment {
     this.pmrem = new THREE.PMREMGenerator(renderer);
     this.rt = this.pmrem.fromCubemap(this.cube.texture);
     this.texture = this.rt.texture;
-    this.bytes = this.rt.width * this.rt.height * 8 * 2 + size * size * 6 * 8;
+    this.bytes = this.rt.width * this.rt.height * 8 * 2 + (size * size * 6 * 8 * 4) / 3;
   }
 
   /** One step (call once per frame, before the pipeline renders); `all` captures the whole cube now. */

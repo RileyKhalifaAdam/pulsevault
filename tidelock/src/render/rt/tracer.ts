@@ -2,7 +2,9 @@
 //
 // Per frame (render): G-buffer of the merged static ship mesh at reduced resolution (MRT, RGBA8 + float depth)
 // → one trace pass (sun visibility over the star's disc, one-bounce sun GI, GGX reflections, near-field AO;
-// every effect a uniform toggle, so tiers never recompile) → temporal accumulation reprojected in ship space
+// every effect a uniform toggle, so tiers never recompile; the low-frequency bounce is traced on a checkerboard
+// that flips every frame and rebuilt from the four traced neighbours in the temporal pass — half its rays; rays
+// leaving through a window read the outside cube at the mip of their lobe) → temporal accumulation reprojected in ship space
 // (depth/normal rejection, neighbourhood clamp while moving, per-effect history caps) → à-trous (edge-aware,
 // variance-steered). composite() then draws the same mesh at full resolution over the rasterised interior and
 // adds sun direct (GGX + Lambert × traced visibility), sun bounce and reflections, in linear HDR.
@@ -134,13 +136,15 @@ interface TierDef {
   passes: number;
   /** À-trous kernel radius: 1 = 3x3, 2 = 5x5. */
   radius: number;
+  /** Bounce rays on alternate pixels per frame (checkerboard), rebuilt from the neighbours in the temporal pass. */
+  checker: boolean;
 }
 const TIERS: Record<RtQuality, TierDef> = {
-  off: { pixels: 0, fx: [0, 0, 0, 0], passes: 0, radius: 1 },
-  low: { pixels: 0.25, fx: [1, 0, 0, 0], passes: 2, radius: 1 },
-  medium: { pixels: 0.25, fx: [1, 1, 0, 0], passes: 3, radius: 2 },
-  high: { pixels: 0.25, fx: [1, 1, 1, 0], passes: 3, radius: 2 },
-  ultra: { pixels: 0.5, fx: [1, 1, 1, 1], passes: 4, radius: 2 },
+  off: { pixels: 0, fx: [0, 0, 0, 0], passes: 0, radius: 1, checker: false },
+  low: { pixels: 0.25, fx: [1, 0, 0, 0], passes: 2, radius: 1, checker: false },
+  medium: { pixels: 0.25, fx: [1, 1, 0, 0], passes: 3, radius: 2, checker: true },
+  high: { pixels: 0.25, fx: [1, 1, 1, 0], passes: 3, radius: 2, checker: true },
+  ultra: { pixels: 0.5, fx: [1, 1, 1, 1], passes: 4, radius: 2, checker: true },
 };
 
 // ---- GPU cost model (A16, 5-core GPU). Assumed effective throughput of divergent fragment-shader traversal:
@@ -203,9 +207,11 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
     uG1: u<THREE.Texture | null>(null),
     uCosSun: u(Math.cos(0.0047)),
     uFrame: u(0),
+    uCheckerB: u(0),
     uEnv: u<THREE.Texture | null>(null),
     uEnvRot: u(new THREE.Matrix3()),
     uEnvGain: u(0),
+    uEnvLod: u(new THREE.Vector2(0, 0)),
     uClampL: u(10),
     uReflMaxRough: u(REFL_MAX_ROUGH),
     uAoRadius: u(0.45),
@@ -478,7 +484,8 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
     let rpp = 0;
     let ns = 0;
     if (t.fx[0]) { rpp += 1; ns += any; }
-    if (t.fx[1]) { rpp += 2; ns += closest * DIVERGENT + any * 1.2; }
+    const kb = t.checker ? 0.5 : 1; // checkerboard bounce: half the pixels trace it each frame
+    if (t.fx[1]) { rpp += 2 * kb; ns += kb * (closest * DIVERGENT + any * 1.2); }
     if (t.fx[2]) { rpp += 2; ns += GLOSSY_FRACTION * (closest * DIVERGENT + any * 1.2); }
     if (t.fx[3]) { rpp += 1; ns += any * 0.5 * DIVERGENT; } // short rays
     // G-buffer + trace overhead + temporal (~40 fetches) + à-trous (~40 per pass) per traced pixel; composite at full res
@@ -661,9 +668,17 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
       shared.uBakedGain.value = input.bakedGain ?? 1;
       const tu = traceMat.uniforms;
       tu.uFrame.value = input.frame | 0;
+      tu.uCheckerB.value = tier.checker ? 1 : 0;
       const env = input.envMap ?? null;
       tu.uEnv.value = env && (env as THREE.CubeTexture).isCubeTexture ? env : null;
       tu.uEnvGain.value = tu.uEnv.value ? (input.envIntensity ?? 1) : 0;
+      if (tu.uEnv.value) {
+        // lod of a lobe of half-width 1 rad on this cube, and its last mip (no mips: lod 0 only)
+        const img = (tu.uEnv.value as THREE.CubeTexture).image as { width?: number } | { width?: number }[];
+        const S = Math.max(1, (Array.isArray(img) ? img[0]?.width : img?.width) ?? 1);
+        const mips = (tu.uEnv.value as THREE.Texture).generateMipmaps && (tu.uEnv.value as THREE.Texture).minFilter === THREE.LinearMipmapLinearFilter;
+        (tu.uEnvLod.value as THREE.Vector2).set(Math.log2((2 * S) / Math.PI), mips ? Math.log2(S) : 0);
+      }
       if (input.envRotation) (tu.uEnvRot.value as THREE.Matrix3).copy(input.envRotation);
       else (tu.uEnvRot.value as THREE.Matrix3).setFromMatrix4(shipM);
       const se = uSunE.value;
@@ -808,7 +823,7 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
       cur = 1 - cur;
       valid = true;
       const px = tw * th;
-      lastRays = px * (f[0] + 2 * f[1] + GLOSSY_FRACTION * (2 * f[2]) + f[3]);
+      lastRays = px * (f[0] + 2 * f[1] * (tier.checker ? 0.5 : 1) + GLOSSY_FRACTION * (2 * f[2]) + f[3]);
     },
 
     composite(hdrColor, target) {

@@ -216,9 +216,11 @@ uniform vec3 uSunE;
 uniform float uCosSun;
 uniform vec4 uFx;       // sun visibility, sun bounce, reflections, AO (1 = on)
 uniform int uFrame;
+uniform int uCheckerB;  // 1: the bounce ray is traced on alternate pixels (checkerboard flipping every frame)
 uniform samplerCube uEnv;
 uniform mat3 uEnvRot;
 uniform float uEnvGain; // 0 = no environment (misses are black)
+uniform vec2 uEnvLod;   // x: log2(2 S / pi) for a cube of S texels a face (lod of a lobe of half-width 1 rad), y: max lod
 uniform float uClampL;  // firefly clamp, max luminance of one sample
 uniform float uReflMaxRough;
 uniform float uAoRadius;
@@ -301,9 +303,14 @@ void main() {
     vis = traceRay(O, coneDir(uSunDir, uCosSun, rnd2(px, 0u)), 1e4, true, tri, b) >= INF ? 1.0 : 0.0;
   }
   if (uFx.y > 0.5) {
-    vec3 d = cosineDir(N, rnd2(px, 1u));
-    float t = traceRay(O, d, 80.0, false, tri, b);
-    if (tri >= 0) bounce = clampL(shadeHit(O, d, t, tri, b, false, rnd2(px, 2u)));
+    // The sun's bounce is the lowest-frequency signal here and is accumulated over many frames anyway, so it is
+    // traced on half the pixels per frame; the temporal pass rebuilds the other half from their four traced
+    // neighbours (marked by a negative red). Half the bounce rays (about a quarter of the trace) for no visible loss.
+    if (uCheckerB == 0 || ((px.x + px.y + uFrame) & 1) == 0) {
+      vec3 d = cosineDir(N, rnd2(px, 1u));
+      float t = traceRay(O, d, 80.0, false, tri, b);
+      if (tri >= 0) bounce = clampL(shadeHit(O, d, t, tri, b, false, rnd2(px, 2u)));
+    } else bounce = vec3(-1.0);
   }
   if (uFx.z > 0.5 && rough < uReflMaxRough) {
     mat3 tb = basis(N);
@@ -314,7 +321,8 @@ void main() {
     if (dot(d, N) <= 0.0) d = reflect(-V, N);
     float t = traceRay(O, d, 120.0, false, tri, b);
     if (tri >= 0) refl = shadeHit(O, d, t, tri, b, true, rnd2(px, 4u));
-    else if (uEnvGain > 0.0) refl = texture(uEnv, uEnvRot * d).rgb * uEnvGain;
+    // escaped through a window: the outside averaged over the lobe (its mip), not one noisy texel of it
+    else if (uEnvGain > 0.0) refl = textureLod(uEnv, uEnvRot * d, clamp(log2(a * 1.5) + uEnvLod.x, 0.0, uEnvLod.y)).rgb * uEnvGain;
     refl = clampL(refl);
   }
   if (uFx.w > 0.5) {
@@ -361,19 +369,24 @@ void main() {
   vec4 rb = texelFetch(uRawB, px, 0);
   // neighbourhood statistics of this frame's samples (clamp, and the variance before history exists)
   vec4 ma = vec4(0.0), qa = vec4(0.0), mb = vec4(0.0), qb = vec4(0.0);
-  float cnt = 0.0;
+  float cnt = 0.0, cntB = 0.0;
   ivec2 hi = ivec2(uSize) - 1;
   for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
     ivec2 q = clamp(px + ivec2(i, j), ivec2(0), hi);
     if (texelFetch(uDepth, q, 0).r >= 1.0) continue;
     vec4 a = texelFetch(uRawA, q, 0);
     vec4 b = texelFetch(uRawB, q, 0);
-    vec4 la = vec4(a.rgb, a.a);
-    ma += la; qa += la * la; mb += b; qb += b * b; cnt += 1.0;
+    // bounce (rgb) only from the pixels that traced it this frame (checkerboard: red < 0 = not traced)
+    float tb = a.r < 0.0 ? 0.0 : 1.0;
+    vec4 la = vec4(a.rgb * tb, a.a);
+    ma += la; qa += la * la; mb += b; qb += b * b; cnt += 1.0; cntB += tb;
   }
-  ma /= cnt; mb /= cnt;
-  vec4 sa = sqrt(max(qa / cnt - ma * ma, 0.0));
-  vec4 sb = sqrt(max(qb / cnt - mb * mb, 0.0));
+  ma.a /= cnt; qa.a /= cnt;
+  ma.rgb /= max(cntB, 1.0); qa.rgb /= max(cntB, 1.0);
+  mb /= cnt; qb /= cnt;
+  vec4 sa = sqrt(max(qa - ma * ma, 0.0));
+  vec4 sb = sqrt(max(qb - mb * mb, 0.0));
+  if (ra.r < 0.0) ra.rgb = ma.rgb; // not traced here this frame: the mean of the traced neighbours
 
   vec3 N = decN(texelFetch(uG0, px, 0).xyz);
   vec2 uv = (vec2(px) + 0.5) / uSize;
@@ -473,6 +486,9 @@ void main() {
   // glossy reflections keep their sharpness: only the first steps on smooth surfaces
   float reflSteps = 1.0 + 8.0 * clamp(rough / max(uReflMaxRough, 1e-3), 0.0, 1.0);
   float reflOn = float(uStep) <= reflSteps ? 1.0 : 0.0;
+  // a rough lobe's reflection is smooth by nature: past ~0.15 the luminance edge-stop only keeps 1-spp noise
+  // clusters alive (blotches), so it fades out and the filter is purely geometric (depth, normal)
+  float roughBlur = smoothstep(0.12, 0.3, rough);
   float tolZ = (0.01 + 0.004 * dist) * float(uStep);
   vec4 sumA = vec4(0.0), sumB = vec4(0.0);
   vec4 wA = vec4(0.0), wB = vec4(0.0);
@@ -493,7 +509,7 @@ void main() {
       w *= exp(-abs(dot(N, Pq - P)) / tolZ) * pow(max(dot(N, Nq), 0.0), 32.0);
     }
     vec4 wa = vec4(vec3(w * exp(-abs(lum(a.rgb) - lb) / sbn)), w * exp(-abs(a.a - ca.a) / sv));
-    float wr = w * exp(-abs(lum(b.rgb) - lr) / sr) * ((i == 0 && j == 0) ? 1.0 : reflOn);
+    float wr = w * mix(exp(-abs(lum(b.rgb) - lr) / sr), 1.0, roughBlur) * ((i == 0 && j == 0) ? 1.0 : reflOn);
     vec4 wb = vec4(vec3(wr), w);
     sumA += a * wa; wA += wa;
     sumB += b * wb; wB += wb;

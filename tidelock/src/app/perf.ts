@@ -32,6 +32,8 @@ export const RT_DEFAULT: RtTier = 'high';
 /** The safety governor: p95 frame time above this for RT_OVER_SECONDS steps the ray tracing down one notch. */
 export const RT_OVER_MS = 40;
 const RT_OVER_SECONDS = 3;
+/** The lowest tier the governor steps down to by itself (the owner can still choose Off in the menu). */
+export const RT_FLOOR: RtTier = 'low';
 /** Back up one notch (never above the owner's choice) after this long well inside budget, and not sooner than RT_RETRY_SECONDS after a drop. */
 const RT_UNDER_MS = 28;
 const RT_UNDER_SECONDS = 30;
@@ -157,7 +159,8 @@ export function rtInfoText(): string {
 }
 
 /**
- * The ray-tracing safety governor: p95 frame time above RT_OVER_MS for 3 s steps the tier down one notch;
+ * The ray-tracing safety governor: p95 frame time above RT_OVER_MS for 3 s steps the tier down one notch (not below
+ * RT_FLOOR);
  * after a long calm it may climb back, never above the owner's choice. Call once per frame; returns the tier
  * to switch to, or null. No allocation.
  */
@@ -197,7 +200,9 @@ export class RtGovernor {
       this.over = this.under = 0;
       return null;
     }
-    if (this.tier !== 'off' && p95 > RT_OVER_MS) {
+    // never below Low on its own: Low (sun visibility only, ~5 ms) is not what makes a frame miss 40 ms, and a
+    // transient stall (a bake, the app returning from the background) must not take ray tracing away for good
+    if (RT_CHOICES.indexOf(this.tier) > RT_CHOICES.indexOf(RT_FLOOR) && p95 > RT_OVER_MS) {
       this.under = 0;
       this.over += dt;
       if (this.over < RT_OVER_SECONDS) return null;
