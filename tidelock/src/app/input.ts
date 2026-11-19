@@ -9,6 +9,10 @@
 //   - HAND: it began on a physical control the pilot can reach (outside the walk zone, or anywhere while
 //     seated). Dragging moves a hand controller, a lever or a rocker; a short tap presses a button, flips a
 //     switch, pages a screen, works the harness buckle. A hand on a control never moves the head.
+//     It began on a loose object within arm's reach (the touch ray from the eye meets it before any control):
+//     the hand takes hold of it, dragging carries it (a spring in the world pulls it toward the hand, it is never
+//     set), lifting the finger lets go with the hand's velocity (a throw); a quick still tap on a clipped,
+//     magnetted or strapped object undoes its stowage (and one on a bunk or a bench uses the bunk or bench too).
 //   - HEAD: everything else. One head finger: drag = look, a quick upward flick = jump / push off. Two head
 //     fingers: pinch to lean in (narrow the view); look is suspended while they pinch. A walk or hand finger is
 //     never half of a pinch. (A bunk or a bench is a place for the body, not a hand control: a touch on one is a
@@ -16,6 +20,7 @@
 // Three fingers down together and up again opens the system menu. Any touch wakes a sleeping pilot (and does
 // nothing else).
 
+import type { V3 } from '../core/types';
 import type { DeviceDef } from '../data/cockpit';
 import type { Session } from '../game';
 import { interiorFov } from '../render/camera';
@@ -85,6 +90,8 @@ interface Gesture {
   ay: number; ap: number;
   /** HEAD: it has been half of a pinch (so it is not a flick). */
   pinched: boolean;
+  /** HAND: the hand holds a loose object (not a control). */
+  prop: boolean;
 }
 
 const clamp = (v: number, lo: number, hi: number): number => (v < lo ? lo : v > hi ? hi : v);
@@ -135,6 +142,29 @@ export function createPlayInput(opts: PlayInputOptions): PlayInput {
     return 0;
   };
   const onFoot = (): boolean => session.mode() === 'onFoot';
+  /**
+   * The touch ray: ship-local unit direction from the eye through a point of the glass (CSS px), the same first-person
+   * camera the renderer draws (interior field of view narrowed by the lean, head yaw then pitch). Reused object.
+   */
+  const RAY: V3 = { x: 0, y: 0, z: -1 };
+  const rayAt = (x: number, y: number): V3 => {
+    const r = surface.getBoundingClientRect();
+    const w = r.width || window.innerWidth, h = r.height || window.innerHeight, aspect = w / Math.max(1, h);
+    const t = Math.tan(interiorFov(aspect) / 2) / api.zoom;
+    const nx = ((x - r.left) / w) * 2 - 1, ny = 1 - ((y - r.top) / h) * 2;
+    const c = session.crew(), cp = Math.cos(c.pitch), sp = Math.sin(c.pitch), cy = Math.cos(c.yaw), sy = Math.sin(c.yaw);
+    const dx = nx * t * aspect, dy0 = ny * t;
+    const dy = dy0 * cp + sp, dz = dy0 * sp - cp; // pitch about +X (camera looks along -Z)
+    RAY.x = dx * cy + dz * sy; RAY.y = dy; RAY.z = -dx * sy + dz * cy; // then yaw about +Y
+    const l = Math.hypot(RAY.x, RAY.y, RAY.z) || 1;
+    RAY.x /= l; RAY.y /= l; RAY.z /= l;
+    return RAY;
+  };
+  /** How far along the touch ray a control is (its centre), m. */
+  const deviceDistance = (def: DeviceDef, dir: V3): number => {
+    const e = session.crew().eye;
+    return (def.pos.x - e.x) * dir.x + (def.pos.y - e.y) * dir.y + (def.pos.z - e.z) * dir.z;
+  };
   const count = (role: TouchRole): number => {
     let n = 0;
     for (const g of gestures.values()) if (g.role === role) n++;
@@ -163,7 +193,8 @@ export function createPlayInput(opts: PlayInputOptions): PlayInput {
 
   /** Take the finger out of play (hand off the control, feet still); it keeps its place but does nothing more. */
   const end = (id: number, g: Gesture): void => {
-    if (g.role === 'hand' && g.grab) session.releaseDevice(id);
+    if (g.role === 'hand' && g.prop) session.propRelease(id, false);
+    else if (g.role === 'hand' && g.grab) session.releaseDevice(id);
     else if (g.role === 'walk') { session.setWalk({ moveX: 0, moveZ: 0 }); ringRest(); }
     if (g === pinchA || g === pinchB) stopPinch();
     g.role = 'dead';
@@ -179,7 +210,7 @@ export function createPlayInput(opts: PlayInputOptions): PlayInput {
     try { surface.setPointerCapture(e.pointerId); } catch { /* not capturable: moves still arrive on the canvas */ }
     // the event's own clock: a slow frame between finger down and finger up must not turn a tap into a hold
     const now = e.timeStamp || performance.now();
-    const g: Gesture = { role: 'dead', def: null, grab: false, x0: e.clientX, y0: e.clientY, x: e.clientX, y: e.clientY, t0: now, moved: 0, base: 0, ay: 0, ap: 0, pinched: false };
+    const g: Gesture = { role: 'dead', def: null, grab: false, x0: e.clientX, y0: e.clientY, x: e.clientX, y: e.clientY, t0: now, moved: 0, base: 0, ay: 0, ap: 0, pinched: false, prop: false };
     let first = now;
     for (const o of gestures.values()) if (o.t0 < first) first = o.t0;
     gestures.set(e.pointerId, g);
@@ -203,8 +234,16 @@ export function createPlayInput(opts: PlayInputOptions): PlayInput {
       nub.style.transform = '';
       return;
     }
-    // HAND: it began on a control within reach
+    // HAND: it began on a control within reach, or on a loose object within reach (the nearer of the two)
     const def = deviceAt(e.clientX, e.clientY);
+    const ray = rayAt(e.clientX, e.clientY);
+    const pd = session.propAt(ray);
+    if (pd < Infinity && (!def || def.kind === 'rest' || pd < deviceDistance(def, ray)) && session.propGrab(e.pointerId, ray)) {
+      g.role = 'hand';
+      g.prop = true;
+      g.def = def && def.kind === 'rest' ? def : null; // a pillow on the sofa: a still tap still uses the sofa
+      return;
+    }
     if (def && def.kind !== 'rest') {
       const k = def.kind;
       g.def = def;
@@ -236,6 +275,7 @@ export function createPlayInput(opts: PlayInputOptions): PlayInput {
     const sens = clamp(opts.sensitivity() || 1, 0.5, 2);
     switch (g.role) {
       case 'hand': {
+        if (g.prop) { session.propMove(e.pointerId, rayAt(g.x, g.y)); break; }
         const def = g.def;
         if (!g.grab || !def) break;
         if (def.kind === 'stick2') {
@@ -295,7 +335,11 @@ export function createPlayInput(opts: PlayInputOptions): PlayInput {
     const tapped = !cancelled && held < TAP_MS && g.moved <= TAP_PX;
     switch (g.role) {
       case 'hand':
-        if (g.grab) session.releaseDevice(e.pointerId);
+        if (g.prop) {
+          session.propRelease(e.pointerId, tapped);
+          if (tapped && g.def) session.tapDevice(g.def.id);
+        }
+        else if (g.grab) session.releaseDevice(e.pointerId);
         else if (tapped && g.def) session.tapDevice(g.def.id);
         break;
       case 'walk':

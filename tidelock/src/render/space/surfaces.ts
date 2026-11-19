@@ -68,7 +68,7 @@ export const TILE_METRES: Record<TileId, [number, number]> = {
 export const TILE_ALBEDO: Record<TileId, P3> = {
   whitePanel: [0.66, 0.655, 0.64], brushed: [0.25, 0.24, 0.23], gunmetal: [0.12, 0.12, 0.13], tread: [0.075, 0.075, 0.077],
   grating: [0.08, 0.08, 0.08], padded: [0.5, 0.5, 0.5], leather: [0.45, 0.45, 0.45], veneer: [0.09, 0.05, 0.03],
-  warmPanel: [0.25, 0.21, 0.17], fabric: [0.55, 0.55, 0.55], darkFloor: [0.15, 0.142, 0.132], netting: [0.05, 0.05, 0.045],
+  warmPanel: [0.25, 0.21, 0.17], fabric: [0.55, 0.55, 0.55], darkFloor: [0.087, 0.083, 0.077], netting: [0.05, 0.05, 0.045],
   hazard: [0.3, 0.22, 0.03], seam: [0.12, 0.12, 0.13], vent: [0.08, 0.08, 0.08], stencil: [0.5, 0.5, 0.5],
 };
 
@@ -417,8 +417,9 @@ const GEN: Partial<Record<TileId, Gen>> = {
     const seam = sm(0.497, 0.493, Math.max(eu, ev));
     const sp = nz(u, v, 40, 21);
     const sc = nz(u, v * 3, 3, 22);
-    // satin warm-grey composite deck (albedo ~0.15, roughness ~0.35): bright enough that a sun patch reads on it
-    const k = 0.15 * (0.92 + 0.16 * sp) + 0.012 * sm(0.62, 0.8, sc);
+    // satin warm-grey composite deck (albedo ~0.085, was 0.055; roughness ~0.33, was 0.46): a sun patch on it
+    // reads as a sharp, slightly glossy pool of light instead of a dull smear
+    const k = 0.085 * (0.92 + 0.16 * sp) + 0.01 * sm(0.62, 0.8, sc);
     set(o, k, k * 0.95, k * 0.88, 0.33 + 0.08 * sc - 0.05 * sp, 0);
     o.h = -0.001 * (1 - seam) + 0.00003 * sp;
     o.ao = 0.5 + 0.5 * seam;
@@ -835,11 +836,13 @@ export const TILE_PHOTO: Partial<Record<TileId, TilePhoto>> = {
   tread: { id: 'tread', colour: 1, normal: 1, rough: 0.8, macro: 0.25 },
   grating: { id: 'grating', colour: 1, normal: 1, rough: 1, macro: 0.2, replace: { metal: 0.9 } },
   padded: { id: 'fabric', colour: 0.8, normal: 0.8, rough: 0.8, macro: 0.2 },
-  leather: { id: 'leather', colour: 1, normal: 1.1, rough: 1, macro: 0.3 },
+  // grain and creases are what make leather read at arm's length: the scan's normal at 1.6x
+  leather: { id: 'leather', colour: 1, normal: 1.6, rough: 1, macro: 0.3 },
   // walnut under a clear coat: the scan's raw-wood roughness only faintly shows through the lacquer
   veneer: { id: 'veneer', colour: 1, normal: 0.5, rough: 0.25, macro: 0.3 },
   warmPanel: { id: 'whitePanel', colour: 0.8, normal: 0.8, rough: 0.8, macro: 0.35 },
-  fabric: { id: 'fabric', colour: 1, normal: 1.5, rough: 1, macro: 0.3 },
+  // rugs, bedding, upholstery: the wool's relief and a stronger low-frequency mottle keep a rug from reading flat
+  fabric: { id: 'fabric', colour: 1, normal: 2, rough: 1, macro: 0.5 },
   darkFloor: { id: 'whitePanel', colour: 0.9, normal: 0.8, rough: 0.8, macro: 0.4 },
   netting: { id: 'netting', colour: 1, normal: 1, rough: 1, macro: 0, replace: { metal: 0 } },
   hazard: { id: 'hullPaint', colour: 0.7, normal: 0.8, rough: 0.7, macro: 0 },
@@ -1075,7 +1078,9 @@ export function surfaceMaterial(
     m.lightMapIntensity = Math.PI;
   }
   const photo = kind !== 'glow' ? shared.photo : null;
-  if (photo) (m as unknown as { defines: Record<string, string> }).defines = kind === 'cut' ? { TL_PHOTO: '', TL_CUT: '' } : { TL_PHOTO: '' };
+  // defines go into the source, not material.defines: the per-probe clones (probes.ts) copy() the material, and
+  // MeshStandardMaterial.copy() resets `defines`
+  const defs = photo ? (kind === 'cut' ? '#define TL_PHOTO\n#define TL_CUT\n' : '#define TL_PHOTO\n') : '';
   m.onBeforeCompile = (sh, renderer) => {
     sh.uniforms.uTiles = shared.uTiles;
     sh.uniforms.uLmB = shared.uLmB;
@@ -1212,7 +1217,7 @@ float tlMetal = tlOrm.b;
 #endif`,
       );
     }
-    sh.fragmentShader = f;
+    sh.fragmentShader = defs + f;
   };
   m.customProgramCacheKey = () => `corvane-surface-2-${kind}-${lm ? 'lm' : 'lit'}${photo ? '-ph' : ''}`;
   return m;

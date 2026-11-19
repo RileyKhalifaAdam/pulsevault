@@ -536,10 +536,8 @@ const AO = /* glsl */ `
 `;
 function hardwareMaterial(map: THREE.Texture, detail: boolean, photo: PhotoDetail | null): THREE.MeshStandardMaterial {
   const m = new THREE.MeshStandardMaterial({ vertexColors: true, map, roughness: 0.5, metalness: 0 });
-  const defs: Record<string, string> = {};
-  if (detail) defs.CK_DETAIL = '';
-  if (photo) defs.CK_PHOTO = '';
-  (m as unknown as { defines: Record<string, string> }).defines = defs;
+  // defines in the source: the per-probe clones (probes.ts) copy() the material, which resets `defines`
+  const defs = `${detail ? '#define CK_DETAIL\n' : ''}${photo ? '#define CK_PHOTO\n' : ''}`;
   m.onBeforeCompile = (sh, renderer) => {
     if (photo) {
       photo.noteRenderer(renderer);
@@ -559,6 +557,7 @@ function hardwareMaterial(map: THREE.Texture, detail: boolean, photo: PhotoDetai
       .replace('#include <metalnessmap_fragment>', '#include <metalnessmap_fragment>\nmetalnessFactor = vPbr.y;')
       .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>\n${BUMP}\n${PH_NORMAL}`)
       .replace('#include <aomap_fragment>', `#include <aomap_fragment>\n${AO}`);
+    sh.fragmentShader = defs + sh.fragmentShader;
   };
   m.customProgramCacheKey = () => `tidelock-cockpit-hw-2${detail ? '-d' : ''}${photo ? '-ph' : ''}`;
   return m;

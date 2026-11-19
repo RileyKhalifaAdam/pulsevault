@@ -17,6 +17,7 @@ import {
   CHANNEL_COUNT,
   CH_FLARE,
   CH_GLASS,
+  CH_HULL,
   type Corner,
   GLOW,
   LAYER,

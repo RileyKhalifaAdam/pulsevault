@@ -990,6 +990,7 @@ hAlbedo *= 0.95 + 0.1 * hMic.b;
 // photo-scanned detail (hero hull, photo/detail.ts): painted livery -> hullPaint, drive-throat metal -> nozzle,
 // bare metal -> brushed / gunmetal; colour x photo/mean, roughness offset, whiteout normal (HULL_FRAG_NORMAL)
 float hPk = 0.0;
+float hPc = 1.0;
 vec4 hPhAlb = vec4(1.0);
 vec4 hPhLin = vec4(0.5, 0.5, 1.0, 0.5);
 vec4 hPB = vec4(1.0);
@@ -997,14 +998,16 @@ vec4 hPB = vec4(1.0);
 {
   vec4 hPA = vec4(0.0);
   if (vFx.y > 0.004) { hPA = PH_A_nozzle; hPB = PH_B_nozzle; hPk = 0.8; }
-  else if (hSlot > 0.5 && hLi <= 1) { hPA = PH_A_hullPaint; hPB = PH_B_hullPaint; hPk = 1.0; }
+  // the scanned paint carries rust-brown dirt patches: on the clear-coated livery only its fine variation is
+  // kept (colour 0.4, ratio clamped), the orange peel, chips and roughness come through in full
+  else if (hSlot > 0.5 && hLi <= 1) { hPA = PH_A_hullPaint; hPB = PH_B_hullPaint; hPk = 1.0; hPc = 0.4; }
   else if (hLi == 3 && dot(hAlbedo, vec3(0.333)) > 0.25) { hPA = PH_A_brushed; hPB = PH_B_brushed; hPk = 0.7; }
   else if (hLi == 3) { hPA = PH_A_gunmetal; hPB = PH_B_gunmetal; hPk = 0.8; }
   hPk *= uPhOn;
   if (hPk > 0.0) {
     hPhAlb = phAlbedo(hPA.x, vHullUv * hPA.zw, hUvDx * hPA.zw, hUvDy * hPA.zw);
     hPhLin = phLinear(hPA.y, vHullUv * hPA.zw, hUvDx * hPA.zw, hUvDy * hPA.zw);
-    hAlbedo *= mix(vec3(1.0), clamp(hPhAlb.rgb * hPB.rgb, 0.0, 3.0), hPk);
+    hAlbedo *= mix(vec3(1.0), clamp(hPhAlb.rgb * hPB.rgb, 0.72, 1.2), hPk * hPc);
     hRough += hPk * (hPhLin.a - hPB.w);
   }
 }

@@ -163,7 +163,7 @@ export function acquirePhotoDetail(q: PhotoDetailQuality): PhotoDetail {
   };
   /** Decode `img` and return its RGBA pixels at s x s (rows from v = 0), or null. */
   const pixels = async (img: PhotoImageData, s: number): Promise<Uint8ClampedArray | null> => {
-    const src = await decodePhotoImage(img, Math.max(s, Math.min(img.size, s)));
+    const src = await decodePhotoImage(img, s);
     const t0 = performance.now();
     try {
       const e = ctx2d(s);

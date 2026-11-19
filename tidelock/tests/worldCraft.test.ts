@@ -271,6 +271,29 @@ describe('contact', () => {
     expect(ship.destroyed).toBe(false);
   });
 
+  it('two ships collide wing tip to wing tip: momentum is kept, both turn away, both take the damage', () => {
+    const w = deepSpace();
+    const a = wren(w, STAR, v3(FAR.x - 12, FAR.y, FAR.z), v3(1, 0, 0));
+    const b = addCraft(w, shipDef('other', 'Wren', stats, SHIP_LAYOUTS.wren, { primaryId: STAR, r: v3(FAR.x + 12, FAR.y, FAR.z + 2), v: v3(-1, 0, 0) }));
+    const m = craftMass(a), M = craftMass(b);
+    // barycentric momentum the frame before and the frame after the hit (gravity is the same on both)
+    const mom = (): V3 => v3(m * a.v.x + M * b.v.x, m * a.v.y + M * b.v.y, m * a.v.z + M * b.v.z);
+    let hit: WorldEvent | undefined, p0 = mom();
+    for (let i = 0; i < 60 * 10 && !hit; i++) { p0 = mom(); advance(w, 1 / 60); hit = drainEvents(w).find((x) => x.type === 'impact'); }
+    expect(hit).toBeDefined();
+    const p1 = mom();
+    console.log(`ship-ship: hit at ${hit && hit.type === 'impact' ? hit.speed.toFixed(2) : '?'} m/s, momentum error ${(len(sub(p1, p0)) / (2 * m)).toExponential(2)}`);
+    expect(len(sub(p1, p0)) / (m * 2)).toBeLessThan(1e-6);
+    // wing tip into wing tip: they meet at the wings (x ±9.5), not at the bounding spheres (2 x 16.5 m) ...
+    expect(b.rel.x - a.rel.x).toBeLessThan(2 * 9.6);
+    expect(b.rel.x - a.rel.x).toBeGreaterThan(2 * 9.3);
+    // ... and the off-centre blow turns each away from the other (most of it goes into the spin)
+    expect(a.w.y).toBeLessThan(-0.01);
+    expect(b.w.y).toBeGreaterThan(0.01);
+    expect(a.hull).toBeLessThan(1);
+    expect(b.hull).toBeLessThan(1);
+  });
+
   it('a fast impact destroys the ship', () => {
     const w = deepSpace();
     rock(w);
@@ -484,6 +507,26 @@ describe('advance, save and load', () => {
     };
     const a = run(false), b = run(true);
     console.log(`save size ${a.length} bytes`);
+    expect(a.length).toBeLessThan(100_000);
+    expect(b).toBe(a);
+  });
+
+  it('save -> load -> continue is bit-identical in contact (the warm-start manifolds are saved)', () => {
+    const run = (saves: boolean): string => {
+      let w = deepSpace();
+      addCraft(w, { id: 'rock', name: 'Rock', kind: 'station', dryMass: 1e9, radius: 40, colliders: [{ kind: 'sphere', a: v3(), radius: 40 }], primaryId: STAR, r: FAR, v: v3() });
+      const ship = wren(w, STAR, v3(FAR.x + 1.2, FAR.y + 40 + reach(v3(0, -1, 0)) + 0.3, FAR.z), v3(0.4, -1, 0));
+      ship.rcs.y = -0.2;
+      for (let i = 0; i < 90; i++) advance(w, 1 / 60);
+      if (saves) {
+        const json = saveWorld(w);
+        expect(json).toContain('"contacts":[{');
+        w = loadWorld(json);
+      }
+      for (let i = 0; i < 120; i++) advance(w, 1 / 60);
+      return saveWorld(w);
+    };
+    const a = run(false), b = run(true);
     expect(a.length).toBeLessThan(100_000);
     expect(b).toBe(a);
   });

@@ -5,6 +5,9 @@
 
 import type { EventBus } from '../core/events';
 import type { BodyDef, Quat, ShipVisualId, StationVisualId, SystemDef, V3 } from '../core/types';
+import type { PropView } from '../world/props';
+
+export type { PropView };
 
 /** Attitude hold: a controller that commands real torque toward a direction. It never sets orientation. */
 export type HoldMode =
@@ -21,8 +24,12 @@ export type HoldMode =
   | 'burn' // along the next planned burn
   | 'dock'; // docking collar onto the axis of the nearest free port (holds the heading when there is none)
 
-/** Why time acceleration is lower than requested ('' = it is not). */
-export type WarpLimit = '' | 'thrust' | 'rotation' | 'contact' | 'atmosphere' | 'proximity' | 'cpu' | 'docked' | 'crew';
+/**
+ * Why time acceleration is lower than requested ('' = it is not). 'props': loose objects are moving in the cabin
+ * (they are simulated at full rate, so time can only go as fast as the CPU budget lets them; asleep they cost
+ * nothing and never limit it).
+ */
+export type WarpLimit = '' | 'thrust' | 'rotation' | 'contact' | 'atmosphere' | 'proximity' | 'cpu' | 'docked' | 'crew' | 'props';
 
 export interface StepInfo {
   /** Sim seconds actually covered by this call. */
@@ -369,4 +376,24 @@ export interface Session {
   releaseDevice(pointerId: number): void;
   /** A short tap: press a button, flip a toggle, pull a handle, page a screen, fasten or release a buckle, use a rest. */
   tapDevice(id: string): boolean;
+}
+
+// ---- loose objects (src/world/props.ts): real rigid bodies in the cabin, moved by forces ----------------------
+// The hand is a spring on the object (HAND_FORCE at most): it is never set. Directions are ship-local unit vectors
+// from the eye (crew().eye) — a touch ray. One object in hand at a time.
+
+export interface Session {
+  /** Every loose object of the player's ship, ship-local poses. The array and its objects are reused: read, do not keep. */
+  props(): readonly PropView[];
+  /** Distance from the eye along `dir` to the loose object it meets within arm's reach, m (Infinity: none). */
+  propAt(dir: V3): number;
+  /** Hand onto the object along `dir` (a touch that began on it). False when nothing is within reach there. */
+  propGrab(pointerId: number, dir: V3): boolean;
+  /** The holding hand follows the touch ray at the distance it took hold. */
+  propMove(pointerId: number, dir: V3): void;
+  /**
+   * Hand off: the object leaves with the hand's velocity (thrown; the body takes the reaction). `tap`: a quick
+   * still touch — it does not throw, and a stowed object (clip, magnet, strap) is undone.
+   */
+  propRelease(pointerId: number, tap: boolean): void;
 }

@@ -48,6 +48,13 @@ const GRAB_SLOP = 0.12;
 
 const SUB_DT = 1 / 120;
 /**
+ * Coasting (felt acceleration below LIGHT_A, nothing in hand, the crew still): contacts are slow, light touches, so
+ * the step is set by how far things move (MAX_MOVE) and turn (ROT_STEP rad), at least every COAST_DT, not by 120 Hz.
+ */
+const LIGHT_A = 0.05;
+const COAST_DT = 0.25;
+const ROT_STEP = 0.2;
+/**
  * Most any point of a body may move in one sub-step, m: less than a 4 cm wall panel, so a contact is always seen;
  * the side it is pushed out of is the side it came from (its position before the sub-step).
  */
@@ -953,7 +960,7 @@ function sub(s: PropsState, rt: Rt, m: ShipMotion, crew: CrewState | null, gi: n
   const a = m.a, W = m.w, al = m.alpha, la = s.lastA, lw = s.lastW;
   // a change in the ship's motion wakes everything loose
   const dax = a.x - la.x, day = a.y - la.y, daz = a.z - la.z, dwx = W.x - lw.x, dwy = W.y - lw.y, dwz = W.z - lw.z;
-  if (dax * dax + day * day + daz * daz > WAKE_DA * WAKE_DA || dwx * dwx + dwy * dwy + dwz * dwz > WAKE_DW * WAKE_DW || al.x * al.x + al.y * al.y + al.z * al.z > 1e-12) {
+  if (dax * dax + day * day + daz * daz > WAKE_DA * WAKE_DA || dwx * dwx + dwy * dwy + dwz * dwz > WAKE_DW * WAKE_DW || (al.x * al.x + al.y * al.y + al.z * al.z) * rt.rmax * rt.rmax > WAKE_DA * WAKE_DA) {
     for (let i = 0; i < n; i++) wake(B[i]);
   }
   la.x = a.x; la.y = a.y; la.z = a.z; lw.x = W.x; lw.y = W.y; lw.z = W.z;
@@ -978,11 +985,16 @@ function sub(s: PropsState, rt: Rt, m: ShipMotion, crew: CrewState | null, gi: n
         const r0 = R[o9] * g.local.x + R[o9 + 1] * g.local.y + R[o9 + 2] * g.local.z;
         const r1 = R[o9 + 3] * g.local.x + R[o9 + 4] * g.local.y + R[o9 + 5] * g.local.z;
         const r2 = R[o9 + 6] * g.local.x + R[o9 + 7] * g.local.y + R[o9 + 8] * g.local.z;
-        const k2 = mass * HAND_OMEGA * HAND_OMEGA;
-        let hx = k2 * (g.hand.x - b.p.x - r0), hy = k2 * (g.hand.y - b.p.y - r1), hz = k2 * (g.hand.z - b.p.z - r2);
+        const k2 = mass * HAND_OMEGA * HAND_OMEGA, c2 = 2 * mass * HAND_OMEGA;
+        let hx = k2 * (g.hand.x - b.p.x - r0) + c2 * g.handVel.x, hy = k2 * (g.hand.y - b.p.y - r1) + c2 * g.handVel.y, hz = k2 * (g.hand.z - b.p.z - r2) + c2 * g.handVel.z;
         const hl = Math.sqrt(hx * hx + hy * hy + hz * hz);
         if (hl > HAND_FORCE) { hx *= HAND_FORCE / hl; hy *= HAND_FORCE / hl; hz *= HAND_FORCE / hl; }
         fx += hx; fy += hy; fz += hz;
+        if (fx * fx + fy * fy + fz * fz <= rt.hold[i] * rt.hold[i]) {
+          // it holds: the hand holding on to a fixed thing pulls the body (and is pulled) the other way
+          if (crew && crewIm > 0) { crew.vel.x -= hx * h * crewIm; crew.vel.y -= hy * h * crewIm; crew.vel.z -= hz * h * crewIm; }
+          continue;
+        }
       }
       if (fx * fx + fy * fy + fz * fz <= rt.hold[i] * rt.hold[i]) continue;
       b.stowed = false; b.asleep = false; b.still = 0;
@@ -1163,7 +1175,9 @@ function sub(s: PropsState, rt: Rt, m: ShipMotion, crew: CrewState | null, gi: n
 /**
  * Advance every object by dt of ship time (s) under the ship's motion (craftMotion() output) and with the crew
  * body (null when nobody is aboard). Sub-stepped at 120 Hz or finer, so that no point of any body moves more
- * than a centimetre per sub-step. Returns the number of sub-steps taken (0 when everything slept).
+ * than MAX_MOVE per sub-step; while the ship coasts (felt acceleration under LIGHT_A, nothing in hand, the crew
+ * still) only that motion bound, ROT_STEP of turn and COAST_DT set the step, and a pure free flight clear of every
+ * surface goes from gap to gap (freeStep). Returns the number of sub-steps taken (0 when everything slept).
  */
 export function stepProps(s: PropsState, ship: ShipMotion, crew: CrewState | null, dt: number): number {
   try {
@@ -1176,19 +1190,20 @@ export function stepProps(s: PropsState, ship: ShipMotion, crew: CrewState | nul
     if (gi < 0) g.id = '';
     // anything to do?
     let awake = gi >= 0;
-    let vmax = 0;
+    let vmax = 0, wmax = 0;
     for (let i = 0; i < n; i++) {
       const b = B[i];
       if (!b.asleep && !b.stowed) {
         awake = true;
-        const v = b.v, w = b.w;
-        const sp = Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z) + Math.sqrt(w.x * w.x + w.y * w.y + w.z * w.z) * rt.bound[i];
+        const v = b.v, w = b.w, wl = Math.sqrt(w.x * w.x + w.y * w.y + w.z * w.z);
+        const sp = Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z) + wl * rt.bound[i];
         if (sp > vmax) vmax = sp;
+        if (wl > wmax) wmax = wl;
       }
     }
     const la = s.lastA, lw = s.lastW;
     const dax = a.x - la.x, day = a.y - la.y, daz = a.z - la.z, dwx = W.x - lw.x, dwy = W.y - lw.y, dwz = W.z - lw.z;
-    if (dax * dax + day * day + daz * daz > WAKE_DA * WAKE_DA || dwx * dwx + dwy * dwy + dwz * dwz > WAKE_DW * WAKE_DW || al.x * al.x + al.y * al.y + al.z * al.z > 1e-12) awake = true;
+    if (dax * dax + day * day + daz * daz > WAKE_DA * WAKE_DA || dwx * dwx + dwy * dwy + dwz * dwz > WAKE_DW * WAKE_DW || (al.x * al.x + al.y * al.y + al.z * al.z) * rt.rmax * rt.rmax > WAKE_DA * WAKE_DA) awake = true;
     if (!awake && crew && crew.seat === '') {
       const cv = crew.vel;
       if (cv.x * cv.x + cv.y * cv.y + cv.z * cv.z > WAKE_V * WAKE_V) {
@@ -1203,9 +1218,28 @@ export function stepProps(s: PropsState, ship: ShipMotion, crew: CrewState | nul
     if (crew) vmax = Math.max(vmax, Math.sqrt(crew.vel.x ** 2 + crew.vel.y ** 2 + crew.vel.z ** 2));
     const w2 = W.x * W.x + W.y * W.y + W.z * W.z;
     const amax = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z) + (w2 + Math.sqrt(al.x * al.x + al.y * al.y + al.z * al.z)) * rt.rmax + 2 * Math.sqrt(w2) * vmax;
-    let nsub = Math.max(Math.ceil(dt / SUB_DT - 1e-9), Math.ceil(((vmax + amax * dt) * dt) / MAX_MOVE));
+    const cv2 = crew ? crew.vel.x * crew.vel.x + crew.vel.y * crew.vel.y + crew.vel.z * crew.vel.z : 0;
+    const light = gi < 0 && amax < LIGHT_A && cv2 < WAKE_V * WAKE_V;
+    let nsub = light
+      ? Math.max(Math.ceil(dt / COAST_DT - 1e-9), Math.ceil(((vmax + amax * dt) * dt) / MAX_MOVE), Math.ceil((wmax * dt) / ROT_STEP))
+      : Math.max(Math.ceil(dt / SUB_DT - 1e-9), Math.ceil(((vmax + amax * dt) * dt) / MAX_MOVE));
     if (nsub < 1) nsub = 1; else if (nsub > MAX_SUB) nsub = MAX_SUB;
     const h = dt / nsub;
+    if (gi < 0 && freeStep(rt, s, crew, amax, w2) > h) {
+      // Everything awake is in free flight, clear of every surface: take steps as long as the nearest possible
+      // contact allows (re-judged every step; back to the fixed step as soon as anything comes near).
+      let left = dt, k = 0;
+      while (left > 0 && k < nsub) {
+        let hk = freeStep(rt, s, crew, amax, w2);
+        if (hk < h) hk = h;
+        if (hk > left || k === nsub - 1) hk = left;
+        sub(s, rt, ship, crew, -1, hk);
+        left -= hk;
+        k++;
+      }
+      s.t += dt;
+      return k;
+    }
     for (let k = 0; k < nsub; k++) {
       sub(s, rt, ship, crew, gi, h);
       if (gi >= 0) {
@@ -1221,6 +1255,86 @@ export function stepProps(s: PropsState, ship: ShipMotion, crew: CrewState | nul
     return nsub;
   } catch {
     return 0;
+  }
+}
+
+/**
+ * Longest sub-step (s) that free flight allows right now, 0 when some awake body touches something or is near it.
+ * The nearest possible contact of each awake body (static boxes, every other body, the crew) is at least its gap;
+ * a step may close half of it at the worst relative speed and felt acceleration (so nothing can tunnel), and turns
+ * no body (or the cabin) by more than a small angle. Pure in-flight drift in a coasting ship thus costs a few steps
+ * per gap crossed instead of 120 per second.
+ */
+function freeStep(rt: Rt, s: PropsState, crew: CrewState | null, amax: number, w2: number): number {
+  const B = s.bodies, n = rt.n, sb = rt.sb, ns = rt.ns;
+  let gap = Infinity, vmax = 0, wmax = 0, any = false;
+  for (let i = 0; i < n; i++) {
+    const b = B[i];
+    if (b.asleep || b.stowed) continue;
+    if (rt.cnt[i] > 0) return 0;
+    any = true;
+    const p = b.p, bd = rt.bound[i];
+    const v = Math.sqrt(b.v.x * b.v.x + b.v.y * b.v.y + b.v.z * b.v.z), w = Math.sqrt(b.w.x * b.w.x + b.w.y * b.w.y + b.w.z * b.w.z);
+    if (v > vmax) vmax = v;
+    if (w > wmax) wmax = w;
+    for (let k = 0; k < ns; k++) {
+      const o = 6 * k;
+      const dx = p.x < sb[o] ? sb[o] - p.x : p.x > sb[o + 3] ? p.x - sb[o + 3] : 0;
+      const dy = p.y < sb[o + 1] ? sb[o + 1] - p.y : p.y > sb[o + 4] ? p.y - sb[o + 4] : 0;
+      const dz = p.z < sb[o + 2] ? sb[o + 2] - p.z : p.z > sb[o + 5] ? p.z - sb[o + 5] : 0;
+      const g = Math.sqrt(dx * dx + dy * dy + dz * dz) - bd;
+      if (g < gap) gap = g;
+    }
+    for (let j = 0; j < n; j++) {
+      if (j === i) continue;
+      const q = B[j].p, g = Math.sqrt((p.x - q.x) ** 2 + (p.y - q.y) ** 2 + (p.z - q.z) ** 2) - bd - rt.bound[j];
+      if (g < gap) gap = g;
+    }
+    if (crew) {
+      const c = crew.pos, y0 = c.y, y1 = c.y + CREW_HEIGHT, cy = p.y < y0 ? y0 : p.y > y1 ? y1 : p.y;
+      const g = Math.sqrt((p.x - c.x) ** 2 + (p.y - cy) ** 2 + (p.z - c.z) ** 2) - bd - CREW_RADIUS;
+      if (g < gap) gap = g;
+    }
+  }
+  if (!any || !(gap > 0)) return 0;
+  // worst closing speed: two bodies head on, or a body and the crew
+  const cv = crew ? Math.sqrt(crew.vel.x * crew.vel.x + crew.vel.y * crew.vel.y + crew.vel.z * crew.vel.z) : 0;
+  const v = 2 * vmax + cv, a = 2 * amax, half = 0.5 * gap;
+  let h = a > 1e-12 ? (Math.sqrt(v * v + 2 * a * half) - v) / a : v > 1e-12 ? half / v : Infinity;
+  if (wmax > 0 && 0.2 / wmax < h) h = 0.2 / wmax;
+  if (w2 > 0 && 0.05 / Math.sqrt(w2) < h) h = 0.05 / Math.sqrt(w2);
+  return h;
+}
+
+/**
+ * How much ship time one stepProps call may cover cheaply, s (for a caller that advances the world in pieces under
+ * time acceleration): Infinity when everything sleeps or is stowed; LONG_CHUNK while the ship coasts (stepped by
+ * motion) or everything awake is in free flight clear of every surface (stepped from gap to gap); otherwise
+ * SHORT_CHUNK (contact under thrust or spin, a hand, a walking crew: 120 Hz).
+ */
+export const SHORT_CHUNK = 0.1;
+export const LONG_CHUNK = 10;
+export function propsChunk(s: PropsState, ship: ShipMotion, crew: CrewState | null): number {
+  try {
+    const rt = runtime(s.layoutId);
+    if (!rt) return Infinity;
+    if (s.grab.id !== '') return SHORT_CHUNK;
+    let awake = false, vmax = 0;
+    for (let i = 0; i < rt.n; i++) {
+      const b = s.bodies[i];
+      if (b.asleep || b.stowed) continue;
+      awake = true;
+      const v = Math.sqrt(b.v.x * b.v.x + b.v.y * b.v.y + b.v.z * b.v.z);
+      if (v > vmax) vmax = v;
+    }
+    if (!awake) return Infinity;
+    const a = ship.a, W = ship.w, al = ship.alpha, w2 = W.x * W.x + W.y * W.y + W.z * W.z;
+    const amax = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z) + (w2 + Math.sqrt(al.x * al.x + al.y * al.y + al.z * al.z)) * rt.rmax + 2 * Math.sqrt(w2) * vmax;
+    const cv2 = crew ? crew.vel.x * crew.vel.x + crew.vel.y * crew.vel.y + crew.vel.z * crew.vel.z : 0;
+    if (amax < LIGHT_A && cv2 < WAKE_V * WAKE_V) return LONG_CHUNK; // coasting: stepped by motion, not by 120 Hz
+    return freeStep(rt, s, crew, amax, w2) > SUB_DT ? LONG_CHUNK : SHORT_CHUNK;
+  } catch {
+    return SHORT_CHUNK;
   }
 }
 

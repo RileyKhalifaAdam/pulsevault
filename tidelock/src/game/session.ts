@@ -23,6 +23,10 @@ import {
   pushOffCrew, rockerValue, roomAt, sitCrew, standCrew, stepCrew, stepDevice, stickAxis,
   type CrewState, type DeviceState,
 } from '../world';
+import {
+  ARM_REACH as PROP_REACH, createPropsState, propsChunk, grab as propHandOn, loadPropsState, moveGrab, pickProp, propInfo, propViews, release as propHandOff,
+  savePropsState, stepProps, unstow, type PropsState, type PropView,
+} from '../world/props';
 import type {
   BodyView, CraftView, CrewView, DeviceView, DockingView, FlightView, HoldMode, PlannedBurn, PlayerMode, PlayerView, PredictionEvent, PredictionView, Session, SessionEvents,
   SessionOptions, StepInfo, TargetView, WarpLimit, WarpView,
@@ -93,6 +97,15 @@ const SEAT_REACH = 1.2;
 /** How far the head turns in the pilot seat, rad. */
 const HEAD_YAW = 2.2;
 const HEAD_PITCH = 1.1;
+// Loose objects: while any is awake (or in hand) the world advances in pieces no longer than props.ts says it can
+// cover cheaply (propsChunk: 0.1 s in contact, 10 s while everything awake drifts in free flight, stepped from gap to
+// gap), each followed by the objects' own integration, so under time acceleration they are as honest as at 1x and
+// the CPU budget, not a shortcut, is what limits the warp ('props'). Asleep they cost nothing.
+/** Smoothing of the hand's velocity (what a released object is thrown with), s. */
+const THROW_TAU = 0.05;
+/** Fastest an arm moves the hand toward where the finger points, m/s (a throw is at most this fast). */
+const HAND_SPEED = 8;
+const NO_PROPS: PropView[] = [];
 /** Hold lamps: the mode each one selects. */
 const HOLD_OF: Partial<Record<DeviceRole, HoldMode>> = {
   holdOff: 'off', holdStability: 'stability', holdPrograde: 'prograde', holdRetrograde: 'retrograde', holdNormal: 'normal', holdAntinormal: 'antinormal',
@@ -121,6 +134,8 @@ interface SessionState {
   devices?: DeviceState[];
   pages?: number[];
   head?: number[];
+  /** Loose objects (src/world/props.ts); absent in older saves: the objects start where the ship's data puts them. */
+  props?: unknown;
 }
 
 const galaxies = new Map<number, SystemDef>();
@@ -262,6 +277,17 @@ class WorldSession implements Session {
   private readonly walk = { moveX: 0, moveZ: 0 };
   private readonly motion = createShipMotion();
   private readonly promptView = { id: '', kind: '', label: '' };
+  // loose objects and the hand on one
+  private loose: PropsState | null = null;
+  private propPointer = -1;
+  private propId = '';
+  private propDist = 0;
+  private propPrevOk = false;
+  private readonly propDir = v3();
+  private readonly propTarget = v3();
+  private readonly propPrev = v3();
+  private readonly propVel = v3();
+  private readonly PEYE = v3();
   private readonly crewView: CrewView = {
     mode: 'helm', posture: 'seated', pos: v3(), eye: v3(), yaw: 0, pitch: 0, vel: v3(), boots: true, gripped: false, roomId: '', roomName: '',
     felt: v3(), prompt: null, asleep: false,
@@ -298,6 +324,10 @@ class WorldSession implements Session {
         }
       }
       if (this.ix.lights >= 0) this.lights = this.devs[this.ix.lights].on;
+      if (state.props !== undefined && state.props !== null && this.loose) {
+        const ps = loadPropsState(state.props);
+        if (ps && ps.layoutId === this.loose.layoutId) this.loose = ps;
+      }
       if (Array.isArray(state.head)) { this.headYaw = clamp(num(state.head[0]), -HEAD_YAW, HEAD_YAW); this.headPitch = clamp(num(state.head[1]), -HEAD_PITCH, HEAD_PITCH); }
       const b = state.crew;
       if (state.mode === 'helm' || !this.layout) { this.playerMode = 'helm'; this.body = null; }
@@ -329,6 +359,9 @@ class WorldSession implements Session {
     this.winN = this.winAt = 0;
     this.limitFrames = 0;
     this.initDevices();
+    this.loose = ship.shipVisual ? createPropsState(ship.shipVisual) : null;
+    this.propPointer = -1;
+    this.propId = '';
   }
 
   /** The ship's controls in their resting state: sticks centred, throttle closed, drive safe, cabin lights on. */
@@ -372,25 +405,33 @@ class WorldSession implements Session {
     this.clock += realDt;
     this.arm();
     this.drowse(realDt);
+    this.handOnProp(realDt, want);
     let why: WarpLimit = '';
     for (let guard = 0; guard < 1e6; guard++) {
       const left = want - info.simDt;
       if (!(left > 1e-7)) break;
       const active = this.command() || this.faFiring; // the assist loop is closed at the control rate too
+      const loose = this.propsAwake();
+      let chunk = active && left > CONTROL_DT ? CONTROL_DT : left;
+      if (loose && this.loose) {
+        const pc = propsChunk(this.loose, craftMotion(world, this.ship, this.motion), this.playerMode === 'onFoot' ? this.body : null);
+        if (chunk > pc) chunk = pc;
+      }
       this.advOpts.budgetMs = budget - (now() - start);
-      const res = advance(world, active && left > CONTROL_DT ? CONTROL_DT : left, this.advOpts);
+      const res = advance(world, chunk, this.advOpts);
       info.simDt += res.simDt;
       info.steps += res.steps;
       if (res.simDt > 0) {
         if (this.playerMode === 'onFoot') this.stepBody(res.simDt);
+        this.stepLoose(res.simDt);
         this.stepDevices(res.simDt);
       }
       const limited = res.limitedBy;
       if (world.events.length > 0) this.pump();
-      if (limited !== '') { why = limited; break; }
+      if (limited !== '') { why = limited === 'cpu' && loose ? 'props' : limited; break; }
       if (want - info.simDt > 1e-7 && now() - start > budget) {
         const c = this.ship;
-        why = active ? 'rotation' : c.propellant > 0 && c.dockedTo === null && (c.throttle > 0 || c.rcs.x !== 0 || c.rcs.y !== 0 || c.rcs.z !== 0) ? 'thrust' : 'cpu';
+        why = active ? 'rotation' : c.propellant > 0 && c.dockedTo === null && (c.throttle > 0 || c.rcs.x !== 0 || c.rcs.y !== 0 || c.rcs.z !== 0) ? 'thrust' : loose ? 'props' : 'cpu';
         break;
       }
     }
@@ -489,6 +530,51 @@ class WorldSession implements Session {
     for (const b of w.bodies) ids.push(b.id);
     if (ids.length === 0) return;
     this.setTarget(ids[(ids.indexOf(this.targetId ?? '') + 1) % ids.length]);
+  }
+
+  /** Is any loose object moving (or in hand)? Asleep and stowed ones cost nothing. */
+  private propsAwake(): boolean {
+    const ps = this.loose;
+    if (!ps) return false;
+    if (ps.grab.id !== '') return true;
+    const bs = ps.bodies;
+    for (let i = 0; i < bs.length; i++) if (!bs[i].asleep && !bs[i].stowed) return true;
+    return false;
+  }
+  /** The loose objects move with what the ship and the pilot's body just did (after the body, as props.ts asks). */
+  private stepLoose(dt: number): void {
+    const ps = this.loose;
+    if (!ps) return;
+    stepProps(ps, craftMotion(this.world, this.ship, this.motion), this.playerMode === 'onFoot' ? this.body : null, dt);
+  }
+  /** Where the eye is now, ship-local (on foot, or the helm eye when strapped in). */
+  private eyeNow(out: V3): V3 {
+    const b = this.body, layout = this.layout;
+    if (this.playerMode === 'onFoot' && b && layout) return crewEye(b, layout, out);
+    const e = layout ? layout.helmEye : null;
+    out.x = e ? e.x : 0; out.y = e ? e.y : 0; out.z = e ? e.z : 0;
+    return out;
+  }
+  /**
+   * Once per frame: the hand moves toward the point on the touch ray at the distance it took hold (an arm: at most
+   * HAND_SPEED), and its velocity is smoothed for a throw.
+   */
+  private handOnProp(realDt: number, simDt: number): void {
+    const ps = this.loose;
+    if (!ps || this.propPointer < 0 || ps.grab.id === '') return;
+    const e = this.eyeNow(this.PEYE), d = this.propDir, k = this.propDist, t = this.propTarget;
+    const dt = simDt > 0 ? simDt : realDt;
+    let gx = e.x + d.x * k - t.x, gy = e.y + d.y * k - t.y, gz = e.z + d.z * k - t.z;
+    const gl = Math.sqrt(gx * gx + gy * gy + gz * gz), lim = HAND_SPEED * dt;
+    if (gl > lim) { gx *= lim / gl; gy *= lim / gl; gz *= lim / gl; }
+    t.x += gx; t.y += gy; t.z += gz;
+    if (this.propPrevOk && dt > 0) {
+      const a = 1 - Math.exp(-realDt / THROW_TAU), pv = this.propPrev, hv = this.propVel;
+      hv.x += ((t.x - pv.x) / dt - hv.x) * a; hv.y += ((t.y - pv.y) / dt - hv.y) * a; hv.z += ((t.z - pv.z) / dt - hv.z) * a;
+    }
+    this.propPrev.x = t.x; this.propPrev.y = t.y; this.propPrev.z = t.z;
+    this.propPrevOk = true;
+    moveGrab(ps, t, dt);
   }
 
   /** The pilot's body moves with what the ship just did. */
@@ -1306,6 +1392,76 @@ class WorldSession implements Session {
     }
   }
 
+  // ------------------------------------------------------------------------------------------ loose objects
+
+  props(): readonly PropView[] {
+    return this.loose ? propViews(this.loose) : NO_PROPS;
+  }
+  /** Unit copy of a direction into out; false when it has no length. */
+  private static unit(dir: V3, out: V3): boolean {
+    const l = Math.sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+    if (!(l > 0) || !Number.isFinite(l)) return false;
+    out.x = dir.x / l; out.y = dir.y / l; out.z = dir.z / l;
+    return true;
+  }
+  /** The loose object on the ray from the eye within reach: its id, and the hand point's distance (propDist). */
+  private propOnRay(dir: V3): string {
+    const ps = this.loose;
+    if (!ps || this.ship.destroyed || this.asleep || !WorldSession.unit(dir, this.propDir)) return '';
+    const e = this.eyeNow(this.PEYE), u = this.propDir;
+    const id = pickProp(ps, e, u, PROP_REACH);
+    if (id === '') return '';
+    const bs = ps.bodies;
+    for (let i = 0; i < bs.length; i++) {
+      if (bs[i].id !== id) continue;
+      const p = bs[i].p, t = (p.x - e.x) * u.x + (p.y - e.y) * u.y + (p.z - e.z) * u.z;
+      this.propDist = t < 0 ? 0 : t > PROP_REACH ? PROP_REACH : t;
+      return id;
+    }
+    return '';
+  }
+  propAt(dir: V3): number {
+    const ps = this.loose, keep = this.propPointer >= 0;
+    if (!ps || keep) return Infinity; // one object in hand at a time
+    const id = this.propOnRay(dir);
+    const info = id ? propInfo(ps, id) : null;
+    return info ? Math.max(0, this.propDist - info.bound) : Infinity;
+  }
+  propGrab(pointerId: number, dir: V3): boolean {
+    const ps = this.loose;
+    if (!ps || this.propPointer >= 0 || this.touch()) return false; // a touch that wakes does nothing else
+    const id = this.propOnRay(dir);
+    if (id === '') return false;
+    const e = this.eyeNow(this.PEYE), u = this.propDir, k = this.propDist, t = this.propTarget;
+    t.x = e.x + u.x * k; t.y = e.y + u.y * k; t.z = e.z + u.z * k;
+    if (!propHandOn(ps, id, t, e)) return false;
+    this.propPointer = pointerId;
+    this.propId = id;
+    this.propPrevOk = false; // the hand starts where it took hold (propTarget)
+    this.propVel.x = this.propVel.y = this.propVel.z = 0;
+    return true;
+  }
+  propMove(pointerId: number, dir: V3): void {
+    if (pointerId !== this.propPointer || this.propPointer < 0) return;
+    this.restT = 0;
+    const l = Math.sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+    if (!(l > 0) || !Number.isFinite(l)) return;
+    this.propDir.x = dir.x / l; this.propDir.y = dir.y / l; this.propDir.z = dir.z / l;
+  }
+  propRelease(pointerId: number, tap: boolean): void {
+    if (pointerId !== this.propPointer || this.propPointer < 0) return;
+    this.propPointer = -1;
+    const ps = this.loose, id = this.propId;
+    this.propId = '';
+    if (!ps) return;
+    if (tap) {
+      propHandOff(ps);
+      unstow(ps, id); // a quick tap undoes a clip, a magnet or a strap (no-op for a loose object)
+      return;
+    }
+    propHandOff(ps, this.propVel, this.playerMode === 'onFoot' ? this.body : null);
+  }
+
   // ------------------------------------------------------------------------------------------ life cycle
 
   reset(): void {
@@ -1333,6 +1489,7 @@ class WorldSession implements Session {
       burns: this.burnList, burnSeq: this.burnSeq, throttle: this.throttle, rearmBlock: this.rearmBlock, settled: this.settled,
       mode: this.playerMode, crew: this.playerMode === 'onFoot' ? this.body : null, lights: this.lights, assist: this.assist,
       devices: this.devs, pages: this.devPage, head: [this.headYaw, this.headPitch],
+      props: this.loose ? savePropsState(this.loose) : null,
     };
     return JSON.stringify({ tidelock: SAVE_VERSION, session: state, world: saveWorld(this.world) });
   }
@@ -1362,6 +1519,7 @@ export function loadSession(json: string, opts: SessionOptions = {}): Session | 
       seed: s.seed, hold: s.hold ?? 'stability', holdQ: s.holdQ ?? null, targetId: s.targetId ?? null, predFrame: s.predFrame ?? null,
       burns: Array.isArray(s.burns) ? s.burns : [], burnSeq: s.burnSeq ?? 0, throttle: s.throttle ?? 0, rearmBlock: !!s.rearmBlock, settled: !!s.settled,
       mode: s.mode === 'helm' ? 'helm' : 'onFoot', crew: s.crew ?? null, lights: s.lights !== false, assist: s.assist === true, devices: s.devices, pages: s.pages, head: s.head,
+      props: s.props,
     });
   } catch {
     return null;

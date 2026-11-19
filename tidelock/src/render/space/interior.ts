@@ -521,7 +521,8 @@ const CYAN: P3 = [0.3, 0.85, 1.0];
 const EMERG: P3 = [1.0, 0.28, 0.07];
 const REACT: P3 = [0.3, 0.72, 1.0];
 const BLUE: P3 = [0.17, 0.34, 0.85];
-const RED_LEATHER: P3 = [0.62, 0.07, 0.055];
+// oxblood leather: x the leather tile (~0.48) gives the scanned leather's own albedo, ~(0.12, 0.022, 0.018)
+const RED_LEATHER: P3 = [0.26, 0.047, 0.038];
 const CHARCOAL: P3 = [0.26, 0.26, 0.28];
 const DARK_RED: P3 = [0.55, 0.09, 0.09];
 const CREAM: P3 = [1.0, 0.95, 0.86];
@@ -534,7 +535,8 @@ const BRUSH = mt('brushed');
 const CHROME = mt('brushed', [1.12, 1.12, 1.14]);
 const TREAD = mt('tread');
 const RUBBER = mt('tread', [0.6, 0.6, 0.6]);
-const GRATE = mt('grating');
+// floor channels and rack backs: alpha-tested walkway grating over the deck below (the cut-out bucket)
+const GRATE = mt('grating', ONE, 'cut');
 const WARMP = mt('warmPanel');
 const VENEER = mt('veneer');
 const DFLOOR = mt('darkFloor');

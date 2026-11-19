@@ -22,6 +22,7 @@ import { beginFrame, createSceneFrame } from '../../src/render/frame';
 import { createSession } from '../../src/game';
 import { INTERIORS } from '../../src/data/interiors';
 import type { CraftView } from '../../src/game/api';
+import { acquirePhotoDetail } from '../../src/render/space/photo/detail';
 
 const params = new URLSearchParams(location.search);
 const has = (k: string): boolean => params.has(k) && params.get(k) !== '';
@@ -71,16 +72,34 @@ const PRESETS: Record<string, Preset> = {
   cockpit: { eye: layout.helmEye, yaw: -6, pitch: -12, nadir: { x: 0, y: -0.857, z: -0.515 }, sun: { x: 0.45, y: 0.6, z: -0.66 }, lights: true },
   night: { ...lounge, lights: false },
 };
-const preset = PRESETS[view] ?? PRESETS.lounge;
+let preset = PRESETS[view] ?? PRESETS.lounge;
 const eye: V3 = { x: num('ex', preset.eye.x), y: num('ey', preset.eye.y), z: num('ez', preset.eye.z) };
-const lookYaw = num('yaw', preset.yaw) * DEG;
-const lookPitch = num('pitch', preset.pitch) * DEG;
-const lights = has('lights') ? num('lights', 1) === 1 : preset.lights;
+let lookYaw = num('yaw', preset.yaw) * DEG;
+let lookPitch = num('pitch', preset.pitch) * DEG;
+let lights = has('lights') ? num('lights', 1) === 1 : preset.lights;
+// multi=<view>[:ex,ey,ez,yaw,pitch]|... renders several views after ONE load into a grid (cols=N, default 2):
+// software rendering spends most of a shot on loading, so a contact sheet of a dozen views costs one load
+// ab=1 (with multi): every view twice, photo detail on (left) and off (right)
+const ab = has('ab');
+const multi = (params.get('multi') ?? '')
+  .split('|')
+  .filter((x) => x)
+  .flatMap((spec) => (ab ? [spec, `${spec} (no photo)`] : [spec]))
+  .map((spec) => {
+    const [name, nums] = spec.replace(' (no photo)', '').split(':');
+    const p = PRESETS[name] ?? PRESETS.lounge;
+    const n = (nums ?? '').split(',').map((x) => (x === '' ? NaN : Number(x)));
+    const pick = (i: number, d: number): number => (Number.isFinite(n[i]) ? n[i] : d);
+    return { label: spec, off: spec.endsWith('(no photo)'), preset: p, eye: { x: pick(0, p.eye.x), y: pick(1, p.eye.y), z: pick(2, p.eye.z) }, yaw: pick(3, p.yaw) * DEG, pitch: pick(4, p.pitch) * DEG };
+  });
 
 // pq: the pipeline's own tier (default q); software rendering cannot screenshot the 'high' pipeline in time
 const pipeQuality = (params.get('pq') ?? quality) as Quality;
 const pipeline = createPipeline(canvas, { quality: pipeQuality });
-pipeline.resize(window.innerWidth, window.innerHeight, window.devicePixelRatio);
+const tileCols = num('cols', 2);
+const tileRows = Math.max(1, Math.ceil(((params.get('multi') ?? '').split('|').filter((x) => x).length * (has('ab') ? 2 : 1)) / tileCols));
+if (has('multi')) pipeline.resize(Math.floor(window.innerWidth / tileCols), Math.floor(window.innerHeight / tileRows), 1);
+else pipeline.resize(window.innerWidth, window.innerHeight, window.devicePixelRatio);
 const scene = createSceneManager(pipeline, { quality });
 const session = createSession({ seed: 1 });
 const frame = createSceneFrame();
@@ -156,6 +175,49 @@ async function main(): Promise<void> {
     scene.render(frame);
     if (i % 4 === 3) await new Promise((r) => setTimeout(r, 0));
   }
+  if (multi.length) {
+    const cols = num('cols', 2);
+    const rows = Math.ceil(multi.length / cols);
+    const w = canvas.width;
+    const h = canvas.height;
+    const sheet = document.createElement('canvas');
+    sheet.width = w * cols;
+    sheet.height = h * rows;
+    const sg = sheet.getContext('2d') as CanvasRenderingContext2D;
+    const lines: string[] = [];
+    for (let k = 0; k < multi.length; k++) {
+      const m = multi[k];
+      preset = m.preset;
+      eye.x = m.eye.x;
+      eye.y = m.eye.y;
+      eye.z = m.eye.z;
+      lookYaw = m.yaw;
+      lookPitch = m.pitch;
+      lights = m.preset.lights;
+      acquirePhotoDetail(quality).uniforms.uPhOn.value = m.off ? 0 : 1;
+      for (let i = 0; i < num('frames', 24); i++) {
+        fill(1 / 30);
+        scene.render(frame);
+        if (i % 4 === 3) await new Promise((r) => setTimeout(r, 0));
+      }
+      fill(1 / 30);
+      scene.render(frame);
+      const x = (k % cols) * w;
+      const y = Math.floor(k / cols) * h;
+      sg.drawImage(canvas, x, y, w, h);
+      sg.fillStyle = '#9fd';
+      sg.font = `${Math.round(h / 28)}px monospace`;
+      sg.fillText(m.label, x + 6, y + h / 22);
+      const s2 = scene.stats();
+      lines.push(`${m.label}: calls ${s2.drawCalls} tris ${s2.triangles} ev ${scene.exposure.toFixed(2)}`);
+    }
+    canvas.style.display = 'none';
+    sheet.style.cssText = 'position:fixed;left:0;top:0;width:100%;height:100%;display:block';
+    document.body.insertBefore(sheet, info);
+    info.textContent = `${lines.join('\n')}\ninterior ${(globalThis as { __tlInterior?: string }).__tlInterior ?? ''}`;
+    ready();
+    return;
+  }
   const st = scene.stats();
   info.textContent =
     `view ${view} · ${quality} · lights ${lights ? 'on' : 'off'} · cam ${scene.camera.mode} fov ${(scene.camera.fovY / DEG).toFixed(0)} · ev ${scene.exposure.toFixed(2)} · limb dip ${dipDeg.toFixed(0)}°\n` +
@@ -164,7 +226,7 @@ async function main(): Promise<void> {
     `interior ${(globalThis as { __tlInterior?: string }).__tlInterior ?? ''}`;
   ready();
 }
-window.addEventListener('resize', () => pipeline.resize(window.innerWidth, window.innerHeight, window.devicePixelRatio));
+if (!has('multi')) window.addEventListener('resize', () => pipeline.resize(window.innerWidth, window.innerHeight, window.devicePixelRatio));
 if (has('bench')) {
   void import('../../src/render/space/surfaces').then((m) => {
     const out: string[] = [];

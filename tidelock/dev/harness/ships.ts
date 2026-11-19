@@ -28,6 +28,7 @@ import type { RGB, ShipLayout, ShipVisualId } from '../../src/core/types';
 import { LAYER, MeshBuilder, CHANNEL_COUNT, hullStyle } from '../../src/render/space/geo';
 import { createHullMaterials, type HullMaterials, type HullQuality, type Livery } from '../../src/render/space/hullMaterials';
 import { createShipVisual, type ShipVisual } from '../../src/render/space/ships';
+import { acquirePhotoDetail } from '../../src/render/space/photo/detail';
 import { INTERIORS } from '../../src/data/interiors';
 
 const params = new URLSearchParams(location.search);
@@ -38,6 +39,16 @@ const DEG = Math.PI / 180;
 const ALL: ShipVisualId[] = ['shrike', 'wren', 'magpie', 'albatross', 'drover', 'halberd', 'caravel'];
 const shipId = (ALL as string[]).includes(str('ship', 'wren')) ? (str('ship', 'wren') as ShipVisualId) : 'wren';
 const quality = str('q', 'high') as HullQuality;
+// the hero hull's photo detail decodes asynchronously: render until it is in (photo=0 skips the wait,
+// photo=off waits and then switches the detail off)
+let photoDone = params.get('photo') === '0';
+let photoFrame = -1;
+const photoDetail = acquirePhotoDetail(quality);
+void photoDetail.ready.then(() => {
+  // photo=off: loaded but switched off, for a before/after
+  if (params.get('photo') === 'off') photoDetail.uniforms.uPhOn.value = 0;
+  photoDone = true;
+});
 const lodParam = str('lod', '0');
 const lodMode = lodParam === 'auto' ? 'auto' : lodParam === '1' ? 'low' : 'hero';
 const sheet = params.get('sheet') === '1';
@@ -355,7 +366,8 @@ function frame(): void {
     composer.render();
   }
   frames++;
-  if (frames === 2) {
+  if (photoDone && photoFrame < 0) photoFrame = frames;
+  if (photoFrame >= 0 && frames === photoFrame + 3) {
     if (params.get('info') === '1' && !sheetCtx) {
       const el = document.createElement('div');
       el.style.cssText = 'position:fixed;left:8px;top:8px;font:11px/1.35 monospace;color:#9fc;white-space:pre;background:rgba(0,0,0,.5);padding:4px';
@@ -364,6 +376,6 @@ function frame(): void {
     }
     (window as unknown as { __ready: boolean }).__ready = true;
   }
-  if (live || frames < 3) requestAnimationFrame(frame);
+  if (live || photoFrame < 0 || frames < photoFrame + 4) requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);

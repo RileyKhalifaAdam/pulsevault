@@ -348,7 +348,7 @@ const F0 = { x: 0, y: 0, z: 0 };
 const F1 = { x: 0, y: 0, z: 0 };
 
 /** Copy a craft's translational state and constants into a particle. */
-export function loadParticle(P: Particle, c: Craft): void {
+export function loadParticle(P: Particle, c: Craft, world?: World): void {
   P.p = c.primary;
   P.x = c.rel.x; P.y = c.rel.y; P.z = c.rel.z;
   P.vx = c.relV.x; P.vy = c.relV.y; P.vz = c.relV.z;
@@ -361,7 +361,10 @@ export function loadParticle(P: Particle, c: Craft): void {
   P.heatDiss = c.heatDissipation;
   const k = craftCompound(c);
   P.reachMax = Math.sqrt(k.cx * k.cx + k.cy * k.cy + k.cz * k.cz) + k.radius;
-  P.contactH = hullReach(c, P.x, P.y, P.z);
+  // The hull's reach toward the ground; in the stepping loop (world given), far from the ground the bound is enough
+  // (it only sizes the approach steps) and the exact reach is taken once within it.
+  const r = Math.sqrt(P.x * P.x + P.y * P.y + P.z * P.z), b = world ? world.bodies[c.primary] : null;
+  P.contactH = !world || (b && r < b.radius + 2 * P.reachMax) ? hullReach(c, P.x, P.y, P.z) : P.reachMax;
   P.fx = P.fy = P.fz = 0;
   P.mdot = 0;
   P.drag = 0;
@@ -388,7 +391,7 @@ function storeParticle(P: Particle, c: Craft): void {
 /** The step a free craft would take right now (what advance() sizes its synchronisation spans with). */
 export function stepEstimate(world: World, c: Craft): number {
   const P = P0, rc = c.rcs, tq = c.torque;
-  loadParticle(P, c);
+  loadParticle(P, c, world);
   const live = !c.destroyed;
   const powered = live && c.propellant > 0 && (c.throttle > 0 || rc.x !== 0 || rc.y !== 0 || rc.z !== 0);
   return chooseDt(P, world.bodies[c.primary], powered, live && (tq.x !== 0 || tq.y !== 0 || tq.z !== 0));
@@ -408,7 +411,7 @@ export function takeSteps(): number {
  */
 export function integrateCraft(world: World, eph: Ephemeris, c: Craft, t0: number, t1: number, tally: Float64Array, cutWhy: number): number {
   const bodies = world.bodies, P = P0;
-  loadParticle(P, c);
+  loadParticle(P, c, world);
   let t = t0, n = 0;
   _stop = STOP_NONE;
   while (t < t1) {

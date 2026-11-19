@@ -736,3 +736,161 @@ describe('the pilot, hands on the physical controls', () => {
     expect(again.player().assist).toBe('on');
   });
 });
+
+describe('loose objects in the hand', () => {
+  /** A session with the pilot standing (boots on, gripped) at ship-local feet position (x, z), facing yaw. */
+  const standAt = (x: number, z: number, yaw: number, opts: { budgetMs: number } = FREE): Session => {
+    const s0 = createSession(opts);
+    const data = JSON.parse(s0.save()) as { session: { crew: { pos: V3; vel: V3; yaw: number; pitch: number } } };
+    const c = data.session.crew;
+    c.pos.x = x; c.pos.z = z; c.vel.x = c.vel.y = c.vel.z = 0; c.yaw = yaw; c.pitch = 0;
+    const s = loadSession(JSON.stringify(data), opts)!;
+    run(s, 0.2);
+    return s;
+  };
+  const prop = (s: Session, id: string) => s.props().find((p) => p.id === id)!;
+  const toward = (s: Session, p: V3): V3 => { const e = s.crew().eye; return { x: p.x - e.x, y: p.y - e.y, z: p.z - e.z }; };
+  /** Horizontal direction at angle th from ship forward (-Z) toward starboard (+X). */
+  const flat = (th: number): V3 => ({ x: Math.sin(th), y: 0, z: -Math.cos(th) });
+
+  it('grab a mug by pointer, carry it, throw it: it crosses the lounge and hits the far wall; the body recoils', () => {
+    // at the galley counter, facing it (port, -X); the mugs are magnetted to the counter top
+    const s = standAt(-2.2, -8.9, Math.PI / 2);
+    expect(s.crew().roomId).toBe('lounge');
+    const mug0 = prop(s, 'mug-galley-1');
+    expect(mug0.stowed).toBe(true);
+    const dir = toward(s, mug0.pos);
+    expect(s.propAt(dir)).toBeLessThan(1);
+    expect(s.propAt(flat(Math.PI / 2))).toBe(Infinity); // nothing to starboard within reach
+    // a quick tap undoes the magnet
+    expect(s.propGrab(3, dir)).toBe(true);
+    s.propRelease(3, true);
+    expect(prop(s, 'mug-galley-1').stowed).toBe(false);
+    // hand on it again, lift it off the counter and hold it out ahead
+    expect(s.propGrab(3, toward(s, prop(s, 'mug-galley-1').pos))).toBe(true);
+    expect(prop(s, 'mug-galley-1').grabbed).toBe(true);
+    // (ahead and a little to port: clear of the galley cabinets and the fridge)
+    s.propMove(3, flat(-0.3));
+    run(s, 1);
+    const eye = s.crew().eye, held = prop(s, 'mug-galley-1').pos;
+    const reachNow = Math.hypot(held.x - eye.x, held.y - eye.y, held.z - eye.z);
+    expect(reachNow).toBeLessThan(1.1);
+    expect(held.y).toBeGreaterThan(0.3); // carried at about eye height, off the counter
+    // float free (boots off) and swing the arm toward starboard: let go as the hand moves across
+    s.setBoots(false);
+    s.step(1 / 60);
+    const v0 = { ...s.crew().vel };
+    for (let i = 0; i <= 6; i++) { s.propMove(3, flat(-0.3 + (0.7 * i) / 6)); s.step(1 / 60); }
+    s.propRelease(3, false);
+    expect(prop(s, 'mug-galley-1').grabbed).toBe(false);
+    s.step(1 / 60);
+    const recoil = s.crew().vel.x - v0.x;
+    let xMax = -Infinity, hitAt = -1;
+    const xs: number[] = [];
+    for (let i = 0; i < 180; i++) {
+      s.step(1 / 60);
+      const p = prop(s, 'mug-galley-1').pos;
+      xs.push(p.x);
+      if (p.x > xMax) { xMax = p.x; hitAt = i; }
+    }
+    const xEnd = xs[xs.length - 1];
+    console.log(`thrown mug: reached x = ${xMax.toFixed(3)} m after ${((hitAt + 1) / 60).toFixed(2)} s (starboard wall at 3.2), then x = ${xEnd.toFixed(3)}; body recoil ${recoil.toFixed(4)} m/s`);
+    expect(xMax).toBeGreaterThan(3.2 - 0.042 - 0.05); // it reached the far (starboard) wall
+    expect(xEnd).toBeLessThan(xMax - 0.02); // and came back off it
+    expect(recoil).toBeLessThan(-0.005); // the arm that threw it pushed the floating body the other way
+  });
+
+  it('at full thrust loose objects slide aft; a carried mug stays in the hand, and holding on to a strapped crate holds the body back', () => {
+    // in the cargo bay beside the strapped crates, facing them (port)
+    const a = standAt(-0.6, 4.5, Math.PI / 2), b = standAt(-0.6, 4.5, Math.PI / 2);
+    const crate = prop(a, 'crate-S1');
+    expect(crate.stowed).toBe(true);
+    expect(a.propGrab(5, toward(a, crate.pos))).toBe(true);
+    const loose0 = { ...prop(a, 'crate-S3').pos };
+    a.setControls({ throttle: 1 });
+    b.setControls({ throttle: 1 });
+    run(a, 0.25);
+    run(b, 0.25);
+    const slid = prop(a, 'crate-S3').pos.z - loose0.z;
+    const va = a.crew().vel.z, vb = b.crew().vel.z;
+    console.log(`full thrust 0.25 s: loose crate slid ${slid.toFixed(3)} m aft; body aft speed ${va.toFixed(3)} m/s holding the strapped crate, ${vb.toFixed(3)} m/s not`);
+    expect(slid).toBeGreaterThan(0.2);
+    expect(prop(a, 'crate-S1').stowed).toBe(true); // the strap holds (crate 25 kg x 12 m/s² + the hand < 1000 N)
+    expect(vb).toBeGreaterThan(2); // falls aft at ~12 m/s²
+    expect(va).toBeLessThan(vb - 0.2); // the hand's pull (up to 160 N on 80 kg) is felt
+    a.propRelease(5, false);
+
+    // carrying a loose mug under thrust: it stays in the hand while the loose things fall aft
+    const c = standAt(-2.2, -8.9, Math.PI / 2);
+    expect(c.propGrab(6, toward(c, prop(c, 'mug-galley-1').pos))).toBe(true);
+    for (let i = 0; i < 60; i++) { c.propMove(6, flat(-0.3)); c.step(1 / 60); }
+    const book0 = { ...prop(c, 'book-lounge').pos };
+    c.setControls({ throttle: 1 });
+    for (let i = 0; i < 18; i++) { c.propMove(6, flat(-0.3)); c.step(1 / 60); }
+    const e = c.crew().eye, m = prop(c, 'mug-galley-1');
+    expect(m.grabbed).toBe(true);
+    expect(Math.hypot(m.pos.x - e.x, m.pos.y - e.y, m.pos.z - e.z)).toBeLessThan(1.1);
+    expect(prop(c, 'book-lounge').pos.z - book0.z).toBeGreaterThan(0.2);
+  });
+
+  it('awake objects limit time acceleration (reason "props"); asleep they do not; saves keep them, old saves get the defaults', () => {
+    const s = standAt(-2.2, -8.9, Math.PI / 2, { budgetMs: 3 });
+    expect(s.propGrab(2, toward(s, prop(s, 'mug-galley-1').pos))).toBe(true);
+    s.propRelease(2, true);
+    s.propMove(2, flat(0));
+    // nudge it loose by hand: grab, pull, let go with some speed
+    expect(s.propGrab(2, toward(s, prop(s, 'mug-galley-1').pos))).toBe(true);
+    for (let i = 0; i <= 6; i++) { s.propMove(2, flat(-0.3 + (0.6 * i) / 6)); s.step(1 / 60); }
+    s.propRelease(2, false);
+    s.setWarp(1e4);
+    s.step(1 / 60);
+    s.step(1 / 60);
+    const w = s.warp();
+    console.log(`with a mug in flight at 1e4x: achieved ${w.achieved.toFixed(0)}x, limited by '${w.limitedBy}'`);
+    expect(w.limitedBy).toBe('props');
+    expect(w.achieved).toBeLessThan(1e4);
+    // save while it flies: the save carries the objects; a save without them loads with the ship's defaults
+    const json = s.save();
+    expect(json).toContain('"props":{');
+    const l = loadSession(json, { budgetMs: 1e9 })!;
+    expect(l.props().find((p) => p.id === 'mug-galley-1')!.pos).toEqual(prop(s, 'mug-galley-1').pos);
+    const old = JSON.parse(json) as { session: { props?: unknown } };
+    delete old.session.props;
+    const o = loadSession(JSON.stringify(old), { budgetMs: 1e9 })!;
+    expect(o.props().find((p) => p.id === 'mug-galley-1')!.stowed).toBe(true);
+    // everything settles and goes to sleep: the warp is granted again
+    const f = createSession({ budgetMs: 3 });
+    f.setWarp(1e4);
+    for (let i = 0; i < 5; i++) f.step(1 / 60);
+    expect(f.warp().limitedBy).not.toBe('props');
+  });
+
+  it('after a burn in orbit the shaken-loose objects settle and sleep: the sleep warp is not held back', () => {
+    const s = createSession({ budgetMs: 3 });
+    const awake = (): number => s.props().filter((p) => !p.asleep && !p.stowed).length;
+    s.setHold('prograde');
+    run(s, 60);
+    s.setControls({ throttle: 1 });
+    run(s, 10); // 12 m/s² for 10 s: the magnetted mugs break free, everything loose slides aft
+    s.setControls({ throttle: 0 });
+    run(s, 0.5); // the drive cuts out: everything wakes as the cabin stops pushing on it
+    const shaken = s.props().filter((p) => !p.stowed).length, woke = awake();
+    let t = 0.5;
+    for (; t < 120 && awake() > 0; t++) run(s, 1);
+    console.log(`after the burn: ${shaken} objects loose, ${woke} still awake 0.5 s after the drive cut out, all asleep after ${t} s of coasting (prograde hold, the cabin turning at the orbital rate)`);
+    expect(shaken).toBeGreaterThan(14);
+    expect(awake()).toBe(0);
+    s.setWarp(1e4);
+    const t0 = s.time();
+    for (let i = 0; i < 60; i++) s.step(1 / 60);
+    expect(s.time() - t0).toBeGreaterThan(2000);
+    expect(s.warp().limitedBy).not.toBe('props');
+  });
+
+  it('the sofa prompt shows to a body standing at the end of the table or pressed into the gap', () => {
+    for (const [x, z] of [[1.47, -9.0], [1.47, -6.0], [1.6, -7.5]]) {
+      const s = standAt(x, z, -Math.PI / 2); // facing starboard, toward the sofa
+      expect(s.crew().prompt?.label, `${x},${z}`).toBe('Sit on the sofa');
+    }
+  });
+});
