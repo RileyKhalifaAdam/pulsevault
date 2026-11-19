@@ -16,6 +16,9 @@
 //   layout=1  markers at the shipLayouts positions            info=1  triangles / draw calls / build time
 //   q         low | medium | high (default) | ultra           time  seconds (blink phase)   lights=0  nav lights off
 //   live=1    keep animating (blinkers, flicker)
+//   eye=x,y,z first-person camera at a ship-local point (or eye=pilot | eye=lounge), look=yaw,pitch deg
+//             (yaw 0 = forward, positive = left); room=<interior room id> draws that room's walls with its
+//             window openings cut out (default: the room the eye preset sits in)
 import * as THREE from 'three';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
@@ -25,6 +28,7 @@ import type { RGB, ShipLayout, ShipVisualId } from '../../src/core/types';
 import { LAYER, MeshBuilder, CHANNEL_COUNT, hullStyle } from '../../src/render/space/geo';
 import { createHullMaterials, type HullMaterials, type HullQuality, type Livery } from '../../src/render/space/hullMaterials';
 import { createShipVisual, type ShipVisual } from '../../src/render/space/ships';
+import { INTERIORS } from '../../src/data/interiors';
 
 const params = new URLSearchParams(location.search);
 const num = (k: string, d: number): number => (params.has(k) ? Number(params.get(k)) : d);
@@ -74,7 +78,14 @@ if (sheet) {
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x000000);
-const camera = new THREE.PerspectiveCamera(num('fov', 32), vw / vh, 0.3, 80000);
+const EYES: Record<string, { eye: [number, number, number]; look: [number, number]; room: string }> = {
+  pilot: { eye: [-0.55, 0.25, -13.45], look: [8, -12], room: 'cockpit' },
+  lounge: { eye: [1.6, 0.2, -7.5], look: [-75, -6], room: 'lounge' },
+};
+const eyeArg = params.get('eye');
+const eyePreset = eyeArg ? EYES[eyeArg] : undefined;
+const eyePos = eyePreset ? eyePreset.eye : eyeArg ? (eyeArg.split(',').map(Number) as [number, number, number]) : null;
+const camera = new THREE.PerspectiveCamera(num('fov', eyePos ? 72 : 32), vw / vh, eyePos ? 0.05 : 0.3, 80000);
 
 // Lighting like the game: one strong warm key (the star), near-black ambient, dim cool planet-shine from
 // below, and a small procedural environment for reflections.
@@ -195,6 +206,52 @@ if (params.get('swatch') === '1') {
   if (params.get('layout') === '1') addMarkers(v.object3d, v.layout);
 }
 const buildMs = performance.now() - t0;
+
+/** The walls of one interior room with its window openings cut out (a stand-in for the interior pass). */
+function addRoomShell(roomId: string): void {
+  const lay = INTERIORS.wren;
+  const room = lay?.rooms.find((r) => r.id === roomId);
+  if (!lay || !room) return;
+  const b = room.box;
+  const mat = new THREE.MeshStandardMaterial({ color: 0x6d7076, roughness: 0.75, metalness: 0, side: THREE.DoubleSide });
+  // wall: [name, fixed axis, value, horizontal axis, vertical axis]
+  const walls: [string, number, number, number, number][] = [
+    ['+x', 0, b.max.x, 2, 1], ['-x', 0, b.min.x, 2, 1], ['+y', 1, b.max.y, 0, 2], ['-y', 1, b.min.y, 0, 2], ['+z', 2, b.max.z, 0, 1], ['-z', 2, b.min.z, 0, 1],
+  ];
+  const lo = [b.min.x, b.min.y, b.min.z];
+  const hi = [b.max.x, b.max.y, b.max.z];
+  for (const [name, ax, val, ha, va] of walls) {
+    const sh = new THREE.Shape([new THREE.Vector2(lo[ha], lo[va]), new THREE.Vector2(hi[ha], lo[va]), new THREE.Vector2(hi[ha], hi[va]), new THREE.Vector2(lo[ha], hi[va])]);
+    for (const w of lay.windows) {
+      if (w.room !== roomId || w.wall !== name) continue;
+      const c = [w.center.x, w.center.y, w.center.z];
+      const x0 = c[ha] - w.width / 2, x1 = c[ha] + w.width / 2, y0 = c[va] - w.height / 2, y1 = c[va] + w.height / 2;
+      sh.holes.push(new THREE.Path([new THREE.Vector2(x0, y0), new THREE.Vector2(x0, y1), new THREE.Vector2(x1, y1), new THREE.Vector2(x1, y0)]));
+    }
+    for (const d of lay.doors) {
+      if (d.a !== roomId && d.b !== roomId) continue;
+      const dl = [d.box.min.x, d.box.min.y, d.box.min.z];
+      const dh = [d.box.max.x, d.box.max.y, d.box.max.z];
+      if (val < dl[ax] - 1e-3 || val > dh[ax] + 1e-3) continue;
+      sh.holes.push(new THREE.Path([new THREE.Vector2(dl[ha], dl[va] + 1e-3), new THREE.Vector2(dl[ha], dh[va]), new THREE.Vector2(dh[ha], dh[va]), new THREE.Vector2(dh[ha], dl[va] + 1e-3)]));
+    }
+    const g = new THREE.ShapeGeometry(sh);
+    const pa = g.attributes.position;
+    for (let i = 0; i < pa.count; i++) {
+      const v3 = [0, 0, 0];
+      v3[ax] = val;
+      v3[ha] = pa.getX(i);
+      v3[va] = pa.getY(i);
+      pa.setXYZ(i, v3[0], v3[1], v3[2]);
+    }
+    g.computeVertexNormals();
+    scene.add(new THREE.Mesh(g, mat));
+  }
+  const lamp = new THREE.PointLight(0xffe2c0, 2.5, 8, 2);
+  lamp.position.set((b.min.x + b.max.x) / 2, b.max.y - 0.3, (b.min.z + b.max.z) / 2);
+  scene.add(lamp);
+}
+if (eyePos) addRoomShell(params.get('room') ?? eyePreset?.room ?? 'cockpit');
 centre.set(num('tx', 0), num('ty', 0), num('tz', 0));
 
 const camDir = new THREE.Vector3();
@@ -288,7 +345,13 @@ function frame(): void {
     });
     if (params.get('info') === '1') info().forEach((l, i) => sheetCtx.fillText(l, 8 * pr, (H - 30 + i * 13) * pr));
   } else {
-    if (frames === 0) aim(num('yaw', 35) * DEG, num('pitch', 20) * DEG, num('dist', 0), num('zoom', 1));
+    if (frames === 0 && eyePos) {
+      const [ly, lp] = (params.get('look') ?? (eyePreset ? eyePreset.look.join(',') : '0,0')).split(',').map(Number);
+      camera.position.set(eyePos[0], eyePos[1], eyePos[2]);
+      camera.lookAt(eyePos[0] - Math.sin(ly * DEG) * Math.cos(lp * DEG), eyePos[1] + Math.sin(lp * DEG), eyePos[2] - Math.cos(ly * DEG) * Math.cos(lp * DEG));
+      const [a, e] = str('sun', '150,35').split(',').map(Number);
+      setSun(a * DEG, e * DEG);
+    } else if (frames === 0) aim(num('yaw', 35) * DEG, num('pitch', 20) * DEG, num('dist', 0), num('zoom', 1));
     composer.render();
   }
   frames++;

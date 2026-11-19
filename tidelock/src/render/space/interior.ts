@@ -21,7 +21,7 @@ import type { Box, InteriorDoor, InteriorLayout, InteriorRoom, InteriorSolid, In
 import type { Quality } from '../pipeline';
 import {
   GLOW_ALWAYS, GLOW_BLINK, GLOW_EMERG, GLOW_MAIN, STENCIL, TILE, TILE_METRES,
-  acquireSurfaceAtlas, createReflectionCube, createSurfaceShared, releaseSurfaceAtlas, surfaceMaterial, surfaceSize,
+  acquireSurfaceAtlas, acquireSurfaceAtlasProgressive, createReflectionCube, createSurfaceShared, releaseSurfaceAtlas, surfaceMaterial, surfaceSize,
   type P3, type StencilId, type TileId,
 } from './surfaces';
 import { INTERIOR_BAKE } from './interior.bake';
@@ -1263,6 +1263,12 @@ function solids(b: Builder, L: InteriorLayout, idx: Map<string, number>): void {
       for (const dz of [-0.4, 0.4]) downlight(b, [cx, C, cz + dz], [0, -1, 0], 0);
     }
     const lr = L.rooms[idx.get('lounge') ?? 0].box;
+    for (const z of [-9.4, -7.9, -6.4]) {
+      downlight(b, [-1.3, C, z], [0, -1, 0], 1.5);
+      downlight(b, [-0.1, C, z + 0.75], [0, -1, 0], 1.1);
+    }
+    bx(b, -0.45, F, lr.min.z + 0.3, 0.45, F + 0.004, lr.max.z - 0.3, mt('brushed', [0.8, 0.8, 0.8]), 0.002, { fit: true });
+    bx(b, -0.4, F + 0.004, lr.min.z + 0.35, 0.4, F + 0.006, lr.max.z - 0.35, DFLOOR, 0.002, { fit: true });
     shelfUnit(b, 1.0, 2.55, lr.min.z, 0.3, 0.95, F, 11);
     shelfUnit(b, 1.45, 2.65, lr.max.z, -0.3, 0.95, F, 21);
     // sideboard with a lamp and a wall screen, port aft
@@ -2055,8 +2061,16 @@ interface PortalDoor {
 
 export function createInteriorVisual(layout: InteriorLayout, opts: InteriorOptions): InteriorVisual {
   const q = opts.quality;
+  const t0 = performance.now();
   const B = buildInterior(layout);
-  const atlas = acquireSurfaceAtlas(surfaceSize(q));
+  const t1 = performance.now();
+  // 'high'/'ultra' start on the 1024 atlas and swap the 2048 one in once it is generated in time slices
+  const want = surfaceSize(q);
+  let atlas = acquireSurfaceAtlas(Math.min(want, 512));
+  let upgrade = want > atlas.size ? acquireSurfaceAtlasProgressive(want) : null;
+  const status = (): string =>
+    `build ${(t1 - t0).toFixed(0)} ms · atlas ${atlas.size} ${atlas.genMs.toFixed(0)} ms${upgrade ? ' (upgrading)' : ''} · bake ${INTERIOR_BAKE.key === B.key ? 'fresh' : 'STALE'}`;
+  (globalThis as { __tlInterior?: string }).__tlInterior = status();
   const shared = createSurfaceShared();
   const env = createReflectionCube(true);
   let lmA: THREE.DataTexture = flat(0.55);
@@ -2153,7 +2167,11 @@ export function createInteriorVisual(layout: InteriorLayout, opts: InteriorOptio
           if (disposed) return false;
           const na = lmTexture(a, bake.w, bake.h);
           const nb = lmTexture(bb, bake.w, bake.h);
-          for (const m of lmMats) m.lightMap = na;
+          // needsUpdate: the per-probe clones of these materials (src/render/probes.ts) follow a version change
+          for (const m of lmMats) {
+            m.lightMap = na;
+            m.needsUpdate = true;
+          }
           shared.uLmB.value = nb;
           lmA.dispose();
           lmB.dispose();
@@ -2177,8 +2195,11 @@ export function createInteriorVisual(layout: InteriorLayout, opts: InteriorOptio
   const chain: number[] = [0, 0, 0, 0, 0, 0];
   const visibleRooms = new Set<string>();
   const ex = [0, 0, 0];
+  const pp = [0, 0, 0];
   const through = (pd: PortalDoor, px: number, py: number, pz: number): boolean => {
-    const pp = [px, py, pz];
+    pp[0] = px;
+    pp[1] = py;
+    pp[2] = pz;
     const den = pp[pd.ta] - ex[pd.ta];
     if (Math.abs(den) < 1e-6) return false;
     const t = (pd.p - ex[pd.ta]) / den;
@@ -2188,15 +2209,14 @@ export function createInteriorVisual(layout: InteriorLayout, opts: InteriorOptio
     const y = ex[1] + (pp[1] - ex[1]) * t;
     return u > pd.u0 - 0.05 && u < pd.u1 + 0.05 && y > pd.y0 - 0.05 && y < pd.y1 + 0.05;
   };
-  const sample = (pd: PortalDoor, k: number): [number, number, number] => {
+  const sp = [0, 0, 0];
+  const sample = (pd: PortalDoor, k: number): void => {
     const ua = 2 - pd.ta;
     const fu = k === 0 ? 0.5 : k === 1 || k === 3 ? 0.08 : 0.92;
     const fy = k === 0 ? 0.5 : k < 3 ? 0.1 : 0.9;
-    const r = [0, 0, 0];
-    r[pd.ta] = pd.p;
-    r[ua] = pd.u0 + (pd.u1 - pd.u0) * fu;
-    r[1] = pd.y0 + (pd.y1 - pd.y0) * fy;
-    return [r[0], r[1], r[2]];
+    sp[pd.ta] = pd.p;
+    sp[ua] = pd.u0 + (pd.u1 - pd.u0) * fu;
+    sp[1] = pd.y0 + (pd.y1 - pd.y0) * fy;
   };
   const walk = (room: number, depth: number): void => {
     for (let di = 0; di < portals.length; di++) {
@@ -2209,7 +2229,10 @@ export function createInteriorVisual(layout: InteriorLayout, opts: InteriorOptio
       let ok = depth === 0;
       if (!ok)
         for (let k = 0; k < 5 && !ok; k++) {
-          const [sx, sy, sz] = sample(pd, k);
+          sample(pd, k);
+          const sx = sp[0];
+          const sy = sp[1];
+          const sz = sp[2];
           let pass = true;
           for (let c = 0; c < depth && pass; c++) pass = through(portals[chain[c]], sx, sy, sz);
           ok = pass;
@@ -2239,7 +2262,8 @@ export function createInteriorVisual(layout: InteriorLayout, opts: InteriorOptio
       vis.fill(0);
       let cur = -1;
       let best = 1e9;
-      B.roomBoxes.forEach((bb, i) => {
+      for (let i = 0; i < B.roomBoxes.length; i++) {
+        const bb = B.roomBoxes[i];
         const dx = Math.max(bb.min.x - e.x, 0, e.x - bb.max.x);
         const dy = Math.max(bb.min.y - e.y, 0, e.y - bb.max.y);
         const dz = Math.max(bb.min.z - e.z, 0, e.z - bb.max.z);
@@ -2248,7 +2272,7 @@ export function createInteriorVisual(layout: InteriorLayout, opts: InteriorOptio
           best = d;
           cur = i;
         }
-      });
+      }
       if (cur >= 0) {
         vis[cur] = 1;
         walk(cur, 0);
@@ -2271,7 +2295,8 @@ export function createInteriorVisual(layout: InteriorLayout, opts: InteriorOptio
     visibleRooms.clear();
     tris = 0;
     calls = 0;
-    B.rooms.forEach((id, i) => {
+    for (let i = 0; i < B.rooms.length; i++) {
+      const id = B.rooms[i];
       const on = vis[i] === 1;
       rooms[id].visible = on;
       if (on) {
@@ -2279,14 +2304,14 @@ export function createInteriorVisual(layout: InteriorLayout, opts: InteriorOptio
         tris += roomTris[i];
         calls += roomMeshes[i].length;
       }
-    });
+    }
   };
   cull(undefined);
 
   let mix = 1;
   let lastT = -1;
   let disposed = false;
-  const textureBytes = atlas.bytes + (fresh ? bake.w * bake.h * 8 * 2 : 16);
+  const lmBytes = fresh ? bake.w * bake.h * 8 * 2 : 16;
   return {
     object3d: root,
     get triangles() {
@@ -2297,7 +2322,9 @@ export function createInteriorVisual(layout: InteriorLayout, opts: InteriorOptio
     },
     rooms,
     visibleRooms,
-    textureBytes,
+    get textureBytes() {
+      return atlas.bytes + lmBytes;
+    },
     ready,
     update(o: InteriorUpdate): void {
       const dt = lastT < 0 ? 1 : clamp(o.time - lastT, 0, 0.5);
@@ -2313,6 +2340,23 @@ export function createInteriorVisual(layout: InteriorLayout, opts: InteriorOptio
       shared.uGlow.value.set(mix, 1, 0.3 + 0.7 * (1 - mix), blink);
       glassK.value = gain * (0.25 + 0.75 * mix) * 0.6;
       cull(o.eye);
+      if (upgrade) {
+        const next = upgrade.step(5);
+        if (next) {
+          upgrade = null;
+          for (const m of lmMats) {
+            m.map = next.map;
+            m.normalMap = next.normalMap;
+            m.roughnessMap = next.ormMap;
+            m.metalnessMap = next.ormMap;
+            m.aoMap = next.ormMap;
+            m.needsUpdate = true;
+          }
+          releaseSurfaceAtlas(atlas);
+          atlas = next;
+          (globalThis as { __tlInterior?: string }).__tlInterior = status();
+        }
+      }
     },
     dispose(): void {
       disposed = true;
@@ -2321,6 +2365,10 @@ export function createInteriorVisual(layout: InteriorLayout, opts: InteriorOptio
       lmA.dispose();
       lmB.dispose();
       env?.dispose();
+      if (upgrade) {
+        const late = upgrade.step(1e9);
+        if (late) releaseSurfaceAtlas(late);
+      }
       releaseSurfaceAtlas(atlas);
       root.removeFromParent();
     },

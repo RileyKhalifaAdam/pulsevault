@@ -50,7 +50,7 @@ export interface TierSettings {
 export const TIER_SETTINGS: Record<PerfTier, TierSettings> = {
   low: { dpr: 1.0, msaa: 0, shadow: 512, shineShadow: 0, shadowEvery: 2, probe: 64, envProbe: 0, chroma: false, sharpen: false, bloomHQ: false, bloomLevels: 5, minScale: 0.6 },
   medium: { dpr: 1.5, msaa: 2, shadow: 1024, shineShadow: 0, shadowEvery: 1, probe: 128, envProbe: 64, chroma: true, sharpen: false, bloomHQ: true, bloomLevels: 6, minScale: 0.6 },
-  high: { dpr: 2.0, msaa: 4, shadow: 2048, shineShadow: 512, shadowEvery: 1, probe: 256, envProbe: 128, chroma: true, sharpen: true, bloomHQ: true, bloomLevels: 6, minScale: 0.6 },
+  high: { dpr: 2.0, msaa: 4, shadow: 2048, shineShadow: 512, shadowEvery: 1, probe: 128, envProbe: 128, chroma: true, sharpen: true, bloomHQ: true, bloomLevels: 6, minScale: 0.6 },
   ultra: { dpr: 2.0, msaa: 4, shadow: 2048, shineShadow: 1024, shadowEvery: 1, probe: 256, envProbe: 128, chroma: true, sharpen: true, bloomHQ: true, bloomLevels: 6, minScale: 0.7 },
 };
 

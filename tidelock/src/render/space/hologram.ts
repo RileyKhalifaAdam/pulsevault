@@ -27,7 +27,7 @@ const ICE: RGB = [0.75, 0.95, 1.0];
 const AMBER: RGB = [1.0, 0.55, 0.14];
 const MAX_SEG = 1500;
 /** Height of the display centre above the lens, m; tilt of the plane toward the crew, rad. */
-const LIFT = 0.15;
+const LIFT = 0.17;
 const TILT = 0.62;
 
 const VS = /* glsl */ `
@@ -230,7 +230,7 @@ export function createHologram(opts: { radius?: number } = {}): Hologram {
     n = 0;
     for (let k = 0; k < CONE_N; k++) {
       for (let j = 0; j < 12; j++) quad[j] = cone[k * 12 + j];
-      fill(quad, CONE_F, 0.07, CYAN);
+      fill(quad, CONE_F, 0.12, CYAN);
     }
     // reference plane: range rings and ticks
     ring(R, 0, 64, 0.0005, 0.22, CYAN, true);
@@ -257,12 +257,24 @@ export function createHologram(opts: { radius?: number } = {}): Hologram {
       fit(o.path, o.pathCount, null);
       fit(o.targetPath, o.targetCount, o.targetPathZ);
     }
-    const s = R / (ext * 1.04);
-    const rg = o ? Math.max(0.01, bodyR * s) : R * 0.45;
+    // radial display scale: the globe at 0.42 R, altitude compressed so a low orbit stands clear of the globe
+    // and a far trajectory still fits (direction exact, distance from the centre remapped)
+    const g0 = R * 0.42;
+    const k = bodyR * 0.25;
+    const amax = Math.max(1, ext - bodyR);
+    const fmax = amax / (amax + k);
+    const rmap = (r: number): number => {
+      const a = Math.max(0, r - bodyR);
+      return r < bodyR ? (g0 * r) / bodyR : g0 + ((R - g0) * (a / (a + k))) / Math.max(1e-6, fmax);
+    };
+    let s = 1;
+    /** Scale for a point at distance r from the body centre (display m per m). */
+    const sc = (r: number): number => (r > 1e-6 ? rmap(r) / r : g0 / bodyR);
+    const rg = o ? g0 : R * 0.45;
     // the globe: latitude rings and meridians, the equator brighter
     for (let k = -2; k <= 2; k++) {
       const lat = (k * Math.PI) / 6;
-      ring(rg * Math.cos(lat), rg * Math.sin(lat), 40, k === 0 ? 0.0007 : 0.0005, k === 0 ? 0.55 : 0.3, CYAN);
+      ring(rg * Math.cos(lat), rg * Math.sin(lat), 40, k === 0 ? 0.0009 : 0.0006, k === 0 ? 0.9 : 0.5, CYAN);
     }
     for (let m = 0; m < 8; m++) {
       const lo = (m / 8) * Math.PI * 2;
@@ -271,7 +283,7 @@ export function createHologram(opts: { radius?: number } = {}): Hologram {
       for (let k = 0; k < 16; k++) {
         const t0 = -Math.PI / 2 + (k / 16) * Math.PI;
         const t1 = -Math.PI / 2 + ((k + 1) / 16) * Math.PI;
-        seg(rg * Math.cos(t0) * cl, rg * Math.sin(t0), rg * Math.cos(t0) * sl, rg * Math.cos(t1) * cl, rg * Math.sin(t1), rg * Math.cos(t1) * sl, 0.0005, 0.3, CYAN);
+        seg(rg * Math.cos(t0) * cl, rg * Math.sin(t0), rg * Math.cos(t0) * sl, rg * Math.cos(t1) * cl, rg * Math.sin(t1), rg * Math.cos(t1) * sl, 0.0006, 0.45, CYAN);
       }
     }
     // the globe's poles: a short axis through it
@@ -282,20 +294,25 @@ export function createHologram(opts: { radius?: number } = {}): Hologram {
     const lim = R * 1.12;
     const path = (a: Float32Array, cnt: number, z: Float32Array | null, w: number, i0: number, c: RGB): void => {
       for (let i = 0; i + 1 < cnt; i++) {
-        const ax = a[i * 2] * s;
-        const az = -a[i * 2 + 1] * s;
-        const ay = z ? z[i] * s : 0;
-        const bx = a[i * 2 + 2] * s;
-        const bz = -a[i * 2 + 3] * s;
-        const by = z ? z[i + 1] * s : 0;
+        const zA = z ? z[i] : 0;
+        const zB = z ? z[i + 1] : 0;
+        const sA = sc(Math.hypot(a[i * 2], a[i * 2 + 1], zA));
+        const sB = sc(Math.hypot(a[i * 2 + 2], a[i * 2 + 3], zB));
+        const ax = a[i * 2] * sA;
+        const az = -a[i * 2 + 1] * sA;
+        const ay = zA * sA;
+        const bx = a[i * 2 + 2] * sB;
+        const bz = -a[i * 2 + 3] * sB;
+        const by = zB * sB;
         if (!(Math.hypot(ax, ay, az) < lim && Math.hypot(bx, by, bz) < lim)) continue;
         seg(ax, ay, az, bx, by, bz, w, i0 * (1 - (0.55 * i) / cnt), c);
       }
     };
-    path(o.path, o.pathCount, null, 0.0011, 1.25, CYAN);
-    if (o.targetCount > 1) path(o.targetPath, o.targetCount, o.targetPathZ, 0.0009, 0.9, AMBER);
+    path(o.path, o.pathCount, null, 0.0015, 2.2, CYAN);
+    if (o.targetCount > 1) path(o.targetPath, o.targetCount, o.targetPathZ, 0.0012, 1.6, AMBER);
     // apsis ticks
     const tick = (x: number, y: number): void => {
+      s = sc(Math.hypot(x, y));
       const px = x * s;
       const pz = -y * s;
       const l = Math.hypot(px, pz) || 1;
@@ -304,10 +321,11 @@ export function createHologram(opts: { radius?: number } = {}): Hologram {
     if (o.hasApo) tick(o.apoX, o.apoY);
     if (o.hasPeri) tick(o.periX, o.periY);
     // the ship: a chevron along its motion, a ring around it
+    s = sc(Math.hypot(o.shipX, o.shipY));
     const sx = o.shipX * s;
     const sz = -o.shipY * s;
-    let hx = o.pathCount > 1 ? o.path[2] * s - sx : 0;
-    let hz = o.pathCount > 1 ? -o.path[3] * s - sz : -1;
+    let hx = o.pathCount > 1 ? o.path[2] - o.shipX : 0;
+    let hz = o.pathCount > 1 ? -(o.path[3] - o.shipY) : -1;
     const hl = Math.hypot(hx, hz) || 1;
     hx /= hl;
     hz /= hl;
@@ -322,6 +340,7 @@ export function createHologram(opts: { radius?: number } = {}): Hologram {
     seg(sx, 0, sz, sx, 0.016, sz, 0.0005, 0.9, ICE);
     // the target: a diamond where it is, a drop line to the plane
     if (o.hasTarget) {
+      s = sc(Math.hypot(o.targetX, o.targetY, o.targetZ));
       const tx = o.targetX * s;
       const tz = -o.targetY * s;
       const ty = o.targetZ * s;
@@ -362,7 +381,7 @@ export function createHologram(opts: { radius?: number } = {}): Hologram {
       uniforms.uTime.value = time % 1000;
       // a gentle flicker: two slow beats and a rare short dip
       const dip = Math.sin(time * 0.71) > 0.985 ? 0.75 : 1;
-      uniforms.uLevel.value = gain * dip * (0.94 + 0.04 * Math.sin(time * 13.1) * Math.sin(time * 7.7));
+      uniforms.uLevel.value = 1.8 * gain * dip * (0.94 + 0.04 * Math.sin(time * 13.1) * Math.sin(time * 7.7));
     },
     dispose(): void {
       geo.dispose();

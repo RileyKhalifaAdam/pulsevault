@@ -13,7 +13,7 @@
 //          night        the lounge view with the cabin lights off
 //   ex ey ez            eye override, ship-local m          yaw pitch   look override, deg
 //   (each view also fixes where the planet and the star are as seen from the ship; the ship is placed to match)
-//   lights=0|1          cabin lights                        q  low (default) | medium | high | ultra
+//   lights=0|1          cabin lights                        q  low | medium (default) | high | ultra   pq  pipeline tier
 import * as THREE from 'three';
 import type { V3 } from '../../src/core/types';
 import { createPipeline, type Quality } from '../../src/render/pipeline';
@@ -77,7 +77,9 @@ const lookYaw = num('yaw', preset.yaw) * DEG;
 const lookPitch = num('pitch', preset.pitch) * DEG;
 const lights = has('lights') ? num('lights', 1) === 1 : preset.lights;
 
-const pipeline = createPipeline(canvas, { quality });
+// pq: the pipeline's own tier (default q); software rendering cannot screenshot the 'high' pipeline in time
+const pipeQuality = (params.get('pq') ?? quality) as Quality;
+const pipeline = createPipeline(canvas, { quality: pipeQuality });
 pipeline.resize(window.innerWidth, window.innerHeight, window.devicePixelRatio);
 const scene = createSceneManager(pipeline, { quality });
 const session = createSession({ seed: 1 });
@@ -144,12 +146,29 @@ async function main(): Promise<void> {
     scene.render(frame);
     if (i % 4 === 3) await new Promise((r) => setTimeout(r, 0));
   }
+  // let the interior finish swapping in its full-size atlas (generated in time slices)
+  for (let i = 0; i < 2000 && ((globalThis as { __tlInterior?: string }).__tlInterior ?? '').includes('upgrading'); i++) {
+    fill(1 / 30);
+    scene.render(frame);
+    if (i % 4 === 3) await new Promise((r) => setTimeout(r, 0));
+  }
   const st = scene.stats();
   info.textContent =
     `view ${view} · ${quality} · lights ${lights ? 'on' : 'off'} · cam ${scene.camera.mode} fov ${(scene.camera.fovY / DEG).toFixed(0)} · ev ${scene.exposure.toFixed(2)} · limb dip ${dipDeg.toFixed(0)}°\n` +
     `frame: draw calls ${st.drawCalls} · triangles ${st.triangles}\n` +
-    `interior: draw calls ${st.interior?.drawCalls ?? '-'} · triangles ${st.interior?.triangles ?? '-'} · system ${((t1 - t0) / 1000).toFixed(1)} s · first frame (interior build) ${((t2 - t1) / 1000).toFixed(2)} s`;
+    `interior: draw calls ${st.interior?.drawCalls ?? '-'} · triangles ${st.interior?.triangles ?? '-'} · system ${((t1 - t0) / 1000).toFixed(1)} s · first frame (interior build) ${((t2 - t1) / 1000).toFixed(2)} s\n` +
+    `interior ${(globalThis as { __tlInterior?: string }).__tlInterior ?? ''}`;
   ready();
 }
 window.addEventListener('resize', () => pipeline.resize(window.innerWidth, window.innerHeight, window.devicePixelRatio));
-main().catch(showError);
+if (has('bench')) {
+  void import('../../src/render/space/surfaces').then((m) => {
+    const out: string[] = [];
+    for (const size of [512, 1024, 2048]) {
+      const a = m.acquireSurfaceAtlas(size);
+      out.push(`atlas ${size}: ${a.genMs.toFixed(0)} ms (stencil ${m.STENCIL_MS.toFixed(0)} ms)`);
+    }
+    info.textContent = out.join('\n');
+    ready();
+  });
+} else main().catch(showError);

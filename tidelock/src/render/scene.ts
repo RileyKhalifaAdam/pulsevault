@@ -52,6 +52,13 @@ import { createCockpitVisual, type CockpitPick, type CockpitUpdate, type Cockpit
 import { InteriorLighting, OutsideEnvironment, textureBytesOf, type InteriorLightingFrame } from './probes';
 import { TIER_SETTINGS, renderInfo } from '../app/perf';
 
+/**
+ * Cabin light level against the sun (interior lightmaps, probes, emitters and the cockpit glass). Tried at 0.45
+ * for hotter sun patches: the GPU auto exposure did not lift the work areas back up within a second, so they
+ * read underexposed; 1 keeps the lighting calibration of docs/ARCHITECTURE.md.
+ */
+const CABIN_GAIN = 1;
+
 // ------------------------------------------------------------------------------------------------ API
 
 /**
@@ -597,7 +604,18 @@ class Manager implements SceneManager {
     const q = this.quality;
     const total = 3 + system.bodies.length + system.stations.length;
     let done = 0;
+    // load-time breakdown (ms per step) for the perf report: globalThis.__tlLoad
+    const loadTimes: string[] = [];
+    let loadT = performance.now();
+    let loadLabel = 'start';
+    const lap = (label: string): void => {
+      const now = performance.now();
+      loadTimes.push(`${loadLabel} ${(now - loadT).toFixed(0)}`);
+      loadT = now;
+      loadLabel = label;
+    };
     const step = async (label: string): Promise<boolean> => {
+      lap(label);
       onProgress?.(Math.min(1, done / total), label);
       done++;
       await tick();
@@ -713,6 +731,8 @@ class Manager implements SceneManager {
     this.evInit = false;
     this.lastFocusId = '';
     this.loading = false;
+    lap('ready');
+    (globalThis as { __tlLoad?: string }).__tlLoad = loadTimes.join(' · ');
     onProgress?.(1, 'Ready');
   }
 
@@ -797,7 +817,13 @@ class Manager implements SceneManager {
     const cl = (COCKPITS as Record<string, CockpitLayout | undefined>)[visualId];
     const cockpit = cl ? createCockpitVisual(cl, { quality: this.quality }) : null;
     if (cockpit) {
-      if (typeof cockpit.object3d.userData.room !== 'string') cockpit.object3d.userData.room = 'cockpit';
+      // a cockpit that tags its own meshes by room (the LIGHTS switch sits in the lounge) keeps an untagged root;
+      // an untagged cockpit is all one room
+      let tagged = false;
+      cockpit.object3d.traverse((o) => {
+        if (o !== cockpit.object3d && typeof o.userData.room === 'string') tagged = true;
+      });
+      if (!tagged && typeof cockpit.object3d.userData.room !== 'string') cockpit.object3d.userData.room = 'cockpit';
       visual.object3d.add(cockpit.object3d);
     }
     const lighting = new InteriorLighting(this.pipeline.renderer, this.insideScene, visual.object3d, layout, this.quality);
@@ -812,6 +838,12 @@ class Manager implements SceneManager {
     ic.updateMatrixWorld();
     lighting.hideDuringCapture = this.glare?.object3d ?? null;
     lighting.warmUp(ic);
+    // the baked lightmaps decode asynchronously: once they are in, the probes are captured again (over frames)
+    visual.ready
+      .then((ok) => {
+        if (ok && (this.interior?.lighting === lighting || this.prebuilt?.lighting === lighting)) lighting.recapture();
+      })
+      .catch(() => undefined);
     ic.position.set(0, 0, 0);
     ic.updateMatrixWorld();
     visual.object3d.visible = false;
@@ -1528,6 +1560,14 @@ class Manager implements SceneManager {
     fc.fov = nc.fov;
     fc.aspect = aspect;
     fc.updateProjectionMatrix();
+    const shiftY = pose.mode === 'interior' ? 0 : frame.camera.shiftY ?? 0;
+    if (shiftY !== 0) {
+      // lens shift: NDC y moves up by shiftY for every point (clip.y += -shiftY * z_view = shiftY * w)
+      nc.projectionMatrix.elements[9] -= shiftY;
+      nc.projectionMatrixInverse.copy(nc.projectionMatrix).invert();
+      fc.projectionMatrix.elements[9] -= shiftY;
+      fc.projectionMatrixInverse.copy(fc.projectionMatrix).invert();
+    }
 
     // ---- stations
     for (let i = 0; i < stations.length; i++) {
@@ -1799,7 +1839,7 @@ class Manager implements SceneManager {
         c.eye.x = eye ? eye.x : 0;
         c.eye.y = eye ? eye.y : 0;
         c.eye.z = eye ? eye.z : 0;
-        c.gain = Math.pow(2, -this.ev);
+        c.gain = Math.pow(2, -this.ev) * CABIN_GAIN;
         unrotTo(c.sunDir, focusShip.q, this.sunDirFocus.x, this.sunDirFocus.y, this.sunDirFocus.z);
         c.sunColor.r = this.keyColor.r * this.keyLevel;
         c.sunColor.g = this.keyColor.g * this.keyLevel;
@@ -1848,6 +1888,12 @@ class Manager implements SceneManager {
           this.pickQ.w = focusShip.q.w;
         }
         layers = this.layersInside;
+      } else if (this.frameNo % 2 === 0) {
+        // outside (the title orbit, a chase view): the interior is hidden, but its time-sliced texture work
+        // (the full-size surface atlas) keeps going so it is done before the player steps inside
+        const c = this.interiorCtx;
+        c.time = this.clock;
+        interior.update(c);
       }
     }
     pipeline.render(layers, dt);

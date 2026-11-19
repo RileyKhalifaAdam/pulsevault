@@ -94,6 +94,9 @@ export interface FrameCamera {
   lookPitch: number;
   /** 'interior' only: the pilot leaning in / narrowing the view (pinch): 1 = normal, up to 3 = three times closer. */
   zoom: number;
+  /** Lens shift, fraction of the half view height the picture moves up (0 = centred; the title frames the ship
+   * above its text with it). Third-person only. */
+  shiftY?: number;
 }
 
 export interface FrameEnvironment {

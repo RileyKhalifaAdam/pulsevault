@@ -16,7 +16,7 @@ import { createRoot, Splash } from '../ui/kit';
 import type { UiHost, UiScreen } from '../ui/host';
 import { createPauseMenu, createTitleScreen, type PauseMenu } from '../ui/screens';
 import { createPerfOverlay } from '../ui/perfOverlay';
-import { PerfMonitor } from './perf';
+import { PerfMonitor, startTier } from './perf';
 import { noteForReport, showFatal, showPlainMessage } from './errors';
 import { createInstrumentData, readInstruments } from '../render/space/instruments';
 import { createPlayInput, type DevicePick, type PlayInput } from './input';
@@ -81,7 +81,7 @@ export async function boot(): Promise<void> {
   }
   const asQuality = (v: unknown): Quality | null => (typeof v === 'string' && (QUALITIES as string[]).includes(v) ? (v as Quality) : null);
   // Quality: the URL pins a tier; a tier chosen in settings pins it too; otherwise ('auto') start at a safe tier
-  // (medium on phones) and let the frame-time record move the resolution scale first, then the tier.
+  // ('high' on an iPhone 15, the target look) and let the frame-time record move the resolution scale first, then the tier.
   const urlQuality = asQuality(params.get('q') ?? params.get('quality'));
   const phone = (() => {
     try {
@@ -90,7 +90,7 @@ export async function boot(): Promise<void> {
       return true;
     }
   })();
-  const autoStart: Quality = phone ? 'medium' : 'high';
+  const autoStart: Quality = startTier(phone ? 'high' : 'ultra');
   const chosen = asQuality(settingsData.quality);
   let quality: Quality = urlQuality ?? chosen ?? autoStart;
   if (settingsData.quality === undefined) settingsData.quality = 'auto';
@@ -208,10 +208,12 @@ export async function boot(): Promise<void> {
     go(name) {
       closeMenu();
       if (current === name) return;
+      if (name === 'flight' && current === 'title') titleOut = TITLE_FADE;
       current = name;
       perf.clear(1); // each screen's frames are their own record
       noteForReport(`screen ${name}`);
       if (name === 'title') {
+        titleOut = 0;
         title?.show();
         if (title && !title.el.isConnected) root.appendChild(title.el);
       } else title?.hide();
@@ -291,6 +293,8 @@ export async function boot(): Promise<void> {
 
   // ---------------------------------------------------------------------------------------------- title, menu, the pilot's touch
   title = createTitleScreen(host);
+  // let the ship show through the title's veil: dark only behind the words at the top and bottom
+  title.el.style.background = 'linear-gradient(180deg, rgba(4,7,12,0.72) 0%, rgba(4,7,12,0) 26%, rgba(4,7,12,0) 64%, rgba(4,7,12,0.82) 100%)';
   menu = createPauseMenu(host);
   menu.onResume = closeMenu;
   // scene.pickDevice(x, y): the physical control under a finger, by a ray from the eye through the 3D cockpit.
@@ -334,6 +338,48 @@ export async function boot(): Promise<void> {
     }, (err) => showFatal(err, 'context restore'));
   };
 
+  // ---- the title view: before the tap, a slow cinematic orbit round the Wren with Chandler's Wheel and Wick
+  // behind it; the tap fades through black into the pilot's eyes. Title mode only: no gameplay UI is drawn.
+  let titleT = 0;
+  /** seconds left of the fade to black on the way from the title into first person (0 = not fading) */
+  let titleOut = 0;
+  const TITLE_FADE = 0.45;
+  /** azimuth of the star seen from the ship (north-up orbit frame), fixed when the title starts */
+  let titleSunAz = Number.NaN;
+  const titleView = (cam: typeof frame.camera, craftId: string, dt: number): boolean => {
+    if (current === 'flight' && titleOut <= 0) {
+      cam.shiftY = 0;
+      return false;
+    }
+    if (Number.isNaN(titleSunAz)) {
+      titleSunAz = 2.35;
+      const star = frame.bodies.find((b) => b.def.kind === 'star');
+      const me = frame.craft.find((c) => c.id === craftId);
+      if (star && me) titleSunAz = Math.atan2(star.r.x - me.r.x, star.r.z - me.r.z);
+    }
+    if (current === 'flight') {
+      titleOut = Math.max(0, titleOut - dt);
+      shadeNow = Math.min(1, 1 - titleOut / TITLE_FADE);
+      shade.style.opacity = shadeNow.toFixed(3);
+    }
+    titleT += dt;
+    cam.mode = 'orbit';
+    cam.focusId = craftId;
+    // a slow north-up orbit centred on the ship, a little above her and breathing in and out: one turn in three
+    // minutes shows every side, with the Wheel and Wick passing behind; it starts on her sunlit bow quarter
+    cam.lookAtId = null;
+    // the camera swings slowly to and fro on the sunlit side (the star 30-75 degrees off the view axis), so
+    // the white armour always catches the light; the shadow side of a hull in space is black
+    cam.yaw = titleSunAz + 0.65 + 0.35 * Math.sin(titleT * 0.045);
+    // low over her flank: the star lies near the ecliptic, so the sides catch it and the deck only grazes
+    cam.pitch = -0.14 + 0.06 * Math.sin(titleT * 0.031 + 1.1);
+    cam.distance = 0.95 + 0.08 * Math.sin(titleT * 0.027);
+    cam.zoom = 1;
+    // portrait: the ship sits in the clear band between the logo and the words below it
+    cam.shiftY = lastH > lastW ? 0.42 : 0.12;
+    return true;
+  };
+
   /** Refill the frame from the session: the world as it is, seen from the pilot's eyes. Always first person. */
   const fill = (dt: number): void => {
     beginFrame(frame, session.time(), dt, session.warp().achieved);
@@ -342,6 +388,7 @@ export async function boot(): Promise<void> {
     const p = session.player();
     const cv = session.crew();
     const cam = frame.camera;
+    if (titleView(cam, p.craftId, dt)) return finishFill(dt);
     cam.mode = 'interior';
     cam.focusId = p.craftId;
     cam.lookAtId = null;
@@ -354,6 +401,11 @@ export async function boot(): Promise<void> {
     cam.lookYaw = cv.yaw;
     cam.lookPitch = cv.pitch;
     cam.zoom = input ? input.zoom : 1;
+    finishFill(dt);
+  };
+  /** The part of the frame that does not depend on the camera: the pilot's controls and screens, lights, docking. */
+  const finishFill = (dt: number): void => {
+    const p = session.player();
     // the physical controls as they are, and what the console screens show (re-read five times a second)
     frame.devices = session.devices();
     instrumentsAge += dt;

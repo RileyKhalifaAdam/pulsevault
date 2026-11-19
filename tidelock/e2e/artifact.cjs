@@ -135,7 +135,7 @@ async function run() {
       const cost = await frame.evaluate(() => { const k = window.__tidelock.scene.stats(); return `${k.drawCalls} draw calls, ${k.triangles} triangles`; });
       await sleep(mode === 'direct' ? 1500 : 300);
       await settle(frame);
-      await page.screenshot({ path: path.join(shots, `artifact-${mode}.png`) });
+      await page.screenshot({ timeout: 180000, path: path.join(shots, `artifact-${mode}.png`) });
       check(s.screen === 'flight' && s.time > t0 + 5 && Number.isFinite(s.alt), `[${mode}] flying: sim +${(s.time - t0).toFixed(0)} s, altitude ${(s.alt / 1000).toFixed(0)} km; frame from the seat: ${cost}`);
       check(!s.errPanel, `[${mode}] no error panel`);
     } catch (err) {

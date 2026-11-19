@@ -3,7 +3,8 @@
 //
 //   createShipVisual(id, { quality, livery?, seed? }) -> { object3d, layout, update(ctx), dispose() }
 //
-// A ship is at most five draw calls (hull, glass, glow, flare sprites, decals) per LOD. Geometry is
+// A ship is at most five draw calls (hull, glass, glow, flare sprites, decals) per LOD (the Wren: hero LOD
+// ~1e5 triangles, reduced LOD about a third of that). Geometry is
 // livery-independent (paint colours are material uniforms) and cached per hull / LOD / variant, so
 // traffic that differs only in paint shares vertex buffers. Nozzles, RCS blocks, hardpoint mounts, the
 // docking collar and the navigation lights are placed from data/shipLayouts.ts.
@@ -24,6 +25,7 @@ import {
   type Surface,
   TAU,
   curve,
+  decalGlyphRect,
   decalIconRect,
   decalStyle,
   flareStyle,
@@ -538,144 +540,441 @@ class Kit {
   icon(name: Parameters<typeof decalIconRect>[0], w: number, h: number, st: Style): void {
     this.b.decal(w, h, decalIconRect(name), st);
   }
+
+  /**
+   * Armour plate standing `lift` proud of a loft between u positions `ua`, `ub` (either order) and v (= z)
+   * z0..z1. Unlike MeshBuilder.plateOn the columns follow the loft's own ring points (`K` per ring), so plates
+   * stay exact on faceted sections, and the chamfer is `bevel` metres measured at each edge. Top level only.
+   */
+  armour(s: Surface, K: number, ua: number, ub: number, z0: number, z1: number, style: Style, lift: number, bevel = 0.045): void {
+    const u0 = Math.min(ua, ub);
+    const u1 = Math.max(ua, ub);
+    if (u1 - u0 < 1e-5 || z1 <= z0) return;
+    const m = { mu: 0, mv: 0 };
+    const zm = (z0 + z1) / 2;
+    s.metric(Math.min(u1, u0 + 0.25 / K), zm, m);
+    const du0 = Math.min((u1 - u0) * 0.3, bevel / m.mu);
+    s.metric(Math.max(u0, u1 - 0.25 / K), zm, m);
+    const du1 = Math.min((u1 - u0) * 0.3, bevel / m.mu);
+    s.metric((u0 + u1) / 2, zm, m);
+    const dz = Math.min((z1 - z0) * 0.3, bevel / m.mv);
+    const a = u0 + du0;
+    const c = u1 - du1;
+    const us: number[] = [a];
+    for (let i = Math.floor(a * K) + 1; i < c * K; i++) if (i / K - us[us.length - 1] > 0.1 / K && c - i / K > 0.1 / K) us.push(i / K);
+    us.push(c);
+    const nz = Math.max(2, this.b.seg(Math.ceil((z1 - z0) / 0.8), 1) + 1);
+    const vs: number[] = [];
+    for (let j = 0; j < nz; j++) vs.push(z0 + dz + ((z1 - z0 - 2 * dz) * j) / (nz - 1));
+    const nu = us.length + 2;
+    const nv = vs.length + 2;
+    const nrm = new THREE.Vector3();
+    this.b.grid({
+      nu,
+      nv,
+      pos: (i, j, out) => {
+        const edge = i === 0 || j === 0 || i === nu - 1 || j === nv - 1;
+        const uu = i === 0 ? u0 : i === nu - 1 ? u1 : us[i - 1];
+        const vv = j === 0 ? z0 : j === nv - 1 ? z1 : vs[j - 1];
+        s.sample(uu, vv, out, nrm);
+        out.addScaledVector(nrm, edge ? -0.012 : lift);
+      },
+      style,
+      crease: 0.45,
+      flip: s.flipped,
+      uvMirror: false,
+      u0: this.b.rand() * 5,
+      v0: this.b.rand() * 5,
+    });
+  }
+
+  /** Stencilled text on a Surface like MeshBuilder.textOn, standing `lift` off it (text on raised plates). */
+  textLift(s: Surface, u: number, v: number, text: string, h: number, st: Style, rot: number, lift: number, spacing = 0.72): void {
+    const m = { mu: 0, mv: 0 };
+    s.metric(u, v, m);
+    const adv = h * spacing;
+    const total = adv * (text.length - 1);
+    for (let i = 0; i < text.length; i++) {
+      const rect = decalGlyphRect(text[i]);
+      if (!rect) continue;
+      const a = -total / 2 + i * adv;
+      let du = 0;
+      let dv = 0;
+      if (rot === 0) du = a / m.mu;
+      else if (rot === 1) dv = -a / m.mv;
+      else if (rot === 2) du = -a / m.mu;
+      else dv = a / m.mv;
+      this.b.decalOn(s, u + du, v + dv, h, h, rect, st, rot, 2, lift);
+    }
+  }
 }
 
 // ================================================================================================ hulls
 
-/** Corvane CD-7 Wren: arrowhead lifting body, twin side-mounted drive pods, bubble canopy. 16 m. */
+// ------------------------------------------------------------------------------------------------ Corvane Wren
+
+/** Finishes of the Wren: white clear-coat armour over a gunmetal body, machinery, red accent paint. */
+const WR = {
+  /** smooth white clear-coat armour (livery primary) */
+  white: hullStyle(LAYER.panel, W, 0.04, 0.34, { slot: 1, wear: 0.2, grime: 0.3 }),
+  /** heavier bolted white plate: nose, canopy cowl */
+  whiteA: hullStyle(LAYER.armor, [0.97, 0.97, 0.96], 0.04, 0.38, { slot: 1, wear: 0.26, grime: 0.38 }),
+  /** dark gunmetal body (livery secondary) */
+  gun: hullStyle(LAYER.panel, W, 0.4, 0.42, { slot: 2, wear: 0.12, grime: 0.55 }),
+  /** exposed machinery: dark steel, machined bright metal */
+  mach: hullStyle(LAYER.metal, [0.17, 0.175, 0.19], 1, 0.4, { wear: 0, grime: 0.65 }),
+  bright: hullStyle(LAYER.metal, [0.55, 0.54, 0.52], 1, 0.3, { wear: 0, grime: 0.45 }),
+  /** dark composite belly */
+  comp: hullStyle(LAYER.carbon, [0.05, 0.052, 0.058], 0.2, 0.55, { wear: 0, grime: 0.45 }),
+  /** red accent paint (livery accent) */
+  red: hullStyle(LAYER.panel, W, 0.1, 0.38, { slot: 3, wear: 0.45, grime: 0.4 }),
+  /** canopy and window frames */
+  frame: hullStyle(LAYER.metal, [0.075, 0.08, 0.09], 0.9, 0.34, { wear: 0, grime: 0.35 }),
+  /** cockpit / lounge dressing seen through the glass from outside */
+  seat: hullStyle(LAYER.carbon, [0.03, 0.03, 0.033], 0.1, 0.6, { wear: 0, grime: 0.1 }),
+  amber: hullStyle(LAYER.carbon, [0.62, 0.26, 0.04], 0, 0.62, { wear: 0, grime: 0.1 }),
+  leather: hullStyle(LAYER.carbon, [0.28, 0.025, 0.022], 0, 0.5, { wear: 0, grime: 0.1 }),
+  veneer: hullStyle(LAYER.ribbed, [0.12, 0.06, 0.03], 0, 0.45, { wear: 0, grime: 0.1 }),
+} as const;
+
+type P3 = readonly [number, number, number];
+/** One body station: top centre, spine edge, shoulder, chamfer foot, three window-band points (x, y pairs), sill, chine, belly edge, keel. */
+const wst = (z: number, top: number, sp: number, sh: P3, ch: P3, sx: readonly number[], sill: P3, chine: P3, be: P3, keel: number): readonly [number, Sec] => [
+  z,
+  [[0, top, 0], [sp, top - 0.005, 0.05], sh, ch, [sx[0], sx[1], 0.1], [sx[2], sx[3], 0.1], [sx[4], sx[5], 0.1], sill, chine, be, [0, keel, 0]],
+];
+
+/**
+ * Corvane Wren, 32 m courier you can live in. The body is one sectioned loft drawn round the rooms of
+ * data/interiors.ts (a 7.2 x 3.5 m pressure hull from the lounge to engineering, the cockpit under a raked
+ * glass canopy at the nose); white armour plates stand proud of the gunmetal body; the two drive pods sit at
+ * the wing roots with a machinery valley between pod and hull; swept wings, twin canted fins. The window
+ * glass is the loft itself at the interior windows (canopy, lounge window, skylight, cabin portholes), each
+ * with a framed reveal back to the room face so the views out work.
+ */
 function buildWren(k: Kit): void {
   const { b, L, hero } = k;
-  const NC = 5;
+  const NC = 11;
+  const K = symSectionCount(NC, k.segs);
+  const half = k.segs >> 1;
+  const u = (kk: number, f: number, port = false): number => k.fu(NC, kk, f, port);
+  /** u of corner kk itself (the middle of its fillet; exact for the straight window band) */
+  const um = (kk: number, port = false, di = 0): number => k.fu(NC, kk, -half + di, port);
+  const engCol: RGB = [0.62, 0.8, 1];
+  const serial = `CW32-${String(715 + k.variant * 113).padStart(4, '0')}`;
+  const CZ0 = -16.05;
+  const CZ1 = -12.7;
+
+  // ---- body: nose and canopy, the flare behind the cockpit, the long pressure hull, the stern
+  const mid = (z: number): readonly [number, Sec] => wst(z, 1.78, 0.78, [3.1, 1.76, 0.15], [3.6, 1.2, 0.1], [3.6, 0.92, 3.6, 0.45, 3.6, -0.05], [3.6, -0.22, 0.1], [4.3, -0.86, 0.05], [2.9, -1.72, 0.35], -1.72);
+  const stations = [
+    wst(-16.45, -0.74, 0.03, [0.06, -0.745, 0], [0.08, -0.75, 0], [0.09, -0.755, 0.095, -0.76, 0.1, -0.765], [0.105, -0.77, 0], [0.14, -0.8, 0.01], [0.09, -0.86, 0.02], -0.88),
+    wst(-16.3, -0.6, 0.35, [0.55, -0.605, 0.05], [0.64, -0.61, 0.02], [0.66, -0.615, 0.67, -0.62, 0.68, -0.625], [0.7, -0.63, 0.02], [1.1, -0.75, 0.03], [0.65, -1.05, 0.15], -1.1),
+    wst(CZ0, -0.44, 0.6, [1.0, -0.445, 0.05], [1.12, -0.45, 0.03], [1.16, -0.452, 1.19, -0.455, 1.22, -0.458], [1.25, -0.46, 0.03], [1.8, -0.7, 0.04], [1.1, -1.35, 0.25], -1.45),
+    wst(-15.75, 0.42, 0.7, [1.45, 0.3, 0.3], [1.72, 0.05, 0.1], [1.75, -0.08, 1.77, -0.2, 1.78, -0.31], [1.8, -0.44, 0.06], [2.45, -0.72, 0.05], [1.5, -1.55, 0.3], -1.62),
+    wst(-15.35, 1.47, 0.75, [1.62, 1.38, 0.45], [2.02, 0.82, 0.12], [2.04, 0.5, 2.06, 0.15, 2.07, -0.15], [2.09, -0.43, 0.08], [2.85, -0.74, 0.05], [1.8, -1.68, 0.35], -1.71),
+    wst(-14.6, 1.93, 0.78, [1.62, 1.88, 0.5], [2.1, 1.22, 0.12], [2.12, 0.92, 2.12, 0.45, 2.13, -0.05], [2.14, -0.42, 0.08], [3.2, -0.76, 0.05], [2.0, -1.72, 0.35], -1.72),
+    wst(-13.6, 2.02, 0.78, [1.62, 1.96, 0.5], [2.12, 1.22, 0.12], [2.13, 0.92, 2.13, 0.45, 2.14, -0.05], [2.16, -0.42, 0.08], [3.5, -0.78, 0.05], [2.15, -1.72, 0.35], -1.72),
+    wst(CZ1, 2.03, 0.78, [1.66, 1.97, 0.5], [2.15, 1.24, 0.12], [2.16, 0.92, 2.16, 0.45, 2.17, -0.05], [2.2, -0.42, 0.08], [3.75, -0.8, 0.05], [2.3, -1.72, 0.35], -1.72),
+    wst(-12.2, 2.0, 0.78, [2.15, 1.9, 0.4], [2.4, 1.3, 0.12], [2.45, 0.92, 2.46, 0.45, 2.47, -0.05], [2.5, -0.3, 0.08], [3.9, -0.82, 0.05], [2.45, -1.72, 0.35], -1.72),
+    wst(-11.4, 1.9, 0.78, [2.65, 1.85, 0.35], [3.15, 1.25, 0.12], [3.2, 0.92, 3.2, 0.45, 3.21, -0.05], [3.22, -0.24, 0.1], [4.1, -0.84, 0.05], [2.7, -1.72, 0.35], -1.72),
+    mid(-10.65),
+    mid(3.2),
+    // the engine deck rises behind the docking collar: a wedge in profile, machinery under the raised roof
+    wst(6.2, 2.4, 0.78, [2.95, 2.36, 0.2], [3.6, 1.45, 0.1], [3.6, 0.92, 3.6, 0.45, 3.6, -0.05], [3.6, -0.22, 0.1], [4.3, -0.86, 0.05], [2.9, -1.72, 0.35], -1.72),
+    wst(10.2, 2.42, 0.78, [2.95, 2.38, 0.2], [3.6, 1.45, 0.1], [3.6, 0.92, 3.6, 0.45, 3.6, -0.05], [3.6, -0.22, 0.1], [4.3, -0.86, 0.05], [2.9, -1.72, 0.35], -1.72),
+    wst(12.6, 2.3, 0.78, [2.9, 2.25, 0.2], [3.5, 1.4, 0.1], [3.5, 0.92, 3.5, 0.45, 3.5, -0.05], [3.5, -0.25, 0.1], [4.1, -0.86, 0.05], [2.8, -1.7, 0.35], -1.7),
+    wst(14.1, 1.9, 0.7, [2.6, 1.85, 0.15], [3.1, 1.15, 0.1], [3.15, 0.8, 3.15, 0.4, 3.15, -0.05], [3.15, -0.3, 0.1], [3.6, -0.85, 0.05], [2.5, -1.55, 0.3], -1.55),
+  ];
+  const inZ = (z: number, z0: number, z1: number): boolean => z > z0 && z < z1;
+  const body = k.loft(stations, {
+    n: 92,
+    extra: [-9.4, -5.6, -8.7, -6.3, -3.85, -2.95, -15.3, -12.6, -10.75, 6.8, 10.3, -14.3],
+    capStart: WR.whiteA,
+    capEnd: WR.mach,
+    paint: (q) => {
+      const z = q.z;
+      if (q.c < 7 && inZ(z, CZ0, CZ1)) return ST.glass; // canopy: everything above the sill
+      if (q.c < 1 && inZ(z, -8.7, -6.3)) return ST.glass; // lounge skylight
+      if (q.c > 3.5 && q.c < 7.5 && q.y > -0.05 && q.y < 0.45 && inZ(z, -3.85, -2.95)) return ST.glass; // cabin portholes
+      if (q.side > 0 && q.c > 3.5 && q.c < 7.5 && q.y > -0.21 && q.y < 0.91 && inZ(z, -9.4, -5.6)) return ST.glass; // lounge window
+      return q.c >= 9 ? WR.comp : WR.gun;
+    },
+  });
+  /** armour / trim plate on the body between two u positions (either order), both sides unless `side` given */
+  const plate = (ua: (port: boolean) => number, ub: (port: boolean) => number, z0: number, z1: number, style: Style = WR.white, lift = 0.085, side = 0, bevel = 0.045): void => {
+    for (const port of [false, true]) {
+      if ((side > 0 && port) || (side < 0 && !port)) continue;
+      k.armour(body, K, ua(port), ub(port), z0, z1, style, lift, bevel);
+    }
+  };
+  const at = (kk: number, f: number) => (port: boolean): number => u(kk, f, port);
+  const atC = (kk: number, di = 0) => (port: boolean): number => um(kk, port, di);
+
+  // ---- white armour: nose, canopy cowl, upper deck, the window band forward of the pods
+  plate(at(7, 0.1), at(7, 0.9), -16.32, -14.25, WR.whiteA);
+  plate(at(7, 0.1), at(7, 0.9), -14.15, -12.75, WR.whiteA);
+  plate(at(8, 0.06), at(8, 0.55), -16.25, -13.2, WR.whiteA);
+  plate(at(0, 0.04), atC(3, -1), -12.56, -10.8, WR.whiteA, 0.1);
+  plate(atC(3, 1), atC(7), -12.56, -10.8, WR.whiteA, 0.1);
+  for (const [z0, z1] of [[-10.6, -8.05], [-7.95, -4.75], [-4.65, -1.2], [3.1, 5.0], [5.1, 7.6], [7.7, 9.6]]) plate(at(1, 0.06), atC(3, -1), z0, z1);
+  // the waist over the washroom and suit room: bare gunmetal deck with service hardware round the collar
+  if (hero) {
+    b.mirror(() => {
+      b.at(2.0, 1.78, 0.1, () => b.greebles(1.9, 2.3, { styles: [WR.mach, WR.gun, WR.bright, WR.red], cell: 0.24, height: 0.14, density: 0.62, pipes: 3, pipeStyle: WR.bright }));
+      b.at(1.0, 1.8, 0.1, () => b.box(0.08, 0.06, 2.3, WR.red, { bevel: 0.015 }));
+    });
+  }
+  // exposed radiators on the aft deck shoulders between the fins and the hull edge
+  plate(at(1, 0.55), at(2, 0.5), 9.9, 13.6, ST.rad, 0.05, 0, 0.03);
+  const BAND_T = atC(3, 1);
+  for (const side of [1, -1]) {
+    const full = side > 0 ? [[-10.6, -9.62], [-5.38, -4.1], [-2.7, -1.3]] : [[-10.6, -7.6], [-7.5, -4.1], [-2.7, -1.3]];
+    for (const [z0, z1] of full) plate(BAND_T, atC(5), z0, z1, WR.white, 0.085, side);
+    if (side > 0) plate(BAND_T, atC(4), -9.52, -5.48, WR.white, 0.085, side);
+    plate(BAND_T, atC(5), -4.0, -2.8, WR.white, 0.085, side);
+  }
+  // lower shelf (sill to chine): the white arrowhead outline seen from above
+  for (const [z0, z1] of [[-12.6, -10.8], [-10.7, -6.2], [-6.1, -1.3], [-1.2, 1.2]]) plate(at(7, 0.1), at(7, 0.86), z0, z1);
+  // raised gunmetal dorsal ridge along the spine
+  for (const [z0, z1] of [[-10.45, -8.95], [-6.05, 1.2], [3.2, 10.6]]) plate(at(0, 0.03), at(0, 0.84), z0, z1, WR.mach, 0.14, 0, 0.06);
+  // ---- canopy frame: windscreen foot, front hoop, rear hoop, sill rails, roof rails
+  const FR = WR.frame;
+  plate(at(0, 0.02), atC(7, 2), -16.12, -15.93, FR, 0.06, 0, 0.03);
+  plate(at(0, 0.02), atC(7, 2), -15.4, -15.27, FR, 0.06, 0, 0.03);
+  plate(at(0, 0.02), atC(7, 2), -12.86, -12.6, FR, 0.07, 0, 0.03);
+  plate(atC(7, -2), atC(7, 2), -16.0, -12.75, FR, 0.06, 0, 0.025);
+  plate(atC(2, -1), atC(2, 1), -15.3, -12.75, FR, 0.05, 0, 0.025);
+  // ---- window frames (lounge window, portholes, skylight)
+  // (frames sit just outside each opening: their sunk inner edges meet the window edge)
+  plate(atC(4, -2), atC(4), -9.56, -5.44, FR, 0.05, 1, 0.02);
+  plate(atC(7), atC(7, 2), -9.56, -5.44, FR, 0.05, 1, 0.02);
+  plate(atC(4), atC(7), -9.56, -9.4, FR, 0.05, 1, 0.02);
+  plate(atC(4), atC(7), -5.6, -5.44, FR, 0.05, 1, 0.02);
+  plate(atC(5, -2), atC(5), -4.0, -2.8, FR, 0.06, 0, 0.02);
+  plate(atC(6), atC(6, 2), -4.0, -2.8, FR, 0.06, 0, 0.02);
+  plate(atC(5), atC(6), -4.0, -3.85, FR, 0.06, 0, 0.02);
+  plate(atC(5), atC(6), -2.95, -2.8, FR, 0.06, 0, 0.02);
+  plate(at(0, 0.02), atC(1, 1), -8.86, -8.7, FR, 0.05, 0, 0.02);
+  plate(at(0, 0.02), atC(1, 1), -6.3, -6.14, FR, 0.05, 0, 0.02);
+  plate(atC(1, -1), atC(1, 1), -8.82, -6.18, FR, 0.05, 0, 0.02);
+  // ---- cyan edge light: along the chine, along the spine edges
+  const CY = lamp(CYAN, 2.4);
+  plate(at(7, 0.9), at(7, 0.97), -15.9, 1.5, CY, 0.02, 0, 0.005);
+  for (const [z0, z1] of [[-10.5, -8.95], [-6.05, 1.15], [3.3, 9.15]]) plate(at(0, 0.9), at(0, 0.97), z0, z1, CY, 0.02, 0, 0.005);
+  // ---- belly: ventral cargo ramp, nose and main gear doors
+  plate(at(9, 0.46), at(9, 1), 6.85, 10.25, WR.gun, 0.025, 0, 0.02);
+  plate(at(9, 0.8), at(9, 1), -14.3, -12.65, WR.gun, 0.02, 0, 0.015);
+  plate(at(9, 0.08), at(9, 0.42), 3.4, 6.2, WR.gun, 0.02, 0, 0.015);
+  plate(at(9, 0.08), at(9, 0.42), -8.2, -6.8, WR.gun, 0.02, 0, 0.015);
+
+  // ---- markings on the body
+  if (hero) {
+    for (const port of [false, true]) {
+      const rs = port ? 3 : 1;
+      k.textLift(body, u(7, 0.45, port), -11.3, 'WREN', 0.3, DC.white, rs, 0.02);
+      k.textLift(body, u(5, 0.5, port), -11.7, serial, 0.2, DC.dark, rs, 0.11);
+      b.decalOn(body, u(4, 0.5, port), -1.9, 0.9, 0.16, decalIconRect('stripeBroken'), DC.accent, rs, 3, 0.1);
+      b.decalOn(body, u(8, 0.3, port), -14.6, 0.34, 0.34, decalIconRect('rescue'), DC.red, rs, 2, 0.1);
+      b.decalOn(body, u(2, 0.5, port), 0.2, 0.8, 0.2, decalIconRect('noStep'), DC.dark, rs, 2, 0.1);
+      b.decalOn(body, u(2, 0.4, port), 7.8, 0.6, 0.16, decalIconRect('dashes'), DC.dark, rs, 2, 0.1);
+      // ramp and gear-door hazard edges
+      b.decalOn(body, u(9, 0.47, port), 8.55, 3.3, 0.12, decalIconRect('hazard'), DC.yellow, 1, 4, 0.04);
+      b.decalOn(body, u(9, 0.72, port), 6.9, 1.2, 0.12, decalIconRect('hazard'), DC.yellow, 0, 3, 0.04);
+      b.decalOn(body, u(9, 0.72, port), 10.2, 1.2, 0.12, decalIconRect('hazard'), DC.yellow, 0, 3, 0.04);
+      b.decalOn(body, u(9, 0.25, port), 4.8, 0.5, 0.5, decalIconRect('warnTri'), DC.yellow, 0, 2, 0.035);
+      b.decalOn(body, u(9, 0.2, port), 1.8, 1.4, 0.8, decalIconRect('scuff'), DC.scuff, 0, 2, 0.02);
+      b.decalOn(body, u(8, 0.5, port), 4.0, 2.2, 0.5, decalIconRect('soot'), DC.soot, rs, 3, 0.02);
+    }
+    k.textLift(body, u(9, 0.8), -2.0, 'CORVANE', 0.5, DC.white, 1, 0.02);
+    b.decalOn(body, u(0, 0.5), 4.2, 0.4, 0.4, decalIconRect('arrow'), DC.yellow, 0, 2, 0.02);
+    b.decalOn(body, u(0, 0.5), 0.2, 0.4, 0.4, decalIconRect('arrow'), DC.yellow, 2, 2, 0.02);
+  }
+
+  // ---- window reveals: framed tunnels from the room faces to the skin (views out from inside stay closed)
+  const RV = ST.dark;
+  b.at(3.41, 0.935, -7.5, () => b.box(0.38, 0.03, 3.86, RV));
+  b.at(3.41, -0.215, -7.5, () => b.box(0.38, 0.03, 3.86, RV));
+  for (const z of [-9.415, -5.585]) b.at(3.41, 0.36, z, () => b.box(0.38, 1.18, 0.03, RV));
+  b.mirror(() => {
+    b.at(3.41, 0.465, -3.4, () => b.box(0.38, 0.03, 0.96, RV));
+    b.at(3.41, -0.065, -3.4, () => b.box(0.38, 0.03, 0.96, RV));
+    for (const z of [-3.865, -2.935]) b.at(3.41, 0.2, z, () => b.box(0.38, 0.56, 0.03, RV));
+    b.at(0.715, 1.585, -7.5, () => b.box(0.03, 0.34, 2.43, RV));
+    // cockpit: sill ledge under the side glass, the overhead window's surround
+    b.at(1.89, -0.445, -13.82, () => b.box(0.36, 0.03, 2.36, RV));
+    b.at(1.015, 1.64, -13.6, () => b.box(0.03, 0.46, 1.66, RV));
+  });
+  for (const z of [-8.715, -6.285]) b.at(0, 1.585, z, () => b.box(1.46, 0.34, 0.03, RV));
+  for (const z of [-14.415, -12.785]) b.at(0, 1.64, z, () => b.box(2.06, 0.46, 0.03, RV));
+  b.at(0, -0.445, -15.42, () => b.box(3.3, 0.03, 0.8, RV));
+  b.at(0, -1.19, -13.3, () => b.box(3.4, 0.04, 3.4, RV));
+
+  // ---- what shows through the glass from outside: console, seats, bulkhead, the lounge (inside the room solids)
+  if (hero) {
+    b.at(0, -0.52, -14.575, () => b.box(3.3, 0.9, 0.76, WR.seat, { bevel: 0.04 }));
+    for (const x of [-0.85, 0, 0.85]) b.at(x, -0.065, -14.6, () => b.box(0.62, 0.01, 0.4, lamp(CYAN, 1.6)));
+    b.mirror(() => {
+      b.at(0.55, -0.62, -13.42, () => b.box(0.54, 0.24, 0.6, WR.seat, { bevel: 0.05 }));
+      b.at(0.55, -0.48, -13.42, () => b.box(0.4, 0.04, 0.46, WR.amber, { bevel: 0.015 }));
+      b.at(0.55, -0.32, -13.16, () => b.box(0.54, 0.76, 0.08, WR.seat, { bevel: 0.03 }));
+      b.at(1.1, 0.2, -11.63, () => b.box(1.16, 2.36, 0.04, WR.frame));
+    });
+    b.at(2.47, -0.79, -7.5, () => b.box(1.38, 0.38, 4.3, WR.leather, { bevel: 0.08 }));
+    b.at(2.97, -0.58, -7.5, () => b.box(0.4, 0.8, 4.3, WR.leather, { bevel: 0.08 }));
+    b.at(0, 1.25, -11.63, () => b.box(1.04, 0.26, 0.04, WR.frame));
+    b.at(1.0, -0.68, -7.5, () => b.box(0.84, 0.6, 1.72, WR.veneer, { bevel: 0.03 }));
+    b.at(-2.885, 1.0, -7.75, () => b.box(0.02, 0.7, 4.1, lamp(WARM, 1.2, true)));
+    b.at(-2.86, -0.55, -7.75, () => b.box(0.6, 0.84, 4.2, WR.gun, { bevel: 0.02 }));
+  }
+
+  // ---- forward cheeks: RCS housings and the nose gear bay, the wing roots seen from the cockpit
+  b.mirror(() => {
+    k.tube(
+      [
+        [-14.8, 0.1, 0.08, -0.5, 2.4],
+        [-13.6, 0.5, 0.3, -0.25, 3.05],
+        [-12.5, 0.76, 0.48, 0.02, 3.15],
+        [-11.3, 0.76, 0.48, 0.02, 3.15],
+        [-10.7, 0.62, 0.4, -0.05, 3.3],
+      ],
+      { n: 10, K: 24, p: 4, capEnd: WR.mach, paint: (q) => (q.ny > 0.35 ? WR.whiteA : q.z > -10.95 ? WR.mach : WR.gun) },
+    );
+    if (hero) {
+      b.at(3.85, -0.35, -11.2, () => b.box(0.06, 0.32, 0.7, heatGlow));
+      b.at(3.2, 0.66, -11.8, () => k.icon('warnTri', 0.24, 0.24, DC.red));
+    }
+  });
+
+  // ---- drive pods at the wing roots
   const podX = L.engines[0].pos.x;
   const podY = L.engines[0].pos.y;
-  const engCol: RGB = [0.62, 0.8, 1];
-  const reg = `CD7-${204 + k.variant * 37}`;
-
-  // ---- lifting body: corners = top centre, shoulder, chine, belly edge, keel
-  const body = k.loft(
-    [
-      [-8.0, [[0, 0.03, 0.02], [0.05, 0.02, 0.02], [0.1, -0.03, 0.01], [0.06, -0.08, 0.02], [0, -0.1, 0.02]]],
-      [-7.3, [[0, 0.27, 0.1], [0.3, 0.21, 0.12], [0.62, -0.03, 0.04], [0.36, -0.22, 0.1], [0, -0.27, 0.1]]],
-      [-5.5, [[0, 0.66, 0.3], [0.7, 0.52, 0.3], [1.45, 0.0, 0.06], [0.95, -0.42, 0.2], [0, -0.5, 0.3]]],
-      [-3.0, [[0, 0.98, 0.4], [1.05, 0.8, 0.4], [2.25, 0.02, 0.07], [1.6, -0.58, 0.25], [0, -0.68, 0.3]]],
-      [0.0, [[0, 1.22, 0.5], [1.35, 1.02, 0.45], [3.0, 0.05, 0.08], [2.3, -0.7, 0.3], [0, -0.8, 0.3]]],
-      [3.0, [[0, 1.25, 0.5], [1.5, 1.05, 0.45], [3.45, 0.08, 0.08], [2.7, -0.72, 0.3], [0, -0.82, 0.3]]],
-      [5.2, [[0, 1.1, 0.4], [1.5, 0.92, 0.4], [3.3, 0.1, 0.08], [2.6, -0.62, 0.3], [0, -0.72, 0.3]]],
-      [6.6, [[0, 0.8, 0.25], [1.4, 0.68, 0.25], [2.9, 0.1, 0.08], [2.3, -0.42, 0.2], [0, -0.5, 0.2]]],
-    ],
-    {
-      n: 34,
-      extra: [-7.0, -1.2, 2.2, 5.6],
-      capStart: ST.carbon,
-      capEnd: ST.dark,
-      paint: (q) => {
-        if (q.z < -7.0) return ST.carbon; // radome
-        if (q.c >= 2.5) return ST.tile; // belly heat shield
-        if (q.c === 2) return ST.metal; // bare leading-edge chine
-        if (q.c === 1) return q.z > -6.2 && q.z < 5.6 ? ST.A : ST.P; // accent line along the shoulder
-        if (q.z > 5.6) return ST.S;
-        if (q.c === 1.5) return q.z > 2.2 ? ST.S : q.z > -1.2 ? ST.P2 : ST.P;
-        return ST.P;
-      },
-    },
-  );
-
-  // ---- canopy: coaming mound, glass bubble, a hint of cockpit
-  k.canopy(0, 0.71, -3.45, 1);
-
-  // ---- dorsal spine with the docking hump
-  k.loft(
-    [
-      [-1.8, [[0, 1.12, 0.05], [0.18, 1.1, 0.05], [0.24, 0.7, 0], [0, 0.7, 0]]],
-      [-0.6, [[0, 1.42, 0.1], [0.45, 1.38, 0.1], [0.56, 0.9, 0], [0, 0.9, 0]]],
-      [0.4, [[0, 1.5, 0.1], [0.7, 1.46, 0.1], [0.82, 0.9, 0], [0, 0.9, 0]]],
-      [1.9, [[0, 1.5, 0.1], [0.7, 1.46, 0.1], [0.82, 0.9, 0], [0, 0.9, 0]]],
-      [3.2, [[0, 1.46, 0.1], [0.4, 1.42, 0.1], [0.52, 0.9, 0], [0, 0.9, 0]]],
-      [5.0, [[0, 1.3, 0.08], [0.28, 1.27, 0.08], [0.38, 0.8, 0], [0, 0.8, 0]]],
-      [6.55, [[0, 0.95, 0.05], [0.18, 0.93, 0.05], [0.24, 0.5, 0], [0, 0.5, 0]]],
-    ],
-    { n: 14, capEnd: ST.dark, paint: (q) => (q.c >= 1.5 ? ST.S : q.z > 3.2 ? ST.S : ST.P), segs: 2 },
-  );
-  k.dockCollar(0.6);
-  if (hero) {
-    k.whip(0.22, 1.42, 3.7, 0.3, 1.98, 4.05);
-    b.at(0, 1.505, 2.55, () => k.icon('arrow', 0.3, 0.3, DC.yellow));
-    b.at(0, 1.505, -0.25, () => k.icon('arrow', 0.3, 0.3, DC.yellow), 0, Math.PI);
-  }
-
-  // ---- drive pods, pylons, winglets
-  b.mirror((side) => {
+  for (const s of [1, -1]) {
+    const px = s * podX;
+    const uo = s > 0 ? 0.25 : 0.75;
+    const white = (uu: number): boolean => (s > 0 ? uu < 0.36 || uu > 0.86 : uu > 0.64 || uu < 0.14);
     const pod = k.tube(
       [
-        [1.0, 0.56, 0.56, podY, podX],
-        [1.45, 0.7, 0.7, podY, podX],
-        [2.6, 0.86, 0.86, podY, podX],
-        [4.6, 0.86, 0.86, podY, podX],
-        [6.0, 0.76, 0.76, podY, podX],
-        [6.75, 0.58, 0.58, podY, podX],
+        [0.5, 0.22, 0.22, podY + 0.05, px],
+        [1.3, 0.78, 0.74, podY + 0.02, px],
+        [2.6, 1.15, 1.13, podY, px],
+        [3.9, 1.28, 1.28, podY, px],
+        [12.8, 1.28, 1.28, podY, px],
+        [14.5, 1.25, 1.25, podY, px],
+        [15.3, 1.2, 1.2, podY, px],
       ],
       {
-        n: 16,
-        K: 24,
-        extra: [1.25, 2.15, 2.5, 5.9],
-        paint: (q) => (q.z < 1.25 ? ST.metal : q.z > 5.9 ? ST.steel : q.z > 2.15 && q.z < 2.5 ? ST.A : ST.S),
+        n: 30,
+        K: 32,
+        extra: [2.6, 2.72, 7.2, 7.32, 12.9, 13.0],
+        paint: (q) => {
+          if ((q.z > 2.6 && q.z < 2.72) || (q.z > 7.2 && q.z < 7.32) || (q.z > 12.9 && q.z < 13.0)) return WR.mach;
+          if (q.z < 2.6) return q.z < 0.8 ? WR.mach : WR.whiteA;
+          if (q.z < 7.2 && white(q.c)) return WR.white;
+          return q.z > 13.0 ? WR.mach : WR.gun;
+        },
       },
     );
-    // intake: lip, duct, shock cone
-    b.at(podX, podY, 1.0, () => {
-      b.lathe([0.565, 0, 0.5, 0.03, 0.45, 0.45, 0.4, 0.95, 0, 0.95], { segs: 24, flip: true, style: (_u, _v, _qi, qj) => (qj === 0 ? ST.metal : ST.pit), crease: 0.6 });
-      b.lathe([0, 0.05, 0.12, 0.45, 0.2, 0.95], { segs: 12, style: ST.steel, crease: 1.2 });
-    });
-    // pylon wing joining pod and body
-    b.at(0, 0.1, 0, () => b.plate([2.3, 0.7, podX, 1.5, podX, 6.3, 2.2, 6.62], 0.36, { style: ST.S2, edgeStyle: ST.metal, bevel: 0.1 }));
-    // winglet with a slight dihedral
-    b.at(podX + 0.78, podY, 0, () => b.plate([0, 3.3, 1.15, 5.45, 1.15, 6.32, 0, 6.5], 0.13, { style: ST.P, edgeStyle: ST.metal, bevel: 0.05, sharp: true }), 0, 0, 0.245);
+    b.at(px, podY, 15.3, () => b.ring(1.11, 1.3, 0.1, WR.mach, { segs: 32, bevel: 0.02 }));
+    b.plateOn(pod, uo - 0.06, uo + 0.06, 8.0, 12.5, { lift: 0.05, style: ST.rad, nu: 3, nv: 6, bevel: 0.03 });
+    b.plateOn(pod, uo + s * 0.075, uo + s * 0.085, 3.1, 7.1, { lift: 0.012, style: lamp(CYAN, 2.4), nu: 1, nv: 3, bevel: 0.004 });
     if (hero) {
-      // markings (decals are authored on the starboard side; the mirror handles port)
-      void side;
-      b.decalOn(pod, 0.125, 3.6, 0.5, 0.5, decalIconRect('logoCorvane'), DC.accent, 1);
-      b.decalOn(pod, 0.1, 5.35, 0.9, 0.22, decalIconRect('hazard'), DC.yellow, 1);
+      const rot = s > 0 ? 1 : 3;
+      k.textLift(pod, uo - s * 0.02, 5.0, 'CORVANE', 0.36, DC.dark, rot, 0.012);
+      b.decalOn(pod, uo + s * 0.05, 6.3, 1.4, 0.14, decalIconRect('stripeBroken'), DC.accent, rot, 4);
+      b.decalOn(pod, uo, 14.4, 1.6, 0.8, decalIconRect('soot'), DC.soot, rot, 3);
+      b.decalOn(pod, uo + s * 0.12, 10.2, 0.32, 0.32, decalIconRect('warnTri'), DC.red, rot, 2);
+      b.decalOn(pod, 0.5, 9.0, 1.8, 0.9, decalIconRect('scuff'), DC.scuff, 0, 2);
     }
-  });
-  k.engine(0, 1.25, engCol, 3);
-  k.engine(1, 1.25, engCol, 3);
-
-  // ---- upper-deck panels: radiators on the aft facets, access plates forward
-  for (const port of [false, true]) {
-    k.panel(body, NC, 1, 0.14, 0.86, 2.7, 5.0, port, ST.rad, 0.03, 4, 5);
-    k.panel(body, NC, 1, 0.2, 0.8, -0.9, 1.5, port, ST.P, 0.022, 3, 5);
-    if (hero) {
-      k.panel(body, NC, 1, 0.3, 0.75, -4.6, -3.4, port, ST.P2, 0.018, 2, 3);
-      b.textOn(body, k.fu(NC, 1, 0.5, port), -2.25, reg, 0.36, DC.dark, port ? 3 : 1);
-      b.decalOn(body, k.fu(NC, 1, 0.5, port), 0.3, 1.5, 0.36, decalIconRect('stripeBroken'), DC.accent, port ? 3 : 1);
-      b.decalOn(body, k.fu(NC, 1, 0.55, port), -5.4, 0.36, 0.36, decalIconRect('warnTri'), DC.red, port ? 3 : 1);
-      b.decalOn(body, k.fu(NC, 1, 0.22, port), 5.85, 0.8, 0.2, decalIconRect('noStep'), DC.white, port ? 3 : 1);
-    }
+    k.engine(s > 0 ? 0 : 1, 2.2, engCol, 4);
   }
 
-  // ---- aft: machinery on the bulkhead, heat exchanger, two vernier bells, a thin tail-light bar
-  b.at(0, 0.3, 6.6, () => b.greebles(3.6, 0.62, { styles: [ST.steel, ST.metal, ST.dark, ST.steel], cell: 0.3, height: 0.2, density: 0.72, pipes: 5, pipeStyle: ST.metal }), Math.PI / 2);
-  b.at(0, -0.14, 6.62, () => {
-    b.box(1.5, 0.42, 0.1, ST.dark, { bevel: 0.03 });
-    b.at(0, 0, 0.055, () => b.box(1.34, 0.3, 0.03, ST.rad, { bevel: 0.01, swapUV: true }));
-  });
-  b.at(0, 0.66, 6.6, () => b.box(1.9, 0.035, 0.05, lamp(WARM, 2.6, true)));
+  // ---- machinery valleys between hull and pods, wings, fins (mirrored)
   b.mirror(() => {
-    b.at(1.9, -0.12, 6.6, () => b.box(0.9, 0.36, 0.16, ST.dark, { bevel: 0.03 }));
-    b.at(1.9, -0.12, 6.69, () => b.box(0.74, 0.22, 0.02, heatGlow));
-    b.at(1.05, -0.14, 6.58, () => {
-      b.nozzle({ throatR: 0.07, exitR: 0.17, length: 0.34, style: ST.steel, inner: engineGlow(engCol), segs: 12, wall: 0.014 });
-      b.at(0, 0, -0.04, () => b.ring(0.1, 0.2, 0.07, ST.metal, { segs: 12, bevel: 0.015 }));
+    b.at(4.15, 0.97, 7.95, () => b.box(1.2, 0.1, 10.7, WR.mach, { bevel: 0.02 }));
+    // propellant tank with red bands and saddles
+    b.at(4.2, 1.38, 4.3, () => b.capsule(0.34, 2.3, WR.gun, 18));
+    for (const z of [3.5, 5.1]) {
+      b.at(4.2, 1.38, z, () => b.cyl(0.36, 0.36, 0.09, WR.red, { segs: 18, capA: false, capB: false }));
+      b.at(4.2, 1.06, z + 0.045, () => b.box(0.62, 0.12, 0.16, WR.mach, { bevel: 0.02 }));
+    }
+    // radiator bank
+    for (let i = 0; i < 14; i++) b.at(4.15, 1.27, 6.45 + i * 0.31, () => b.box(1.0, 0.48, 0.035, ST.rad));
+    for (const x of [3.66, 4.64]) b.at(x, 1.28, 8.47, () => b.box(0.05, 0.52, 4.2, WR.mach));
+    // feed lines into the pod, actuators at the stern
+    b.pipe([3.74, 1.07, 2.7, 3.74, 1.07, 11.6, 3.95, 0.98, 12.6, 4.3, 0.9, 13.3], 0.055, WR.bright, { smoothPath: true, sides: 8 });
+    b.pipe([4.62, 1.12, 3.0, 4.62, 1.12, 12.0, 4.7, 1.0, 13.0], 0.045, WR.mach, { smoothPath: true, sides: 6 });
+    b.pipe([3.9, 1.6, 5.4, 3.9, 1.6, 6.2, 3.85, 1.3, 6.5], 0.035, WR.red, { smoothPath: true, sides: 6 });
+    if (hero) {
+      for (const z of [11.2, 12.1]) {
+        b.strut(4.0, 1.0, z, 4.55, 1.2, z + 0.55, 0.06, WR.bright, 6);
+        b.at(4.0, 1.08, z, () => b.box(0.22, 0.16, 0.3, WR.red, { bevel: 0.02 }));
+      }
+      b.at(4.15, 1.05, 12.9, () => b.box(0.9, 0.06, 0.5, heatGlow));
+      b.at(4.15, 1.03, 2.75, () => b.greebles(1.1, 0.4, { styles: [WR.mach, WR.gun, WR.bright], cell: 0.18, height: 0.12, density: 0.8 }), 0, Math.PI / 2);
+      b.at(4.35, 1.73, 4.3, () => k.icon('warnTri', 0.26, 0.26, DC.red));
+    }
+
+    // exposed machinery bay on the hull side ahead of the pods (washroom / suit room)
+    k.face(3.6, 0.35, 0.12, 'px', () => {
+      b.box(2.7, 0.04, 1.14, WR.mach);
+      if (hero) b.greebles(2.5, 0.98, { styles: [WR.mach, WR.gun, WR.bright, WR.red], cell: 0.22, height: 0.16, density: 0.75, pipes: 4, pipeStyle: WR.bright });
+      else b.at(0, 0.06, 0, () => b.box(2.4, 0.12, 0.9, WR.gun));
     });
+
+    // wing: gunmetal spar box, white armour skin standing on it, wing-tip pod, cyan leading-edge line
+    const wy = -0.42;
+    b.at(0, wy, 0, () => b.plate([4.8, 2.6, 9.25, 4.8, 9.25, 8.7, 4.8, 13.4], 0.36, { style: WR.gun, edgeStyle: WR.mach, bevel: 0.12 }));
+    b.at(0, wy + 0.2, 0, () => b.plate([6.15, 3.95, 8.95, 5.35, 8.95, 8.25, 6.15, 11.6], 0.07, { style: WR.white, edgeStyle: WR.white, bevel: 0.025 }));
+    b.at(0, wy - 0.2, 0, () => b.plate([6.3, 4.6, 8.9, 5.9, 8.9, 8.1, 6.3, 10.9], 0.05, { style: WR.comp, bevel: 0.02 }));
+    b.at(0, wy + 0.2, 0, () => b.plate([6.1, 11.8, 8.95, 8.45, 8.95, 8.62, 6.1, 12.2], 0.06, { style: WR.red, bevel: 0.015 }));
+    b.between(6.2, wy + 0.245, 3.99, 8.9, wy + 0.245, 5.34, (len) => b.at(0, 0, len / 2, () => b.box(0.035, 0.012, len, lamp(CYAN, 2.4))));
+    b.at(9.3, wy, 4.4, () => b.cyl(0.22, 0.2, 4.6, WR.gun, { segs: 12, bevel: 0.06 }));
+    b.at(9.3, wy, 4.25, () => b.cyl(0.08, 0.22, 0.16, WR.whiteA, { segs: 12, capA: false }));
+    if (hero) {
+      b.at(7.4, wy + 0.236, 9.2, () => k.icon('noStep', 0.8, 0.2, DC.dark));
+      b.at(7.6, wy + 0.236, 7.0, () => k.icon('scuff', 1.6, 0.8, DC.scuff));
+      b.at(6.0, wy + 0.19, 12.0, () => k.icon('soot', 1.2, 0.6, DC.soot));
+    }
+
+    // twin canted fins: white armour, gunmetal edges, red tip caps, the logo on the outer face
+    const cant = 0.3;
+    // (the fin roots stand clear of the cargo-bay and engineering overheads; the strobes sit on the tips)
+    const fx = 2.7;
+    const fy = 2.28;
+    k.fin(fx, fy, [0, 8.5, 0, 13.0, -0.3, 13.95, 2.2, 14.85, 2.2, 13.55], 0.26, cant, WR.white, WR.mach);
+    k.fin(fx, fy, [1.82, 13.32, 1.82, 14.7, 2.25, 14.88, 2.25, 13.56], 0.29, cant, WR.red, WR.red);
+    k.fin(fx, fy, [-0.1, 8.35, -0.1, 13.0, -0.4, 14.05, 0.3, 14.05, 0.3, 8.6], 0.34, cant, WR.mach, WR.mach);
+    if (hero) {
+      const hh = 1.25;
+      b.at(fx + hh * Math.sin(cant) + 0.131 * Math.cos(cant), fy + hh * Math.cos(cant) - 0.131 * Math.sin(cant), 12.9, () => b.with(FACE.px, () => k.icon('logoCorvane', 0.9, 0.9, DC.accent)), 0, 0, -cant);
+    }
   });
 
-  // ---- gear doors and belly hardpoints
+  // ---- stern between the pods: machinery wall, heat vents, auxiliary bells, tail light bar
+  b.at(0, 0.0, 14.1, () => b.greebles(5.2, 2.4, { styles: [WR.mach, WR.gun, ST.dark, WR.bright], cell: 0.3, height: 0.24, density: hero ? 0.72 : 0.4, pipes: hero ? 6 : 2, pipeStyle: WR.bright }), Math.PI / 2);
+  b.mirror(() => {
+    b.at(1.55, -0.95, 14.16, () => b.box(1.3, 0.36, 0.1, WR.mach, { bevel: 0.02 }));
+    b.at(1.55, -0.95, 14.22, () => b.box(1.14, 0.24, 0.02, heatGlow));
+    b.at(0.7, 0.85, 14.2, () => {
+      b.nozzle({ throatR: 0.08, exitR: 0.2, length: 0.36, style: ST.hot, inner: engineGlow(engCol), segs: 12, wall: 0.015 });
+      b.at(0, 0, -0.05, () => b.ring(0.12, 0.25, 0.08, WR.mach, { segs: 12, bevel: 0.015 }));
+    });
+  });
+  b.at(0, 1.3, 14.14, () => b.box(2.6, 0.04, 0.05, lamp(WARM, 2.6, true)));
+
+  // ---- dorsal: docking collar, sensor mast, antennas; ventral: sensor blister
+  k.dockCollar(0.8);
   if (hero) {
-    for (const port of [false, true]) k.panel(body, NC, 3, 0.1, 0.55, 2.4, 4.4, port, ST.steel, 0.012, 2, 2);
+    b.at(0, 2.52, 9.6, () => b.box(0.3, 0.12, 1.0, WR.mach, { bevel: 0.03 }));
+    k.whip(0.12, 2.56, 9.3, 0.2, 3.5, 9.9, 0.018);
+    k.whip(-0.12, 2.56, 9.8, -0.2, 3.2, 10.4, 0.015);
+    b.at(0, -1.73, -9.6, () => b.sphere(0.26, WR.comp, 14, 0.45), Math.PI / 2);
+    b.at(0, -1.74, 12.4, () => b.box(0.9, 0.1, 1.4, WR.mach, { bevel: 0.03 }));
   }
   k.hardpoints(() => [0, 1, 0], 0.3);
-  k.rcsBlocks(0.8);
-  k.navLights(1);
+  k.rcsBlocks(0.9);
+  k.navLights(1.2);
 }
 
 /** Corvane Shrike: long nose, forward-swept wings on chine strakes, twin canted fins, two close-set drives. 15 m. */
@@ -1519,8 +1818,8 @@ interface HullDef {
 }
 
 const HULLS: Record<ShipVisualId, HullDef> = {
-  // Corvane: bone white, graphite, signal orange
-  wren: { build: buildWren, uvScale: 1, livery: { primary: [0.74, 0.73, 0.69], secondary: [0.075, 0.082, 0.095], accent: [0.6, 0.15, 0.02] } },
+  // Corvane: clear-coat white armour, gunmetal, signal red
+  wren: { build: buildWren, uvScale: 1, livery: { primary: [0.78, 0.78, 0.765], secondary: [0.2, 0.205, 0.22], accent: [0.5, 0.03, 0.025] } },
   // Corvane military: gunship grey, pale grey, red
   shrike: { build: buildShrike, uvScale: 1, livery: { primary: [0.12, 0.13, 0.145], secondary: [0.34, 0.35, 0.36], accent: [0.4, 0.022, 0.01] } },
   // Ilmarin: pale grey, deep blue, amber
@@ -1629,7 +1928,9 @@ export function createShipVisual(id: ShipVisualId, opts: ShipVisualOptions): Shi
   if (!def) throw new Error(`unknown hull: ${id}`);
   const layout = SHIP_LAYOUTS[id];
   const seed = opts.seed ?? 0;
-  const mats: HullMaterials = createHullMaterials({ livery: opts.livery ?? def.livery, quality: opts.quality });
+  // the player's Wren gets the hero finish: clear coat, micro detail, and a skin that is drawn from inside too
+  const heroFinish = id === 'wren' ? { clearcoat: opts.quality !== 'low', doubleSided: true } : undefined;
+  const mats: HullMaterials = createHullMaterials({ livery: opts.livery ?? def.livery, quality: opts.quality, hero: heroFinish });
   const mode = opts.lod ?? 'auto';
   const lods: (0 | 1)[] = mode === 'hero' ? [0] : mode === 'low' || opts.quality === 'low' ? [1] : [0, 1];
 

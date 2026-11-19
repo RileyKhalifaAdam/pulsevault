@@ -67,7 +67,15 @@ export const SHIP_LAYOUTS: Record<ShipVisualId, ShipLayout> = {
     dockingPort: { pos: v(0, 1.95, 2.2), dir: PY },
     cockpit: v(-0.55, 0.25, -13.45),
     chaseCam: { distance: 64, height: 14 },
-    lights: navLights(v(9.4, 0.0, 6.5), v(0, 4.4, 13.0), [{ pos: v(0, -1.7, 1.0), color: RED, blink: 2.2 }]),
+    // visual only: lenses on the wing-tip pods, strobes on both fin tips, belly and dorsal beacons
+    lights: [
+      { pos: v(-9.53, -0.42, 6.5), color: RED, blink: 0 },
+      { pos: v(9.53, -0.42, 6.5), color: GREEN, blink: 0 },
+      { pos: v(3.36, 4.4, 14.7), color: WHITE, blink: 1.4 },
+      { pos: v(-3.36, 4.4, 14.7), color: WHITE, blink: 1.4 },
+      { pos: v(0, -1.8, 1.0), color: RED, blink: 2.2 },
+      { pos: v(0, 2.62, 10.9), color: RED, blink: 2.2 },
+    ],
   },
 
   // Ilmarin Drover — crew module, truss spine with six cans, one big bell

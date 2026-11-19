@@ -174,6 +174,8 @@ async function run() {
     await h.tapAt(vw.width / 2, vw.height * 0.45);
     await sleep(1200);
     await settle(f);
+    // the title fades through black into the pilot's eyes: wait for the eyes to open (slow frames in software GL)
+    await f.waitForFunction(() => [...document.body.children].every((e) => e.tagName === 'CANVAS' || parseFloat(getComputedStyle(e).opacity) < 0.02 || getComputedStyle(e).backgroundColor !== 'rgb(0, 0, 0)'), null, { timeout: 30000 }).catch(() => undefined);
     s = await st(f);
     check(s.screen === 'flight' && s.mode === 'onFoot' && s.posture === 'walking' && s.room === 'cockpit' && s.cam === 'interior',
       `${tag}tap to begin: standing in the cockpit (mode=${s.mode}, posture=${s.posture}, room=${s.room}, at ${s.x.toFixed(2)}, ${s.z.toFixed(2)})`);
@@ -217,7 +219,7 @@ async function run() {
       const fix = name.startsWith('fix-');
       if (!fix && !DECK_SHOTS) return;
       await settle(f); await sleep(350); await settle(f);
-      await page.screenshot({ path: path.join(shots, fix ? `${name}.png` : `deck-${name}.png`) });
+      await page.screenshot({ timeout: 180000, path: path.join(shots, fix ? `${name}.png` : `deck-${name}.png`) });
     };
     const free = (pts) => f.evaluate((q) => q.every(([x, y]) => !window.__tidelock.scene.pickDevice(x, y)), pts);
     try {
@@ -536,7 +538,7 @@ async function run() {
   if (only !== 'portrait') {
     const { browser, page, errors } = await launch('iphone15l', { deviceScaleFactor: 2 });
     const f = page.mainFrame();
-    const shot = async (name) => { if (!DECK_SHOTS) return; await settle(f); await sleep(350); await settle(f); await page.screenshot({ path: path.join(shots, `deck-${name}.png`) }); };
+    const shot = async (name) => { if (!DECK_SHOTS) return; await settle(f); await sleep(350); await settle(f); await page.screenshot({ timeout: 180000, path: path.join(shots, `deck-${name}.png`) }); };
     try {
       const h = await fingers(page);
       h.setLook({ x: 640, y: 90 });

@@ -58,7 +58,7 @@ const { launch, serveDist, waitReady } = require('./pw.cjs');
     }
     await page.waitForTimeout(opt.wait);
     fs.mkdirSync(path.dirname(path.resolve(out)), { recursive: true });
-    await page.screenshot({ path: out });
+    await page.screenshot({ path: out, timeout: Math.max(180000, opt.timeout) });
     console.log(`wrote ${out}`);
   } catch (e) {
     failed = true;

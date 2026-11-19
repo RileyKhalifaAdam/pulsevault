@@ -36,7 +36,7 @@ const num = (k: string, d: number): number => (has(k) ? Number(params.get(k)) : 
 const DEG = Math.PI / 180;
 const view = params.get('view') ?? 'lounge';
 const quality = (params.get('q') ?? 'medium') as Quality;
-const useProxy = (params.get('interior') ?? 'proxy') === 'proxy';
+const useProxy = (params.get('interior') ?? 'real') === 'proxy';
 
 document.body.style.cssText = 'margin:0;background:#000;overflow:hidden';
 const canvas = document.createElement('canvas');
@@ -45,6 +45,7 @@ document.body.appendChild(canvas);
 const info = document.createElement('pre');
 info.style.cssText = 'position:fixed;left:6px;top:4px;margin:0;font:9px/1.25 monospace;color:#9fd;opacity:0.85;white-space:pre-wrap;pointer-events:none';
 document.body.appendChild(info);
+if (params.get('hud') === '0') info.style.visibility = 'hidden';
 const ready = (): void => {
   (window as unknown as { __ready: boolean }).__ready = true;
 };
@@ -69,6 +70,8 @@ interface Preset {
   lights: boolean;
 }
 const lounge: Preset = { eye: { x: -2.1, y: 0.62, z: -4.95 }, yaw: -52, pitch: -16, nadir: { x: 0.3, y: -0.9, z: 0.3 }, sun: { x: 0.8, y: 0.5, z: -0.15 }, lights: true };
+// the sun high on the port side: through the skylight onto the red sofa, the planet low in the big window
+const sunny: Preset = { ...lounge, nadir: { x: 0.6, y: -0.75, z: 0.2 }, sun: { x: -0.7, y: 0.7, z: 0.1 } };
 const PRESETS: Record<string, Preset> = {
   lounge,
   cockpit: { eye: layout.helmEye, yaw: -6, pitch: -14, nadir: { x: 0, y: -0.857, z: -0.515 }, sun: { x: 0.25, y: 0.55, z: -0.8 }, lights: true },
@@ -76,7 +79,13 @@ const PRESETS: Record<string, Preset> = {
   window: { eye: { x: 1.3, y: 0.55, z: -6.6 }, yaw: -112, pitch: -24, nadir: { x: 0.5, y: -0.85, z: 0.1 }, sun: { x: -0.4, y: 0.6, z: -0.7 }, lights: true },
   corridor: { eye: { x: 0, y: 0.62, z: 2.2 }, yaw: 0, pitch: -4, nadir: { x: 0.3, y: -0.9, z: 0.3 }, sun: { x: 0.8, y: 0.5, z: -0.15 }, lights: true },
   cargo: { eye: { x: 0.4, y: 0.7, z: 9.3 }, yaw: 8, pitch: -10, nadir: { x: 0.3, y: -0.9, z: 0.3 }, sun: { x: 0.8, y: 0.5, z: -0.15 }, lights: true },
+  aft: { eye: { x: 0, y: 0.62, z: -4.2 }, yaw: 180, pitch: -4, nadir: { x: 0.3, y: -0.9, z: 0.3 }, sun: { x: 0.8, y: 0.5, z: -0.15 }, lights: true },
+  cabin: { eye: { x: 1.25, y: 0.62, z: -1.45 }, yaw: -27, pitch: -20, nadir: { x: 0.3, y: -0.9, z: 0.3 }, sun: { x: 0.8, y: 0.5, z: -0.15 }, lights: true },
+  engineering: { eye: { x: 0, y: 0.62, z: 10.4 }, yaw: 180, pitch: -12, nadir: { x: 0.3, y: -0.9, z: 0.3 }, sun: { x: 0.8, y: 0.5, z: -0.15 }, lights: true },
+  hero: { eye: layout.helmEye, yaw: 8, pitch: -6, nadir: { x: 0.2, y: -0.6, z: -0.77 }, sun: { x: 0.2, y: 0.85, z: 0.5 }, lights: true },
   dark: { ...lounge, lights: false },
+  sunny,
+  night: { ...sunny, sun: { x: 0.2, y: -0.95, z: 0.2 }, lights: true },
 };
 const preset = PRESETS[view] ?? lounge;
 const eye: V3 = { x: num('ex', preset.eye.x), y: num('ey', preset.eye.y), z: num('ez', preset.eye.z) };
@@ -267,6 +276,10 @@ function proxyInterior(lay: InteriorLayout, _opts: InteriorOptions): InteriorVis
     },
     triangles: tris,
     drawCalls: calls,
+    rooms: Object.fromEntries(roomGroup) as unknown as Record<string, THREE.Group>,
+    visibleRooms: new Set(roomGroup.keys()),
+    textureBytes: 0,
+    ready: Promise.resolve(false),
   };
 }
 
@@ -277,6 +290,7 @@ pipeline.resize(window.innerWidth, window.innerHeight, window.devicePixelRatio);
 const scene = createSceneManager(pipeline, { quality, skyQuality: 'low', interiorFactory: useProxy ? proxyInterior : undefined });
 const session = createSession({ seed: 1 });
 const frame = createSceneFrame();
+(window as unknown as { __scene: unknown }).__scene = scene;
 const v = (a: V3): THREE.Vector3 => new THREE.Vector3(a.x, a.y, a.z);
 
 /** The session's craft with the player ship moved over Wick and turned so the planet and the star sit where wanted. */
@@ -340,7 +354,9 @@ async function main(): Promise<void> {
     `lighting ${view} · ${quality} · ${useProxy ? 'proxy' : 'real'} interior · lights ${lights ? 'on' : 'off'} · cam ${scene.camera.mode} fov ${(scene.camera.fovY / DEG).toFixed(0)}\n` +
     `frame: draw calls ${st.drawCalls} · triangles ${st.triangles} · msaa ${ps.msaa} · auto exposure ${ps.autoExposure ? 'on' : 'off'} · ${ps.width}x${ps.height}\n` +
     (li ? `rooms ${li.rooms}/${li.roomsTotal} from ${li.room || '-'} · lighting draws ${li.drawCalls} · probes ${mb(li.probeBytes)} MB · shadows ${mb(li.shadowBytes)} MB\n` : 'no interior lighting\n') +
-    `textures ${mb(st.textureBytes)} MB · targets ${mb(st.targetBytes)} MB · load ${((t1 - t0) / 1000).toFixed(1)} s\n` +
+    `textures ${mb(st.textureBytes)} MB · targets ${mb(st.targetBytes)} MB · programs ${pipeline.renderer.info.programs?.length ?? 0} · load ${((t1 - t0) / 1000).toFixed(1)} s\n` +
+    `${(globalThis as { __tlInterior?: string }).__tlInterior ?? ''}\n` +
+    `load: ${(globalThis as { __tlLoad?: string }).__tlLoad ?? ''}\n` +
     renderInfoText();
   ready();
 }

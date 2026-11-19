@@ -490,6 +490,57 @@ function generateHullArray(n: number, seed: number): Uint8Array<ArrayBuffer> {
   return out;
 }
 
+// ------------------------------------------------------------------------------------------------ micro detail
+
+/**
+ * Hero micro-detail map (one RGBA8 2D texture, tiles every 2 m of hull UV): rg = tangent normal of a fine
+ * pressed-panel pattern (shallow stamped beads, fastener dimples) plus micro-scratches and grain; b = roughness /
+ * albedo modulation (scratches polish, smudges dull); a = 0.5 (unused). Sampled on top of the tiling finish by
+ * hulls that ask for it (the player's Wren), so close-ups hold up without a bigger array texture.
+ */
+function generateMicro(n: number, seed: number): Uint8Array<ArrayBuffer> {
+  const s = n / 1024;
+  const rnd = rng(seed * 4481 + 71);
+  const F = new Field(n);
+  const grain = fbm(n, 256, 256, 1, rnd);
+  const smudge = fbm(n, 6, 6, 4, rnd, 0.55);
+  // pressed panels: stamped rectangles with a soft bead round them, a few fastener dimples at the corners
+  const rects: number[][] = [];
+  bsp(0, 0, n, n, 150 * s, 420 * s, rnd, rects);
+  for (const r of rects) {
+    const ins = 10 * s;
+    F.hatch(r[0] + ins, r[1] + ins, r[2] - ins, r[3] - ins, 18 * s, 4 * s, 0.35, -0.12, 0.5);
+    if (rnd() < 0.6) for (let q = 0; q < 4; q++) F.bump(q & 1 ? r[2] - ins - 9 * s : r[0] + ins + 9 * s, q & 2 ? r[3] - ins - 9 * s : r[1] + ins + 9 * s, 3.2 * s, -0.35, 0.3);
+  }
+  for (let i = 0; i < n * n; i++) {
+    F.h[i] += (grain[i] - 0.5) * 0.05;
+    F.t[i] = 0.5 + (smudge[i] - 0.5) * 0.5;
+  }
+  // micro-scratches: short straight hairlines, mostly along one direction (wiping, handling), some random
+  const cnt = Math.round(2600 * s * s);
+  for (let i = 0; i < cnt; i++) {
+    const x = rnd() * n;
+    const y = rnd() * n;
+    const a = rnd() < 0.7 ? 0.35 + (rnd() - 0.5) * 0.5 : rnd() * Math.PI;
+    const len = (8 + rnd() * rnd() * 110) * s;
+    const x1 = x + Math.cos(a) * len;
+    const y1 = y + Math.sin(a) * len;
+    F.line(x, y, x1, y1, Math.max(0.9, 1.1 * s), 0.05);
+    // polish along the scratch (tone up = smoother, brighter)
+    const steps = Math.ceil(len);
+    for (let k = 0; k <= steps; k++) {
+      const px = Math.round(x + ((x1 - x) * k) / steps) & (n - 1);
+      const py = Math.round(y + ((y1 - y) * k) / steps) & (n - 1);
+      const j = py * n + px;
+      F.t[j] = Math.min(1, F.t[j] + 0.28);
+    }
+  }
+  const out = new Uint8Array(n * n * 4);
+  encode(F, 1.0 * s + 0.6, 0, out);
+  for (let i = 0; i < n * n; i++) out[i * 4 + 3] = 128;
+  return out;
+}
+
 // ------------------------------------------------------------------------------------------------ decal atlas
 
 // Stroke font on a 4 x 6 grid (y down). Each glyph: strokes separated by spaces, points as digit pairs.
@@ -775,6 +826,42 @@ interface TexSet {
   decal: THREE.DataTexture;
   refs: number;
 }
+interface MicroSet {
+  tex: THREE.DataTexture;
+  refs: number;
+}
+const microCache = new Map<string, MicroSet>();
+/** hero micro-detail map size by tier (GPU: 4 B/texel + mips: 22 / 5.6 / 1.4 / 1.4 MB) */
+export const MICRO_SIZE: Record<HullQuality, number> = { low: 512, medium: 512, high: 1024, ultra: 2048 };
+
+function acquireMicro(quality: HullQuality, seed: number): { key: string; tex: THREE.DataTexture } {
+  const key = `${quality}:${seed}`;
+  let set = microCache.get(key);
+  if (!set) {
+    const n = MICRO_SIZE[quality];
+    const tex = new THREE.DataTexture(generateMicro(n, seed), n, n, THREE.RGBAFormat, THREE.UnsignedByteType);
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.magFilter = THREE.LinearFilter;
+    tex.minFilter = THREE.LinearMipmapLinearFilter;
+    tex.generateMipmaps = true;
+    tex.anisotropy = TEX_ANISO[quality];
+    tex.colorSpace = THREE.NoColorSpace;
+    tex.needsUpdate = true;
+    set = { tex, refs: 0 };
+    microCache.set(key, set);
+  }
+  set.refs++;
+  return { key, tex: set.tex };
+}
+
+function releaseMicro(key: string): void {
+  const set = microCache.get(key);
+  if (!set) return;
+  if (--set.refs <= 0) {
+    set.tex.dispose();
+    microCache.delete(key);
+  }
+}
 const texCache = new Map<string, TexSet>();
 
 const TEX_SIZE: Record<HullQuality, number> = { low: 256, medium: 512, high: 512, ultra: 1024 };
@@ -830,6 +917,9 @@ vTint = aTint; vSurf = aSurf; vFx = aFx; vHullUv = uv;
 
 const HULL_FRAG_PARS = /* glsl */ `
 uniform mediump sampler2DArray uHullTex;
+#ifdef HULL_MICRO
+uniform sampler2D uHullMicro;
+#endif
 uniform vec3 uLivery[3];
 uniform float uHeat;
 uniform float uThrottle;
@@ -884,6 +974,13 @@ float hAO = vTint.a;
 // tone variation: per-panel shade, large soft clouds
 hAlbedo *= (0.8 + 0.4 * hTone) * (0.88 + 0.24 * hMac.r);
 hRough += (hTone - 0.5) * 0.22 + (hMid.r - 0.5) * 0.2;
+#ifdef HULL_MICRO
+// hero micro detail: pressed-panel beads on painted / armour finishes, scratches and smudges everywhere
+vec4 hMic = texture(uHullMicro, vHullUv * 0.5);
+float hMicN = hLi <= 1 ? 1.0 : (hLi == 3 || hLi == 4 ? 0.45 : 0.25);
+hRough += (0.5 - hMic.b) * 0.3;
+hAlbedo *= 0.95 + 0.1 * hMic.b;
+#endif
 // grime: seams, cavities, streaks, and wherever the baked AO says dirt would collect
 float hGrime = vFx.z * clamp(hCav * 0.95 + 0.5 * hMac.g * hMac.a + (1.0 - hAO) * 0.6, 0.0, 1.0);
 hAlbedo *= 1.0 - 0.72 * hGrime;
@@ -902,6 +999,18 @@ hMetal *= 1.0 - 0.7 * hScorch;
 // cavity darkening also under direct light (there are no shadow maps)
 hAlbedo *= mix(1.0, hAO, 0.55);
 hRough = clamp(hRough, 0.07, 1.0);
+#ifndef HULL_STATION
+// heat tint: metal next to the drive throats oxidises from straw through bronze and violet to blue
+if (vFx.y > 0.004) {
+  float hOx = vFx.y;
+  vec3 hOxC = mix(vec3(1.0, 0.8, 0.5), vec3(0.62, 0.42, 0.72), smoothstep(0.25, 0.6, hOx));
+  hOxC = mix(hOxC, vec3(0.34, 0.4, 0.62), smoothstep(0.6, 0.95, hOx));
+  hAlbedo *= mix(vec3(1.0), hOxC, 0.85 * smoothstep(0.0, 0.25, hOx));
+  hRough = mix(hRough, 0.5, 0.3 * hOx);
+}
+#endif
+// clear coat over painted livery colours (primary armour and accent paint), lost where it is worn or dirty
+float hCoat = (abs(hSlot - 1.0) < 0.5 || hSlot > 2.5) ? (1.0 - hWear) * (1.0 - 0.75 * hGrime) * (1.0 - hScorch) : 0.0;
 // heat: aerobraking / radiators (uHeat) and engine-adjacent metal (uThrottle)
 float hHeatA = vFx.x * uHeat;
 float hHeatE = vFx.y * uThrottle;
@@ -919,6 +1028,9 @@ diffuseColor.rgb = hAlbedo;
 const HULL_FRAG_NORMAL = /* glsl */ `
 {
   vec3 hN = vec3((hTex.rg * 2.0 - 1.0) * HULL_NRM[hLi] * (1.0 - 0.35 * hWear), 0.0);
+#ifdef HULL_MICRO
+  hN.xy += (hMic.rg * 2.0 - 1.0) * (0.85 * hMicN);
+#endif
 #ifdef HULL_STATION
   hN.xy += (hBig.rg * 2.0 - 1.0) * (HULL_NRM[hLi] * 0.85);
 #endif
@@ -1123,6 +1235,12 @@ export interface HullMaterialOptions {
    * own albedo times `flood` (linear RGB radiance of a fully lit white surface). Ships never set this.
    */
   station?: { flood: RGB };
+  /**
+   * Hero finish (the player's ship): a clear coat over the livery paint (MeshPhysicalMaterial, geometric
+   * normal under the coat), the micro-detail map (MICRO_SIZE by tier) and, when `doubleSided`, the hull
+   * drawn from inside too (the skin seen past the window reveals from the cabin).
+   */
+  hero?: { clearcoat?: boolean; doubleSided?: boolean };
 }
 
 /**
@@ -1145,14 +1263,24 @@ export function createHullMaterials(opts: HullMaterialOptions): HullMaterials {
   };
   const station = opts.station;
   if (station) U.uFlood.value.set(station.flood[0], station.flood[1], station.flood[2]);
+  const hero = station ? undefined : opts.hero;
+  const coat = !!hero?.clearcoat;
+  const micro = hero ? acquireMicro(opts.quality, opts.seed ?? 1) : null;
+  const uMicro = { value: micro ? micro.tex : null };
 
-  const hull = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5, metalness: 0 });
-  if (station) {
+  const hull: THREE.MeshStandardMaterial = coat
+    ? new THREE.MeshPhysicalMaterial({ color: 0xffffff, roughness: 0.5, metalness: 0, clearcoat: 0.85, clearcoatRoughness: 0.06 })
+    : new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5, metalness: 0 });
+  if (hero?.doubleSided) hull.side = THREE.DoubleSide;
+  {
     const withDefines = hull as THREE.Material & { defines?: Record<string, string> };
-    withDefines.defines = { ...(withDefines.defines ?? {}), HULL_STATION: '' };
+    const d: Record<string, string> = { ...(withDefines.defines ?? {}) };
+    if (station) d.HULL_STATION = '';
+    if (micro) d.HULL_MICRO = '';
+    withDefines.defines = d;
   }
   hull.onBeforeCompile = (shader) => {
-    Object.assign(shader.uniforms, { uHullTex: U.uHullTex, uLivery: U.uLivery, uHeat: U.uHeat, uThrottle: U.uThrottle, uDamage: U.uDamage, uFlood: U.uFlood });
+    Object.assign(shader.uniforms, { uHullTex: U.uHullTex, uLivery: U.uLivery, uHeat: U.uHeat, uThrottle: U.uThrottle, uDamage: U.uDamage, uFlood: U.uFlood, uHullMicro: uMicro });
     shader.vertexShader = shader.vertexShader.replace('#include <common>', `#include <common>\n${ATTR_VERT_PARS}`).replace('#include <begin_vertex>', `#include <begin_vertex>\n${ATTR_VERT}`);
     shader.fragmentShader = shader.fragmentShader
       .replace('#include <common>', `#include <common>\n${HULL_FRAG_PARS}`)
@@ -1162,8 +1290,9 @@ export function createHullMaterials(opts: HullMaterialOptions): HullMaterials {
       .replace('#include <normal_fragment_maps>', HULL_FRAG_NORMAL)
       .replace('#include <emissivemap_fragment>', 'totalEmissiveRadiance += hEmis;')
       .replace('#include <aomap_fragment>', HULL_FRAG_AO);
+    if (coat) shader.fragmentShader = shader.fragmentShader.replace('material.clearcoat = clearcoat;', 'material.clearcoat = clearcoat * hCoat;');
   };
-  hull.customProgramCacheKey = () => (station ? 'tidelock-hull-2-station' : 'tidelock-hull-2');
+  hull.customProgramCacheKey = () => (station ? 'tidelock-hull-3-station' : `tidelock-hull-3${micro ? '-micro' : ''}${coat ? '-coat' : ''}`);
 
   const glass = new THREE.MeshPhysicalMaterial({
     color: new THREE.Color(0.016, 0.022, 0.03),
@@ -1262,6 +1391,7 @@ export function createHullMaterials(opts: HullMaterialOptions): HullMaterials {
       disposed = true;
       for (const m of byChannel) m.dispose();
       releaseTextures(key);
+      if (micro) releaseMicro(micro.key);
     },
   };
 }

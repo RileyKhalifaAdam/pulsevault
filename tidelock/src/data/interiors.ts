@@ -186,7 +186,7 @@ const WREN: InteriorLayout = {
   interactables: [
     { id: 'helm', kind: 'helm', room: 'cockpit', pos: v(-0.55, -0.25, -13.1), radius: 1.1, label: 'Take the helm' },
     { id: 'lights', kind: 'lights', room: 'lounge', pos: v(-1.1, 0.2, -10.39), radius: 0.9, label: 'Cabin lights' },
-    { id: 'table', kind: 'tableSeat', room: 'lounge', pos: v(2.2, -0.55, -7.5), radius: 1.0, label: 'Sit on the sofa' },
+    { id: 'table', kind: 'tableSeat', room: 'lounge', pos: v(2.2, -0.55, -7.5), radius: 1.6, label: 'Sit on the sofa' },
     { id: 'hatch', kind: 'hatch', room: 'corridor', pos: v(0, 1.3, 2.2), radius: 1.2, label: 'Docking hatch' },
     { id: 'bunk', kind: 'bunk', room: 'cabin-port', pos: v(-2.6, -0.45, -3.4), radius: 1.0, label: 'Lie down' },
   ],

@@ -132,6 +132,8 @@ function noiseTable(): Float32Array {
   return t;
 }
 let NZ: Float32Array = new Float32Array(1);
+/** Time spent drawing the stencil block on a canvas (diagnostics). */
+export let STENCIL_MS = 0;
 /** Periodic fbm in [0,1], ~0.5 mean: (u, v) in tile units, k integer repeats per tile, o decorrelating offset. */
 function nz(u: number, v: number, k: number, o = 0): number {
   const x = (u * k + o * 0.371) * NT;
@@ -348,11 +350,11 @@ const GEN: Partial<Record<TileId, Gen>> = {
   },
   veneer(u, v, o) {
     const w = nz(u, v, 2, 15);
-    const rings = frac(v * 18 + w * 3.2 + nz(u, v * 4, 1, 16) * 1.5);
-    const s = sm(0.0, 0.25, rings) * sm(1.0, 0.55, rings);
+    const rings = frac(v * 34 + w * 1.4 + nz(u, v * 6, 1, 16) * 0.7);
+    const s = sm(0.0, 0.3, rings) * sm(1.0, 0.6, rings);
     const pore = sm(0.6, 0.72, nz(u * 0.25, v, 12, 17));
-    const k = 0.78 + 0.45 * s - 0.12 * pore;
-    set(o, 0.11 * k, 0.062 * k, 0.034 * k, 0.28 + 0.06 * w + pore * 0.06, 0);
+    const k = 0.8 + 0.32 * s - 0.1 * pore + 0.1 * (w - 0.5);
+    set(o, 0.09 * k, 0.052 * k, 0.03 * k, 0.28 + 0.06 * w + pore * 0.06, 0);
     o.h = -pore * 0.00002 + s * 0.00001;
     o.ao = 1;
   },
@@ -384,8 +386,8 @@ const GEN: Partial<Record<TileId, Gen>> = {
     const seam = sm(0.497, 0.493, Math.max(eu, ev));
     const sp = nz(u, v, 40, 21);
     const sc = nz(u, v * 3, 3, 22);
-    const k = 0.055 * (0.85 + 0.35 * sp) + 0.02 * sm(0.6, 0.8, sc);
-    set(o, k, k * 0.98, k * 0.95, 0.5 + 0.2 * sc - 0.1 * sp, 0);
+    const k = 0.055 * (0.9 + 0.2 * sp) + 0.008 * sm(0.62, 0.8, sc);
+    set(o, k, k * 0.98, k * 0.95, 0.46 + 0.1 * sc - 0.06 * sp, 0);
     o.h = -0.001 * (1 - seam) + 0.00003 * sp;
     o.ao = 0.5 + 0.5 * seam;
   },
@@ -395,9 +397,9 @@ const GEN: Partial<Record<TileId, Gen>> = {
     const b = frac((u - v) * P);
     const da = Math.abs(a - 0.5);
     const db = Math.abs(b - 0.5);
-    const ra = sm(0.47, 0.44, da);
-    const rb = sm(0.47, 0.44, db);
-    const knot = da > 0.4 && db > 0.4 ? 1 : 0;
+    const ra = sm(0.43, 0.465, da);
+    const rb = sm(0.43, 0.465, db);
+    const knot = da > 0.42 && db > 0.42 ? 1 : 0;
     const rope = Math.max(ra, rb, knot);
     const braid = frac((ra > rb ? b : a) * 14) < 0.5 ? 0.85 : 1;
     const k = 0.07 * braid;
@@ -475,7 +477,8 @@ function drawStencil(w: number, h: number): Uint8ClampedArray | null {
   const cv = document.createElement('canvas');
   cv.width = w;
   cv.height = h;
-  const g = cv.getContext('2d');
+  // CPU-backed: the read-back below must not wait for the GPU to drain the loading work queued before it
+  const g = cv.getContext('2d', { willReadFrequently: true });
   if (!g) return null;
   g.fillStyle = '#222';
   g.fillRect(0, 0, w, h);
@@ -542,8 +545,9 @@ function drawStencil(w: number, h: number): Uint8ClampedArray | null {
   return g.getImageData(0, 0, w, h).data;
 }
 
-function generate(S: number): SurfaceAtlas {
+function* generateSteps(S: number): Generator<void, SurfaceAtlas, void> {
   const t0 = typeof performance !== 'undefined' ? performance.now() : 0;
+  let paused = 0;
   NZ = noiseTable();
   const alb = new Uint8Array(S * S * 4);
   const nrm = new Uint8Array(S * S * 4);
@@ -568,6 +572,7 @@ function generate(S: number): SurfaceAtlas {
     }
     const strip = ti >= 12;
     if (id === 'stencil') {
+      const ts = typeof performance !== 'undefined' ? performance.now() : 0;
       const w = cx1 - cx0;
       const h = cy1 - cy0;
       const img = drawStencil(Math.round(rdu * S), Math.round(rdv * S));
@@ -591,11 +596,17 @@ function generate(S: number): SurfaceAtlas {
         }
       void w;
       void h;
+      STENCIL_MS = (typeof performance !== 'undefined' ? performance.now() : 0) - ts;
       continue;
     }
     const gen = GEN[id];
     if (!gen) continue;
     for (let y = cy0; y < cy1; y++) {
+      if ((y & 15) === 15) {
+        const tp = typeof performance !== 'undefined' ? performance.now() : 0;
+        yield;
+        paused += (typeof performance !== 'undefined' ? performance.now() : 0) - tp;
+      }
       let v = ((y + 0.5) / S - rv) / rdv;
       v = strip ? Math.min(0.9999, Math.max(0, v)) : frac(v);
       for (let x = cx0; x < cx1; x++) {
@@ -649,7 +660,7 @@ function generate(S: number): SurfaceAtlas {
     t.needsUpdate = true;
     return t;
   };
-  const genMs = (typeof performance !== 'undefined' ? performance.now() : 0) - t0;
+  const genMs = (typeof performance !== 'undefined' ? performance.now() : 0) - t0 - paused;
   return {
     size: S,
     map: mk(alb, true),
@@ -657,6 +668,50 @@ function generate(S: number): SurfaceAtlas {
     ormMap: mk(orm, false),
     bytes: Math.round(S * S * 4 * 3 * 1.334),
     genMs,
+  };
+}
+
+function generate(S: number): SurfaceAtlas {
+  const g = generateSteps(S);
+  for (;;) {
+    const r = g.next();
+    if (r.done) return r.value;
+  }
+}
+
+/**
+ * The shared atlas at `size`, generated in time slices: call step(ms) once per frame until it returns the atlas
+ * (already acquired for the caller). Lets 'high' start on a smaller atlas and swap the full one in.
+ */
+export function acquireSurfaceAtlasProgressive(size: number): { step(budgetMs: number): SurfaceAtlas | null } {
+  const have = atlases.get(size);
+  if (have) {
+    have.refs++;
+    return { step: () => have.atlas };
+  }
+  const g = generateSteps(size);
+  let done: SurfaceAtlas | null = null;
+  return {
+    step(budgetMs: number): SurfaceAtlas | null {
+      if (done) return done;
+      const t = performance.now();
+      while (performance.now() - t < budgetMs) {
+        const r = g.next();
+        if (r.done) {
+          const e = atlases.get(size);
+          if (e) {
+            for (const tx of [r.value.map, r.value.normalMap, r.value.ormMap]) tx.dispose();
+            e.refs++;
+            done = e.atlas;
+          } else {
+            atlases.set(size, { atlas: r.value, refs: 1 });
+            done = r.value;
+          }
+          return done;
+        }
+      }
+      return null;
+    },
   };
 }
 
@@ -832,7 +887,7 @@ export function surfaceMaterial(
       .replace('#include <metalnessmap_fragment>', 'float metalnessFactor = metalness * tlOrm.b;')
       .replace(
         '#include <normal_fragment_maps>',
-        THREE.ShaderChunk.normal_fragment_maps.replace('texture2D( normalMap, vNormalMapUv )', 'textureGrad( normalMap, tlUV, tlDx, tlDy )'),
+        THREE.ShaderChunk.normal_fragment_maps.replaceAll('texture2D( normalMap, vNormalMapUv )', 'textureGrad( normalMap, tlUV, tlDx, tlDy )'),
       )
       .replace('#include <aomap_fragment>', THREE.ShaderChunk.aomap_fragment.replace('texture2D( aoMap, vAoMapUv ).r', 'tlOrm.r'));
     if (kind === 'glow') f = f.replace('#include <emissivemap_fragment>', 'totalEmissiveRadiance = vColor.rgb * tlMapS.rgb * vGlowK * uGain;');

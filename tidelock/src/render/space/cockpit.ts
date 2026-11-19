@@ -666,15 +666,15 @@ function makeDecals(aniso: number): Decals {
   }
   c.restore();
   // vent grille: dark slots
-  c.fillStyle = '#5a5a5a';
+  c.fillStyle = '#9a9a9a';
   c.fillRect(0, 128, 256, 128);
-  c.fillStyle = '#0a0a0a';
-  for (let y = 136; y < 248; y += 14) for (let x = 8; x < 248; x += 60) c.fillRect(x, y, 52, 7);
+  c.fillStyle = '#1c1c1c';
+  for (let y = 138; y < 248; y += 12) for (let x = 10; x < 248; x += 60) c.fillRect(x, y, 50, 5);
   // maker's mark and serials (dark print on the white panels)
   c.fillStyle = '#2a2d31';
   c.textAlign = 'center';
   c.textBaseline = 'middle';
-  c.font = `700 40px ${SANS}`;
+  c.font = `700 34px ${SANS}`;
   c.fillText('C O R V A N E', 352, 34);
   c.font = `700 26px ${SANS}`;
   c.fillText('WREN  ·  CV-W 2207  ·  FLIGHT DECK', 256, 96);
@@ -686,7 +686,7 @@ function makeDecals(aniso: number): Decals {
   tex.anisotropy = aniso;
   tex.generateMipmaps = true;
   tex.minFilter = THREE.LinearMipmapLinearFilter;
-  return { tex, white: [24 / W, 1 - 24 / H], stripes: uvr(64, 0, 128, 64), grille: uvr(0, 128, 256, 128), logo: uvr(200, 8, 304, 52), serial: uvr(16, 76, 480, 40), warn: uvr(264, 140, 240, 40) };
+  return { tex, white: [24 / W, 1 - 24 / H], stripes: uvr(64, 0, 128, 64), grille: uvr(0, 128, 256, 128), logo: uvr(176, 10, 336, 48), serial: uvr(16, 76, 480, 40), warn: uvr(264, 140, 240, 40) };
 }
 
 interface Bundle {
@@ -864,9 +864,13 @@ export function createCockpitVisual(layout: CockpitLayout, opts: { quality: Qual
     // centre: maker's mark, a vent, the hologram projector on the crest
     const fc = faceAt(0);
     D.frame(fc);
-    D.rect(0, 0.06, 0.0012, 0.17, 0.028, PAINT, decals.logo);
-    D.rect(0, -0.07, 0.0012, 0.2, 0.06, GUND, decals.grille);
-    holo = new THREE.Vector3(st ? (st.x1 + 0) / 2 - 0.005 : 0, C_[0], C_[1]);
+    D.rect(0, 0.07, 0.0012, 0.2, 0.0286, PAINT, decals.logo);
+    // panel seams and a gunmetal trim strip, so the white reads as fitted panels
+    for (const sx of [-1, 1]) D.box(sx * 0.135, -0.01, 0.0009, 0.0015, halfFace - 0.02, 0.001, GUND);
+    D.box(0, halfFace - 0.014, 0.0012, 0.19, 0.0035, 0.0013, GUN);
+    D.box(0, -halfFace + 0.03, 0.0009, 0.12, 0.0015, 0.001, GUND);
+    D.rect(0, -0.06, 0.0012, 0.16, 0.05, GUN, decals.grille);
+    holo = new THREE.Vector3(st ? st.x1 + 0.03 : 0, C_[0], C_[1]);
     D.frame(upM(holo.x, holo.y - 0.004, holo.z));
     D.lathe([[0.062, 0], [0.062, 0.006], [0.054, 0.012], [0.042, 0.012], [0.04, 0.008]], seg, [GUN, GUN, GUN, BLACK]);
     D.lathe([[0.04, 0.008], [0.034, 0.011], [0, 0.0125]], seg, GLOSS);
@@ -1051,6 +1055,9 @@ export function createCockpitVisual(layout: CockpitLayout, opts: { quality: Qual
     S.rbox(0, 0.42, 0.074, 0.245, 0.38, 0.012, 0.01, 1, GUND);
     for (let i = 0; i < 4; i++) S.rbox(0, 0.15 + i * 0.135, -0.035, 0.145, 0.06, 0.025, 0.022, cs, AMBERP, [2, -1, 0.008, 2]);
     for (const sx of [-1, 1]) S.rbox(sx * 0.205, 0.38, -0.035, 0.055, 0.33, 0.05, 0.035, cs, LEATHER);
+    // amber piping down the outer edge of each back bolster, and a maker's plate on the shell
+    for (const sx of [-1, 1]) S.rbox(sx * 0.258, 0.38, -0.01, 0.006, 0.3, 0.03, 0.005, 1, AMBERP);
+    S.rbox(0, 0.62, 0.088, 0.06, 0.016, 0.003, 0.002, 1, METAL);
     S.rbox(0, 0.9, 0.0, 0.16, 0.1, 0.065, 0.05, cs, LEATHER);
     S.rbox(0, 0.9, -0.058, 0.11, 0.065, 0.016, 0.012, cs, AMBERP, [2, -1, 0.006, 2]);
     // the headrest's twin posts
@@ -1396,7 +1403,8 @@ export function createCockpitVisual(layout: CockpitLayout, opts: { quality: Qual
   const emMat = new THREE.MeshBasicMaterial({ vertexColors: true, map: atlas.tex, blending: THREE.AdditiveBlending, transparent: true, depthWrite: false, side: THREE.DoubleSide, toneMapped: false });
   const root = new THREE.Group();
   root.name = 'cockpit';
-  root.userData.room = 'cockpit';
+  // untagged root: every mesh carries its own room (the LIGHTS switch is in the lounge), so room culling
+  // hides the cockpit hardware and the switch separately
   const geos: THREE.BufferGeometry[] = [];
   let drawCalls = 0;
   let triangles = 0;
@@ -1459,9 +1467,10 @@ export function createCockpitVisual(layout: CockpitLayout, opts: { quality: Qual
     const m = add(aux, am, 'cockpit', false, false);
     if (m) m.receiveShadow = true;
   }
-  const hologram = holo ? createHologram({ radius: 0.085 }) : null;
+  const hologram = holo ? createHologram({ radius: 0.12 }) : null;
   if (hologram && holo) {
     hologram.object3d.position.copy(holo);
+    hologram.object3d.userData.room = 'cockpit';
     root.add(hologram.object3d);
     drawCalls++;
   }
