@@ -358,6 +358,7 @@ export async function boot(): Promise<void> {
   const frame = createSceneFrame();
   const instruments = createInstrumentData();
   let instrumentsAge = 1;
+  let instrumentsSig = -1;
   let lost = false;
   pipeline.onContextLost = () => {
     lost = true;
@@ -442,7 +443,13 @@ export async function boot(): Promise<void> {
     // the physical controls as they are, and what the console screens show (re-read five times a second)
     frame.devices = session.devices();
     instrumentsAge += dt;
-    if (instrumentsAge >= 0.2 || !frame.instruments) {
+    // a lamp that changes (a button pressed) re-reads the screens at once, so they never lag the lamp
+    let sig = 0;
+    const devs = frame.devices;
+    for (let i = 0; i < devs.length; i++) if (devs[i].lit) sig += i + 1 + (i + 1) * (i + 1) * 31;
+    const lampsChanged = sig !== instrumentsSig;
+    instrumentsSig = sig;
+    if (instrumentsAge >= 0.2 || lampsChanged || !frame.instruments) {
       instrumentsAge = 0;
       frame.instruments = readInstruments(session, instruments, frame.devices, session.cockpit());
     }
