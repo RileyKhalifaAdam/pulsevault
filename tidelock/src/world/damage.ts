@@ -1,28 +1,40 @@
 // Located damage (docs/SIMULATION.md W2-C item 5): manifold point -> hull zone (src/data/hullZones.ts) -> the
-// component struck (window, collar, RCS quad, drive pod, radiator, tank) or the zone's structural panel; the contact
-// energy split between the two bodies by compliance; graded overload; the derived health arrays the allocator,
-// dynamics and thermal read. Pure, deterministic, allocation-free per hit/step (module scratch), plain-JSON state.
+// component struck (window, collar, RCS housing, drive pod, radiator, tank) among the components UNDER THAT ZONE'S
+// SKIN, or the zone's structural panel; the contact energy split between the two bodies by compliance; energy past a
+// destroyed component goes to its zone's panel, past a crushed-through panel to the primary structure, so every joule
+// is booked (Σ absorbed = E until the structure is gone: then the ship is lost); the deceleration of an impact as a
+// graded-overload dose; graded overload over a tick; the derived health arrays the allocator, dynamics and thermal
+// read. Pure, deterministic, allocation-free per hit/step (module scratch), plain-JSON state.
+//
+// Loss of the craft (replaces hull ≤ 0 from hullStrength and the 15 g death): isDestroyed(d), true when the primary
+// structure is used up (structure ≤ 0) or the overload damage reaches 1 (overloadD ≥ 1). A nose-first crash of a 60 t
+// Wren: 25 m/s nose cap 0.73, D 0.40; 50 m/s nose cap 0, structure 0.61, D 0.84; ≥ 54 m/s lost (tests/damage.test.ts).
 //
 // WIRING (wave 2):
 // - contact.ts contactPair / surfaceContact, after solveManifold(m, CA, CB, …, RES) with RES.energy > 0, replacing
 //   `c.hull -= RES.energy / c.hullStrength` for both craft (today's double counting):
 //     complianceSplit(RES.energy, kOf(s), kOf(o), SPLIT)   // K_SHIP 1e7, K_STATION 1e9, K_GROUND 1e9 N/m
-//     ship s (body A): damageFromManifold(s.damage, model(s), m, CA, CB, craftCompound(s).names, SPLIT[0], true)
-//     ship o (body B, ship–ship): damageFromManifold(o.damage, model(o), m, CA, CB, names(o), SPLIT[1], false)
+//     ship s (body A): k = damageFromManifold(s.damage, model(s), m, CA, CB, craftCompound(s).names, SPLIT[0], true)
+//       then impactOverload(s.damage, |RES.impulse|, k >= 0 ? DAMAGE_COMPONENTS[k].zone : Z_NOSE, s)
+//     ship o (body B, ship–ship): the same with SPLIT[1], false, and its own impulse magnitude
 //     a station keeps its scalar hull: st.hull -= SPLIT[1] / st.hullStrength
-//   then `if (deriveHealth(c.damage, model, c.jetHealth, c.engineHealth, c.radiatorHealth)) rebuild c.jetTable` and
-//   c.hull = c.damage.hull; destroy when c.damage.hull <= 0 or c.damage.overloadD >= 1.
+//   then `if (deriveHealth(c.damage, model, c.jetHealth, c.engineHealth, c.radiatorHealth)) rebuild c.jetTable`,
+//   c.hull = c.damage.hull; destroy the craft when isDestroyed(c.damage).
 //   Landing (surfaceContact): the same with the touchdown's RES.energy and K_GROUND (no LAND_MAX_SPEED cut).
-// - setup.ts / load: model = buildDamageModel(c.jets) once per craft (jet -> quad map; rebuilt at load, not saved);
-//   c.damage = loadDamageState(saved?.damage). §1.4: `zones` = c.damage.zones, `overloadD` = c.damage.overloadD.
-// - session.ts, once per tick after consumeLedger(c, mean): overloadStep(c.damage, mean, c) (n = |mean.f|/(m·g0),
-//   D += ((n − 6)/(9 − 6))·T/2 s; replaces the 15 g death in crew/dynamics).
+// - capture.ts ring steps with IO.energy > 0 (the hard stop): complianceSplit(IO.energy, K_SHIP, K_STATION, SPLIT);
+//   damageComponent(s.damage, model, C_COLLAR, SPLIT[0]).
+// - setup.ts / load: model = buildDamageModel(c.jets) once per craft (jet -> housing map; rebuilt at load, not saved);
+//   c.damage = loadDamageState(saved?.damage). §1.4: `zones` = c.damage.zones, `overloadD` = c.damage.overloadD; one
+//   saved field more: c.damage.structure.
+// - session.ts, once per tick after consumeLedger(c, mean): overloadStep(c.damage, mean, c) (n = |mean.f|/(m·g0) with
+//   m = dry + propellant + rcsPropellant, D += ((n − 6)/(9 − 6))·T/2 s; replaces the 15 g death in crew/dynamics).
+//   mean.f leaves out contact impulses (they go to dvImpulse): impactOverload above books those.
 // - Reads nothing of §1.4 but jets; writes zones, overloadD, jetHealth, engineHealth, radiatorHealth (and hull).
-// Rate: per contact solve (impact) and once per tick (overload); ~0.2 µs per manifold point in node.
+// Rate: per contact solve (impact) and once per tick (overload); ~0.3 µs per manifold point in node.
 
 import type { Quat, V3 } from '../core/types';
 import {
-  DAMAGE_COMPONENTS, DAMAGE_PRIORITY, HULL_ZONES, N_HULL_ZONES, PART_ZONE, RCS_HIT_RADIUS,
+  DAMAGE_COMPONENTS, DAMAGE_PRIORITY, HULL_ZONES, N_HULL_ZONES, PART_ZONE, RCS_HIT_RADIUS, STRUCTURE_CAPACITY,
   Z_BELLY_AFT, Z_BELLY_FWD, Z_DORSAL_AFT, Z_DORSAL_FWD, Z_FLANK_PORT, Z_FLANK_STBD, Z_NOSE,
 } from '../data/hullZones';
 import type { ContactBody, Manifold } from './compound';
@@ -47,19 +59,21 @@ export interface DamageState {
   zones: number[];
   /** Overload damage 0..1 (1 = structural failure): the §1.4 `overloadD` field. */
   overloadD: number;
-  /** Derived (not saved): area-weighted mean health of the 12 structural panels. */
+  /** Health 0..1 of the primary structure behind the panels (STRUCTURE_CAPACITY J); 0 = the ship is lost. Saved. */
+  structure: number;
+  /** Derived (not saved): area-weighted mean health of the 12 structural panels; 0 once destroyed. */
   hull: number;
 }
 
 export function makeDamageState(): DamageState {
   const zones: number[] = new Array(NC);
   for (let i = 0; i < NC; i++) zones[i] = 1;
-  return { zones, overloadD: 0, hull: 1 };
+  return { zones, overloadD: 0, structure: 1, hull: 1 };
 }
 
 /** JSON-safe copy (every value is a finite double and round-trips exactly). */
-export function saveDamageState(d: DamageState): { zones: number[]; overloadD: number } {
-  return { zones: d.zones.slice(), overloadD: d.overloadD };
+export function saveDamageState(d: DamageState): { zones: number[]; overloadD: number; structure: number } {
+  return { zones: d.zones.slice(), overloadD: d.overloadD, structure: d.structure };
 }
 
 /** Loader with defaults: an old save (or a missing / short array) is undamaged; values clamped to [0, 1]. */
@@ -73,8 +87,15 @@ export function loadDamageState(raw: unknown): DamageState {
   }
   const D = o.overloadD;
   d.overloadD = typeof D === 'number' && Number.isFinite(D) && D > 0 ? (D > 1 ? 1 : D) : 0;
+  const S = o.structure;
+  d.structure = typeof S === 'number' && Number.isFinite(S) ? (S < 0 ? 0 : S > 1 ? 1 : S) : 1;
   d.hull = hullMean(d);
   return d;
+}
+
+/** The craft is lost: primary structure used up, or overload damage complete. */
+export function isDestroyed(d: DamageState): boolean {
+  return d.structure <= 0 || d.overloadD >= 1;
 }
 
 // ------------------------------------------------------------------------------------------------ model (load time)
@@ -86,24 +107,27 @@ export interface DamageModel {
   box: Float64Array;
   /** Part-name -> component for part-bound components (pods, radiators, tanks). */
   partComp: Map<string, number>;
-  /** Component index of each jet's RCS quad (-1 = none), and the jets' positions (3 per jet). */
+  /** Component index of each jet's RCS housing (-1 = none), and the jets' positions (3 per jet). */
   jetQuad: Int16Array;
   jetPos: Float64Array;
-  /** Component index per quad index (0..3), per engine index, per radiator index. */
+  /** Component index per RCS housing index, per engine index, per radiator index. */
   quadComp: Int16Array;
   engineComp: Int16Array;
   radiatorComp: Int16Array;
-  /** Order in which kinds are tried. */
-  order: Int8Array;
+  /** The non-panel components of each zone in DAMAGE_PRIORITY order: zoneComp[zoneStart[z] .. zoneStart[z + 1]). */
+  zoneStart: Int16Array;
+  zoneComp: Int16Array;
   /** Panel areas / total (weights of the hull mean). */
   panelW: Float64Array;
+  /** Primary structure capacity, J. */
+  structCap: number;
 }
 
 /**
- * Build the per-craft model: each jet joins the nearest RCS quad centre (ties go to the starboard quad), hit boxes
- * flattened. Allocates; call once per craft at setup and at load (nothing here is saved).
+ * Build the per-craft model: each jet joins the nearest RCS housing centre, per-zone hit lists, flattened hit boxes.
+ * Allocates; call once per craft at setup and at load (nothing here is saved).
  */
-export function buildDamageModel(jets: readonly { pos: V3 }[]): DamageModel {
+export function buildDamageModel(jets: readonly { pos: V3 }[], structureCapacity = STRUCTURE_CAPACITY): DamageModel {
   const kind = new Int8Array(NC), cap = new Float64Array(NC), box = new Float64Array(NC * 6).fill(NaN);
   const partComp = new Map<string, number>();
   const quads: number[] = [], engines: number[] = [], rads: number[] = [];
@@ -126,18 +150,26 @@ export function buildDamageModel(jets: readonly { pos: V3 }[]): DamageModel {
     for (const qi of quads) {
       const c = DAMAGE_COMPONENTS[qi].centre!;
       const d = (j.pos.x - c.x) ** 2 + (j.pos.y - c.y) ** 2 + (j.pos.z - c.z) ** 2;
-      if (d < bd - 1e-9 || (Math.abs(d - bd) <= 1e-9 && c.x > 0)) { bd = d; best = qi; }
+      if (d < bd) { bd = d; best = qi; }
     }
     jetQuad[k] = best;
   });
-  const order = new Int8Array(DAMAGE_PRIORITY.map((k) => KIND_CODE[k]));
+  const prio = (i: number): number => DAMAGE_PRIORITY.indexOf(DAMAGE_COMPONENTS[i].kind);
+  const zoneStart = new Int16Array(N_HULL_ZONES + 1), list: number[] = [];
+  for (let z = 0; z < N_HULL_ZONES; z++) {
+    zoneStart[z] = list.length;
+    const cs = HULL_ZONES[z].components.filter((i) => DAMAGE_COMPONENTS[i].kind !== 'panel');
+    cs.sort((a, b) => prio(a) - prio(b) || a - b);
+    list.push(...cs);
+  }
+  zoneStart[N_HULL_ZONES] = list.length;
   let A = 0;
   for (let z = 0; z < N_HULL_ZONES; z++) A += HULL_ZONES[z].area;
   const panelW = new Float64Array(N_HULL_ZONES);
   for (let z = 0; z < N_HULL_ZONES; z++) panelW[z] = HULL_ZONES[z].area / A;
   return {
     kind, cap, box, partComp, jetQuad, jetPos, quadComp: Int16Array.from(quads), engineComp: Int16Array.from(engines),
-    radiatorComp: Int16Array.from(rads), order, panelW,
+    radiatorComp: Int16Array.from(rads), zoneStart, zoneComp: Int16Array.from(list), panelW, structCap: structureCapacity,
   };
 }
 
@@ -165,51 +197,68 @@ const inBox = (b: Float64Array, i: number, p: V3): boolean => {
 };
 
 /**
- * The component a hit at ship-local `p` on part `part` strikes: the first kind in DAMAGE_PRIORITY whose hit volume
- * holds it (window and collar boxes, a sphere of RCS_HIT_RADIUS round any jet of a quad, the part itself for
- * pods, radiators and tanks) and that still has health; else the panel of `zone`.
+ * The component a hit at ship-local `p` on part `part` in skin zone `zone` strikes: the first of that zone's
+ * components (in DAMAGE_PRIORITY order) whose hit volume holds the point (window and collar boxes, a sphere of
+ * RCS_HIT_RADIUS round any jet of a housing, the part itself for pods, radiators and tanks) and that still has
+ * health; else the zone's panel (component index = zone). Never a component under another zone's skin.
  */
 export function componentAt(d: DamageState, m: DamageModel, part: string, p: V3, zone: number): number {
+  if (!(zone >= 0 && zone < N_HULL_ZONES)) return Z_NOSE;
   const r2 = RCS_HIT_RADIUS * RCS_HIT_RADIUS;
   const pc = m.partComp.get(part);
-  for (let k = 0; k < m.order.length; k++) {
-    const kc = m.order[k];
+  for (let k = m.zoneStart[zone], e = m.zoneStart[zone + 1]; k < e; k++) {
+    const i = m.zoneComp[k];
+    if (d.zones[i] <= 0) continue;
+    const kc = m.kind[i];
     if (kc === 1 || kc === 5) {
-      for (let i = 0; i < NC; i++) if (m.kind[i] === kc && d.zones[i] > 0 && inBox(m.box, i, p)) return i;
+      if (inBox(m.box, i, p)) return i;
     } else if (kc === 2) {
       for (let j = 0; j < m.jetQuad.length; j++) {
-        const q = m.jetQuad[j];
-        if (q < 0 || d.zones[q] <= 0) continue;
+        if (m.jetQuad[j] !== i) continue;
         const dx = p.x - m.jetPos[j * 3], dy = p.y - m.jetPos[j * 3 + 1], dz = p.z - m.jetPos[j * 3 + 2];
-        if (dx * dx + dy * dy + dz * dz <= r2) return q;
+        if (dx * dx + dy * dy + dz * dz <= r2) return i;
       }
-    } else if (pc !== undefined && m.kind[pc] === kc && d.zones[pc] > 0) {
-      return pc;
+    } else if (pc === i) {
+      return i;
     }
   }
   return zone;
 }
 
-/** Put `E` joules into component `i` (overflow beyond its health goes to its zone's panel). Returns the component. */
+/**
+ * Put `E` joules into component `i`: beyond its remaining health the rest goes to its zone's panel, beyond the
+ * panel's to the primary structure. Returns the energy left over once the structure is gone too (0 while the craft
+ * stands; > 0 only for a lost craft), so Σ absorbed + returned = E.
+ */
 export function absorb(d: DamageState, m: DamageModel, i: number, E: number): number {
-  if (!(E > 0)) return i;
-  const h = d.zones[i], need = h * m.cap[i];
-  if (E <= need || m.kind[i] === 0) {
-    const nh = h - E / m.cap[i];
-    d.zones[i] = nh > 0 ? nh : 0;
-  } else {
-    d.zones[i] = 0;
-    const z = DAMAGE_COMPONENTS[i].zone, rest = E - need;
-    const nh = d.zones[z] - rest / m.cap[z];
-    d.zones[z] = nh > 0 ? nh : 0;
+  if (!(E > 0)) return 0;
+  let rest = E;
+  if (m.kind[i] !== 0) {
+    const need = d.zones[i] * m.cap[i];
+    if (rest <= need) { const h = d.zones[i] - rest / m.cap[i]; d.zones[i] = h > 0 ? h : 0; rest = 0; } else { d.zones[i] = 0; rest -= need; }
+  }
+  if (rest > 0) {
+    const z = DAMAGE_COMPONENTS[i].zone, need = d.zones[z] * m.cap[z];
+    if (rest <= need) { const h = d.zones[z] - rest / m.cap[z]; d.zones[z] = h > 0 ? h : 0; rest = 0; } else { d.zones[z] = 0; rest -= need; }
+  }
+  if (rest > 0) {
+    const need = d.structure * m.structCap;
+    if (rest <= need) { const h = d.structure - rest / m.structCap; d.structure = h > 0 ? h : 0; rest = 0; } else { d.structure = 0; rest -= need; }
   }
   d.hull = hullMean(d);
-  return i;
+  return rest;
+}
+
+/** Energy straight into one component (e.g. the collar from the capture ring's hard stop). Returns the overflow. */
+export function damageComponent(d: DamageState, m: DamageModel, i: number, E: number): number {
+  return absorb(d, m, i, E);
 }
 
 /** One hit: zone, component, absorb. Returns the component index struck. */
 export function damageAt(d: DamageState, m: DamageModel, part: string, p: V3, nOut: V3, E: number): number {
-  return absorb(d, m, componentAt(d, m, part, p, zoneOfPoint(part, p, nOut)), E);
+  const c = componentAt(d, m, part, p, zoneOfPoint(part, p, nOut));
+  absorb(d, m, c, E);
+  return c;
 }
 
 // ------------------------------------------------------------------------------------------------ energy split
@@ -266,17 +315,44 @@ export function damageFromManifold(d: DamageState, m: DamageModel, man: Manifold
 
 // ------------------------------------------------------------------------------------------------ overload
 
+/** Mass of a craft for the load factor: dry + main propellant + RCS propellant (missing fields count 0). */
+const massOf = (c: { dryMass: number; propellant: number; rcsPropellant?: number }): number =>
+  c.dryMass + c.propellant + (c.rcsPropellant !== undefined && c.rcsPropellant > 0 ? c.rcsPropellant : 0);
+
 /**
  * Graded overload over one consumed ledger span (once per tick, per quantum under warp — exact for a constant mean):
- * n = |f|/(m·g0); D += max(0, (n − 6)/(9 − 6))·T / 2 s. Returns nothing; destroy the craft when d.overloadD >= 1.
+ * n = |f|/(m·g0), m = dry + propellant + RCS propellant; D += max(0, (n − 6)/(9 − 6))·T / 2 s. Destroy the craft
+ * when isDestroyed(d).
  */
-export function overloadStep(d: DamageState, mean: { f: V3; T: number }, c: { dryMass: number; propellant: number }): void {
-  const f = mean.f, m = c.dryMass + c.propellant;
+export function overloadStep(d: DamageState, mean: { f: V3; T: number }, c: { dryMass: number; propellant: number; rcsPropellant?: number }): void {
+  const f = mean.f, m = massOf(c);
   if (!(mean.T > 0) || !(m > 0)) return;
   const n = Math.sqrt(f.x * f.x + f.y * f.y + f.z * f.z) / (m * G0);
-  if (n <= OVERLOAD_LIMIT) return;
+  if (!(n > OVERLOAD_LIMIT)) return;
   const D = d.overloadD + ((n - OVERLOAD_LIMIT) / (OVERLOAD_ULTIMATE - OVERLOAD_LIMIT)) * (mean.T / OVERLOAD_TIME);
   d.overloadD = D > 1 ? 1 : D;
+  if (d.overloadD >= 1) d.hull = 0;
+}
+
+/**
+ * The overload dose of a contact impulse J (N·s, magnitude on this craft) that struck skin zone `zone`: Δv = J/m
+ * over a pulse of T = min(π·√(m/K_SHIP) (the elastic contact's half period), 2·crushDepth/Δv (a constant-force crush
+ * through the zone's crushable depth)), n = Δv/(g0·T), D += max(0, (n − 6)/3)·T/2 s. For n ≫ 9 this is a Δv dose,
+ * D ≈ Δv/(6·g0) ≈ Δv/59 m/s, nearly independent of T. Returns n. Call once per manifold solve that has a craft.
+ */
+export function impactOverload(d: DamageState, J: number, zone: number, c: { dryMass: number; propellant: number; rcsPropellant?: number }): number {
+  const m = massOf(c);
+  if (!(J > 0) || !(m > 0) || !Number.isFinite(J)) return 0;
+  const dv = J / m;
+  const depth = zone >= 0 && zone < N_HULL_ZONES ? HULL_ZONES[zone].crushDepth : 0.2;
+  const T1 = Math.PI * Math.sqrt(m / K_SHIP), T2 = (2 * depth) / dv, T = T1 < T2 ? T1 : T2;
+  const n = dv / (G0 * T);
+  if (n > OVERLOAD_LIMIT) {
+    const D = d.overloadD + ((n - OVERLOAD_LIMIT) / (OVERLOAD_ULTIMATE - OVERLOAD_LIMIT)) * (T / OVERLOAD_TIME);
+    d.overloadD = D > 1 ? 1 : D;
+    if (d.overloadD >= 1) d.hull = 0;
+  }
+  return n;
 }
 
 // ------------------------------------------------------------------------------------------------ derived
@@ -285,11 +361,11 @@ function hullMean(d: DamageState): number {
   let s = 0, A = 0;
   for (let z = 0; z < N_HULL_ZONES; z++) { const a = HULL_ZONES[z].area; s += a * d.zones[z]; A += a; }
   const h = s / A;
-  return d.overloadD >= 1 ? 0 : h;
+  return d.overloadD >= 1 || d.structure <= 0 ? 0 : h;
 }
 
 /**
- * Fill the §1.4 health arrays: jetHealth[j] = 1 while its quad has health, 0 once disabled (50 kJ); engineHealth
+ * Fill the §1.4 health arrays: jetHealth[j] = 1 while its RCS housing has health, 0 once disabled (50 kJ); engineHealth
  * and radiatorHealth = their component's health (thrust × health, rejection × health). Returns true when any
  * jetHealth entry changed (the caller rebuilds the jet allocation table).
  */

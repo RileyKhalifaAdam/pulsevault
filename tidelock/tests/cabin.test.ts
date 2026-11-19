@@ -3,15 +3,19 @@
 import { describe, expect, it } from 'vitest';
 import * as esbuild from 'esbuild';
 import { INTERIORS } from '../src/data/interiors';
-import { BOUNDARY_SPACE, buildCabinNet, lumpedCabinNet, type CabinNetDef } from '../src/data/cabinNet';
+import { BOUNDARY_SPACE, DIFFUSER_U, buildCabinNet, lumpedCabinNet, unionVolInRoom, type CabinNetDef } from '../src/data/cabinNet';
 import {
-  C_STAR, MAX_GAS_STEP, R_STAR, compileCabin, draftAt, draftBound, expansionY, inventory, loadCabin, makeCabinIo,
-  newCabin, orificeMassFlow, saveCabin, stepCabin, type CabinIo, type CabinNet, type CabinState,
+  BND_STRIDE, C_STAR, MAX_GAS_STEP, R_STAR, cabinSubsteps, compileCabin, draftAt, draftBound, expansionY, inventory, loadCabin,
+  makeCabinIo, newCabin, orificeMassFlow, roomAirVel, saveCabin, stepCabin, stepCabinQuantum, type CabinIo, type CabinNet,
+  type CabinState,
 } from '../src/world/cabin';
 import {
   GAMMA, IN_CHX, IN_FANS, IN_H, IN_PUMP, IN_REG, IN_SCRUB, METAB_REF, MOLAR_MASS, OUT_CO2_MADE, OUT_CO2_SCRUBBED,
   OUT_H2O_MADE, OUT_O2_USED, OUT_VENT0, R_GAS, ROOM_STRIDE, S_CO2, S_H2O, S_O2,
 } from '../src/world/life';
+
+/** The sleep-warp quantum q = 2¹¹·Q (§1.3). */
+const QS = 2048 / 120;
 
 const WREN = INTERIORS.wren!;
 const roomIdx = (id: string): number => WREN.rooms.findIndex((r) => r.id === id);
@@ -38,7 +42,15 @@ describe('cabin network data', () => {
     const V = def.rooms.reduce((a, r) => a + r.V, 0);
     const gross = WREN.rooms.reduce((a, r) => a + (r.box.max.x - r.box.min.x) * (r.box.max.y - r.box.min.y) * (r.box.max.z - r.box.min.z), 0);
     expect(gross).toBeCloseTo(370.5, 0); // the plan's 370.5 m³ is the gross box volume
-    expect(V).toBeCloseTo(314.8, 1); // minus the solids (racks, reactor, bunks, lockers …)
+    expect(V).toBeCloseTo(315.70, 2); // minus the UNION of the solids (racks, reactor, bunks, lockers …)
+    // review D5: the sofa and its back overlap by 0.45 × 0.45 × 4.4 m and count once
+    const lounge = def.rooms[roomIdx('lounge')];
+    const lb = WREN.rooms[roomIdx('lounge')].box;
+    const sum = WREN.solids.filter((x) => x.room === 'lounge').reduce((a, x) => a + (x.box.max.x - x.box.min.x) * (x.box.max.y - x.box.min.y) * (x.box.max.z - x.box.min.z), 0);
+    const g = (lb.max.x - lb.min.x) * (lb.max.y - lb.min.y) * (lb.max.z - lb.min.z);
+    expect(lounge.V - (g - sum)).toBeCloseTo(0.45 * 0.45 * 4.4, 9);
+    const b = (x0: number, x1: number) => ({ min: { x: x0, y: 0, z: 0 }, max: { x: x1, y: 1, z: 1 } });
+    expect(unionVolInRoom(b(0, 10), [b(1, 3), b(2, 4), b(2.5, 3.5), b(9, 12)])).toBeCloseTo(4, 12);
     expect(def.orifices[0].A).toBeCloseTo(2.1, 9);
     expect(def.ducts.filter((d) => d.group === 0).length).toBe(WREN.doors.length);
     expect(() => compileCabin(def)).not.toThrow();
@@ -152,7 +164,7 @@ describe('pinhole leak', () => {
     expect(tau / 86400).toBeGreaterThan(30);
     expect(tau / 86400).toBeLessThan(32);
   });
-  it('the same pinhole in the Wren\'s cargo bay drains the whole ship (314.8 m³: ≈ 26 days), every species conserved', () => {
+  it('the same pinhole in the Wren\'s cargo bay drains the whole ship (315.7 m³: ≈ 26 days), every species conserved', () => {
     const def = buildCabinNet(WREN, { extra: [{ id: 'pinhole', a: 'cargo', b: 'space', A: 1e-6, open0: 1 }] });
     const net = compileCabin(def);
     const st = newCabin(net, 293), io = makeCabinIo(net);
@@ -231,9 +243,27 @@ describe('conservation, stability, determinism, save/load', () => {
     inventory(net, st, inv1);
     return [0, 1, 2, 3].map((s) => Math.abs(inv1[s] - inv0[s] - src[s]) / inv0[s]);
   }
-  it('every species is conserved to 1e-12 (gas + tank + films + condensate + sources − sinks), h = 0.1 and 10 s', () => {
+  it('every species is conserved to 1e-12 (gas + tank + films + condensate + sources − sinks), h = 0.1, 10 and 17 s', () => {
     for (const e of runBooked(0.1, 36000)) expect(e).toBeLessThan(1e-12);
     for (const e of runBooked(10, 8640)) expect(e).toBeLessThan(1e-12);
+    for (const e of runBooked(QS, 5063)) expect(e).toBeLessThan(1e-12);
+    // panes that fog and then EVAPORATE (review D1: the small-pane overdraw created water)
+    for (const h of [0.1, 10, QS]) {
+      const { net, st, io } = busy();
+      io.inp[IN_H] = h;
+      const inv0 = new Float64Array(4), inv1 = new Float64Array(4);
+      inventory(net, st, inv0);
+      let w = 0;
+      const steps = Math.round((h < 1 ? 1 : 4) * 3600 / h); // (the kg tank and films round at ~1e-17 per add)
+      for (let n = 0; n < steps; n++) {
+        io.paneT.fill(n < steps / 2 ? 276 : 305);
+        stepCabin(net, st, io);
+        w += io.out[OUT_H2O_MADE] / MOLAR_MASS[S_H2O];
+        for (let s2 = 0; s2 < 4; s2++) if (s2 === S_H2O) w -= io.out[OUT_VENT0 + s2];
+      }
+      inventory(net, st, inv1);
+      expect(Math.abs(inv1[S_H2O] - inv0[S_H2O] - w) / inv0[S_H2O]).toBeLessThan(1e-12);
+    }
   });
   it('stable at h = 10 s: a 0.01 m² breach empties the ship monotonically, no negative moles', () => {
     const def = buildCabinNet(WREN, { extra: [{ id: 'breach', a: 'lounge', b: 'space', A: 0.01, open0: 1 }] });
@@ -251,19 +281,49 @@ describe('conservation, stability, determinism, save/load', () => {
     }
     expect(prev).toBeLessThan(1e-3);
   });
-  it('1× (h = 0.1 s) and warp (h = 10 s) agree over 6 h', () => {
-    const a = busy(), b = busy();
-    a.io.inp[IN_H] = 0.1; b.io.inp[IN_H] = 10;
+  it('1× (h = 0.1 s) and warp (one step per 17.07 s sleep quantum) agree over 6 h', () => {
+    expect(cabinSubsteps(QS)).toBe(1);
+    expect(MAX_GAS_STEP).toBeGreaterThanOrEqual(QS);
+    const a = busy();
+    a.io.inp[IN_H] = 0.1;
     for (let n = 0; n < 6 * 36000; n++) stepCabin(a.net, a.st, a.io);
-    for (let n = 0; n < 6 * 360; n++) stepCabin(b.net, b.st, b.io);
-    for (let i = 0; i < a.net.nR; i++) {
-      expect(Math.abs(b.io.ppCO2[i] / a.io.ppCO2[i] - 1)).toBeLessThan(0.02);
-      expect(Math.abs(b.io.ppO2[i] / a.io.ppO2[i] - 1)).toBeLessThan(2e-3);
-      expect(Math.abs(b.io.p[i] / a.io.p[i] - 1)).toBeLessThan(2e-3);
+    for (const q of [10, QS, 2 * QS]) {
+      const b = busy();
+      const nq = Math.round(6 * 3600 / q);
+      for (let n = 0; n < nq; n++) stepCabinQuantum(b.net, b.st, b.io, q);
+      let worst = 0;
+      for (let i = 0; i < a.net.nR; i++) {
+        worst = Math.max(worst, Math.abs(b.io.ppCO2[i] / a.io.ppCO2[i] - 1));
+        expect(Math.abs(b.io.ppO2[i] / a.io.ppO2[i] - 1)).toBeLessThan(2e-3);
+        expect(Math.abs(b.io.p[i] / a.io.p[i] - 1)).toBeLessThan(2e-3);
+      }
+      console.log(`q = ${q.toFixed(2)} s (${cabinSubsteps(q)} step/quantum): worst-room ppCO₂ vs 1× after 6 h ${worst.toExponential(2)}`);
+      expect(worst).toBeLessThan(q <= QS ? 5e-3 : 1e-2);
+      // the regulator is a split step: the ship's ppO₂ lags the setpoint a little more at large h, so the tank
+      // (6 kg injected against the venting pump) agrees to 1 %
+      expect(Math.abs(b.st.o2Tank - a.st.o2Tank) / (100 - a.st.o2Tank)).toBeLessThan(0.01);
     }
-    // the regulator is a split step: the ship's ppO₂ lags the setpoint by ≤ 10 Pa more at h = 10 s, so the tank
-    // (6 kg injected against the venting pump) agrees to 1 %
-    expect(Math.abs(b.st.o2Tank - a.st.o2Tank) / (100 - a.st.o2Tank)).toBeLessThan(0.01);
+  });
+  it('stepCabinQuantum: sub-step amounts sum, means average, and the result equals hand-made sub-steps with ramped T', () => {
+    const a = busy(), b = busy();
+    const q = 4 * QS; // 4 sub-steps
+    expect(cabinSubsteps(q)).toBe(4);
+    for (let n = 0; n < 10; n++) {
+      const T1 = Array.from(a.io.roomT, (_, i) => 290 + i + 0.2 * (n + 1));
+      // a: by hand
+      const T0 = Array.from({ length: a.net.nR }, (_, i) => a.st.rooms[i * ROOM_STRIDE + 4]);
+      let o2 = 0;
+      a.io.inp[IN_H] = q / 4;
+      for (let j = 1; j <= 4; j++) {
+        for (let i = 0; i < a.net.nR; i++) a.io.roomT[i] = j < 4 ? T0[i] + (T1[i] - T0[i]) * (j / 4) : T1[i];
+        stepCabin(a.net, a.st, a.io);
+        o2 += a.io.out[OUT_O2_USED];
+      }
+      for (let i = 0; i < b.net.nR; i++) b.io.roomT[i] = T1[i];
+      stepCabinQuantum(b.net, b.st, b.io, q);
+      expect(Array.from(b.st.rooms)).toEqual(Array.from(a.st.rooms));
+      expect(Math.abs(b.io.out[OUT_O2_USED] - o2)).toBeLessThan(1e-15);
+    }
   });
   it('deterministic and save → JSON → load → step is bit-identical', () => {
     const a = busy(), b = busy();
@@ -283,6 +343,31 @@ describe('conservation, stability, determinism, save/load', () => {
   });
 });
 
+describe('boundaries', () => {
+  it('review D8: a docked umbilical to boundary 1 (a station at 101.3 kPa) refills a 70 kPa room with station air', () => {
+    const def = lumpedCabinNet(30);
+    def.orifices.push({ id: 'umbilical', a: 0, b: -2, A: 5e-3, Cd: 0.6, pos: { x: 0, y: 0, z: 0 }, L: 0, open0: 1 });
+    const net = compileCabin(def);
+    expect(net.nB).toBe(2);
+    const st = newCabin(net, 294), io = makeCabinIo(net);
+    quiet(io);
+    expect(io.bnd.length).toBe(2 * BND_STRIDE);
+    for (let k = 0; k < 4; k++) st.rooms[k] *= 0.7;
+    const j = BND_STRIDE; // boundary 1: p, T, then mole fractions N₂, O₂, CO₂, H₂O
+    io.bnd[j] = 101325; io.bnd[j + 1] = 294; io.bnd[j + 2] = 0.78; io.bnd[j + 3] = 0.21; io.bnd[j + 4] = 0.0004; io.bnd[j + 5] = 0.0096;
+    const n0 = totalMoles(net, st);
+    io.inp[IN_H] = 0.1;
+    let inflow = 0;
+    for (let n = 0; n < 20000; n++) { stepCabin(net, st, io); for (let s = 0; s < 4; s++) inflow -= io.out[OUT_VENT0 + s]; }
+    expect(Math.abs(io.p[0] / 101325 - 1)).toBeLessThan(1e-4);
+    expect(totalMoles(net, st)).toBeGreaterThan(n0);
+    // the space boundary (0) is untouched and still vacuum
+    expect(io.bnd[0]).toBe(0);
+    expect(buildCabinNet(WREN, { extra: [{ id: 'umb', a: 'suitroom', b: 'boundary:1', A: 5e-3 }] }).nBoundary).toBe(2);
+    void inflow;
+  });
+});
+
 describe('draught', () => {
   it('exactly zero with the fans off and the doors equalised (no wake for loose objects)', () => {
     const net = compileCabin(buildCabinNet(WREN));
@@ -299,31 +384,90 @@ describe('draught', () => {
     expect(st.draftEpoch).toBe(0);
     draftAt(net, st, roomIdx('lounge'), 0.5, 0, -7, u);
     expect([u[0], u[1], u[2]]).toEqual([0, 0, 0]);
+    roomAirVel(net, st, roomIdx('lounge'), u);
+    expect([u[0], u[1], u[2]]).toEqual([0, 0, 0]);
   });
-  it('fans on: a real, constant field (≈ 0.2 m³/s per door, grille speed ~1 m/s); the epoch moves only on a real change', () => {
-    const net = compileCabin(buildCabinNet(WREN));
+  it('review D2: 1× and warp publish the same draught (thermal steps once per quantum, the gas ramps T)', () => {
+    // fans off and fans on; the cockpit warming (window sun) or cooling at a steady rate, the rest constant
+    for (const fans of [0, 1]) {
+      for (const rate of [0.3, 1, -1, 4]) { // K/min (1.57e-3 m³/s of expansion per K/min out of the cockpit)
+        const run = (q: number): CabinState => {
+          const net = compileCabin(buildCabinNet(WREN));
+          const st = newCabin(net), io = makeCabinIo(net);
+          io.inp[IN_FANS] = fans;
+          io.metab[roomIdx('lounge')] = 110;
+          stepCabinQuantum(net, st, io, 0.1);
+          const e0 = st.draftEpoch;
+          const n = Math.round(Math.min(3600, 30 / Math.abs(rate) * 60) / q); // 1 h, or a 30 K swing
+          for (let k = 0; k < n; k++) { io.roomT[0] = 294 + rate / 60 * q * (k + 1); stepCabinQuantum(net, st, io, q); }
+          st.draftEpoch -= e0;
+          return st;
+        };
+        const a = run(0.1);
+        for (const q of [QS, 4 * QS]) {
+          const b = run(q);
+          // epochs: a real, changing expansion flow republishes on 5 % steps in both; never on every sub-step
+          if (fans === 0) console.log(`fans off, cockpit ${rate} K/min, q ${q.toFixed(1)} s: draftEpoch 1× ${a.draftEpoch}, warp ${b.draftEpoch}`);
+          expect(Math.abs(b.draftEpoch - a.draftEpoch)).toBeLessThanOrEqual(1);
+          for (let k = 0; k < a.draftQ.length; k++) {
+            expect(b.draftQ[k] === 0).toBe(a.draftQ[k] === 0);
+            if (a.draftQ[k] !== 0) expect(Math.abs(b.draftQ[k] / a.draftQ[k] - 1)).toBeLessThan(0.11);
+          }
+        }
+        if (rate === 1 && fans === 0) expect(a.draftEpoch).toBe(0); // below DRAFT_ON at 1×, and so under warp
+      }
+    }
+  });
+  it('fans on: 0.15 m/s along each supply → return column (W3-B item 7), a uniform mean ≈ 0.01 m/s; constant per epoch', () => {
+    const def = buildCabinNet(WREN);
+    const net = compileCabin(def);
     const st = newCabin(net), io = makeCabinIo(net);
     io.metab[roomIdx('cockpit')] = 150;
     io.inp[IN_H] = 0.1;
     stepCabin(net, st, io);
     expect(st.draftEpoch).toBe(1);
     for (let k = 0; k < net.nO; k++) expect(Math.abs(Math.abs(st.draftQ[k]) - 0.2)).toBeLessThan(2e-3);
+    const u = new Float64Array(3), U = new Float64Array(3);
+    for (const d of def.ducts) {
+      const room = d.b;
+      // on the jet axis, from the diffuser to 80 % of the way to the return door
+      const door = def.orifices[d.gate].pos;
+      const L = Math.hypot(door.x - d.jetPos.x, door.y - d.jetPos.y, door.z - d.jetPos.z);
+      for (const f of [0.2, 0.5, 0.8]) {
+        const s = f * L;
+        draftAt(net, st, room, d.jetPos.x + s * d.jetDir.x, d.jetPos.y + s * d.jetDir.y, d.jetPos.z + s * d.jetDir.z, u);
+        const along = u[0] * d.jetDir.x + u[1] * d.jetDir.y + u[2] * d.jetDir.z;
+        expect(along).toBeGreaterThan(0.1);
+        expect(along).toBeLessThan(0.25);
+      }
+      roomAirVel(net, st, room, U);
+      const Um = Math.hypot(U[0], U[1], U[2]);
+      expect(Um).toBeGreaterThan(1e-4);
+      expect(Um).toBeLessThan(0.08); // Σ Q·Δx / V: the room-to-room ventilation cannot move the room's mean faster
+      console.log(`${def.rooms[room].id}: V ${net.V[room].toFixed(1)} m³, |Ū| ${Um.toFixed(4)} m/s`);
+      if (def.rooms[room].id === 'lounge' || def.rooms[room].id === 'cargo') expect(Um).toBeLessThan(0.02);
+      expect(draftBound(net, st, room)).toBeGreaterThanOrEqual(DIFFUSER_U * 0.999);
+    }
+    // divergence theorem check of roomAirVel on a room whose only openings are one supply and one return
+    const cp = roomIdx('cabin-port');
+    roomAirVel(net, st, cp, U);
+    const dPort = def.ducts.find((d) => d.b === cp)!, oPort = def.orifices[dPort.gate];
+    const Q = st.draftQ[net.nO + def.ducts.indexOf(dPort)];
+    const sgn = Math.sign(st.draftQ[dPort.gate]) * (oPort.b === cp ? -1 : 1); // the door's flow leaves cp
+    expect(sgn).toBe(1);
+    expect(U[2]).toBeCloseTo(Q * (oPort.pos.z - dPort.outPos.z) / net.V[cp], 3);
+    // the field is constant over a day of warp with thermal swings; the epoch moves only on a real change
     for (let n = 0; n < 36000; n++) stepCabin(net, st, io);
-    io.inp[IN_H] = 10;
-    for (let n = 0; n < 8640; n++) {
-      if (n % 360 === 0) for (let i = 0; i < net.nR; i++) io.roomT[i] = 294 + ((n / 360) % 3); // thermal swings
-      stepCabin(net, st, io);
+    draftAt(net, st, roomIdx('lounge'), 0, 0.2, -7.5, U);
+    for (let n = 0; n < 5063; n++) {
+      if (n % 211 === 0) for (let i = 0; i < net.nR; i++) io.roomT[i] = 294 + ((n / 211) % 3);
+      stepCabinQuantum(net, st, io, QS);
     }
     expect(st.draftEpoch).toBe(1);
-    const u = new Float64Array(3);
-    const lounge = roomIdx('lounge');
-    draftAt(net, st, lounge, 0, 0.2, -7.5, u);
-    const um = Math.hypot(u[0], u[1], u[2]);
-    expect(um).toBeGreaterThan(0.005);
-    expect(um).toBeLessThan(0.3);
-    expect(draftBound(net, st, lounge)).toBeGreaterThan(um);
-    io.inp[IN_FANS] = 0; io.inp[IN_H] = 0.1;
-    stepCabin(net, st, io);
+    draftAt(net, st, roomIdx('lounge'), 0, 0.2, -7.5, u);
+    expect([u[0], u[1], u[2]]).toEqual([U[0], U[1], U[2]]);
+    io.inp[IN_FANS] = 0;
+    stepCabinQuantum(net, st, io, 0.1);
     expect(st.draftEpoch).toBe(2);
     expect(Array.from(st.draftQ).every((q) => q === 0)).toBe(true);
   });
@@ -336,7 +480,7 @@ describe('cost', () => {
     const code = `
       import { INTERIORS } from './src/data/interiors';
       import { buildCabinNet } from './src/data/cabinNet';
-      import { compileCabin, makeCabinIo, newCabin, stepCabin } from './src/world/cabin';
+      import { compileCabin, makeCabinIo, newCabin, stepCabin, stepCabinQuantum } from './src/world/cabin';
       export function run(h) {
         const def = buildCabinNet(INTERIORS.wren, { extra: [{ id: 'pinhole', a: 'cargo', b: 'space', A: 1e-6, open0: 1 }] });
         const net = compileCabin(def), st = newCabin(net), io = makeCabinIo(net);
@@ -352,10 +496,12 @@ describe('cost', () => {
       }`;
     const out = esbuild.buildSync({ stdin: { contents: code, resolveDir: (globalThis as unknown as { process: { cwd(): string } }).process.cwd(), loader: 'ts' }, bundle: true, write: false, format: 'iife', globalName: 'B', platform: 'node' });
     const B = new Function(`${out.outputFiles[0].text}; return B;`)() as { run(h: number): number };
-    for (const h of [0.1, 10]) {
+    for (const h of [0.1, QS]) {
       const us = B.run(h);
-      console.log(`cabin step h=${h}: ${us.toFixed(2)} µs (10 rooms, 10 orifices, 9 fan ducts, 8 panes; best of 8)`);
+      console.log(`cabin step h=${h.toFixed(2)}: ${us.toFixed(2)} µs (10 rooms, 10 orifices, 9 fan ducts, 8 panes; best of 8)`);
+      if (h === QS) console.log(`sleep 1e4 @60 fps: ${(1e4 / 60 / QS).toFixed(2)} quanta/frame × 1 step = ${(us * 1e4 / 60 / QS).toFixed(1)} µs/frame node`);
       expect(us).toBeLessThan(20);
     }
+    void stepCabinQuantum;
   });
 });

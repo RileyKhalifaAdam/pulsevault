@@ -13,29 +13,42 @@
 //   hand slides along it with 150 N of kinetic friction and sticks again below 2 cm/s; it lets go when it slides off
 //   an end or the arm is pulled past full extension. Pull input shortens the target arm (hand over hand).
 // - Push-off: the push must lie in the friction cone, ≤ 35° from the surface normal (μ = tan 35° = 0.70, the boots'
-//   μ_s); a wish outside is clamped to the cone edge (the foot or hand would slip). Legs ≤ 1 kN over 0.25 s
-//   (3.125 m/s; peeling the boot magnets costs bootWell(0) = 2 J → 3.117 m/s), arms ≤ 300 N over 0.3 s (1.125 m/s).
-//   The flick speed maps to effort (0..1) linearly.
+//   μ_s); a wish outside is clamped to the cone edge with the force cut to F·cosθ/cos 35° (the surface's normal load
+//   shrinks with the angle, and friction with it). Legs ≤ 1 kN over 0.25 s (3.125 m/s; peeling the boot magnets
+//   costs bootWell(0) = 2 J → 3.117 m/s), arms ≤ 300 N over 0.3 s (1.125 m/s). The flick speed maps to effort
+//   (0..1) linearly.
 // - Momentum exchange with the ship: every hand and push impulse J on the body is recorded with the opposite sign in
 //   a ReactionLedger (craft axes): J_ship = −ΣJ, L_ship = −Σ∫p × F (about the CoM). The body's attitude is slaved to
 //   the ship until W3-D gives it its own, so the wrist and shoulder couples close inside the ship: the reaction
 //   moment is −p × F, which conserves total angular momentum exactly (tests/hands.test.ts).
+// - THE RULE (one rule for every crew support, 1× and warp alike): the craft's mass excludes the crew (dynamics.ts
+//   craft mass = dry + propellant), so EVERY force a support puts on a crew body — hands, push-off, transitions,
+//   walls, boots, harness, bunk — goes to the ship with the opposite sign, its share of the felt load included
+//   (a held body under thrust drags on the ship with m·f: ship + crew then accelerate at F/(M + m), exactly).
+//   A ledger that only some contacts feed is a reactionless drive (push off one wall into the ledger, stop at the
+//   far one outside it: the ship keeps Δv). So the session must NOT apply consumeReaction's J, L to the craft
+//   until all of them write it: crew.ts's wall contact sub-step (recordBodyStep, or recordImpulse with its
+//   impulse), body.ts bootImpulse (recordImpulse(led, p, bootLastJ)), the harness / bunk / seat body
+//   (recordBodyStep over its step, W1-C: requested) and props held in hand. tests/hands.test.ts 'push off, fly
+//   across, stop at the far wall' shows the closed ledger leaves the ship with Δv = 0.
 //
 // WIRING (wave 2):
 // - crew.ts stepCrew, floating with a grip, per tick (h = Q): stepGrip(grip, holds, crew CoM p, crew.vel, felt (crewFelt
 //   + tides.tidalAccel), Q, ledger) instead of the free sub-step for that tick (the grip owns the body's motion while
 //   held; the contact solver still runs for walls). GRIP_LOST → emit 'contact' with a = BODY_CREW, J = 0 (or a new
 //   'grab'/'release' kind: events.ts needs it — requested). Under warp (h > QS_DT) a held body is quasi-static:
-//   gripEquilibrium (the spring's equilibrium under the felt load, or lost when it exceeds the limits).
+//   gripEquilibrium(grip, holds, p, v, felt, quantum, ledger) (the spring's equilibrium under the felt load, the
+//   same reaction rule as 1×, or lost when the load exceeds the limits).
 // - Input (app/input.ts → session latch): a tap on a surface while floating → pickHandhold(holds, n, touch, …)
-//   → grab(grip, holds, i, p, shoulderOffset, ledger); a drag while held → setGripPull; a flick on a surface →
+//   → grab(grip, holds, i, p, shoulderOffset); a drag while held → setGripPull; a flick on a surface →
 //   startPush(push, n, dir, flickEffort(speed), limb); a tap on the held hold → release(grip).
-// - Push per tick while active: pushTick(push, p, v, Q, ledger, out) gives the tick's mean acceleration for crew.ts
-//   `sub`; at the end pushPeel(push, v, ledger) when the boots were gripped (replaces JUMP_SPEED / PUSH_SPEED / the
-//   look-direction push in pushOffCrew).
+// - Push per tick while active: pushTick(push, p, Q, ledger, out) gives the tick's mean acceleration for crew.ts
+//   `sub`; at the end pushPeel(n, v, bootWell(gap), p, ledger) when the boots were gripped (replaces JUMP_SPEED /
+//   PUSH_SPEED / the look-direction push in pushOffCrew).
 // - The ship: once per tick, after the crew step, consumeReaction(ledger, J, L) → the craft takes Δv = q·J/M and
 //   Δω = I⁻¹·L (craft axes) through the wave-2 impulse hook (W2-D hub: §1.4 `extImpulse {J, L}` is listed for wave 3;
-//   it is needed now — requested). The crew then sees the ship's jump through the ledger's dvImpulse like any other.
+//   it is needed now — requested) — only once THE RULE above holds; until then consume and discard. The crew then
+//   sees the ship's jump through the ledger's dvImpulse like any other.
 // - Devices (devices.ts, reach 'arm'): reachPoint(eye, bodyQ, leanDir, leanMax, device.pos, boxes, n, r).ok replaces
 //   "within 0.9 m of the eye". Props pick-up uses the same call.
 // - Save: saveGrip / loadGrip, savePush / loadPush, saveReaction / loadReaction (loader defaults: not holding, not
@@ -72,6 +85,8 @@ export const SLIDE_STICK_V = 0.02;
 export const ARM_MIN = 0.2;
 export const ARM_PULL_MAX = 0.68;
 export const PUSH_CONE = (35 * Math.PI) / 180;
+const PUSH_COS = Math.cos(PUSH_CONE);
+const PUSH_SIN = Math.sin(PUSH_CONE);
 export const LEG_PUSH_F = 1000;
 export const LEG_PUSH_T = 0.25;
 export const ARM_PUSH_F = 300;
@@ -105,9 +120,12 @@ export function consumeReaction(led: ReactionLedger, J: V3, L: V3): void {
 /**
  * Record a body step: it went (p0, v0) → (p1, v1) over hs under its own felt f (ship frame) plus the hand/limb force.
  * The limb's impulse is J = m(v1 − v0) − m·f·hs; the ship takes −J and −[m(p1×v1 − p0×v0) − m·p̄×f·hs].
- * Returns |J|/hs (the mean limb force, N).
+ * The start state, m and hs come in the module scratch RS (p0 xyz, v0 xyz, m, hs) and the mean limb force |J|/hs
+ * (N) goes out in RS[8]: only object arguments, so V8 boxes no doubles across the call (no per-tick garbage).
  */
-function record(led: ReactionLedger | null, m: number, p0x: number, p0y: number, p0z: number, v0x: number, v0y: number, v0z: number, p: V3, v: V3, f: V3, hs: number): number {
+const RS = new Float64Array(9);
+function record(led: ReactionLedger | null, p: V3, v: V3, f: V3): void {
+  const p0x = RS[0], p0y = RS[1], p0z = RS[2], v0x = RS[3], v0y = RS[4], v0z = RS[5], m = RS[6], hs = RS[7];
   const jx = m * (v.x - v0x - f.x * hs), jy = m * (v.y - v0y - f.y * hs), jz = m * (v.z - v0z - f.z * hs);
   if (led) {
     led.J.x -= jx; led.J.y -= jy; led.J.z -= jz;
@@ -117,7 +135,25 @@ function record(led: ReactionLedger | null, m: number, p0x: number, p0y: number,
     const lz = m * (p.x * v.y - p.y * v.x - (p0x * v0y - p0y * v0x)) - m * hs * (mx * f.y - my * f.x);
     led.L.x -= lx; led.L.y -= ly; led.L.z -= lz;
   }
-  return Math.sqrt(jx * jx + jy * jy + jz * jz) / hs;
+  RS[8] = hs > 0 ? Math.sqrt(jx * jx + jy * jy + jz * jz) / hs : 0;
+}
+
+/**
+ * Any other crew support step into the ledger (crew.ts wall contacts, body.ts harness / bunk / boots, props
+ * carried): a body of mass m went (p0, v0) → (p1, v1) over h under its felt f plus the support's force; the ship
+ * takes the support's reaction. Returns the mean support force, N. (Per contact event, not in the grip's sub-step
+ * loop.)
+ */
+export function recordBodyStep(led: ReactionLedger, m: number, p0: V3, v0: V3, p1: V3, v1: V3, f: V3, h: number): number {
+  RS[0] = p0.x; RS[1] = p0.y; RS[2] = p0.z; RS[3] = v0.x; RS[4] = v0.y; RS[5] = v0.z; RS[6] = m; RS[7] = h > 0 ? h : 0;
+  record(led, p1, v1, f);
+  return RS[8];
+}
+
+/** An instantaneous impulse J (N·s, craft axes) the ship gave a crew body at p (a wall bounce, bootLastJ): the ship takes −J. */
+export function recordImpulse(led: ReactionLedger, p: V3, J: V3): void {
+  led.J.x -= J.x; led.J.y -= J.y; led.J.z -= J.z;
+  led.L.x -= p.y * J.z - p.z * J.y; led.L.y -= p.z * J.x - p.x * J.z; led.L.z -= p.x * J.y - p.y * J.x;
 }
 
 // ------------------------------------------------------------------------------------------------ reach
@@ -320,45 +356,57 @@ export function setGripPull(gs: GripState, ext: number, dir: V3 | null = null): 
   gs.tgt.x = dx * e; gs.tgt.y = dy * e; gs.tgt.z = dz * e;
 }
 
-const FZ: V3 = { x: 0, y: 0, z: 0 };
+const FF: V3 = { x: 0, y: 0, z: 0 };
+const fin = (x: number): number => (x - x === 0 ? x : 0);
 
 /**
  * One step of a held body (h = Q: 4 exact sub-steps; h ≤ 0.02 s: the same with coefficients for that h). p, v =
  * the body point (CoM) and velocity relative to the ship, craft axes, updated in place. f = felt acceleration at
- * the body (constant over the step). The hand's reaction goes into led. Returns GRIP_HELD, GRIP_SLIDING or GRIP_LOST.
+ * the body (constant over the step; a non-finite component counts as 0, as in body.ts: it must not poison the
+ * saved state). The hand's reaction goes into led. Returns GRIP_HELD, GRIP_SLIDING or GRIP_LOST.
  */
 export function stepGrip(gs: GripState, holds: Float64Array, p: V3, v: V3, f: V3 | null, h: number, led: ReactionLedger | null): number {
   if (!gs.on) return GRIP_FREE;
-  const ff = f ?? FZ, hs = h / SUBSTEPS, m = BODY_MASS;
+  if (!(h > 0)) return gs.slide ? GRIP_SLIDING : GRIP_HELD;
+  const ff = FF;
+  ff.x = f ? fin(f.x) : 0; ff.y = f ? fin(f.y) : 0; ff.z = f ? fin(f.z) : 0;
+  const hs = h / SUBSTEPS, m = BODY_MASS;
   let P = PHI;
   if (h !== Q) { if (rtH !== hs) { oscTransition(PHI_RT, 0, GRIP_OMEGA, 1, hs); rtH = hs; } P = PHI_RT; }
   const o = gs.hold * HOLD_STRIDE, kind = holds[o + 7];
-  let axx = 0, axy = 0, axz = 0, rail = false;
+  let axx = 0, axy = 0, axz = 0, rail = false, railL = 0;
   if (kind === 0 || kind === 2) {
     const dx = holds[o + 3] - holds[o], dy = holds[o + 4] - holds[o + 1], dz = holds[o + 5] - holds[o + 2], l = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    if (l > 0) { axx = dx / l; axy = dy / l; axz = dz / l; rail = true; }
+    if (l > 0) { axx = dx / l; axy = dy / l; axz = dz / l; rail = true; railL = l; }
   }
   const aHold = RAIL_HOLD_F / m, aKin = RAIL_SLIDE_F / m;
+  RS[6] = m; RS[7] = hs;
   gs.fPeak = 0;
   for (let i = 0; i < SUBSTEPS; i++) {
-    const p0x = p.x, p0y = p.y, p0z = p.z, v0x = v.x, v0y = v.y, v0z = v.z;
+    const p0x = p.x, p0y = p.y, p0z = p.z;
+    RS[0] = p0x; RS[1] = p0y; RS[2] = p0z; RS[3] = v.x; RS[4] = v.y; RS[5] = v.z;
     const tx = gs.g.x + gs.tgt.x - gs.off.x, ty = gs.g.y + gs.tgt.y - gs.off.y, tz = gs.g.z + gs.tgt.z - gs.off.z;
     const ex = p.x - tx, ey = p.y - ty, ez = p.z - tz;
     // muscle acceleration the critically damped spring asks for, with the felt load fed forward
     let amx = -W2 * ex - 2 * GRIP_OMEGA * v.x - ff.x, amy = -W2 * ey - 2 * GRIP_OMEGA * v.y - ff.y, amz = -W2 * ez - 2 * GRIP_OMEGA * v.z - ff.z;
     if (rail && !gs.slide && Math.abs(amx * axx + amy * axy + amz * axz) > aHold) gs.slide = true;
     if (gs.slide) {
-      // along the rail: kinetic friction against the hand's slip (the hand slides with the body); across: the spring
+      // along the rail: kinetic friction against the hand's slip (the hand slides with the body); across: the spring.
+      // The whole hand force (across + friction) stays ≤ GRIP_FMAX: the friction gets what the across part leaves.
       const va = v.x * axx + v.y * axy + v.z * axz, an = amx * axx + amy * axy + amz * axz;
       amx -= an * axx; amy -= an * axy; amz -= an * axz;
-      const al = Math.sqrt(amx * amx + amy * amy + amz * amz);
-      if (al > AMAX) { const s = AMAX / al; amx *= s; amy *= s; amz *= s; }
+      let al = Math.sqrt(amx * amx + amy * amy + amz * amz);
+      if (al > AMAX) { const s = AMAX / al; amx *= s; amy *= s; amz *= s; al = AMAX; }
+      const kMax = Math.sqrt(AMAX * AMAX - al * al), kLim = aKin < kMax ? aKin : kMax;
       const fa = ff.x * axx + ff.y * axy + ff.z * axz;
-      let ka = va > 0 ? -aKin : va < 0 ? aKin : 0;
+      let ka = va > 0 ? -kLim : va < 0 ? kLim : 0;
       // friction cannot reverse the slip within the sub-step: stop exactly at zero slip
       const vaEnd = va + (ka + fa) * hs;
       let stick = false;
-      if (va !== 0 && vaEnd * va <= 0 && Math.abs(fa) <= aHold) { ka = -va / hs - fa; stick = true; }
+      if (va !== 0 && vaEnd * va <= 0 && Math.abs(fa) <= aHold) {
+        const kn = -va / hs - fa;
+        if (kn <= kMax && kn >= -kMax) { ka = kn; stick = true; }
+      }
       const ax = amx + ka * axx + ff.x, ay = amy + ka * axy + ff.y, az = amz + ka * axz + ff.z;
       p.x += v.x * hs + 0.5 * ax * hs * hs; p.y += v.y * hs + 0.5 * ay * hs * hs; p.z += v.z * hs + 0.5 * az * hs * hs;
       v.x += ax * hs; v.y += ay * hs; v.z += az * hs;
@@ -366,12 +414,11 @@ export function stepGrip(gs: GripState, holds: Float64Array, p: V3, v: V3, f: V3
       const dpa = (p.x - p0x) * axx + (p.y - p0y) * axy + (p.z - p0z) * axz;
       gs.g.x += dpa * axx; gs.g.y += dpa * axy; gs.g.z += dpa * axz;
       const u = ((gs.g.x - holds[o]) * axx + (gs.g.y - holds[o + 1]) * axy + (gs.g.z - holds[o + 2]) * axz);
-      const L = Math.sqrt((holds[o + 3] - holds[o]) ** 2 + (holds[o + 4] - holds[o + 1]) ** 2 + (holds[o + 5] - holds[o + 2]) ** 2);
       const vaNow = v.x * axx + v.y * axy + v.z * axz;
       if (stick || (vaNow < SLIDE_STICK_V && vaNow > -SLIDE_STICK_V && Math.abs(fa) <= aHold)) gs.slide = false;
-      const F = record(led, m, p0x, p0y, p0z, v0x, v0y, v0z, p, v, ff, hs);
-      if (F > gs.fPeak) gs.fPeak = F;
-      if (u < 0 || u > L) { release(gs); return GRIP_LOST; }
+      record(led, p, v, ff);
+      if (RS[8] > gs.fPeak) gs.fPeak = RS[8];
+      if (u < 0 || u > railL) { release(gs); return GRIP_LOST; }
     } else {
       const al = Math.sqrt(amx * amx + amy * amy + amz * amz);
       let exact = false;
@@ -390,8 +437,8 @@ export function stepGrip(gs: GripState, holds: Float64Array, p: V3, v: V3, f: V3
         p.x += v.x * hs + 0.5 * ax * hs * hs; p.y += v.y * hs + 0.5 * ay * hs * hs; p.z += v.z * hs + 0.5 * az * hs * hs;
         v.x += ax * hs; v.y += ay * hs; v.z += az * hs;
       }
-      const F = record(led, m, p0x, p0y, p0z, v0x, v0y, v0z, p, v, ff, hs);
-      if (F > gs.fPeak) gs.fPeak = F;
+      record(led, p, v, ff);
+      if (RS[8] > gs.fPeak) gs.fPeak = RS[8];
     }
     // the arm cannot stretch: past full extension the hand is pulled off the hold
     const sx = p.x + gs.off.x - gs.g.x, sy = p.y + gs.off.y - gs.g.y, sz = p.z + gs.off.z - gs.g.z;
@@ -401,23 +448,28 @@ export function stepGrip(gs: GripState, holds: Float64Array, p: V3, v: V3, f: V3
 }
 
 /**
- * Quasi-static hold under warp (h > 0.02 s): the body sits at the spring's equilibrium (the target, the felt load
- * fed forward) with v = 0 while the felt load needs ≤ GRIP_FMAX (and ≤ RAIL_HOLD_F along a rail); otherwise the hand
- * lets go (GRIP_LOST; the body then drifts, quasistatic.ts). No reaction: a steady hold passes the felt load into
- * the ship continuously, which is already the ship's own acceleration.
+ * Quasi-static hold under warp (h > 0.02 s, the quantum): the body sits at the spring's equilibrium (the target,
+ * the felt load fed forward) with v = 0 while the felt load needs ≤ GRIP_FMAX (and ≤ RAIL_HOLD_F along a rail);
+ * otherwise the hand lets go (GRIP_LOST; the body then drifts, quasistatic.ts). Same momentum rule as stepGrip at
+ * 1×: the hand's impulse on the body over the quantum, J = m(0 − v) − m·f·h (the entry stop plus the felt load
+ * carried), goes to the ship (led), so switching between 1× and warp neither creates nor loses momentum.
  */
-export function gripEquilibrium(gs: GripState, holds: Float64Array, p: V3, v: V3, f: V3): number {
+export function gripEquilibrium(gs: GripState, holds: Float64Array, p: V3, v: V3, f: V3, h = 0, led: ReactionLedger | null = null): number {
   if (!gs.on) return GRIP_FREE;
-  const fl = Math.sqrt(f.x * f.x + f.y * f.y + f.z * f.z);
+  const fx = fin(f.x), fy = fin(f.y), fz = fin(f.z);
+  const fl = Math.sqrt(fx * fx + fy * fy + fz * fz);
   const o = gs.hold * HOLD_STRIDE, kind = holds[o + 7];
   let fa = 0;
   if (kind === 0 || kind === 2) {
     const dx = holds[o + 3] - holds[o], dy = holds[o + 4] - holds[o + 1], dz = holds[o + 5] - holds[o + 2], l = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    if (l > 0) fa = Math.abs(f.x * dx + f.y * dy + f.z * dz) / l;
+    if (l > 0) fa = Math.abs(fx * dx + fy * dy + fz * dz) / l;
   }
   if (fl * BODY_MASS > GRIP_FMAX || fa * BODY_MASS > RAIL_HOLD_F) { release(gs); return GRIP_LOST; }
+  RS[0] = p.x; RS[1] = p.y; RS[2] = p.z; RS[3] = fin(v.x); RS[4] = fin(v.y); RS[5] = fin(v.z); RS[6] = BODY_MASS; RS[7] = h > 0 ? h : 0;
   p.x = gs.g.x + gs.tgt.x - gs.off.x; p.y = gs.g.y + gs.tgt.y - gs.off.y; p.z = gs.g.z + gs.tgt.z - gs.off.z;
   v.x = v.y = v.z = 0;
+  FF.x = fx; FF.y = fy; FF.z = fz;
+  record(led, p, v, FF);
   gs.slide = false;
   return GRIP_HELD;
 }
@@ -445,8 +497,10 @@ export const flickEffort = (speed: number, full: number): number => (!(speed > 0
 
 /**
  * Start a push off a surface with unit normal n (out of the surface, craft axes) in the wished direction `want`:
- * inside the 35° cone it is used as is; outside it is clamped to the cone edge (the limb would slip); a wish into
- * the surface gives no push. Force = effort × the limb's maximum, for the limb's fixed stroke time.
+ * inside the 35° cone it is used as is; outside it is clamped to the cone edge (the limb would slip) and the force
+ * that reaches the body drops to F·cosθ/cos 35° (θ = the wish's angle from the normal: the surface's normal load
+ * and so its friction shrink); a wish into or along the surface gives no push. Force = effort × the limb's maximum
+ * (× that factor), for the limb's fixed stroke time.
  */
 export function startPush(ps: PushState, n: V3, want: V3, effort: number, limb: number): number {
   const nl = Math.sqrt(n.x * n.x + n.y * n.y + n.z * n.z), wl = Math.sqrt(want.x * want.x + want.y * want.y + want.z * want.z);
@@ -454,17 +508,20 @@ export function startPush(ps: PushState, n: V3, want: V3, effort: number, limb: 
   const nx = n.x / nl, ny = n.y / nl, nz = n.z / nl, wx = want.x / wl, wy = want.y / wl, wz = want.z / wl;
   const c = wx * nx + wy * ny + wz * nz;
   if (!(c > 0)) return PUSH_NONE;
-  let res = PUSH_IN_CONE, dx = wx, dy = wy, dz = wz;
-  const cc = mcos(PUSH_CONE);
+  let res = PUSH_IN_CONE, dx = wx, dy = wy, dz = wz, k = 1;
+  const cc = PUSH_COS;
   if (c < cc) {
-    const tx = wx - c * nx, ty = wy - c * ny, tz = wz - c * nz, tl = Math.sqrt(tx * tx + ty * ty + tz * tz), ss = msin(PUSH_CONE);
+    const tx = wx - c * nx, ty = wy - c * ny, tz = wz - c * nz, tl = Math.sqrt(tx * tx + ty * ty + tz * tz), ss = PUSH_SIN;
     dx = cc * nx + (ss * tx) / tl; dy = cc * ny + (ss * ty) / tl; dz = cc * nz + (ss * tz) / tl;
+    // the limb pushes along the wish with F: the surface carries N = F·cosθ and friction at most μN, so the force
+    // that reaches the body is the cone edge's, N/cos 35° = F·cosθ/cos 35° (the rest slips away)
+    k = c / cc;
     res = PUSH_CLAMPED;
   }
   const e = effort > 1 ? 1 : effort;
   ps.on = true; ps.limb = limb; ps.t = 0;
   ps.T = limb === LIMB_ARMS ? ARM_PUSH_T : LEG_PUSH_T;
-  ps.F = e * (limb === LIMB_ARMS ? ARM_PUSH_F : LEG_PUSH_F);
+  ps.F = k * e * (limb === LIMB_ARMS ? ARM_PUSH_F : LEG_PUSH_F);
   ps.d.x = dx; ps.d.y = dy; ps.d.z = dz; ps.n.x = nx; ps.n.y = ny; ps.n.z = nz;
   return res;
 }
@@ -480,7 +537,7 @@ export const PUSH_MU_MATCHES_BOOTS = Math.abs(PUSH_MU - BOOT_MU_S) < 0.01;
  */
 export function pushTick(ps: PushState, p: V3, h: number, led: ReactionLedger | null, out: V3): number {
   out.x = out.y = out.z = 0;
-  if (!ps.on) return 0;
+  if (!ps.on || !(h > 0)) return 0;
   const left = ps.T - ps.t, dt = left < h ? (left > 0 ? left : 0) : h;
   const a = ps.F / BODY_MASS, k = (a * dt) / h;
   out.x = k * ps.d.x; out.y = k * ps.d.y; out.z = k * ps.d.z;

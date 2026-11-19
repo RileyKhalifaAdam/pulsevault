@@ -1,8 +1,8 @@
 // Life support (docs/SIMULATION.md W2-D item 4, item 3 humidity, item 6 cautions): the crew's metabolism at the
 // real rates, the O₂ regulator from the high-pressure tank, the regenerable CO₂ scrubber, the condensing heat
 // exchanger, condensation and fog on cold window panes, the saturation-pressure table (dew point without
-// Math.log) and the life-support caution conditions with hysteresis. Pure, deterministic, allocation-free per
-// step; SI units (mol, kg, Pa, K, W, s).
+// Math.log) and the raw values of the life-support caution conditions (caution.ts latches them). Pure,
+// deterministic, allocation-free per step; SI units (mol, kg, Pa, K, W, s).
 //
 // These are the LOCAL (per-room, species-specific) processes of one cabin gas step. src/world/cabin.ts
 // stepCabin calls lifeLocal() first and then the transport between rooms (operator splitting; both halves
@@ -24,8 +24,15 @@
 //   * §1.4: life.o2Tank (kg) is st.o2Tank; additive fields (loader defaults in cabin.ts loadCabin):
 //     life.condensate (kg of water in the CHX tank; W3-B's daily condensate dump reads and zeroes it),
 //     cabin.fog (kg/m² of water on each pane; W2-F renders fogFraction()).
-//   * Master caution (hub): cabin.ts writes io.out[OUT_CAUTION] (latched bits CAU_*) and io.out[OUT_CAUTION_ROSE]
-//     (bits that rose this step: a rising bit wakes the sleeper, W2-D item 6).
+//   * Master caution (hub): caution.ts is the ONE owner of every latch, lamp and wake (review D7). This file only
+//     exports the raw values (cabinCautionValues, written by every stepCabin): io.out[OUT_PPCO2_MAX] → caution.ts
+//     C_CO2, io.out[OUT_PPO2_MIN] → C_O2 (the worst MONITORED room), and four more conditions with their
+//     thresholds as caution.ts CautionDefs (CABIN_CAUTIONS: cabin pressure low / high, rapid depressurisation,
+//     O₂ tank low); wave 2 appends them to caution.ts CAUTIONS (4 new slots) and fills them from
+//     io.out[OUT_P_MIN], io.out[OUT_P_MAX], io.out[OUT_DEPRESS_MIN] and st.o2Tank / O2_TANK_FULL.
+//   * Crew heat (review D7): shipSystems' `crewW[room]` input must be io.roomHeat[room] (the sensible part), NOT
+//     io.metab: the latent part leaves as vapour and returns to thermal through io.paneHeat / OUT_CHX_HEAT where
+//     it condenses. (Equivalently crewW = metab·SENSIBLE_FRAC while the crew have O₂.)
 //
 // Rates (NASA BVAD, the per-crew-member daily average at 11.82 MJ/day of metabolic expenditure = 136.8 W):
 // O₂ 0.84 kg/day, CO₂ 1.00 kg/day (RQ = 0.866), water vapour 2.0 kg/day (the plan's humidity figure: respiration,
@@ -35,6 +42,7 @@
 // numbers, which is the check that the 136.8 W anchor is the one the plan meant.
 
 import type { CabinIo, CabinNet, CabinState } from './cabin';
+import type { CautionDef } from './caution';
 
 // ------------------------------------------------------------------------------------------------ wrappers
 // (§1.1 rule 6: wave 2 moves them into src/world/math.ts). Used at module load only.
@@ -73,6 +81,8 @@ export const RQ = CO2_MOL_PER_J / O2_MOL_PER_J;
 /** Latent heat of vaporisation (skin/lung temperature), J/kg; per mol. */
 export const H_FG = 2.43e6;
 export const H_FG_MOL = H_FG * MOLAR_MASS[S_H2O];
+/** Sensible share of the metabolic heat (the rest leaves as the latent heat of the 2 kg/day of vapour): 0.585. */
+export const SENSIBLE_FRAC = 1 - H2O_MOL_PER_J * H_FG_MOL;
 /** Activity levels, W (thermal plan: crew 80–250 W). */
 export const METAB_SLEEP = 80;
 export const METAB_REST = 110;
@@ -106,20 +116,15 @@ export const FOG_FULL = 5e-3;
 
 // ------------------------------------------------------------------------------------------------ cautions
 
-export const CAU_PPO2_LOW = 1;
-export const CAU_PPCO2_HIGH = 2;
-export const CAU_P_LOW = 4;
-export const CAU_P_HIGH = 8;
-export const CAU_DEPRESS = 16;
-export const CAU_O2_TANK = 32;
-/** Set / clear thresholds (hysteresis). ppO₂ < 16 kPa and ppCO₂ > 1 kPa are the plan's (W2-D item 6). */
-export const PPO2_LOW_SET = 16000, PPO2_LOW_CLR = 16500;
-export const PPCO2_SET = 1000, PPCO2_CLR = 900;
-export const P_LOW_SET = 90000, P_LOW_CLR = 92000;
-export const P_HIGH_SET = 106000, P_HIGH_CLR = 104000;
-/** Rapid depressurisation: moles leaving at more than this pressure rate (temperature changes excluded), Pa/s. */
-export const DEPRESS_SET = -9, DEPRESS_CLR = -3;
-export const O2_TANK_LOW_SET = 0.1 * O2_TANK_FULL, O2_TANK_LOW_CLR = 0.12 * O2_TANK_FULL;
+/** Cabin caution conditions for caution.ts (review D7: caution.ts owns every latch; ppCO₂ > 1 kPa and ppO₂ < 16 kPa
+ *  are its existing C_CO2 / C_O2). Append these to caution.ts CAUTIONS; values from cabinCautionValues. */
+export const CABIN_CAUTIONS: readonly CautionDef[] = [
+  { id: 'cabin-p-low', dir: -1, on: 90000, off: 92000, neutral: 101325 }, // worst monitored room, Pa
+  { id: 'cabin-p-high', dir: 1, on: 106000, off: 104000, neutral: 101325 },
+  // rapid depressurisation: moles leaving at more than 9 Pa/s (temperature changes excluded), any monitored room
+  { id: 'cabin-depress', dir: -1, on: -9, off: -3, neutral: 0 },
+  { id: 'o2-tank', dir: -1, on: 0.10, off: 0.12, neutral: 1 }, // st.o2Tank / O2_TANK_FULL
+];
 
 // ------------------------------------------------------------------------------------------------ saturation table
 
@@ -146,6 +151,16 @@ export function psat(T: number): number {
   const i = u | 0;
   u -= i;
   return PSAT[i] + (PSAT[i + 1] - PSAT[i]) * u;
+}
+
+/** psat(T) written to out[k] (the allocation-free form for the per-step path). */
+export function psatInto(T: number, out: Float64Array, k: number): void {
+  let u = (T - PSAT_T0) / PSAT_DT;
+  if (!(u > 0)) { out[k] = PSAT[0]; return; }
+  if (u >= PSAT_N - 1) { out[k] = PSAT[PSAT_N - 1]; return; }
+  const i = u | 0;
+  u -= i;
+  out[k] = PSAT[i] + (PSAT[i + 1] - PSAT[i]) * u;
 }
 
 /** Dew (frost) point of a vapour partial pressure, K: the inverse of psat by bisection on the table, no log. */
@@ -188,11 +203,16 @@ export const OUT_O2_INJECTED = 4; // kg from the tank
 export const OUT_CHX_WATER = 5; // kg condensed in the CHX
 export const OUT_CHX_HEAT = 6; // W of latent heat into the HVAC coolant
 export const OUT_HYPOXIA = 7; // 1 when the crew could not get the O₂ they needed (a room ran out)
-export const OUT_CAUTION = 8; // latched CAU_* bits
-export const OUT_CAUTION_ROSE = 9; // bits that rose this step
+export const OUT_PPO2_MIN = 8; // lowest ppO₂ of the monitored rooms, Pa (caution.ts C_O2)
+export const OUT_PPCO2_MAX = 9; // highest ppCO₂ of the monitored rooms, Pa (caution.ts C_CO2)
 export const OUT_DRAFT_CHANGED = 10; // 1 when the published draft field changed (st.draftEpoch advanced)
 export const OUT_VENT0 = 11; // + species: mol lost to boundaries (space) through orifices / ducts
-export const OUT_LEN = OUT_VENT0 + N_SPECIES;
+export const OUT_P_MIN = OUT_VENT0 + N_SPECIES; // lowest / highest total pressure of the monitored rooms, Pa
+export const OUT_P_MAX = OUT_P_MIN + 1;
+export const OUT_DEPRESS_MIN = OUT_P_MIN + 2; // most negative mole rate as a pressure rate, Pa/s
+export const OUT_LEN = OUT_P_MIN + 3;
+/** Output slots that are amounts over the step (summed over the sub-steps of a quantum); OUT_CHX_HEAT is a mean. */
+export const OUT_AMOUNT_END = OUT_CHX_WATER + 1;
 
 // ------------------------------------------------------------------------------------------------ local step
 
@@ -214,15 +234,17 @@ export function lifeLocal(net: CabinNet, st: CabinState, io: CabinIo): void {
     const W = io.metab[i];
     const b = i * ROOM_STRIDE;
     if (!(W > 0)) { io.roomHeat[i] = 0; continue; }
-    let o2 = W * O2_MOL_PER_J * h;
-    if (o2 > g[b + S_O2]) { o2 = g[b + S_O2]; hyp = 1; }
+    const need = W * O2_MOL_PER_J * h;
+    let o2 = need, f = 1;
+    // hypoxia (review D8): metabolism is aerobic, so the vapour and the heat scale with the O₂ actually taken
+    if (o2 > g[b + S_O2]) { o2 = g[b + S_O2]; hyp = 1; f = need > 0 ? o2 / need : 0; }
     const co2 = o2 * RQ;
-    const w = W * H2O_MOL_PER_J * h;
+    const w = W * H2O_MOL_PER_J * h * f;
     g[b + S_O2] -= o2;
     g[b + S_CO2] += co2;
     g[b + S_H2O] += w;
     o2Used += o2; co2Made += co2; h2oMade += w;
-    io.roomHeat[i] = W - W * H2O_MOL_PER_J * H_FG_MOL;
+    io.roomHeat[i] = W * f * SENSIBLE_FRAC;
   }
   out[OUT_O2_USED] = o2Used * MOLAR_MASS[S_O2];
   out[OUT_CO2_MADE] = co2Made * MOLAR_MASS[S_CO2];
@@ -300,11 +322,14 @@ function waterSinks(net: CabinNet, st: CabinState, io: CabinIo, i: number, b: nu
   // targets in room-air terms: the surface holds p_v = p_sat(T_surface), and p_v (not the concentration) equalises
   // across the film at uniform total pressure, so the dew point of the room ends at the surface temperature
   const iRT = 1 / (R_GAS * g[b + R_T]);
-  const cCoil = chx > 0 ? psat(io.inp[IN_TCOIL]) * iRT : 0;
+  // (psat into typed scratch, not as a return value: a call that is not inlined returns a boxed double)
+  let cCoil = 0;
+  if (chx > 0) { psatInto(io.inp[IN_TCOIL], net.wScr, 2); cCoil = net.wScr[2] * iRT; }
   if (chx > 0 && c0 > cCoil) chxOn = 1;
   for (let q = p0; q < p1; q++) {
     const w = L[q];
-    tgt[w] = psat(io.paneT[w]) * iRT;
+    psatInto(io.paneT[w], tgt, w);
+    tgt[w] *= iRT;
     act[w] = c0 > tgt[w] || st.fog[w] > 0 ? 1 : 0;
   }
   let c1 = c0;
@@ -323,7 +348,8 @@ function waterSinks(net: CabinNet, st: CabinState, io: CabinIo, i: number, b: nu
       const w = L[q];
       if (act[w] !== 1) continue;
       const flux = hm * net.pA[w] * (c1 - tgt[w]); // mol/s onto the pane (> 0 condensing)
-      if (flux < 0 && -flux * h * MW > st.fog[w]) { act[w] = st.fog[w] > 0 ? 2 : 0; changed = true; }
+      // the film holds fog·A kg (review D1: the area was missing, so small panes were overdrawn)
+      if (flux < 0 && -flux * h * MW > st.fog[w] * net.pA[w]) { act[w] = st.fog[w] > 0 ? 2 : 0; changed = true; }
     }
     if (!changed) break;
   }
@@ -334,7 +360,7 @@ function waterSinks(net: CabinNet, st: CabinState, io: CabinIo, i: number, b: nu
     nOut += m;
     st.condensate += m * MW;
     io.out[OUT_CHX_WATER] += m * MW;
-    io.out[OUT_CHX_HEAT] += m * H_FG_MOL / h;
+    if (h > 0) io.out[OUT_CHX_HEAT] += m * H_FG_MOL / h; // (review D6: h = 0 gave NaN)
   }
   for (let q = p0; q < p1; q++) {
     const w = L[q];
@@ -346,7 +372,7 @@ function waterSinks(net: CabinNet, st: CabinState, io: CabinIo, i: number, b: nu
     if (film < 0) film = 0; // rounding of a whole-film evaporation
     st.fog[w] = film;
     nOut += m;
-    io.paneHeat[w] += m * H_FG_MOL / h;
+    if (h > 0) io.paneHeat[w] += m * H_FG_MOL / h;
   }
   let n1 = n0 - nOut;
   if (n1 < 0) n1 = 0;
@@ -354,11 +380,10 @@ function waterSinks(net: CabinNet, st: CabinState, io: CabinIo, i: number, b: nu
 }
 
 /**
- * Latch the life-support caution bits with hysteresis from this step's room states (monitored rooms only) and
- * the tank. `rate[i]` is the room's mole rate expressed as a pressure rate (Pa/s, temperature changes excluded).
+ * The raw cabin caution values of this step's room states (monitored rooms only) into io.out (caution.ts latches
+ * them; see CABIN_CAUTIONS). With no monitored room the values are neutral.
  */
-export function cautionUpdate(net: CabinNet, st: CabinState, io: CabinIo): void {
-  const prev = st.caution;
+export function cabinCautionValues(net: CabinNet, io: CabinIo): void {
   let ppo2Min = Infinity, ppco2Max = -Infinity, pMin = Infinity, pMax = -Infinity, rMin = Infinity;
   for (let i = 0; i < net.nR; i++) {
     if (!io.monitor[i]) continue;
@@ -368,16 +393,10 @@ export function cautionUpdate(net: CabinNet, st: CabinState, io: CabinIo): void 
     if (io.p[i] > pMax) pMax = io.p[i];
     if (io.depress[i] < rMin) rMin = io.depress[i];
   }
-  let c = prev;
-  c = latch(c, CAU_PPO2_LOW, ppo2Min < PPO2_LOW_SET, ppo2Min > PPO2_LOW_CLR);
-  c = latch(c, CAU_PPCO2_HIGH, ppco2Max > PPCO2_SET, ppco2Max < PPCO2_CLR);
-  c = latch(c, CAU_P_LOW, pMin < P_LOW_SET, pMin > P_LOW_CLR);
-  c = latch(c, CAU_P_HIGH, pMax > P_HIGH_SET, pMax < P_HIGH_CLR);
-  c = latch(c, CAU_DEPRESS, rMin < DEPRESS_SET, rMin > DEPRESS_CLR);
-  c = latch(c, CAU_O2_TANK, st.o2Tank < O2_TANK_LOW_SET, st.o2Tank > O2_TANK_LOW_CLR);
-  st.caution = c;
-  io.out[OUT_CAUTION] = c;
-  io.out[OUT_CAUTION_ROSE] = c & ~prev;
+  const o = io.out;
+  o[OUT_PPO2_MIN] = ppo2Min === Infinity ? 21000 : ppo2Min;
+  o[OUT_PPCO2_MAX] = ppco2Max === -Infinity ? 0 : ppco2Max;
+  o[OUT_P_MIN] = pMin === Infinity ? 101325 : pMin;
+  o[OUT_P_MAX] = pMax === -Infinity ? 101325 : pMax;
+  o[OUT_DEPRESS_MIN] = rMin === Infinity ? 0 : rMin;
 }
-
-const latch = (c: number, bit: number, set: boolean, clear: boolean): number => (set ? c | bit : clear ? c & ~bit : c);

@@ -18,8 +18,9 @@
 //   * setup.ts / load (derived, never saved): c.thermalNet = compileThermal(WREN_THERMAL) (src/data/thermalNet.ts)
 //     once per hull type with a network; c.thermal = loadThermal(saved?.thermal, WREN_THERMAL) (§1.4 thermal.T).
 //   * The per-step call is systemsStep (src/world/shipSystems.ts), which calls thermalSources + thermalStep. It
-//     runs every 12 ticks (10 Hz, h = 0.1 s) on the grid at 1×, and under warp once per quantum with
-//     thermalSubsteps(q) implicit steps of ≤ 30 s (MAX_THERMAL_STEP). No limitedBy: the step is stable at any h.
+//     runs every 12 ticks (10 Hz, h = 0.1 s) on the grid at 1×, and under warp every systemsSpanTicks(...) ticks
+//     (≈ 120 s of sim time, a whole number of quanta) with thermalSubsteps(h) implicit steps of ≤ 30 s
+//     (MAX_THERMAL_STEP). No limitedBy: the step is stable at any h.
 //   * Environment (env Float64Array, ENV_* slots): the wiring fills it once per systems step from the ephemeris:
 //     sun direction and planet nadir in CRAFT axes (q⁻¹·(r_star − r), q⁻¹·(r_planet − r), normalised), S = L/(4πd²)
 //     (luminosity from the star's T_eff and radius: σT⁴·R²/d²), ν = shadowFactor(...) (analytic disc overlap),
@@ -30,7 +31,7 @@
 //     writes thermal.T[] and driveInhibit (via shipSystems.ts). Pure, deterministic, allocation-free per step.
 //
 // Measured (node 22, esbuild bundle, this container): 38-node Wren network (119 L entries, 175 program ops):
-// thermalStep 2.2 µs + thermalSources 0.6 µs; the whole systemsStep 4.0 µs (≈ 8 µs on the A16 est.).
+// thermalStep 2.3 µs + thermalSources 0.6 µs; the whole systemsStep 4.2 µs (≈ 8 µs on the A16 est.).
 
 /** Stefan–Boltzmann constant, W/(m²·K⁴). */
 export const SIGMA = 5.670374419e-8;
@@ -513,22 +514,24 @@ export function storedHeat(net: ThermalNet, T: ArrayLike<number>, Tref = 293): n
 
 // ------------------------------------------------------------------------------------------------ state
 
-/** §1.4 `thermal: { T: number[] }` plus the interlock latch (saved, so a load resumes the hysteresis). */
+/** §1.4 `thermal: { T: number[] }` plus the interlock and caution latches (saved, so a load resumes the hysteresis). */
 export interface ThermalState {
   T: number[];
   /** driveInhibit latch: set above the interlock limits, cleared below them minus the hysteresis band. */
   inhibit: boolean;
+  /** Per node: 1 while above its caution temperature (cleared HOT_HYST below it); a new 1 is a caution pulse. */
+  hot: number[];
 }
 
 export function makeThermalState(def: ThermalNetDef): ThermalState {
-  return { T: def.nodes.map((d) => d.T0), inhibit: false };
+  return { T: def.nodes.map((d) => d.T0), inhibit: false, hot: def.nodes.map(() => 0) };
 }
 
 export function saveThermal(s: ThermalState): ThermalState {
-  return { T: s.T.slice(), inhibit: s.inhibit };
+  return { T: s.T.slice(), inhibit: s.inhibit, hot: s.hot.slice() };
 }
 
-/** Loader with defaults: a missing or wrong-length save gives the network's initial temperatures. */
+/** Loader with defaults: a missing, wrong-length or non-finite save gives the network's initial temperatures. */
 export function loadThermal(saved: unknown, def: ThermalNetDef): ThermalState {
   const s = makeThermalState(def);
   const o = saved as Partial<ThermalState> | null | undefined;
@@ -536,5 +539,6 @@ export function loadThermal(saved: unknown, def: ThermalNetDef): ThermalState {
     for (let i = 0; i < s.T.length; i++) s.T[i] = o.T[i];
   }
   if (o && typeof o.inhibit === 'boolean') s.inhibit = o.inhibit;
+  if (o && Array.isArray(o.hot) && o.hot.length === def.nodes.length) for (let i = 0; i < s.hot.length; i++) s.hot[i] = o.hot[i] === 1 ? 1 : 0;
   return s;
 }

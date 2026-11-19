@@ -111,8 +111,29 @@ describe('exact Hill/Clohessy–Wiltshire flow', () => {
     // the frozen-vertical idealisation p̈ = 2n²p: x₀·cosh(√2 n t)
     const frozen = Math.acosh(1.2) / (Math.SQRT2 * N);
     console.log(`[tides] 5 m → 6 m: LVLH hold ${lvlh.toFixed(1)} s; inertial ship ${fixed.toFixed(1)} s; frozen vertical ${frozen.toFixed(1)} s; plan text ${(Math.acosh(1.2) / (Math.sqrt(3) * N)).toFixed(1)} s`);
-    expect(fixed).toBeGreaterThan(300);
-    expect(fixed).toBeLessThan(500);
+    // pinned against an independent RK4 of the inertial ODE (0.05 s steps, the crossing interpolated) and the
+    // analytic numbers: 406.2 s for an inertially fixed ship, 330.4 s for an LVLH hold by distance; the plan text's
+    // 324 s (√3) is not either case and is not accepted
+    const cross = (x0: V3, v0: V3): number => {
+      const h = 0.05; let t = 0, s = [x0.x, x0.y, x0.z, v0.x, v0.y, v0.z], d0 = 5;
+      const fd = (tt: number, y: number[]): number[] => {
+        const r = rhatAt(tt), d = 3 * (r.x * y[0] + r.y * y[1] + r.z * y[2]);
+        return [y[3], y[4], y[5], N2 * (d * r.x - y[0]), N2 * (d * r.y - y[1]), N2 * (d * r.z - y[2])];
+      };
+      for (;;) {
+        const k1 = fd(t, s), k2 = fd(t + h / 2, s.map((y, j) => y + (h / 2) * k1[j])), k3 = fd(t + h / 2, s.map((y, j) => y + (h / 2) * k2[j])), k4 = fd(t + h, s.map((y, j) => y + h * k3[j]));
+        s = s.map((y, j) => y + (h / 6) * (k1[j] + 2 * k2[j] + 2 * k3[j] + k4[j]));
+        const d1 = Math.hypot(s[0], s[1], s[2]);
+        if (d1 >= 6) return t + (h * (6 - d0)) / (d1 - d0);
+        t += h; d0 = d1;
+      }
+    };
+    const fixedRk = cross(v3(5, 0, 0), v3()), lvlhRk = cross(v3(5, 0, 0), v3(0, 0, -N * 5)), lvlhDist = reach(v3(5, 0, 0), v3(0, 0, -N * 5), false);
+    console.log(`[tides] RK4 crossing: inertial ${fixedRk.toFixed(2)} s, LVLH (distance) ${lvlhRk.toFixed(2)} s; closed form ${fixed.toFixed(2)} / ${lvlhDist.toFixed(2)} s`);
+    expect(Math.abs(fixed - fixedRk)).toBeLessThan(0.05);
+    expect(Math.abs(lvlhDist - lvlhRk)).toBeLessThan(0.05);
+    expect(Math.abs(fixed - 406.2)).toBeLessThan(0.5);
+    expect(Math.abs(lvlhDist - 330.4)).toBeLessThan(0.5);
   });
 
   it('tideDelta added to the drift closed form matches RK4 under thrust over a 5 s segment', () => {

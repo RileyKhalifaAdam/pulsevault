@@ -60,6 +60,29 @@ describe('the rotor and the gyrostat', () => {
     expect((p0.x + p2.x - 2 * p.x) / (d * d)).toBeCloseTo(a.x, 3);
   });
 
+  it('the rotor contact body moves the 441 m rim at Ω·r = 65.7 m/s and pulls Ω²·r = 9.79 m/s² there', () => {
+    const rotor = initRotor(MP.rotor, 0), st = { rel: v3(), relV: v3(), q: { x: 0, y: 0, z: 0, w: 1 }, w: v3() };
+    const RB = makeContactBody();
+    for (const t of [0, 17.3, 1234.5]) {
+      rotorContactBody(RB, st, MP, rotor, t);
+      // a point on the rim at rotor-local (441, 0, 0), in world: R(q)·r; its velocity ω_world × p
+      const q = RB.q, l = v3(441, 0, 0);
+      const tx = 2 * (q.y * l.z - q.z * l.y), ty = 2 * (q.z * l.x - q.x * l.z), tz = 2 * (q.x * l.y - q.y * l.x);
+      const p = v3(l.x + q.w * tx + (q.y * tz - q.z * ty), l.y + q.w * ty + (q.z * tx - q.x * tz), l.z + q.w * tz + (q.x * ty - q.y * tx));
+      const W = RB.w.y; // body ω is (0, Ω, 0) for a station at rest, so ω_world = Ω ŷ
+      expect(Math.abs(RB.w.x) + Math.abs(RB.w.z)).toBe(0);
+      const vel = v3(W * p.z, 0, -W * p.x);
+      expect(Math.abs(len(vel) - WHEEL_SPIN * 441) / (WHEEL_SPIN * 441)).toBeLessThan(1e-14);
+      expect(Math.abs(W * W * len(p) - WHEEL_SPIN * WHEEL_SPIN * 441) / 9.79).toBeLessThan(1e-14);
+      expect(W * W * len(p)).toBeCloseTo(9.79, 2);
+      // and the point is where rotorPoint puts it
+      const P = v3(), V = v3(), A = v3();
+      rotorPoint(rotor, t, l, P, V, A);
+      expect(len(v3(P.x - p.x, P.y - p.y, P.z - p.z))).toBeLessThan(1e-9);
+      expect(len(v3(V.x - vel.x, V.y - vel.y, V.z - vel.z))).toBeLessThan(1e-9);
+    }
+  });
+
   it('the rotor angle after 1e5 s of warp is analytic, and an impulse keeps θ continuous', () => {
     const r = initRotor(MP.rotor, 0, 0.3);
     expect(rotorAngle(r, 1e5)).toBe(0.3 + WHEEL_SPIN * 1e5);
@@ -122,9 +145,21 @@ describe('the rotor and the gyrostat', () => {
     rotorContactBody(RB, st, MP, rotor, t);
     const m = new Manifold(), res = makeContactResult();
     expect(collide(sphereCompound(2), ship, comp, RB, m)).toBeGreaterThan(0);
+    // before the solve: the approach speed is the rotor's surface velocity (v + ω × (p − x)) along the normal at the manifold point
+    let vn = 0;
+    for (let i = 0; i < m.n; i++) {
+      const P = m.point(i, ship, v3()), N = m.normal(i, RB, v3());
+      const wq = RB.q, ww = v3(), wb = RB.w; // ω in world: R·w
+      const tx = 2 * (wq.y * wb.z - wq.z * wb.y), ty = 2 * (wq.z * wb.x - wq.x * wb.z), tz = 2 * (wq.x * wb.y - wq.y * wb.x);
+      ww.x = wb.x + wq.w * tx + (wq.y * tz - wq.z * ty); ww.y = wb.y + wq.w * ty + (wq.z * tx - wq.x * tz); ww.z = wb.z + wq.w * tz + (wq.x * ty - wq.y * tx);
+      const rx = P.x - RB.p.x, ry = P.y - RB.p.y, rz = P.z - RB.p.z;
+      const u = (RB.v.x + ww.y * rz - ww.z * ry) * N.x + (RB.v.y + ww.z * rx - ww.x * rz) * N.y + (RB.v.z + ww.x * ry - ww.y * rx) * N.z;
+      vn = Math.max(vn, u);
+    }
     solveManifold(m, ship, RB, 1 / 120, { ...DEFAULT_CONTACT, positionIterations: 0 }, res);
-    expect(res.approachSpeed).toBeCloseTo(WHEEL_SPIN * r, 0);
-    console.log(`rim/spoke impact speed ${res.approachSpeed.toFixed(3)} m/s (Ω r = ${(WHEEL_SPIN * r).toFixed(3)})`);
+    expect(Math.abs(res.approachSpeed - vn) / vn).toBeLessThan(1e-9);
+    expect(Math.abs(res.approachSpeed - WHEEL_SPIN * r) / (WHEEL_SPIN * r)).toBeLessThan(0.01);
+    console.log(`spoke impact speed ${res.approachSpeed.toFixed(4)} m/s = surface velocity · n ${vn.toFixed(4)} (Ω·r ${(WHEEL_SPIN * r).toFixed(3)} at the sphere centre)`);
     const Om0 = rotor.rotorOmega, th0 = rotorAngle(rotor, t);
     rotorContactAfter(RB, st, MP, rotor, t);
     expect(rotor.rotorOmega).toBeLessThan(Om0);

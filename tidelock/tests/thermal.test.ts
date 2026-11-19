@@ -1,9 +1,17 @@
 // Thermal network (src/world/thermal.ts, src/data/thermalNet.ts, src/world/shipSystems.ts): W2-D item 1 tests.
 import { describe, expect, it } from 'vitest';
 import { defaultDemand } from '../src/data/powerNet';
-import { N_LOOP, N_PANE0, N_ROOM0, N_SKIRT0, N_TPS_BF, WREN_THERMAL } from '../src/data/thermalNet';
+import {
+  LOOP_T_SAT, N_LOOP, N_PANE0, N_RAD0, N_REACTOR, N_ROOM0, N_ROOMS, N_SKIRT0, N_TPS_BF, PUMP_G_MAX, RAD_EPS, RAD_PANEL_AREA, ROOM_CAUTION,
+  ROOM_VOLUME, SCRAM_LOOP, WREN_THERMAL,
+} from '../src/data/thermalNet';
+import { C_BREAKER, C_CABIN_COLD, C_OVERTEMP, C_SCRAM } from '../src/world/caution';
+import { L_GALLEY } from '../src/data/powerNet';
 import { Z_BELLY_FWD, Z_DORSAL_FWD } from '../src/data/hullZones';
-import { makeShipSystems, makeSystemsInputs, makeSystemsState, saveSystems, loadSystems, systemsStep, type ShipSystems, type SystemsInputs, type SystemsState } from '../src/world/shipSystems';
+import {
+  makeShipSystems, makeSystemsInputs, makeSystemsState, radiatorG, saveSystems, loadSystems, systemsDue, systemsSpanTicks, systemsStep,
+  type ShipSystems, type SystemsInputs, type SystemsState,
+} from '../src/world/shipSystems';
 import {
   BOOK_DU, BOOK_IN, BOOK_RAD, compileThermal, ENV_ALB, ENV_NU, ENV_NX, ENV_NY, ENV_NZ, ENV_S, ENV_SX, ENV_SY, ENV_SZ, ENV_TPL, ENV_VF,
   makeThermalEnv, planetIrTemp, shadowFactor, SIGMA, thermalSources, thermalStep, type ThermalNetDef,
@@ -15,16 +23,19 @@ const PERIOD = 2 * Math.PI * Math.sqrt((A_ORB * A_ORB * A_ORB) / MU);
 const D_SUN = 1.2e11, R_SUN = 6e8;
 const T_SS = Math.pow(((1 - ALBEDO) * S0) / SIGMA, 0.25);
 
-/** Circular equatorial orbit in the XZ plane, the star along +X (β = 0); craft axes = inertial axes. */
-function orbitEnv(env: Float64Array, t: number): void {
+type Rot = (x: number, y: number, z: number, out: number[]) => void;
+const INERTIAL: Rot = (x, y, z, o) => { o[0] = x; o[1] = y; o[2] = z; };
+const RV = [0, 0, 0];
+/** Circular equatorial orbit in the XZ plane, the star along +X (β = 0); craft axes = rot(inertial axes). */
+function orbitEnv(env: Float64Array, t: number, rot: Rot = INERTIAL): void {
   const th = (2 * Math.PI * t) / PERIOD;
   const rx = A_ORB * Math.cos(th), rz = A_ORB * Math.sin(th);
   const sx = D_SUN - rx, sz = -rz;
   const ds = Math.hypot(sx, sz);
   env[ENV_S] = S0;
   env[ENV_NU] = shadowFactor(sx, 0, sz, R_SUN, -rx, 0, -rz, R_P);
-  env[ENV_SX] = sx / ds; env[ENV_SY] = 0; env[ENV_SZ] = sz / ds;
-  env[ENV_NX] = -rx / A_ORB; env[ENV_NY] = 0; env[ENV_NZ] = -rz / A_ORB;
+  rot(sx / ds, 0, sz / ds, RV); env[ENV_SX] = RV[0]; env[ENV_SY] = RV[1]; env[ENV_SZ] = RV[2];
+  rot(-rx / A_ORB, 0, -rz / A_ORB, RV); env[ENV_NX] = RV[0]; env[ENV_NY] = RV[1]; env[ENV_NZ] = RV[2];
   env[ENV_VF] = (R_P / A_ORB) ** 2;
   const cz = rx / A_ORB; // sun at +X: cos ζ at the sub-ship point
   env[ENV_ALB] = cz > 0 ? ALBEDO * S0 * cz : 0;
@@ -235,22 +246,27 @@ describe('the Wren network', () => {
   });
 
   it('is deterministic and save → load → step is bit-identical', () => {
-    const run = (saveAt: number): number[] => {
+    const run = (saveAt: number): (number | string)[] => {
       let { sys, st, inp } = wren();
       for (let k = 0; k < 400; k++) {
         if (k === saveAt) st = loadSystems(JSON.parse(JSON.stringify(saveSystems(st))));
         orbitEnv(inp.env, k * 7.3);
         inp.heatIn[Z_BELLY_FWD] = k % 3 === 0 ? 1e5 : 0;
+        inp.power.driveArmed = k > 80 && k < 300 ? 1 : 0;
         inp.power.lit = k > 100 && k < 200 ? 2 : 0;
         inp.jetPower[0] = inp.jetPower[1] = inp.power.lit ? 6.8e9 : 0;
+        if (k === 150) st.thermal.T[N_ROOM0 + 2] = 310; // a hot room: the per-node latch is part of the state
         systemsStep(sys, st, inp, k % 2 ? 0.1 : 17.07);
       }
-      return [...st.thermal.T, st.power.soc, st.power.reactorP, st.caution.active];
+      return [...st.thermal.T, st.power.soc, st.power.reactorP, st.caution.active, JSON.stringify(saveSystems(st))];
     };
     const a = run(-1), b = run(-1), c = run(250);
     expect(b).toEqual(a);
     expect(c).toEqual(a);
     expect(loadSystems(undefined).thermal.T.length).toBe(38);
+    const d = loadSystems({ power: { soc: 0.5 } });
+    expect(d.power.scram).toBe(0); expect(d.power.standbyS).toBe(0); expect(d.thermal.hot.every((h) => h === 0)).toBe(true);
+    expect(Number.isNaN(d.tick)).toBe(true);
   });
 
   it('costs a few µs per step in node', () => {
@@ -270,5 +286,266 @@ describe('the Wren network', () => {
     console.log(`segments ${sys.pout.segments} V ${sys.pout.V} soc ${st.power.soc}; thermalStep (38 nodes, ${sys.net.nnz} L entries, ${sys.net.progA.length} program ops): ${step.toFixed(2)} µs; systemsStep: ${full.toFixed(2)} µs`);
     expect(step).toBeLessThan(20);
     expect(full).toBeLessThan(40);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------- review fixes
+const FULL_JET = 0.5 * 400e3 * 34e3;
+
+/** Arm, wait for the drive bus, burn at full thrust until driveInhibit (1× systems steps of 0.1 s). */
+function burnToInhibit(x: { sys: ShipSystems; st: SystemsState; inp: SystemsInputs }): number {
+  const { sys, st, inp } = x;
+  inp.power.driveArmed = 1;
+  let t = 0;
+  while (!sys.pout.driveReady) { systemsStep(sys, st, inp, 0.1); t += 0.1; }
+  inp.power.lit = 2; inp.jetPower[0] = inp.jetPower[1] = FULL_JET;
+  while (!st.thermal.inhibit) { systemsStep(sys, st, inp, 0.1); t += 0.1; }
+  return t;
+}
+
+describe('review D1: the interlock removes the heat source', () => {
+  it('after a full burn with DRIVE ARM left on, the loop never reaches NaK saturation (1 h)', () => {
+    const x = wren(), { sys, st, inp } = x;
+    const t = burnToInhibit(x);
+    inp.power.lit = 0; inp.jetPower.fill(0); // engines out (dynamics honours the inhibit); ARM stays on
+    let loopMax = 0, reactorMax = 0, tSetback = -1;
+    for (let k = 0; k < 36000; k++) {
+      systemsStep(sys, st, inp, 0.1);
+      loopMax = Math.max(loopMax, st.thermal.T[N_LOOP]); reactorMax = Math.max(reactorMax, st.thermal.T[N_REACTOR]);
+      if (tSetback < 0 && st.power.reactorP < 1e5) tSetback = k * 0.1;
+    }
+    console.log(`D1: inhibit after ${t.toFixed(1)} s of arm+burn; armed 1 h after: loop max ${loopMax.toFixed(1)} K, reactor max ${reactorMax.toFixed(1)} K, setback to < 0.1 MW in ${tSetback.toFixed(1)} s`);
+    expect(loopMax).toBeLessThan(LOOP_T_SAT);
+    expect(loopMax).toBeLessThan(SCRAM_LOOP);
+    expect(st.power.scram).toBe(0);
+    expect(tSetback).toBeLessThan(5); // 10 MW at the 10 %/s setback ramp ≈ 3.6 s
+    expect(st.thermal.T[N_LOOP]).toBeLessThan(1000);
+  });
+
+  it('armed and never lit: the standby lapses after 60 s and the loop stays far from the interlock', () => {
+    const { sys, st, inp } = wren();
+    inp.power.driveArmed = 1;
+    let readyAt = -1, loopMax = 0;
+    for (let k = 0; k < 36000; k++) {
+      systemsStep(sys, st, inp, 0.1);
+      if (readyAt < 0 && sys.pout.driveReady) readyAt = k * 0.1;
+      loopMax = Math.max(loopMax, st.thermal.T[N_LOOP]);
+      expect(st.thermal.inhibit).toBe(false);
+    }
+    console.log(`D1: armed 1 h, never lit: drive ready at ${readyAt.toFixed(1)} s, standby lapsed at 60 s, loop max ${loopMax.toFixed(0)} K`);
+    expect(sys.pout.driveReady).toBe(false);
+    expect(sys.pout.standby).toBe(false);
+    expect(st.power.reactorP).toBeLessThan(1e5);
+    expect(loopMax).toBeLessThan(700);
+    // cycling DRIVE ARM restarts the standby
+    inp.power.driveArmed = 0; systemsStep(sys, st, inp, 0.1);
+    inp.power.driveArmed = 1;
+    for (let k = 0; k < 250; k++) systemsStep(sys, st, inp, 0.1);
+    expect(sys.pout.driveReady).toBe(true);
+  });
+
+  it('arm, wait 40 s, light: the burn runs; the standby lapse is resolved inside one 120 s step', () => {
+    const { sys, st, inp } = wren();
+    inp.power.driveArmed = 1;
+    for (let k = 0; k < 400; k++) systemsStep(sys, st, inp, 0.1);
+    expect(sys.pout.driveReady).toBe(true);
+    inp.power.lit = 2; inp.jetPower[0] = inp.jetPower[1] = FULL_JET;
+    for (let k = 0; k < 600; k++) systemsStep(sys, st, inp, 0.1);
+    expect(sys.pout.driveFrac).toBe(1);
+    expect(st.thermal.inhibit).toBe(false);
+    // the lapse is resolved inside a long step (exact two-piece ramp)
+    const a = wren(), b = wren();
+    a.inp.power.driveArmed = 1; b.inp.power.driveArmed = 1;
+    for (let k = 0; k < 1200; k++) systemsStep(a.sys, a.st, a.inp, 0.1);
+    systemsStep(b.sys, b.st, b.inp, 120);
+    expect(a.st.power.reactorP).toBeLessThan(1e5); // back to the hotel load (+ charging)
+    expect(Math.abs(b.st.power.reactorP - a.st.power.reactorP)).toBeLessThan(0.02 * a.st.power.reactorP);
+  });
+
+  it('auto-scram near NaK saturation: reactor to zero within ~1 s, latched, caution and wake', () => {
+    const { sys, st, inp } = wren();
+    for (let k = 0; k < 50; k++) systemsStep(sys, st, inp, 0.1);
+    expect(st.power.reactorP).toBeGreaterThan(0);
+    for (const i of [N_LOOP, N_REACTOR, N_RAD0, N_RAD0 + 1]) st.thermal.T[i] = SCRAM_LOOP + 5; // the hot loop group
+    systemsStep(sys, st, inp, 0.1);
+    expect(st.power.scram).toBe(1);
+    expect(st.power.reactorSet).toBe(0);
+    expect(st.caution.active & (1 << C_SCRAM)).not.toBe(0);
+    expect(sys.wake & (1 << C_SCRAM)).not.toBe(0);
+    for (let k = 0; k < 10; k++) systemsStep(sys, st, inp, 0.1);
+    expect(st.power.reactorP).toBe(0);
+    st.power.reactorSet = 1; // the lever alone does not restart a scrammed reactor
+    for (let k = 0; k < 10; k++) systemsStep(sys, st, inp, 0.1);
+    expect(st.power.reactorP).toBe(0);
+    expect(sys.pout.V).toBeGreaterThan(105); // the battery carries the hotel bus
+  });
+
+  it('radiators lost: the loop heats for days on the hotel load waste; the scram stops it short of saturation', () => {
+    const { sys, st, inp } = wren();
+    inp.radiatorHealth[0] = 0; inp.radiatorHealth[1] = 0;
+    let t = 0, loopMax = 0;
+    while (!st.power.scram && t < 20 * 86400) { systemsStep(sys, st, inp, 30); t += 30; }
+    for (let k = 0; k < 2880; k++) { systemsStep(sys, st, inp, 30); loopMax = Math.max(loopMax, st.thermal.T[N_LOOP]); }
+    console.log(`D1: radiators lost: scram after ${(t / 86400).toFixed(2)} days; loop max in the day after ${loopMax.toFixed(1)} K`);
+    expect(st.power.scram).toBe(1);
+    expect(loopMax).toBeLessThan(LOOP_T_SAT);
+  });
+});
+
+describe('review D2: the thermostats hold the cabin', () => {
+  const ATT: Record<string, Rot> = {
+    inertial: INERTIAL,
+    'nose-to-sun': (x, y, z, o) => { o[0] = -z; o[1] = y; o[2] = -x; },
+    'tail-to-sun': (x, y, z, o) => { o[0] = z; o[1] = y; o[2] = x; },
+    'belly-to-sun': (x, y, z, o) => { o[0] = y; o[1] = -x; o[2] = z; },
+    'top-to-sun': (x, y, z, o) => { o[0] = y; o[1] = x; o[2] = z; },
+  };
+  const day = (rot: Rot | null, shut: number): { lo: number; hi: number; caution: number } => {
+    const { sys, st, inp } = wren();
+    inp.shutters.fill(shut);
+    let lo = Infinity, hi = -Infinity, caution = 0;
+    for (let k = 0; k < 2 * 2880; k++) { // two days at h = 30 s; the second day is judged
+      if (rot) orbitEnv(inp.env, k * 30 + 15, rot);
+      systemsStep(sys, st, inp, 30);
+      caution |= st.caution.active;
+      if (k < 2880) continue;
+      for (let r = 0; r < N_ROOMS; r++) { const T = st.thermal.T[N_ROOM0 + r]; lo = Math.min(lo, T); hi = Math.max(hi, T); }
+    }
+    return { lo, hi, caution };
+  };
+  it('294 ± 2 K for a day at h = 30 s in five attitudes with the shutters closed, and in deep space', () => {
+    const out: string[] = [];
+    for (const [name, rot] of [...Object.entries(ATT), ['deep space', null] as const]) {
+      const r = day(rot, 1);
+      out.push(`${name} ${r.lo.toFixed(1)}..${r.hi.toFixed(1)}`);
+      expect(r.lo).toBeGreaterThan(292); expect(r.hi).toBeLessThan(296);
+      expect(r.caution & ((1 << C_CABIN_COLD) | (1 << C_OVERTEMP))).toBe(0);
+    }
+    console.log(`D2 rooms, day 2, shutters closed: ${out.join('; ')}`);
+  });
+  it('shutters open: the cold attitudes still hold; open windows in direct sun out-run the coolers', () => {
+    const tail = day(ATT['tail-to-sun'], 0), deep = day(null, 0), top = day(ATT['top-to-sun'], 0);
+    console.log(`D2 shutters open: tail ${tail.lo.toFixed(1)}..${tail.hi.toFixed(1)}, deep space ${deep.lo.toFixed(1)}..${deep.hi.toFixed(1)}, top-to-sun ${top.lo.toFixed(1)}..${top.hi.toFixed(1)}`);
+    for (const r of [tail, deep]) { expect(r.lo).toBeGreaterThan(292); expect(r.hi).toBeLessThan(296); }
+    expect(top.hi).toBeGreaterThan(296);
+  });
+  it('a cold cabin raises the cabin-cold caution and wakes', () => {
+    const { sys, st, inp } = wren();
+    systemsStep(sys, st, inp, 0.1);
+    st.thermal.T[N_ROOM0 + 4] = 280;
+    systemsStep(sys, st, inp, 0.1);
+    expect(sys.wake & (1 << C_CABIN_COLD)).not.toBe(0);
+  });
+});
+
+describe('review D3: burns do not cook the engineering room', () => {
+  it('after a full burn to the interlock no room exceeds 305 K over the next 6 h; a hot room raises a caution', () => {
+    const x = wren(), { sys, st, inp } = x;
+    burnToInhibit(x);
+    inp.power.lit = 0; inp.power.driveArmed = 0; inp.jetPower.fill(0);
+    let hi = 0;
+    for (let k = 0; k < 720; k++) {
+      systemsStep(sys, st, inp, 30);
+      for (let r = 0; r < N_ROOMS; r++) hi = Math.max(hi, st.thermal.T[N_ROOM0 + r]);
+    }
+    console.log(`D3: warmest room in the 6 h after a full burn: ${hi.toFixed(1)} K`);
+    expect(hi).toBeLessThan(ROOM_CAUTION);
+    st.thermal.T[N_ROOM0 + 9] = ROOM_CAUTION + 1;
+    systemsStep(sys, st, inp, 0.1);
+    expect(sys.wake & (1 << C_OVERTEMP)).not.toBe(0);
+  });
+});
+
+describe('review D4: bad inputs cannot poison the network', () => {
+  it('h = 0, NaN or negative h is a no-op; NaN inputs are sanitised', () => {
+    const { sys, st, inp } = wren();
+    orbitEnv(inp.env, 100);
+    systemsStep(sys, st, inp, 1);
+    const before = JSON.stringify(saveSystems(st));
+    for (const h of [0, -1, NaN, Infinity]) { systemsStep(sys, st, inp, h); expect(sys.wake).toBe(0); }
+    expect(JSON.stringify(saveSystems(st))).toBe(before);
+    inp.jetPower[0] = NaN; inp.heatIn[3] = NaN; inp.env[2] = NaN; inp.env[0] = Infinity; inp.crewW[1] = NaN;
+    inp.power.demand[L_GALLEY] = NaN; inp.power.fault[2] = NaN; inp.power.lit = NaN; inp.pumpCmd = NaN; inp.shutters[0] = NaN; inp.radiatorHealth[0] = NaN;
+    for (let k = 0; k < 10; k++) systemsStep(sys, st, inp, k ? 0.1 : 30);
+    expect(st.thermal.T.every((t) => Number.isFinite(t) && t > 0)).toBe(true);
+    expect(Number.isFinite(st.power.soc)).toBe(true);
+    expect(sys.pout.V).toBeGreaterThan(105);
+  });
+  it('the interlock and the caution read a NaN temperature as over the limit', () => {
+    const { sys, st, inp } = wren();
+    systemsStep(sys, st, inp, 0.1);
+    st.thermal.T[N_LOOP] = NaN;
+    systemsStep(sys, st, inp, 0.1);
+    expect(st.thermal.inhibit).toBe(true);
+    expect(st.power.scram).toBe(1);
+    expect(st.caution.active & (1 << C_OVERTEMP)).not.toBe(0);
+  });
+});
+
+describe('review D5: every new overheat and every new trip lights the lamp again', () => {
+  it('a second hot node and a second trip each wake', () => {
+    const { sys, st, inp } = wren();
+    systemsStep(sys, st, inp, 0.1);
+    st.thermal.T[N_ROOM0 + 2] = ROOM_CAUTION + 3;
+    systemsStep(sys, st, inp, 0.1);
+    expect(sys.wake & (1 << C_OVERTEMP)).not.toBe(0);
+    st.thermal.T[N_ROOM0 + 2] = ROOM_CAUTION + 3; // still hot: no new wake
+    systemsStep(sys, st, inp, 0.1);
+    expect(sys.wake & (1 << C_OVERTEMP)).toBe(0);
+    st.thermal.T[N_ROOM0 + 2] = ROOM_CAUTION + 3;
+    st.thermal.T[N_ROOM0 + 8] = ROOM_CAUTION + 3; // a different node
+    systemsStep(sys, st, inp, 0.1);
+    expect(sys.wake & (1 << C_OVERTEMP)).not.toBe(0);
+    // two breaker trips in consecutive steps
+    inp.power.fault[4] = 1; inp.power.fault[7] = 0.2; // LIFE SUP trips in 0.07 s, UTILITY (25 A on 15 A) in 2.8 s
+    const wakes: number[] = [];
+    for (let k = 0; k < 200 && wakes.length < 2; k++) { systemsStep(sys, st, inp, 0.1); if (sys.wake & (1 << C_BREAKER)) wakes.push(sys.newTrips); }
+    expect(wakes.length).toBe(2);
+    expect(wakes[0]).not.toBe(wakes[1]);
+  });
+});
+
+describe('review D6: the radiator panel as effectiveness–NTU', () => {
+  it('radiatorG reproduces Q = ṁc_p(1 − e^−N)(T_in − T_eq) in series with the panel, 2ṁc_p → ṁc_p', () => {
+    const mcp = 18000;
+    for (const Tp of [5, 100, 330, 1100, 3000, 2e4]) {
+      const hA = 4 * RAD_EPS * SIGMA * Tp ** 3 * 26, N = hA / mcp, G = radiatorG(mcp, Tp, 26);
+      const exact = mcp * (N > 1e-12 ? -Math.expm1(-N) : N);
+      expect(Math.abs((G * hA) / (G + hA) - exact)).toBeLessThan(1e-9 * exact);
+      expect(G).toBeGreaterThan(mcp * (1 - 1e-12)); expect(G).toBeLessThanOrEqual(2 * mcp);
+    }
+    expect(radiatorG(0, 1000, 26)).toBe(0);
+    expect(radiatorG(mcp, 1000, 0)).toBe(0);
+  });
+  it('at the 1150 K interlock the panels sit near 1100 K and reject ≈ 3.6 MW', () => {
+    const x = wren(), { st } = x;
+    burnToInhibit(x);
+    const Tr = st.thermal.T[N_RAD0], Q = RAD_EPS * SIGMA * 4 * RAD_PANEL_AREA * Tr ** 4;
+    console.log(`D6: loop ${st.thermal.T[N_LOOP].toFixed(1)} K, panels ${Tr.toFixed(1)} K, rejecting ${(Q / 1e6).toFixed(2)} MW (ṁc_p ${PUMP_G_MAX} W/K per panel)`);
+    expect(Tr).toBeGreaterThan(1085);
+    expect(Q).toBeGreaterThan(3.4e6);
+  });
+});
+
+describe('review D7: room volumes', () => {
+  it('free air 314.8 m³ = the plan\'s 370.5 m³ of boxes minus 55.8 m³ of solids', () => {
+    const sum = ROOM_VOLUME.reduce((a, b) => a + b, 0);
+    expect(sum).toBeCloseTo(314.8, 1);
+  });
+});
+
+describe('review D8: the warp schedule', () => {
+  it('10 Hz at 1×; under warp whole quanta to ≈ 120 s (4 sub-steps of 29.9 s at q = 2¹¹ ticks); one quantum with the drive on', () => {
+    expect(systemsSpanTicks(1, false)).toBe(12);
+    expect(systemsSpanTicks(8, false)).toBe(12);
+    expect(systemsSpanTicks(2048, false)).toBe(7 * 2048);
+    expect(systemsSpanTicks(2048, true)).toBe(2048);
+    expect(systemsSpanTicks(65536, false)).toBe(65536);
+    // the call sequence depends on the quanta only (any frame budget sees the same quantum boundaries)
+    const st = makeSystemsState();
+    const hs: number[] = [];
+    for (let tick = 0; tick <= 2048 * 30; tick += 2048) { const h = systemsDue(st, tick, 2048, false); if (h) hs.push(h); }
+    expect(hs.length).toBe(4);
+    expect(hs.every((h) => h === (7 * 2048) / 120)).toBe(true);
   });
 });

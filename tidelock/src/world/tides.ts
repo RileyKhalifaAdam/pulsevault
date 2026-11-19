@@ -41,6 +41,12 @@ const mcos = (x: number): number => Math.cos(x);
 const msin = (x: number): number => Math.sin(x);
 
 export const Q = 1 / 120;
+/**
+ * Longest drift segment tideDelta may span while the ship thrusts (|a_s| > 0), s. Its thrust terms are a series in t:
+ * measured against RK4 at |a_s| = 9.8 m/s²: 1.2e-8 m at 5 s, 5.5e-4 m at 30 s, 0.4 m at 90 s. quasistatic.ts
+ * re-anchors thrusting segments at ≤ 5 s already; a coasting segment (a_s = 0) is exact at any length.
+ */
+export const TIDE_THRUST_SEG_MAX = 5;
 
 /** Tidal acceleration a = n²(3r̂(r̂·p) − p) at p (relative to the CoM), any consistent axes. out may alias p. */
 export function tidalAccel(n2: number, rhat: V3, p: V3, out: V3): V3 {
@@ -175,7 +181,8 @@ const FV: V3 = { x: 0, y: 0, z: 0 };
 /**
  * Add the tide to a drift closed form in place (quasistatic.ts driftEval, after its own x, v at time t since the
  * anchor): x += CW(x₀, v₀, t) − (x₀ + v₀t) − T₀a_s·t⁴/24 − Ṫ₀a_s·t⁵/40, v += CW_v − v₀ − T₀a_s·t³/6 − Ṫ₀a_s·t⁴/8.
- * aS = the ship's proper acceleration the anchor holds (inertial; quasistatic's path has −½a_s t²).
+ * aS = the ship's proper acceleration the anchor holds (inertial; quasistatic's path has −½a_s t²). With aS ≠ 0,
+ * t must stay ≤ TIDE_THRUST_SEG_MAX (the caller re-anchors); with aS = 0 it is exact at any t.
  */
 export function tideDelta(ta: TideAnchor, x0: V3, v0: V3, aS: V3, t: number, x: V3, v: V3): void {
   const n = ta.n;

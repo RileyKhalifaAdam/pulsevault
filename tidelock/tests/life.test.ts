@@ -3,13 +3,19 @@
 import { describe, expect, it } from 'vitest';
 import { INTERIORS } from '../src/data/interiors';
 import { BOUNDARY_SPACE, buildCabinNet, lumpedCabinNet, type CabinNetDef } from '../src/data/cabinNet';
-import { compileCabin, inventory, makeCabinIo, newCabin, stepCabin, type CabinIo, type CabinNet, type CabinState } from '../src/world/cabin';
+import { compileCabin, inventory, loadCabin, makeCabinIo, newCabin, saveCabin, stepCabin, type CabinIo, type CabinNet, type CabinState } from '../src/world/cabin';
 import {
-  CAU_DEPRESS, CAU_O2_TANK, CAU_P_LOW, CAU_PPCO2_HIGH, CAU_PPO2_LOW, CHX_ETA, CHX_Q, FOG_FULL, H2O_KG_DAY, H_CONV_FAN,
-  H_FG, IN_CHX, IN_FANS, IN_H, IN_REG, IN_SCRUB, METAB_REF, METAB_SLEEP, MOLAR_MASS, OUT_CAUTION, OUT_CAUTION_ROSE,
-  OUT_CO2_MADE, OUT_H2O_MADE, OUT_HYPOXIA, OUT_O2_INJECTED, OUT_O2_USED, PPO2_SET, RHO_CP_AIR, ROOM_STRIDE, R_GAS,
-  SCRUB_ETA, SCRUB_Q, S_CO2, S_H2O, S_O2, cSat, dewPoint, fogFraction, psat,
+  CABIN_CAUTIONS, CHX_ETA, CHX_Q, FOG_FULL, H2O_KG_DAY, H_CONV_FAN, H_FG, IN_CHX, IN_FANS, IN_H, IN_REG, IN_SCRUB, METAB_REF,
+  METAB_SLEEP, MOLAR_MASS, O2_TANK_FULL, OUT_CHX_HEAT, OUT_CO2_MADE, OUT_DEPRESS_MIN, OUT_H2O_MADE, OUT_HYPOXIA, OUT_O2_INJECTED,
+  OUT_O2_USED, OUT_PPCO2_MAX, OUT_PPO2_MIN, OUT_P_MIN, PPO2_SET, RHO_CP_AIR, ROOM_STRIDE, R_GAS, SCRUB_ETA, SCRUB_Q,
+  SENSIBLE_FRAC, S_CO2, S_H2O, S_O2, cSat, dewPoint, fogFraction, psat,
 } from '../src/world/life';
+import { CAUTIONS, C_CO2, C_O2, type CautionDef } from '../src/world/caution';
+
+/** caution.ts's latch rule for one CautionDef (active past `on`, inactive again only past `off`). */
+const latch = (d: CautionDef, active: boolean, v: number): boolean =>
+  d.dir > 0 ? (active ? !(v < d.off) : v > d.on) : (active ? !(v > d.off) : v < d.on);
+const cab = (id: string): CautionDef => CABIN_CAUTIONS.find((c) => c.id === id)!;
 
 const WREN = INTERIORS.wren!;
 const roomIdx = (id: string): number => WREN.rooms.findIndex((r) => r.id === id);
@@ -51,8 +57,9 @@ describe('metabolism at the real rates', () => {
     expect(po2 - io.ppO2[0]).toBeCloseTo(172.6, 0);
     // sensible heat to the room air: metabolic minus the latent heat leaving as vapour
     expect(io.roomHeat[0]).toBeCloseTo(METAB_REF - H2O_KG_DAY / DAY * H_FG, 6);
+    expect(io.roomHeat[0]).toBeCloseTo(METAB_REF * SENSIBLE_FRAC, 9);
   });
-  it('in the Wren (314.8 m³ of free air) CO₂ rises 176 Pa/day with the scrubber off, fans mixing', () => {
+  it('in the Wren (315.7 m³ of free air) CO₂ rises 175.5 Pa/day with the scrubber off, fans mixing', () => {
     const net = compileCabin(buildCabinNet(WREN));
     const st = newCabin(net, 293.15), io = makeCabinIo(net);
     io.roomT.fill(293.15); io.paneT.fill(293.15);
@@ -62,7 +69,7 @@ describe('metabolism at the real rates', () => {
     const mean = (): number => { let n = 0, v = 0; for (let i = 0; i < net.nR; i++) { n += st.rooms[i * ROOM_STRIDE + S_CO2]; v += net.V[i]; } return n * R_GAS * 293.15 / v; };
     const c0 = mean();
     for (let n = 0; n < DAY / 10; n++) stepCabin(net, st, io);
-    expect(mean() - c0).toBeCloseTo(149.5 * 370.5 / 314.8, 0);
+    expect(mean() - c0).toBeCloseTo(149.5 * 370.5 / 315.70, 0);
   });
   it('consumables are exact under warp: the same O₂ breathed at h = 0.1 s and h = 10 s', () => {
     const a = lumped(50), b = lumped(50);
@@ -84,6 +91,13 @@ describe('metabolism at the real rates', () => {
     expect(hyp).toBe(1);
     expect(st.rooms[S_O2]).toBeGreaterThanOrEqual(0);
     expect(io.ppO2[0]).toBeLessThan(1);
+    // review D8: aerobic metabolism stops with the O₂: no more vapour, no more heat, so a vented or sealed ship
+    // does not grow fog without bound
+    const w0 = st.rooms[S_H2O];
+    for (let n = 0; n < 100; n++) stepCabin(net, st, io);
+    expect(io.out[OUT_H2O_MADE]).toBeLessThan(1e-9 * H2O_KG_DAY);
+    expect(io.roomHeat[0]).toBeLessThan(1e-6);
+    expect(st.rooms[S_H2O] - w0).toBeLessThan(1e-9);
   });
 });
 
@@ -162,19 +176,52 @@ describe('fog on cold panes', () => {
     expect(io.paneHeat[0]).toBe(0);
     expect(Math.abs(water() / w0 - 1)).toBeLessThan(1e-12);
   });
+  it('review D1: a fogged 0.45 m² cabin window warmed to 300 K evaporates at h = 10 s without creating water', () => {
+    for (const A of [0.45, 3.6]) {
+      const def: CabinNetDef = lumpedCabinNet(20);
+      def.panes.push({ id: 'w', room: 0, A });
+      const net = compileCabin(def);
+      const st = newCabin(net, 294), io = makeCabinIo(net);
+      io.roomT.fill(294);
+      off(io);
+      const water = (): number => { const v = new Float64Array(4); inventory(net, st, v); return v[S_H2O]; };
+      const w0 = water();
+      io.paneT[0] = 275; io.inp[IN_H] = 10;
+      for (let n = 0; n < 1000; n++) stepCabin(net, st, io);
+      expect(st.fog[0]).toBeGreaterThan(0);
+      expect(Math.abs(water() / w0 - 1)).toBeLessThan(1e-12);
+      // the dry-out time at h = 10 s against h = 0.1 s
+      const dry = (h: number): number => {
+        const s2 = loadCabin(net, saveCabin(st).cabin, saveCabin(st).life), io2 = makeCabinIo(net);
+        io2.roomT.fill(294); off(io2); io2.paneT[0] = 300; io2.inp[IN_H] = h;
+        let t = 0;
+        while (s2.fog[0] > 0 && t < 1e5) { stepCabin(net, s2, io2); t += h; }
+        const v = new Float64Array(4); inventory(net, s2, v);
+        expect(Math.abs(v[S_H2O] / w0 - 1)).toBeLessThan(1e-12);
+        return t;
+      };
+      const t1 = dry(0.1), t10 = dry(10);
+      console.log(`pane ${A} m²: dries in ${t1.toFixed(1)} s at h = 0.1 s, ${t10.toFixed(1)} s at h = 10 s`);
+      expect(Math.abs(t10 / t1 - 1)).toBeLessThan(0.02); // backward Euler, first order (was 24 s early at A = 3.6)
+    }
+  });
 });
 
-describe('cautions', () => {
-  it('a sleeper in a closed-off cabin with the fans off pools CO₂ to the 1 kPa caution in hours; it rises once and wakes them', () => {
+describe('caution values (caution.ts latches them)', () => {
+  const dCO2 = CAUTIONS[C_CO2], dO2 = CAUTIONS[C_O2];
+  it('a sleeper in a closed-off cabin with the fans off pools CO₂ to the 1 kPa caution in hours; it rises once', () => {
+    expect(dCO2.on).toBe(1000);
     const net = compileCabin(buildCabinNet(WREN));
     const st = newCabin(net), io = makeCabinIo(net);
     io.inp[IN_FANS] = 0;
     io.metab[roomIdx('cabin-port')] = METAB_SLEEP;
     io.inp[IN_H] = 10;
-    let rose = 0, tRise = -1;
+    let rose = 0, tRise = -1, on = false;
     for (let n = 0; n < 2 * 8640; n++) {
       stepCabin(net, st, io);
-      if (io.out[OUT_CAUTION_ROSE] & CAU_PPCO2_HIGH) { rose++; if (tRise < 0) tRise = (n + 1) * 10; }
+      const next = latch(dCO2, on, io.out[OUT_PPCO2_MAX]);
+      if (next && !on) { rose++; if (tRise < 0) tRise = (n + 1) * 10; }
+      on = next;
     }
     expect(rose).toBe(1);
     expect(tRise / 3600).toBeGreaterThan(3);
@@ -183,40 +230,58 @@ describe('cautions', () => {
     const st2 = newCabin(net), io2 = makeCabinIo(net);
     io2.metab[roomIdx('cabin-port')] = METAB_SLEEP;
     io2.inp[IN_H] = 10;
-    for (let n = 0; n < 2 * 8640; n++) { stepCabin(net, st2, io2); expect(io2.out[OUT_CAUTION]).toBe(0); }
+    for (let n = 0; n < 2 * 8640; n++) { stepCabin(net, st2, io2); expect(io2.out[OUT_PPCO2_MAX]).toBeLessThan(dCO2.on); }
   });
-  it('low ppO₂ latches below 16 kPa and clears above 16.5 kPa (hysteresis); a low tank is a caution', () => {
+  it('low ppO₂ is the worst monitored room; it latches below 16 kPa and clears above 16.5 kPa; a low tank', () => {
     const { net, st, io } = lumped(20);
     io.inp[IN_REG] = 0;
     io.metab[0] = METAB_REF;
     io.inp[IN_H] = 10;
-    let t = 0;
-    while (!(io.out[OUT_CAUTION] & CAU_PPO2_LOW)) { stepCabin(net, st, io); t += 10; if (t > 10 * DAY) break; }
+    let t = 0, on = false;
+    stepCabin(net, st, io);
+    while (!(on = latch(dO2, on, io.out[OUT_PPO2_MIN]))) { stepCabin(net, st, io); t += 10; if (t > 10 * DAY) break; }
     expect(io.ppO2[0]).toBeLessThan(16000);
     expect(io.ppO2[0]).toBeGreaterThan(15900);
+    expect(io.out[OUT_PPO2_MIN]).toBe(io.ppO2[0]);
     io.inp[IN_REG] = 1;
     st.o2Tank = 5;
     stepCabin(net, st, io);
-    expect(io.ppO2[0]).toBeGreaterThan(16000); // the regulator is lifting it (cap 1 g/s)
     let cleared = false;
     for (let n = 0; n < 200 && !cleared; n++) {
       stepCabin(net, st, io);
-      if (!(io.out[OUT_CAUTION] & CAU_PPO2_LOW)) { cleared = true; expect(io.ppO2[0]).toBeGreaterThan(16500); }
+      on = latch(dO2, on, io.out[OUT_PPO2_MIN]);
+      if (!on) { cleared = true; expect(io.ppO2[0]).toBeGreaterThan(16500); }
     }
     expect(cleared).toBe(true);
-    expect(io.out[OUT_CAUTION] & CAU_O2_TANK).toBe(CAU_O2_TANK);
+    expect(latch(cab('o2-tank'), false, st.o2Tank / O2_TANK_FULL)).toBe(true);
+    // an unmonitored room (the airlock being pumped) does not count; no monitored room gives neutral values
+    io.monitor[0] = 0;
+    stepCabin(net, st, io);
+    expect(io.out[OUT_PPO2_MIN]).toBe(dO2.neutral);
   });
-  it('a 0.01 m² breach sets the rapid-depress caution at once and the low-pressure caution soon after', () => {
+  it('a 0.01 m² breach: rapid-depress at once, low pressure soon after', () => {
     const def = buildCabinNet(WREN, { extra: [{ id: 'breach', a: 'lounge', b: 'space', A: 0.01, open0: 1 }] });
     const net = compileCabin(def);
     const st = newCabin(net), io = makeCabinIo(net);
     io.inp[IN_H] = 0.1;
     stepCabin(net, st, io);
-    expect(io.out[OUT_CAUTION_ROSE] & CAU_DEPRESS).toBe(CAU_DEPRESS);
-    let t = 0.1;
-    while (!(io.out[OUT_CAUTION] & CAU_P_LOW)) { stepCabin(net, st, io); t += 0.1; }
+    expect(latch(cab('cabin-depress'), false, io.out[OUT_DEPRESS_MIN])).toBe(true);
+    let t = 0.1, on = false;
+    while (!(on = latch(cab('cabin-p-low'), on, io.out[OUT_P_MIN]))) { stepCabin(net, st, io); t += 0.1; }
     expect(t).toBeGreaterThan(10);
     expect(t).toBeLessThan(60); // τ = V/(C_d·A·c*) ≈ 230 s; 90 kPa after ≈ 27 s
+  });
+  it('review D6: a step of h = 0 changes nothing and writes no NaN', () => {
+    const { net, st, io } = lumped(30);
+    io.metab[0] = 150;
+    io.inp[IN_H] = 10;
+    for (let n = 0; n < 100; n++) stepCabin(net, st, io);
+    const before = JSON.stringify(saveCabin(st));
+    io.inp[IN_H] = 0;
+    stepCabin(net, st, io);
+    expect(JSON.stringify(saveCabin(st))).toBe(before);
+    for (const v of io.out) expect(Number.isFinite(v)).toBe(true);
+    expect(io.out[OUT_CHX_HEAT]).toBe(0);
   });
 });
 

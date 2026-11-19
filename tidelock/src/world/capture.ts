@@ -240,9 +240,10 @@ const VW = new Float64Array(12);
 /** Geometry: pc, rA, rB, a, u, w (port axes world), dW, vrel, theta(world), wrel. */
 const GW = new Float64Array(30);
 const MAX_ROWS = 9;
-const RS = 24;
+const RS = 26;
 // Row layout: 0-2 n, 3-5 (rA×n | n), 6-8 IA⁻¹(..), 9-11 (rB×n | n), 12-14 IB⁻¹(..), 15 K, 16 bias, 17 gamma, 18 lambda,
-// 19 type (0 lin, 1 ang), 20 clamp (0 none, 1 λ≥0, −1 λ≤0, 2 |λ|≤μλax, 3 |λ|≤Rλax), 21 role (0 ring lin, 1 ring ang, 2 stop)
+// 19 type (0 lin, 1 ang), 20 clamp (0 none, 1 λ≥0, −1 λ≤0, 2 |λ|≤μλax), 21 role (0 ring lin, 1 ring ang, 2 stop,
+// 3 friction), 22 k (0 = rigid), 23 C, 24 Jv before the solve, 25 spare
 const ROWS = new Float64Array(MAX_ROWS * RS);
 let nRows = 0, axialRow = -1;
 
@@ -276,13 +277,42 @@ function addRow(type: number, nx: number, ny: number, nz: number, C: number, k: 
   let K = ax * R[o + 6] + ay * R[o + 7] + az * R[o + 8] + bx * R[o + 12] + by * R[o + 13] + bz * R[o + 14];
   if (type === 0) K += invMA + invMB;
   R[o + 15] = K;
-  if (k === Infinity) { R[o + 16] = 0; R[o + 17] = 0; } else {
+  if (k === Infinity) { R[o + 16] = 0; R[o + 17] = 0; R[o + 22] = 0; } else {
     const c = 2 * zeta * msqrt(k / K), den = c + h * k;
     R[o + 16] = (k * C) / den;
     R[o + 17] = 1 / (h * den);
+    R[o + 22] = k;
   }
-  R[o + 18] = 0; R[o + 19] = type; R[o + 20] = clamp; R[o + 21] = role;
+  R[o + 18] = 0; R[o + 19] = type; R[o + 20] = clamp; R[o + 21] = role; R[o + 23] = C;
+  R[o + 24] = rowVel(o);
   return nRows++;
+}
+
+/** Jv of the row at offset o with the working velocities. */
+function rowVel(o: number): number {
+  const R = ROWS, V = VW;
+  if (R[o + 19] === 0) {
+    // n·(vA − vB) + (rA×n)·ωA − (rB×n)·ωB
+    return R[o] * (V[0] - V[6]) + R[o + 1] * (V[1] - V[7]) + R[o + 2] * (V[2] - V[8]) +
+      R[o + 3] * V[3] + R[o + 4] * V[4] + R[o + 5] * V[5] - R[o + 9] * V[9] - R[o + 10] * V[10] - R[o + 11] * V[11];
+  }
+  return R[o] * (V[3] - V[9]) + R[o + 1] * (V[4] - V[10]) + R[o + 2] * (V[5] - V[11]);
+}
+
+/**
+ * Energy each row took out of the pair this step and did not store in its spring (J, ≥ 0 for a row on its own):
+ * −λ·(Jv₀ + Jv₁)/2 − ½k·((C + h·Jv₁)² − C²). Stop rows -> io.energy (structure), the rest -> io.heat.
+ */
+function dissipation(io: RingIO, h: number): void {
+  let eS = 0, eH = 0;
+  for (let i = 0; i < nRows; i++) {
+    const o = i * RS, l = ROWS[o + 18], j0 = ROWS[o + 24], j1 = rowVel(o), k = ROWS[o + 22], C = ROWS[o + 23];
+    const c1 = C + h * j1;
+    const e = -0.5 * l * (j0 + j1) - (k > 0 ? 0.5 * k * (c1 * c1 - C * C) : 0);
+    if (ROWS[o + 21] === 2) eS += e; else eH += e;
+  }
+  io.energy = eS > 0 ? eS : 0;
+  io.heat = eH > 0 ? eH : 0;
 }
 
 function solveRows(iterations: number, invMA: number, invMB: number): void {
@@ -290,20 +320,13 @@ function solveRows(iterations: number, invMA: number, invMB: number): void {
   for (let it = 0; it < iterations; it++) {
     for (let i = 0; i < nRows; i++) {
       const o = i * RS, type = R[o + 19];
-      let jv: number;
-      if (type === 0) {
-        // n·(vA − vB) + (rA×n)·ωA − (rB×n)·ωB
-        jv = R[o] * (V[0] - V[6]) + R[o + 1] * (V[1] - V[7]) + R[o + 2] * (V[2] - V[8]) +
-          R[o + 3] * V[3] + R[o + 4] * V[4] + R[o + 5] * V[5] - R[o + 9] * V[9] - R[o + 10] * V[10] - R[o + 11] * V[11];
-      } else {
-        jv = R[o] * (V[3] - V[9]) + R[o + 1] * (V[4] - V[10]) + R[o + 2] * (V[5] - V[11]);
-      }
+      const jv = rowVel(o);
       const lam0 = R[o + 18];
       let lam = lam0 - (jv + R[o + 16] + R[o + 17] * lam0) / (R[o + 15] + R[o + 17]);
       const cl = R[o + 20];
-      if (cl === 1) { if (lam < 0) lam = 0; } else if (cl === -1) { if (lam > 0) lam = 0; } else if (cl >= 2) {
+      if (cl === 1) { if (lam < 0) lam = 0; } else if (cl === -1) { if (lam > 0) lam = 0; } else if (cl === 2) {
         const ax = axialRow >= 0 ? R[axialRow * RS + 18] : 0;
-        const lim = (cl === 2 ? GUIDE_MU : RING_RADIUS) * (ax > 0 ? ax : 0);
+        const lim = RING_MU * (ax > 0 ? ax : 0);
         if (lam > lim) lam = lim; else if (lam < -lim) lam = -lim;
       }
       const d = lam - lam0;
@@ -386,21 +409,39 @@ function latchedRotation(A: ContactBody, B: ContactBody, refQ: Quat): void {
   TH[0] = RB[0] * tx + RB[1] * ty + RB[2] * tz; TH[1] = RB[3] * tx + RB[4] * ty + RB[5] * tz; TH[2] = RB[6] * tx + RB[7] * ty + RB[8] * tz;
 }
 
-/** refQ at capture: the current relative attitude with its swing removed (axes opposed exactly, roll kept). */
+/** refQ at capture: the current relative attitude, swing included (the ring deflects with the collar). */
 function captureRef(A: ContactBody, B: ContactBody, s: CaptureState): void {
-  swingVector(TH);
-  // the swing in station axes: Rbᵀ·θ; refQ = q(−swing) ⊗ R_rel (station-local)
-  const tx = RB[0] * TH[0] + RB[3] * TH[1] + RB[6] * TH[2], ty = RB[1] * TH[0] + RB[4] * TH[1] + RB[7] * TH[2], tz = RB[2] * TH[0] + RB[5] * TH[1] + RB[8] * TH[2];
-  const ang = msqrt(tx * tx + ty * ty + tz * tz), sn = ang > 1e-15 ? msin(-0.5 * ang) / ang : 0;
-  QS.x = tx * sn; QS.y = ty * sn; QS.z = tz * sn; QS.w = mcos(0.5 * ang);
-  const bx = -B.q.x, by = -B.q.y, bz = -B.q.z, bw = B.q.w, a = A.q;
-  QR.x = bw * a.x + bx * a.w + by * a.z - bz * a.y; QR.y = bw * a.y - bx * a.z + by * a.w + bz * a.x;
-  QR.z = bw * a.z + bx * a.y - by * a.x + bz * a.w; QR.w = bw * a.w - bx * a.x - by * a.y - bz * a.z;
-  const r = s.refQ;
-  r.x = QS.w * QR.x + QS.x * QR.w + QS.y * QR.z - QS.z * QR.y;
-  r.y = QS.w * QR.y - QS.x * QR.z + QS.y * QR.w + QS.z * QR.x;
-  r.z = QS.w * QR.z + QS.x * QR.y - QS.y * QR.x + QS.z * QR.w;
-  r.w = QS.w * QR.w - QS.x * QR.x - QS.y * QR.y - QS.z * QR.z;
+  const bx = -B.q.x, by = -B.q.y, bz = -B.q.z, bw = B.q.w, a = A.q, r = s.refQ;
+  r.x = bw * a.x + bx * a.w + by * a.z - bz * a.y; r.y = bw * a.y - bx * a.z + by * a.w + bz * a.x;
+  r.z = bw * a.z + bx * a.y - by * a.x + bz * a.w; r.w = bw * a.w - bx * a.x - by * a.y - bz * a.z;
+}
+
+/**
+ * Move the ring's references toward centre over h: refOff toward 0 at REF_SLEW_V, refQ's swing (the collar axis,
+ * station axes, against −portDir) toward 0 at REF_SLEW_W about the swing axis (roll kept). Returns true once centred.
+ */
+function slewRef(g: RingGeom, s: CaptureState, h: number): boolean {
+  const o = s.refOff, ol = msqrt(o.x * o.x + o.y * o.y), dv = REF_SLEW_V * h;
+  if (ol <= dv) { o.x = 0; o.y = 0; } else { const k = (ol - dv) / ol; o.x *= k; o.y *= k; }
+  // collar axis in station axes: refQ·collarDir
+  const q = s.refQ, d = g.collarDir;
+  const tx = 2 * (q.y * d.z - q.z * d.y), ty = 2 * (q.z * d.x - q.x * d.z), tz = 2 * (q.x * d.y - q.y * d.x);
+  const cx = d.x + q.w * tx + (q.y * tz - q.z * ty), cy = d.y + q.w * ty + (q.z * tx - q.x * tz), cz = d.z + q.w * tz + (q.x * ty - q.y * tx);
+  const P = g.portDir, px = -P.x, py = -P.y, pz = -P.z;
+  // axis c × (−dir), angle atan2(|·|, c·(−dir))
+  const ax = cy * pz - cz * py, ay = cz * px - cx * pz, az = cx * py - cy * px;
+  const sn = msqrt(ax * ax + ay * ay + az * az), ang = matan2(sn, cx * px + cy * py + cz * pz);
+  const dw = REF_SLEW_W * h;
+  if (ang > 1e-12 && sn > 1e-15) {
+    const st = ang < dw ? ang : dw, k = msin(0.5 * st) / sn;
+    const sx = ax * k, sy = ay * k, sz = az * k, sw = mcos(0.5 * st);
+    const rx = sw * q.x + sx * q.w + sy * q.z - sz * q.y, ry = sw * q.y - sx * q.z + sy * q.w + sz * q.x;
+    const rz = sw * q.z + sx * q.y - sy * q.x + sz * q.w, rw = sw * q.w - sx * q.x - sy * q.y - sz * q.z;
+    const l = msqrt(rx * rx + ry * ry + rz * rz + rw * rw);
+    q.x = rx / l; q.y = ry / l; q.z = rz / l; q.w = rw / l;
+    return ol <= dv && ang <= dw;
+  }
+  return ol <= dv;
 }
 
 /** Port-axes read-outs of the deviation, relative velocity, rotation and rate into the state. */
@@ -437,13 +478,15 @@ function writeBack(A: ContactBody, B: ContactBody, io: RingIO): void {
 const ITER = 4;
 
 /**
- * One step of the ring between ship A and station B over io.h (after both were advanced to this time): engagement,
- * the envelope test at first contact, the ring rows (soft constraints, implicit), stops, guidance limits, phase
- * changes, latch-load check. Writes A and B velocities in place and the impulses into io. Returns a CAP_* code.
+ * One step of the ring between ship A and station B over io.h, called at the START of that span (both bodies then
+ * drift over it): engagement, the envelope test at first contact, the rows (soft constraints, implicit), stops,
+ * friction, reference slew, phase changes, latch-load check, dissipation. Writes A and B velocities in place and the
+ * impulses and energies into io. Returns a CAP_* code. h ≤ 0 / NaN / ∞: CAP_NONE, nothing touched.
  */
 export function captureStep(g: RingGeom, s: CaptureState, A: ContactBody, B: ContactBody, io: RingIO): number {
   const h = io.h;
-  io.J.x = io.J.y = io.J.z = 0; io.L.x = io.L.y = io.L.z = 0;
+  io.J.x = io.J.y = io.J.z = 0; io.L.x = io.L.y = io.L.z = 0; io.energy = 0; io.heat = 0;
+  if (!(h > 0 && h < Infinity)) return CAP_NONE;
   if (s.latched && s.phase === 'hard') return CAP_NONE;
   const invMA = A.invMass, invMB = B.invMass;
   // the hook motor draws the ring in while it can (load from the last step)
@@ -451,17 +494,27 @@ export function captureStep(g: RingGeom, s: CaptureState, A: ContactBody, B: Con
     const e = s.ext - HOOK_SPEED * h;
     s.ext = e > 0 ? e : 0;
   }
+  const centred = s.latched ? slewRef(g, s, h) : false;
   geometry(g, A, B, s.latched ? s.ext : RING_EXT);
   const ax = GW[9], ay = GW[10], az = GW[11], ux = GW[12], uy = GW[13], uz = GW[14], wx = GW[15], wy = GW[16], wz = GW[17];
   const dx = GW[18], dy = GW[19], dz = GW[20];
   const sx = dx * ux + dy * uy + dz * uz, sy = dx * wx + dy * wy + dz * wz, sa = dx * ax + dy * ay + dz * az; // sa < 0: compressed
   const lat = msqrt(sx * sx + sy * sy);
   const cosAng = -(GW[24] * ax + GW[25] * ay + GW[26] * az);
+  // the collar's lowest rim point toward the ring: e = −(a − (a·cw)·cw)/|…| (none when the axes are opposed)
+  const cwx = GW[24], cwy = GW[25], cwz = GW[26], acw = ax * cwx + ay * cwy + az * cwz;
+  let ex = ax - acw * cwx, ey = ay - acw * cwy, ez = az - acw * cwz;
+  const el = msqrt(ex * ex + ey * ey + ez * ez);
+  if (el > 1e-12) { const k = -RING_RADIUS / el; ex *= k; ey *= k; ez *= k; } else { ex = ey = ez = 0; }
+  const saRim = sa + ex * ax + ey * ay + ez * az; // = sa − R·sin(tilt)
+  // its closing rate along a (relative velocity at the rim point: v_pc + ω_rel × e), for the speculative contact
+  const vRim = (GW[21] + GW[28] * ez - GW[29] * ey) * ax + (GW[22] + GW[29] * ex - GW[27] * ez) * ay + (GW[23] + GW[27] * ey - GW[28] * ex) * az;
   let code = CAP_NONE;
   if (s.latched) latchedRotation(A, B, s.refQ); else swingVector(TH);
   readouts(s, TH);
   if (!s.latched) {
-    const touching = sa < 0 && lat <= RING_CATCH && cosAng >= COS_ENGAGE;
+    // touching within this span (speculative: the implicit row then starts the force when the face is reached)
+    const touching = saRim + h * (vRim < 0 ? vRim : 0) < 0 && lat <= RING_CATCH && cosAng >= COS_ENGAGE;
     if (!touching) {
       const was = s.engaged;
       s.engaged = false; s.load = s.shear = s.moment = 0;
@@ -475,6 +528,7 @@ export function captureStep(g: RingGeom, s: CaptureState, A: ContactBody, B: Con
       code = CAP_CONTACT;
       if (io.armed && io.collarOk && lat <= CAP_LATERAL && io.angle <= CAP_ANGLE && io.closing <= CAP_SPEED) {
         s.latched = true; s.phase = 'soft'; s.ext = RING_EXT; s.dwell = 0;
+        s.refOff.x = sx; s.refOff.y = sy; s.refOff.z = 0;
         captureRef(A, B, s);
         latchedRotation(A, B, s.refQ);
         readouts(s, TH);
@@ -482,23 +536,32 @@ export function captureStep(g: RingGeom, s: CaptureState, A: ContactBody, B: Con
       }
     }
   }
-  // rows
   nRows = 0; axialRow = -1;
   const L = s.latched;
-  axialRow = addRow(0, ax, ay, az, sa, RING_K, RING_ZETA, L ? 0 : 1, 0, h, invMA, invMB);
-  addRow(0, ux, uy, uz, sx, RING_K, RING_ZETA, L ? 0 : 2, 0, h, invMA, invMB);
-  addRow(0, wx, wy, wz, sy, RING_K, RING_ZETA, L ? 0 : 2, 0, h, invMA, invMB);
-  const tu = TH[0] * ux + TH[1] * uy + TH[2] * uz, tw = TH[0] * wx + TH[1] * wy + TH[2] * wz;
-  addRow(1, ux, uy, uz, tu, RING_KT, RING_ZETA, L ? 0 : 3, 1, h, invMA, invMB);
-  addRow(1, wx, wy, wz, tw, RING_KT, RING_ZETA, L ? 0 : 3, 1, h, invMA, invMB);
-  if (L) addRow(1, ax, ay, az, TH[0] * ax + TH[1] * ay + TH[2] * az, RING_KT, RING_ZETA, 0, 1, h, invMA, invMB);
-  if (sa < -RING_STROKE) addRow(0, ax, ay, az, sa + RING_STROKE, STOP_K, STOP_ZETA, 1, 2, h, invMA, invMB);
-  else if (L && sa > RING_STROKE) addRow(0, ax, ay, az, sa - RING_STROKE, STOP_K, STOP_ZETA, -1, 2, h, invMA, invMB);
-  if (lat > RING_STROKE) {
-    const k = 1 / lat;
-    addRow(0, (sx * ux + sy * wx) * k, (sx * uy + sy * wy) * k, (sx * uz + sy * wz) * k, lat - RING_STROKE, STOP_K, STOP_ZETA, -1, 2, h, invMA, invMB);
+  if (!L) {
+    // bumper at the rim point: unilateral face row, Coulomb friction across it, the axial stop
+    GW[3] += ex; GW[4] += ey; GW[5] += ez; GW[6] += ex; GW[7] += ey; GW[8] += ez;
+    axialRow = addRow(0, ax, ay, az, saRim, RING_K, RING_ZETA, 1, 0, h, invMA, invMB);
+    addRow(0, ux, uy, uz, 0, Infinity, 0, 2, 3, h, invMA, invMB);
+    addRow(0, wx, wy, wz, 0, Infinity, 0, 2, 3, h, invMA, invMB);
+    if (saRim < -RING_STROKE) addRow(0, ax, ay, az, saRim + RING_STROKE, STOP_K, STOP_ZETA, 1, 2, h, invMA, invMB);
+  } else {
+    axialRow = addRow(0, ax, ay, az, sa, RING_K, RING_ZETA, 0, 0, h, invMA, invMB);
+    addRow(0, ux, uy, uz, sx - s.refOff.x, RING_K, RING_ZETA, 0, 0, h, invMA, invMB);
+    addRow(0, wx, wy, wz, sy - s.refOff.y, RING_K, RING_ZETA, 0, 0, h, invMA, invMB);
+    const tu = TH[0] * ux + TH[1] * uy + TH[2] * uz, tw = TH[0] * wx + TH[1] * wy + TH[2] * wz, ta = TH[0] * ax + TH[1] * ay + TH[2] * az;
+    addRow(1, ux, uy, uz, tu, RING_KT, RING_ZETA, 0, 1, h, invMA, invMB);
+    addRow(1, wx, wy, wz, tw, RING_KT, RING_ZETA, 0, 1, h, invMA, invMB);
+    addRow(1, ax, ay, az, ta, RING_KT, RING_ZETA, 0, 1, h, invMA, invMB);
+    if (sa < -RING_STROKE) addRow(0, ax, ay, az, sa + RING_STROKE, STOP_K, STOP_ZETA, 1, 2, h, invMA, invMB);
+    else if (sa > RING_STROKE) addRow(0, ax, ay, az, sa - RING_STROKE, STOP_K, STOP_ZETA, -1, 2, h, invMA, invMB);
+    if (lat > RING_STROKE) {
+      const k = 1 / lat;
+      addRow(0, (sx * ux + sy * wx) * k, (sx * uy + sy * wy) * k, (sx * uz + sy * wz) * k, lat - RING_STROKE, STOP_K, STOP_ZETA, -1, 2, h, invMA, invMB);
+    }
   }
   solveRows(ITER, invMA, invMB);
+  dissipation(io, h);
   writeBack(A, B, io);
   // loads through the ring over the step (N, N·m), port axes
   const Jx = io.J.x, Jy = io.J.y, Jz = io.J.z;
@@ -511,10 +574,10 @@ export function captureStep(g: RingGeom, s: CaptureState, A: ContactBody, B: Con
     s.latched = false; s.phase = 'soft'; s.dwell = 0;
     return CAP_BREAK;
   }
-  // phase changes
+  // phase changes (settling counts only once the references are centred)
   const vr = msqrt(GW[21] * GW[21] + GW[22] * GW[22] + GW[23] * GW[23]), wr = msqrt(GW[27] * GW[27] + GW[28] * GW[28] + GW[29] * GW[29]);
   if (s.phase === 'soft') {
-    s.dwell = vr < SETTLE_V && wr < SETTLE_W ? s.dwell + h : 0;
+    s.dwell = centred && vr < SETTLE_V && wr < SETTLE_W ? s.dwell + h : 0;
     if (s.dwell >= SETTLE_T && code === CAP_NONE) { s.phase = 'retract'; s.dwell = 0; return CAP_RETRACT; }
   } else if (s.phase === 'retract' && s.ext === 0) {
     const off = msqrt(dx * dx + dy * dy + dz * dz), th = msqrt(TH[0] * TH[0] + TH[1] * TH[1] + TH[2] * TH[2]);
@@ -525,7 +588,8 @@ export function captureStep(g: RingGeom, s: CaptureState, A: ContactBody, B: Con
 
 /**
  * Make the joint rigid (CAP_HARD): one momentum-conserving impulse pair that removes the remaining relative velocity
- * at the collar point and the relative rotation rate, then the caller pins the pose kinematically. io gets the impulses.
+ * at the collar point and the relative rotation rate, then the caller pins the pose kinematically. io gets the
+ * impulses (and the kinetic energy removed as io.heat).
  */
 export function captureHarden(g: RingGeom, s: CaptureState, A: ContactBody, B: ContactBody, io: RingIO): void {
   const invMA = A.invMass, invMB = B.invMass;
@@ -533,11 +597,37 @@ export function captureHarden(g: RingGeom, s: CaptureState, A: ContactBody, B: C
   nRows = 0; axialRow = -1;
   for (let k = 0; k < 3; k++) {
     const o = 9 + 3 * k;
-    addRow(0, GW[o], GW[o + 1], GW[o + 2], 0, Infinity, 0, 0, 0, io.h, invMA, invMB);
-    addRow(1, GW[o], GW[o + 1], GW[o + 2], 0, Infinity, 0, 0, 1, io.h, invMA, invMB);
+    addRow(0, GW[o], GW[o + 1], GW[o + 2], 0, Infinity, 0, 0, 0, 1, invMA, invMB);
+    addRow(1, GW[o], GW[o + 1], GW[o + 2], 0, Infinity, 0, 0, 1, 1, invMA, invMB);
   }
   solveRows(16, invMA, invMB);
+  dissipation(io, 1);
   writeBack(A, B, io);
+}
+
+/**
+ * Elastic energy stored in the ring (and its stops) at the bodies' current poses, J: ½k·C² over the rows the next
+ * step would build (latched: axial, lateral − refOff, rotation; free: the rim face row while touching). For checks.
+ */
+export function capturePotential(g: RingGeom, s: CaptureState, A: ContactBody, B: ContactBody): number {
+  geometry(g, A, B, s.latched ? s.ext : RING_EXT);
+  const ax = GW[9], ay = GW[10], az = GW[11], ux = GW[12], uy = GW[13], uz = GW[14], wx = GW[15], wy = GW[16], wz = GW[17];
+  const dx = GW[18], dy = GW[19], dz = GW[20];
+  const sx = dx * ux + dy * uy + dz * uz, sy = dx * wx + dy * wy + dz * wz, sa = dx * ax + dy * ay + dz * az;
+  const stop = (c: number): number => 0.5 * STOP_K * c * c;
+  if (!s.latched) {
+    const acw = ax * GW[24] + ay * GW[25] + az * GW[26];
+    const px = ax - acw * GW[24], py = ay - acw * GW[25], pz = az - acw * GW[26];
+    const saRim = sa - RING_RADIUS * msqrt(px * px + py * py + pz * pz);
+    if (!(saRim < 0)) return 0;
+    return 0.5 * RING_K * saRim * saRim + (saRim < -RING_STROKE ? stop(saRim + RING_STROKE) : 0);
+  }
+  latchedRotation(A, B, s.refQ);
+  const lx = sx - s.refOff.x, ly = sy - s.refOff.y, lat = msqrt(sx * sx + sy * sy);
+  let E = 0.5 * RING_K * (sa * sa + lx * lx + ly * ly) + 0.5 * RING_KT * (TH[0] * TH[0] + TH[1] * TH[1] + TH[2] * TH[2]);
+  if (sa < -RING_STROKE) E += stop(sa + RING_STROKE); else if (sa > RING_STROKE) E += stop(sa - RING_STROKE);
+  if (lat > RING_STROKE) E += stop(lat - RING_STROKE);
+  return E;
 }
 
 /** Gap between the collar and the ring face along the port axis (m, ≥ 0 apart; for proximityLimit). */

@@ -16,6 +16,11 @@
 // keeping the samples outside all other parts (tests/damage.test.ts re-measures them; agreement within 15%).
 // Radius: local radius of curvature for stagnation heating (q ∝ 1/√R): leading edges and the nose small, flat
 // panels large. Panel capacity = energyDensity (1–5 MJ/m³, crushable structure) × area × crushDepth.
+// A component can only be struck through the skin of its own zone (src/world/damage.ts componentAt): its `zone` is
+// the zone of the skin over it, so a hit is never booked on a component in another zone.
+// RCS: the Wren's 10 jets sit in 6 separate housings (fore: starboard cheek, port cheek, dorsal, ventral; aft: one
+// cluster per pod), so there are 6 RCS components, not the plan's 4 quads (the centreline fore jets are neither
+// starboard nor port).
 
 import { INTERIORS } from './interiors';
 import type { V3 } from '../core/types';
@@ -48,7 +53,8 @@ export interface DamageComponent {
   zone: number;
   /**
    * Index among the components of its kind: engine i = ShipLayout.engines[i] (0 = starboard +X), radiator 0 =
-   * starboard, rcs quad 0..3 (fore-stbd, fore-port, aft-stbd, aft-port), window i = order below.
+   * starboard, rcs cluster 0..5 (fore-stbd, fore-port, fore-dorsal, fore-ventral, aft-stbd, aft-port), window i =
+   * order below.
    */
   index: number;
   /** Energy that brings health to 0, J. Windows crack at `crack` J (health ≤ 1 − crack/capacity). */
@@ -57,7 +63,7 @@ export interface DamageComponent {
   /** Hit volume, ship-local AABB (windows, collar), or the compound parts that ARE the component (pods, radiators, tanks). */
   box: { min: V3; max: V3 } | null;
   parts: string[];
-  /** RCS quads: the centre of the cluster (jets are assigned to the nearest quad at load). */
+  /** RCS clusters: the centre of the housing (jets are assigned to the nearest cluster at load). */
   centre: V3 | null;
   /** Windows: the opening's area (the breach area when broken), m². */
   breachArea: number;
@@ -135,12 +141,17 @@ function windowBox(w: { wall: string; center: V3; width: number; height: number 
 /** Window crack / break energies (W2-C item 5), J. */
 export const WINDOW_CRACK = 10e3;
 export const WINDOW_BREAK = 30e3;
-/** RCS quad disabled, drive pod, radiator, collar and tank capacities, J. */
+/**
+ * RCS housing disabled, drive pod, radiator, collar and tank capacities, J. STRUCTURE_CAPACITY: the primary structure
+ * (keel, frames) behind every panel, which takes what a crushed-through panel passes on; at 0 the ship is lost. It is
+ * today's hullStrength for the Wren (½ · 43 t · (25 m/s)²), so the energy scale of a loss is kept.
+ */
 export const RCS_QUAD_CAPACITY = 50e3;
 export const POD_CAPACITY = 500e3;
 export const RADIATOR_CAPACITY = 100e3;
 export const COLLAR_CAPACITY = 150e3;
 export const TANK_CAPACITY = 200e3;
+export const STRUCTURE_CAPACITY = 0.5 * 43e3 * 25 * 25;
 
 function buildComponents(): DamageComponent[] {
   const out: DamageComponent[] = [];
@@ -155,12 +166,15 @@ function buildComponents(): DamageComponent[] {
     if (zone === undefined) continue;
     out.push({ ...base, id: w.id, kind: 'window', zone, index: wi++, capacity: WINDOW_BREAK, crack: WINDOW_CRACK, box: windowBox(w), breachArea: w.width * w.height });
   }
-  // RCS quads (fore clusters round z -12.5..-14.5, aft clusters on the pod sterns round z 11..12)
+  // RCS housings (ShipLayout.wren.rcs): fore on the cheeks (±3.9, 0.2, −12), dorsal (0, 2, −12.5) behind the canopy,
+  // ventral (0, −1.7, −12.5) under the cabin; aft round each pod stern (±4.8..6, −1.5..1.1, 11..12)
   const quads: [string, number, V3][] = [
-    ['rcs-fore-stbd', Z_NOSE, v(2.6, 0.3, -13.0)],
-    ['rcs-fore-port', Z_NOSE, v(-2.6, 0.3, -13.0)],
-    ['rcs-aft-stbd', Z_POD_STBD, v(5.6, -0.2, 11.5)],
-    ['rcs-aft-port', Z_POD_PORT, v(-5.6, -0.2, 11.5)],
+    ['rcs-fore-stbd', Z_FLANK_STBD, v(3.9, 0.2, -12)],
+    ['rcs-fore-port', Z_FLANK_PORT, v(-3.9, 0.2, -12)],
+    ['rcs-fore-dorsal', Z_CANOPY, v(0, 2, -12.5)],
+    ['rcs-fore-ventral', Z_BELLY_FWD, v(0, -1.7, -12.5)],
+    ['rcs-aft-stbd', Z_POD_STBD, v(5.2, -0.2, 11.7)],
+    ['rcs-aft-port', Z_POD_PORT, v(-5.2, -0.2, 11.7)],
   ];
   quads.forEach(([id, zone, c], i) => out.push({ ...base, id, kind: 'rcs', zone, index: i, capacity: RCS_QUAD_CAPACITY, centre: c }));
   // drive pods (engine 0 = starboard, layout order), radiators, tanks
@@ -176,6 +190,8 @@ function buildComponents(): DamageComponent[] {
 }
 
 export const DAMAGE_COMPONENTS: readonly DamageComponent[] = buildComponents();
+/** Index of the docking collar (capture.ts routes the ring's hard-stop energy here). */
+export const C_COLLAR = DAMAGE_COMPONENTS.findIndex((c) => c.id === 'collar');
 
 export const HULL_ZONES: readonly HullZone[] = ZONE_SPECS.map((z, i) => ({
   ...z,
@@ -185,5 +201,5 @@ export const HULL_ZONES: readonly HullZone[] = ZONE_SPECS.map((z, i) => ({
 /** Hit-test priority of the kinds: the first matching component takes the energy (then the zone's panel). */
 export const DAMAGE_PRIORITY: readonly DamageKind[] = ['window', 'collar', 'rcs', 'engine', 'radiator', 'tank'];
 
-/** Radius round each RCS jet within which a hit strikes its quad, m. */
+/** Radius round each RCS jet within which a hit (on its zone's skin) strikes its housing, m. */
 export const RCS_HIT_RADIUS = 0.8;

@@ -7,10 +7,16 @@
 // WIRING (wave 2):
 // - setup.ts createWorld (W2-B), per station, at construction AND at load (derived, not saved):
 //     const mp = stationMassProps(layout)   // cached per layout
-//     dryMass = mp.mass; gyration = mp.gyration (principal, about mp.com, station axes)
+//     dryMass = mp.mass; gyration = mp.gyration (the DIAGONAL of the inertia tensor about mp.com in station axes,
+//     ÷ mass; NOT principal unless mp.products ≈ 0: true for the Wheel, spindle, outpost and citadel; the refinery's
+//     largest product is 46% of its smallest moment and the drydock's 144% (its Iy 2.96e12 vs principal 1.58e12), so
+//     those two need W3-A's full tensor `mp.tensor` or principal axes)
 //     rotor fields (§1.4, saved): rotorOmega/rotorAngle0/rotorT0/rotorH = initRotor(mp.rotor, t) (or loadRotor(raw))
-//   mp.com is the CoM in layout coordinates: ≤ 0.05 m for the Wheel; the refinery's is metres off. Shift colliders,
-//   ports (and the renderer) by −com, or keep `com` (W3-A). Replaces STATION_MASS = 1e9 and the box gyration.
+//   mp.com is the CoM in layout coordinates. Offsets |com|: ringHabitat 0.26 m (0, 0.26, 0), citadel 0.00 m,
+//   outpost 24.6 m (0, 24.6, 0), spindle 61.1 m (0, −61.1, 0), refinery 62.0 m (−52.3, 31.2, −11.8), drydock 186.5 m
+//   (88.8, 164.0, 2.0). Shift colliders, ports (and the renderer) by −com, or keep `com` (W3-A); either way the craft's
+//   position must be the CoM, or gravity and rotation act about the wrong point. Replaces STATION_MASS = 1e9 and
+//   the box gyration.
 // - dynamics.ts rotateCraft (W2-B's Euler term): I·ω̇ = τ − ω × (I·ω + rotorH). Torque-free and axisymmetric
 //   (the Wheel coasting), gyrostatFree(q, w, I, h, dt) is exact at any dt (warp-free); a GG torque needs the ODE.
 // - contact.ts: split the station's compound into static and rotating colliders once: rotorSplit(layout) →
@@ -246,8 +252,9 @@ export interface StationMassProps {
   com: V3;
   /**
    * Moments about the CoM along the station axes, kg·m², and the products of inertia (Ixy, Ixz, Iyz) those axes
-   * neglect; `principal` are the eigenvalues of the full tensor. Where |products| is not ≪ inertia (drydock: Ixy ≈
-   * 0.3·Ixx; refinery a few %) the station axes are not principal: W3-A's full `inertia: number[6]` takes `tensor`.
+   * neglect; `principal` are the eigenvalues of the full tensor. Where |products| is not ≪ inertia (drydock: the
+   * largest product 1.44× its smallest moment; refinery 0.46×) the station axes are not principal: W3-A's full
+   * `inertia: number[6]` takes `tensor`.
    */
   inertia: V3;
   products: V3;

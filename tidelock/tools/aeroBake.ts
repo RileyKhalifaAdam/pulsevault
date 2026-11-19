@@ -23,7 +23,9 @@
 //   Zones: projected windward area per zone Σ_zone A c (W2-B heating, W2-D sun / albedo / IR).
 
 import { HULL_COLLIDERS, type HullPartDef } from '../src/data/hullColliders';
+import { HULL_ZONES, N_HULL_ZONES } from '../src/data/hullZones';
 import { PART_BOX, PART_CAPSULE, compileCompound, compoundContains, type Compound } from '../src/world/compound';
+import { zoneOfPoint } from '../src/world/damage';
 
 export const CP_MAX = 1.84;
 export const C_F = 0.002;
@@ -32,36 +34,23 @@ export const N_SMALL = 17;
 export const COLS_BIG = 6;
 /** Small-grid columns: Ap, S(3), G(3), Mg(3), D_N(6: xx yy zz xy xz yz), D_F(9 row-major), zones(12). */
 export const COLS_SMALL = 1 + 3 + 3 + 3 + 6 + 9 + 12;
-export const N_ZONES = 12;
+export const N_ZONES = N_HULL_ZONES;
 
 /**
- * PROVISIONAL zone table, until W2-C delivers HULL_ZONES in src/data/hullColliders.ts (then: tag by it and re-bake).
- * radius = the local radius of curvature that sets the stagnation heating (m); mirror = the zone's mirror image.
+ * Skin zones: W2-C's HULL_ZONES (src/data/hullZones.ts, re-exported by hullColliders.ts in wave 2), in ITS index
+ * order, with its radii (the local radius of curvature that sets the stagnation heating, m). Cells are tagged by
+ * W2-C's own zoneOfPoint (src/world/damage.ts: PART_ZONE, then the outward normal and position), so the aero heat
+ * lands on the same zone index W2-D's skin nodes and W2-C's damage use. mirror = the zone's port/starboard twin.
  */
-export const ZONES: { name: string; radius: number; mirror: number }[] = [
-  { name: 'nose', radius: 0.9, mirror: 0 },
-  { name: 'canopy', radius: 0.45, mirror: 1 },
-  { name: 'belly-fwd', radius: 1.27, mirror: 2 },
-  { name: 'belly-aft', radius: 1.27, mirror: 3 },
-  { name: 'dorsal-fwd', radius: 0.8, mirror: 4 },
-  { name: 'dorsal-aft', radius: 0.8, mirror: 5 },
-  { name: 'chine-port', radius: 0.3, mirror: 7 },
-  { name: 'chine-stbd', radius: 0.3, mirror: 6 },
-  { name: 'pod-port', radius: 1.27, mirror: 9 },
-  { name: 'pod-stbd', radius: 1.27, mirror: 8 },
-  { name: 'wing-port', radius: 0.12, mirror: 11 },
-  { name: 'wing-stbd', radius: 0.12, mirror: 10 },
-];
+const twinId = (id: string): string => (id.includes('port') ? id.replace('port', 'stbd') : id.includes('stbd') ? id.replace('stbd', 'port') : id);
+export const ZONES: { name: string; radius: number; mirror: number }[] = HULL_ZONES.map((z) => ({
+  name: z.id, radius: z.radius, mirror: HULL_ZONES.findIndex((o) => o.id === twinId(z.id)),
+}));
 
-function zoneOf(name: string, x: number, y: number, z: number, ny: number): number {
-  const port = x < 0;
-  if (/^(wing|fin)/.test(name) || Math.abs(x) > 6.2) return port ? 10 : 11;
-  if (/^pod/.test(name)) return port ? 8 : 9;
-  if (z < -13.4 || /^(nose|chin|windscreen)/.test(name)) return 0;
-  if (/^(canopy|cockpit)/.test(name)) return 1;
-  if (/(chine|flank|cheek|shoulder|valley|radiator|tank|flare)/.test(name) || Math.abs(x) > 3.3) return port ? 6 : 7;
-  if (ny < -0.5 || y < -1.0) return z < 1 ? 2 : 3;
-  return z < 1 ? 4 : 5;
+const ZP = { x: 0, y: 0, z: 0 }, ZN = { x: 0, y: 0, z: 0 };
+function zoneOf(name: string, x: number, y: number, z: number, nx: number, ny: number, nz: number): number {
+  ZP.x = x; ZP.y = y; ZP.z = z; ZN.x = nx; ZN.y = ny; ZN.z = nz;
+  return zoneOfPoint(name, ZP, ZN);
 }
 
 export interface Skin {
@@ -82,7 +71,7 @@ export function sampleSkin(cmp: Compound, spacing: number): Skin {
     const l = Math.hypot(nx, ny, nz);
     nx /= l; ny /= l; nz /= l;
     if (compoundContains(cmp, px + 1e-3 * nx, py + 1e-3 * ny, pz + 1e-3 * nz)) return;
-    out.push(px, py, pz, nx, ny, nz, A, part, zoneOf(cmp.names[part], px, py, pz, ny));
+    out.push(px, py, pz, nx, ny, nz, A, part, zoneOf(cmp.names[part], px, py, pz, nx, ny, nz));
   };
   for (let i = 0; i < cmp.n; i++) {
     const o = i * PS;

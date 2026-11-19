@@ -18,18 +18,31 @@
 //   21    primary coolant loop: NaK-78 pressurised to 2.5 bar (saturation ≈ 1178 K by Clausius–Clapeyron from
 //         1058 K at 1 bar, ΔH_vap ≈ 79 kJ/mol; melts at 261 K), 400 kg NaK + 600 kg piping/HX. Interlock 1150 K.
 //         (The review's correction: NaK boils near 1058 K at 1 bar, so an 1100 K loop must be pressurised.)
-//   22    reactor bay: core, BeO reflector, W/LiH shadow shield (≈ 6 t; LiH c_p 3.5 kJ/kgK) ≈ 12 MJ/K.
+//   22    reactor bay: core, BeO reflector, W/LiH shadow shield (≈ 6 t; LiH c_p 3.5 kJ/kgK) ≈ 12 MJ/K. Limit 1400 K
+//         (fuel cladding; it runs ~100 K above the loop at the drive load). It is thermally isolated from the
+//         habitable volume (review D3): 1 W/K to the engineering room (vacuum gap + MLI behind the shadow shield),
+//         5 W/K of titanium struts to the aft structure; its heat leaves through the loop.
 //   23    avionics bay (racks, battery): 500 kg, limit 358 K.
 //   24–33 cabin air + furnishings per room (INTERIORS.wren.rooms order): ρc_p·V + 8 kJ/(K·m³) of lining and
-//         furniture, V = room box minus its solids (370 m³ in all, as the plan's 370.5).
+//         furniture, V = FREE air volume = room box minus its solids, 314.8 m³ in all. (The plan's per-room figures
+//         — cockpit 27.7, lounge 89.1, cargo 107.5, engineering 39.2, 370.5 m³ — are the bare BOX volumes: they sum
+//         to 370.56 m³ before the 55.8 m³ of consoles, seats, bunks and racks is subtracted. Measured in review D7.)
+//         Caution 305 K (hot); the cabin-cold caution watches the coldest room (< 283 K).
 //   34–37 window pane groups (= shutter groups): 0 cockpit front, 1 cockpit sides + overhead, 2 lounge, 3 cabins.
 //
-// Radiator sizing (D4): εσA·T⁴ = 0.85·σ·52·1100⁴ = 3.67 MW. Drive waste ε_d·½·ṁ·vₑ² = 4.4e-4·½·F·vₑ ≈ 6.0 MW at
+// Radiator sizing (D4): εσA·T⁴ = 0.85·σ·52·1100⁴ = 3.67 MW for a panel AT 1100 K. The panel node is the panel's
+// mean temperature; the pumped link is the linearised effectiveness–NTU conductance G = ṁc_p·f(NTU),
+// f = 1/(1/(1 − e^−N) − 1/N) ∈ (1, 2], N = 4εσT³A/(ṁc_p) (shipSystems.ts radiatorG): at 20 kg/s per panel and the
+// 1150 K loop interlock the panels sit at ≈ 1096 K and reject ≈ 3.6 MW (review D6; the plain ṁc_p link put them at
+// 1056 K, 3.1 MW). Cabin envelope (review D2): MLI ε* ≈ 0.009 → U = 4ε*σT̄³ ≈ 0.03 W/m²K over ~1100 m² of skin (33 W/K): with
+// the 5 kW of heaters the rooms hold 294 ± 2 K in every attitude with the shutters closed, and in the cold
+// attitudes with them open; open windows in direct sun out-run the coolers (the plan's "turn the ship or shut").
+// Drive waste ε_d·½·ṁ·vₑ² = 4.4e-4·½·F·vₑ ≈ 6.0 MW at
 // 2 × 400 kN, vₑ 34 km/s; 80% goes to the nozzle skirts (which radiate it themselves: equilibrium ≈ 1600 K at
 // 2.4 MW each, τ ≈ 18 s, the afterglow), 20% into the loop. NOTE for the owner (see the report): the reactor's
 // waste at the drive load, P_e(1 − η)/η = 10 MW·0.7/0.3 = 23 MW, is ~6× what 52 m² can reject at 1100 K, so full
-// burns are limited by the loop + reactor heat capacity (≈ 13 MJ/K): about 8–9 min from a cold loop before the
-// 1150 K interlock. That is the plan's "long burns heat the ship and the drive cuts itself", with numbers.
+// burns are limited by the loop + reactor heat capacity (≈ 13 MJ/K): about 7.5 min from a cold loop before the
+// 1150 K interlock (tests: 447 s of burn after the 18 s standby). That is the plan's "long burns heat the ship and the drive cuts itself", with numbers.
 
 import { HULL_ZONES, N_HULL_ZONES, Z_BELLY_AFT, Z_BELLY_FWD, Z_CANOPY, Z_DORSAL_AFT, Z_DORSAL_FWD, Z_FLANK_PORT, Z_FLANK_STBD, Z_NOSE, Z_POD_PORT, Z_POD_STBD, Z_WING_PORT, Z_WING_STBD, type SkinMaterial } from './hullZones';
 import { INTERIORS } from './interiors';
@@ -67,7 +80,9 @@ export const SKIN_MATERIAL: Record<SkinMaterial, { c: number; alpha: number; eps
 export const TPS_AREAL_C = 3500; // J/(m²·K)
 export const TPS_K_OVER_T = 2.4; // W/(m²·K)
 export const TPS_LIMIT = 1900;
-export const SKIN_STRUCT_U = 0.3; // MLI + standoffs, W/(m²·K)
+/** MLI blanket + standoffs between the skin and the pressure shell, W/(m²·K): effective emittance ε* ≈ 0.009 at a
+ *  mean ≈ 240 K (4ε*σT³ ≈ 0.028) plus penetrations (review D2; the earlier 0.3 leaked 330 W/K and froze the cabin). */
+export const SKIN_STRUCT_U = 0.03;
 export const SKIN_LATERAL_G = 2; // between neighbouring zones, W/K
 export const STRUCT_C = 2000 * 900;
 export const STRUCT_G = 300;
@@ -83,6 +98,8 @@ export const SKIRT_C = 300 * 350;
 export const SKIRT_AREA = 8;
 export const SKIRT_LIMIT = 1800;
 export const RAD_PANEL_AREA = 13; // one side of one panel, m²
+export const RAD_EPS = 0.85;
+export const RAD_ALPHA = 0.15;
 export const RAD_C = 13 * 8 * 700 + 30 * 900;
 export const LOOP_C = 400 * 900 + 600 * 500;
 export const LOOP_LIMIT = 1150;
@@ -91,6 +108,18 @@ export const LOOP_T_SAT = 1178;
 export const LOOP_T_MELT = 261;
 export const REACTOR_C = 12e6;
 export const REACTOR_LOOP_G = 2e5;
+export const REACTOR_LIMIT = 1400;
+/** Reactor bay → engineering room and → aft structure (struts), loop piping → aft structure, W/K (review D3). */
+export const REACTOR_ROOM_G = 1;
+export const REACTOR_STRUCT_G = 5;
+export const LOOP_STRUCT_G = 2;
+/** Automatic scram (review D1): loop within 10 K of NaK saturation, or the reactor bay at its limit. */
+export const SCRAM_LOOP = LOOP_T_SAT - 10;
+export const SCRAM_REACTOR = REACTOR_LIMIT;
+/** Room over-temperature caution, K. */
+export const ROOM_CAUTION = 305;
+/** Per-node over-temperature latch hysteresis, K. */
+export const HOT_HYST = 10;
 /** Radiator pump: the largest flow per panel, kg/s, and NaK c_p: G_max = ṁ·c_p per panel. */
 export const PUMP_MDOT = 20;
 export const NAK_CP = 900;
@@ -108,7 +137,7 @@ export const INHIBIT_HYST = 50;
 /** Thermostats: room setpoint, deadband half-width and proportional band, K; per-room HVAC capacity, W. */
 export const HVAC_SET = 294;
 export const HVAC_DEAD = 0.5;
-export const HVAC_BAND = 1.5;
+export const HVAC_BAND = 1.0;
 /** The coolers reject into the dorsal-aft skin (a body-mounted low-temperature radiator panel). */
 export const HVAC_SINK = Z_DORSAL_AFT;
 /** Heat-pump COP: a fraction of Carnot, clamped. */
@@ -153,8 +182,19 @@ const ROOM_STRUCT: Record<string, number> = {
   corridor: N_STRUCT_M, 'cabin-port': N_STRUCT_M, 'cabin-stbd': N_STRUCT_M, washroom: N_STRUCT_M, suitroom: N_STRUCT_M,
   cargo: N_STRUCT_A, engineering: N_STRUCT_A,
 };
-/** HVAC capacity per room (heating and cooling each), W: 5 kW in all (W2-D item 2). */
-export const HVAC_CAP: readonly number[] = ROOMS.map((r) => (r.id === 'cockpit' || r.id === 'lounge' ? 1200 : 325));
+/** Thermostat capacities per room, W. Coolers 5 kW in all (W2-D item 2), weighted to the window rooms (sun load).
+ *  Heaters 8 kW in all (deviation from the plan's 5 kW, review D2): the cold case — deep space, no sun or planet,
+ *  shutters closed — measures ≈ 7.5 kW of envelope loss against ≈ 2.5 kW of internal heat; split in proportion to
+ *  the room's lining area plus HVAC_WINDOW_WEIGHT × its window area. */
+export const HVAC_TOTAL = 8000;
+/** A window loses about this many times the heat of a m² of lined wall (pane U 3 W/m²K to a pane that radiates to
+ *  space, against the lining's few W/m² through the MLI). */
+export const HVAC_WINDOW_WEIGHT = 25;
+const ROOM_WIN_AREA: readonly number[] = ROOMS.map((r) => WREN.windows.filter((w) => w.room === r.id).reduce((a, w) => a + w.width * w.height, 0));
+const HEAT_W: readonly number[] = ROOM_SURFACE.map((A, i) => A + HVAC_WINDOW_WEIGHT * ROOM_WIN_AREA[i]);
+const HEAT_W_SUM = HEAT_W.reduce((a, b) => a + b, 0);
+export const HVAC_HEAT_CAP: readonly number[] = HEAT_W.map((w) => (HVAC_TOTAL * w) / HEAT_W_SUM);
+export const HVAC_COOL_CAP: readonly number[] = ROOMS.map((r) => (r.id === 'cockpit' || r.id === 'lounge' ? 1200 : 325));
 
 /** Window → shutter group, skin zone. */
 const WINDOW_GROUP: Record<string, number> = {
@@ -235,10 +275,10 @@ function build(): ThermalNetDef {
   node('radiator-stbd', RAD_C, 300, 1200, 1150);
   node('radiator-port', RAD_C, 300, 1200, 1150);
   node('loop', LOOP_C, 320, LOOP_LIMIT, LOOP_LIMIT - 50);
-  node('reactor-bay', REACTOR_C, 330, 1250, 1150);
+  node('reactor-bay', REACTOR_C, 330, REACTOR_LIMIT, REACTOR_LIMIT - 100);
   node('avionics', AVIONICS_C, 300, 358, 340);
   // 24–33 rooms
-  ROOMS.forEach((r, i) => node(`room-${r.id}`, 1.2 * 1005 * ROOM_VOLUME[i] + FURNISH_C * ROOM_VOLUME[i], 294));
+  ROOMS.forEach((r, i) => node(`room-${r.id}`, 1.2 * 1005 * ROOM_VOLUME[i] + FURNISH_C * ROOM_VOLUME[i], 294, Infinity, ROOM_CAUTION));
   // 34–37 pane groups
   const groupArea = [0, 0, 0, 0];
   for (const w of WREN.windows) groupArea[WINDOW_GROUP[w.id]] += w.width * w.height;
@@ -266,9 +306,9 @@ function build(): ThermalNetDef {
   link(N_LOOP, N_REACTOR, REACTOR_LOOP_G);
   PUMP_LINKS.push(link(N_LOOP, N_RAD0, PUMP_G_MAX));
   PUMP_LINKS.push(link(N_LOOP, N_RAD0 + 1, PUMP_G_MAX));
-  link(N_LOOP, N_STRUCT_A, 20);
-  link(N_REACTOR, N_ROOM0 + roomIndex('engineering'), 30);
-  link(N_REACTOR, N_STRUCT_A, 50);
+  link(N_LOOP, N_STRUCT_A, LOOP_STRUCT_G);
+  link(N_REACTOR, N_ROOM0 + roomIndex('engineering'), REACTOR_ROOM_G);
+  link(N_REACTOR, N_STRUCT_A, REACTOR_STRUCT_G);
   link(N_AVIONICS, N_STRUCT_F, 100);
   link(N_AVIONICS, N_ROOM0 + roomIndex('cockpit'), 150);
 
@@ -289,12 +329,12 @@ function build(): ThermalNetDef {
     surfaces.push({ node: N_SKIRT0 + e, alpha: 0.8, eps: 0.8, area: SKIRT_AREA, facets: cylinder(SKIRT_AREA, 0), radiator: -1 });
   }
   for (let k = 0; k < 2; k++) {
-    surfaces.push({ node: N_RAD0 + k, alpha: 0.15, eps: 0.85, area: 2 * RAD_PANEL_AREA, facets: [0, 1, 0, RAD_PANEL_AREA, 0, -1, 0, RAD_PANEL_AREA], radiator: k });
+    surfaces.push({ node: N_RAD0 + k, alpha: RAD_ALPHA, eps: RAD_EPS, area: 2 * RAD_PANEL_AREA, facets: [0, 1, 0, RAD_PANEL_AREA, 0, -1, 0, RAD_PANEL_AREA], radiator: k });
   }
   return { nodes, links, surfaces, windows, zoneNode };
 }
 
-/** Link indices of the two radiator pump links (loop ↔ radiator k): G = flow·PUMP_G_MAX·radiatorHealth[k]. */
+/** Link indices of the two radiator pump links (loop ↔ radiator k): G = ṁc_p·f(NTU) (shipSystems.ts radiatorG). */
 export const PUMP_LINKS: number[] = [];
 /** Link indices of the door links (one per INTERIORS door): G = DOOR_G + fan·FAN_G. */
 export const FAN_LINKS: number[] = [];

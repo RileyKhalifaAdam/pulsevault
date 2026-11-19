@@ -13,7 +13,7 @@
 import { INTERIORS } from './interiors';
 import { SHIP_LAYOUTS } from './shipLayouts';
 import { Z_DORSAL_FWD } from './hullZones';
-import { HVAC_CAP, HVAC_SINK, N_AVIONICS, N_LOOP, N_ROOM0, N_STRUCT_A, N_STRUCT_F, N_STRUCT_M } from './thermalNet';
+import { HVAC_COOL_CAP, HVAC_HEAT_CAP, HVAC_SINK, N_AVIONICS, N_LOOP, N_ROOM0, N_STRUCT_A, N_STRUCT_F, N_STRUCT_M } from './thermalNet';
 
 /** Exterior lamps dissipate in the dorsal-fore skin (skin node index = hull zone index). */
 const Z_DORSAL_FWD_NODE = Z_DORSAL_FWD;
@@ -33,6 +33,13 @@ export const SHORE_P = 50e3;
 export const REACTOR_P_RATED = 28e6;
 export const REACTOR_RAMP = 0.02;
 export const REACTOR_ETA = 0.3;
+/** Reactor protection (review D1): setback ramp-down when the drive interlock trips, and the scram rate (control
+ *  drums in: fission power falls in ~1 s; decay heat is W3-B's), fractions of rated per second. */
+export const SETBACK_RAMP = 0.1;
+export const SCRAM_RAMP = 1;
+/** The drive standby (DRIVE ARM, nothing lit) lapses after this long, s: the reactor's whole drive-load output is
+ *  dumped into the shunt while it waits (10 MW + 23 MW of conversion waste), so "arm, wait, light" has a window. */
+export const STANDBY_MAX_S = 60;
 /** Torch electrical load per engine, and the drive-bus fraction that counts as "carrying the load". */
 export const DRIVE_P_ENGINE = 5e6;
 export const N_ENGINES = 2;
@@ -61,7 +68,7 @@ export const CIRCUITS: readonly CircuitDef[] = [
   { id: 'avionics', name: 'AVIONICS', rating: 15, uvTrip: true, faultNode: N_AVIONICS },
   { id: 'flt-ctl', name: 'FLT CTL', rating: 25, uvTrip: true, faultNode: N_STRUCT_M },
   { id: 'life-sup', name: 'LIFE SUP', rating: 15, uvTrip: false, faultNode: N_STRUCT_M },
-  { id: 'thermal', name: 'THERMAL', rating: 70, uvTrip: false, faultNode: N_STRUCT_A },
+  { id: 'thermal', name: 'THERMAL', rating: 100, uvTrip: false, faultNode: N_STRUCT_A }, // 8 kW heaters + 3 kW pump
   { id: 'exterior', name: 'EXT LTS', rating: 10, uvTrip: false, faultNode: N_STRUCT_F },
   { id: 'utility', name: 'UTILITY', rating: 15, uvTrip: false, faultNode: N_STRUCT_M },
 ];
@@ -103,9 +110,9 @@ function build(): LoadDef[] {
   L.push({ id: 'cmg', circuit: 3, P: CMG_P, kind: LOAD_CP, node: N_STRUCT_M });
   L.push({ id: 'fans', circuit: 4, P: 600, kind: LOAD_CP, node: N_ROOM0 + 3 }); // corridor
   L.push({ id: 'scrubber', circuit: 4, P: 500, kind: LOAD_CP, node: N_ROOM0 + 9 }); // engineering
-  ROOMS.forEach((r, i) => L.push({ id: `heater-${r.id}`, circuit: 5, P: HVAC_CAP[i], kind: LOAD_CP, node: N_ROOM0 + i }));
+  ROOMS.forEach((r, i) => L.push({ id: `heater-${r.id}`, circuit: 5, P: HVAC_HEAT_CAP[i], kind: LOAD_CP, node: N_ROOM0 + i }));
   // cooler compressor work ends in the sink with the heat it moves
-  ROOMS.forEach((r, i) => L.push({ id: `cooler-${r.id}`, circuit: 5, P: HVAC_CAP[i], kind: LOAD_CP, node: HVAC_SINK }));
+  ROOMS.forEach((r, i) => L.push({ id: `cooler-${r.id}`, circuit: 5, P: HVAC_COOL_CAP[i], kind: LOAD_CP, node: HVAC_SINK }));
   L.push({ id: 'pump', circuit: 5, P: PUMP_P, kind: LOAD_CP, node: N_LOOP });
   L.push({ id: 'floods', circuit: 6, P: 400, kind: LOAD_RES, node: Z_DORSAL_FWD_NODE });
   L.push({ id: 'nav', circuit: 6, P: 50, kind: LOAD_RES, node: Z_DORSAL_FWD_NODE });

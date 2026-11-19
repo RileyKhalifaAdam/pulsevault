@@ -1,7 +1,10 @@
 // Landed contact on a rotating body (docs/SIMULATION.md W2-C item 4): what the ground has to supply to keep a resting
 // craft pinned, and whether it can. Lift-off when the needed normal force reaches zero (no position jump: the craft
 // is released at its pinned pose with the ground's velocity), slide when the tangential load exceeds μ_s·F_n, tip
-// when the centre of pressure leaves the support polygon of the hull's ground points. Pure, allocation-free.
+// when the centre of pressure leaves the support polygon of the hull's ground points. Sliding includes yaw: the
+// friction of the support points also has to hold the moment about the normal, and force and yaw moment share the
+// friction (elliptic limit surface: (Ft/μFn)² + (Mn/(μFn·r_eff))² ≤ 1, r_eff = mean distance of the support points
+// from the centre of pressure, the pressure shared equally). Pure, allocation-free.
 //
 // WIRING (wave 2, contact.ts updateJoints 'landed' branch, every tick and every quantum while landed):
 //   IO.n = local up (unit, world); IO.F = m·g_eff (W1-C landedProperAccel's gravity + centrifugal in the rotating
@@ -11,7 +14,9 @@
 //     flags = groundState(IO)
 //   LIFT → release the joint as is (delete the `rel *= 1 + 0.01/r` snap; relV stays the ground velocity, so nothing
 //   jumps), SLIDE → release into a rigid body in compound contact with friction (the compound solver), TIP → the same
-//   (the contact solve then pivots it about the edge). Otherwise stay pinned. Replaces the aUp > g − v²/r test.
+//   (the contact solve then pivots it about the edge; also returned with no support points, np = 0, since nothing
+//   holds the craft up), INVALID (a non-finite input) → keep the pin as it is and do nothing. Otherwise stay pinned.
+//   Replaces the aUp > g − v²/r test.
 // Reads nothing of §1.4; ≈ 0.1 µs per call in node for 4–8 support points.
 
 import type { V3 } from '../core/types';
@@ -23,6 +28,8 @@ export const GROUND_PIN = 0;
 export const GROUND_SLIDE = 1;
 export const GROUND_TIP = 2;
 export const GROUND_LIFT = 4;
+/** A non-finite input: the caller keeps the current state (never releases on NaN). */
+export const GROUND_INVALID = 8;
 
 const MAXP = 16;
 
@@ -41,10 +48,13 @@ export interface GroundIO {
   Fn: number;
   Ft: number;
   cop: V3;
+  /** Outputs: yaw moment about the normal through the centre of pressure (N·m), friction lever r_eff (m). */
+  Mn: number;
+  rEff: number;
 }
 
 export function makeGroundIO(): GroundIO {
-  return { n: { x: 0, y: 1, z: 0 }, F: { x: 0, y: 0, z: 0 }, M: { x: 0, y: 0, z: 0 }, h: 0, pts: new Float64Array(MAXP * 3), np: 0, Fn: 0, Ft: 0, cop: { x: 0, y: 0, z: 0 } };
+  return { n: { x: 0, y: 1, z: 0 }, F: { x: 0, y: 0, z: 0 }, M: { x: 0, y: 0, z: 0 }, h: 0, pts: new Float64Array(MAXP * 3), np: 0, Fn: 0, Ft: 0, cop: { x: 0, y: 0, z: 0 }, Mn: 0, rEff: 0 };
 }
 
 const P2 = new Float64Array(MAXP * 2);
@@ -56,6 +66,8 @@ const HULL = new Int16Array(MAXP + 1);
  */
 export function groundState(io: GroundIO): number {
   const n = io.n, F = io.F;
+  io.Mn = 0; io.rEff = 0;
+  if (!finiteIn(io)) { io.Fn = 0; io.Ft = 0; io.cop.x = io.cop.y = io.cop.z = 0; return GROUND_INVALID; }
   const fn = -(F.x * n.x + F.y * n.y + F.z * n.z);
   io.Fn = fn;
   const tx = F.x + fn * n.x, ty = F.y + fn * n.y, tz = F.z + fn * n.z;
@@ -67,10 +79,33 @@ export function groundState(io: GroundIO): number {
   const k = -1 / fn;
   const cx = k * (n.y * mz - n.z * my), cy = k * (n.z * mx - n.x * mz), cz = k * (n.x * my - n.y * mx);
   io.cop.x = cx; io.cop.y = cy; io.cop.z = cz;
+  // yaw about the normal through the CoP: M·n + ((0 − c) × T)·n, and the friction lever of the support points
+  const Mn = io.M.x * n.x + io.M.y * n.y + io.M.z * n.z - ((cy * tz - cz * ty) * n.x + (cz * tx - cx * tz) * n.y + (cx * ty - cy * tx) * n.z);
+  io.Mn = Mn;
+  const np = io.np < MAXP ? io.np : MAXP, pts = io.pts;
+  let r = 0;
+  for (let i = 0; i < np; i++) {
+    let dx = pts[i * 3] - cx, dy = pts[i * 3 + 1] - cy, dz = pts[i * 3 + 2] - cz;
+    const dn = dx * n.x + dy * n.y + dz * n.z;
+    dx -= dn * n.x; dy -= dn * n.y; dz -= dn * n.z;
+    r += Math.sqrt(dx * dx + dy * dy + dz * dz);
+  }
+  const rEff = np > 0 ? r / np : 0;
+  io.rEff = rEff;
   let flags = GROUND_PIN;
-  if (io.Ft > MU_S * fn) flags |= GROUND_SLIDE;
+  const cap = MU_S * fn, f = io.Ft / cap, y = rEff > 0 ? Mn / (cap * rEff) : Mn !== 0 ? Infinity : 0;
+  if (f * f + y * y > 1) flags |= GROUND_SLIDE;
   if (!insideSupport(io, cx, cy, cz)) flags |= GROUND_TIP;
   return flags;
+}
+
+function finiteIn(io: GroundIO): boolean {
+  const { n, F, M } = io;
+  if (!Number.isFinite(n.x + n.y + n.z + F.x + F.y + F.z + M.x + M.y + M.z + io.h)) return false;
+  const np = io.np < MAXP ? io.np : MAXP;
+  let s = 0;
+  for (let i = 0; i < np * 3; i++) s += io.pts[i];
+  return Number.isFinite(s);
 }
 
 /** Is the in-plane point inside the convex hull of the support points (projected on the plane)? */

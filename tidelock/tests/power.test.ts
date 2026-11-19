@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   BATT_E_CAP, BATT_R, BREAKER_TRIP_S, CIRCUITS, defaultDemand, DRIVE_P_ENGINE, L_AVIONICS, L_GALLEY, L_LIGHT0, LOADS, N_CIRCUITS,
-  REACTOR_P_RATED, REACTOR_RAMP,
+  REACTOR_P_RATED, REACTOR_RAMP, SCRAM_RAMP, SETBACK_RAMP, STANDBY_MAX_S,
 } from '../src/data/powerNet';
 import { C_BATTERY, C_CO2, cautionAck, cautionStep, loadCaution, makeCautionState, makeCautionValues, saveCaution } from '../src/world/caution';
 import { loadPower, makePowerInputs, makePowerOut, makePowerState, powerStep, savePower, vocOf, type PowerInputs, type PowerOut, type PowerState } from '../src/world/power';
@@ -35,13 +35,32 @@ describe('hotel bus', () => {
     expect((soc0 - st.soc) * BATT_E_CAP).toBeCloseTo(o.battJ, 6);
   });
 
-  it('SOC is exact at any step: one 30 s step equals 300 steps of 0.1 s (constant loads)', () => {
+  it('SOC (midpoint rule, second order): one 30 s step equals 300 steps of 0.1 s to 1e-8 of ΔSOC', () => {
     const a = setup(0), b = setup(0);
     powerStep(a.st, a.inp, a.o, 30);
     for (let k = 0; k < 300; k++) powerStep(b.st, b.inp, b.o, 0.1);
     const d = 0.8 - a.st.soc;
     console.log(`ΔSOC over 30 s: ${d.toExponential(6)}; |1 step − 300 steps| / ΔSOC = ${(Math.abs(a.st.soc - b.st.soc) / d).toExponential(2)}`);
     expect(Math.abs(a.st.soc - b.st.soc)).toBeLessThan(1e-8 * d);
+  });
+
+  it('a long powerStep sub-steps itself: one 3600 s call matches 0.1 s steps to 1e-9 of ΔSOC (review D9)', () => {
+    const run = (h: number, T: number, soc0: number): number => {
+      const { st, inp, o } = setup(0);
+      inp.demand[L_GALLEY] = 1; st.soc = soc0;
+      for (let k = 0; k < Math.round(T / h); k++) powerStep(st, inp, o, h);
+      return st.soc;
+    };
+    for (const soc0 of [0.8, 0.3]) {
+      const ref = run(0.1, 3600, soc0), one = run(3600, 3600, soc0), w30 = run(30, 3600, soc0);
+      const e1 = Math.abs(one - ref) / (soc0 - ref), e30 = Math.abs(w30 - ref) / (soc0 - ref);
+      console.log(`D9: SOC ${soc0} over 1 h: rel. error of ΔSOC, one 3600 s call ${e1.toExponential(1)}, 30 s steps ${e30.toExponential(1)}`);
+      expect(e1).toBeLessThan(1e-9); expect(e30).toBeLessThan(1e-9);
+    }
+    // near empty: the trajectory, not the step-counted empty time, is what must agree (empty at 1460.2 s)
+    const a = run(0.1, 1440, 0.05), b = run(30, 1440, 0.05), c = run(1440, 1440, 0.05);
+    expect(Math.abs(a - b)).toBeLessThan(1e-9); expect(Math.abs(a - c)).toBeLessThan(1e-9);
+    expect(a).toBeGreaterThan(0);
   });
 
   it('the battery runs empty exactly at its energy and the bus then sheds load (electronics trip below 100 V)', () => {
@@ -126,6 +145,49 @@ describe('reactor and drive bus', () => {
     expect(Math.abs(a.o.reactorAvg * 30 - E)).toBeLessThan(1e-9 * E);
   });
 
+  it('the standby lapses after STANDBY_MAX_S, exactly inside a long step (two-piece ramp)', () => {
+    const a = setup(1), b = setup(1);
+    for (const x of [a, b]) { x.inp.driveArmed = 1; x.inp.demand.fill(0); x.st.soc = 1; }
+    let E = 0;
+    for (let k = 0; k < 1000; k++) { powerStep(a.st, a.inp, a.o, 0.1); E += a.o.reactorAvg * 0.1; }
+    powerStep(b.st, b.inp, b.o, 100);
+    expect(a.st.standbyS).toBe(STANDBY_MAX_S);
+    expect(a.o.standby).toBe(false);
+    expect(Math.abs(b.st.reactorP - a.st.reactorP)).toBeLessThan(1e-6 * REACTOR_P_RATED);
+    expect(Math.abs(b.o.reactorAvg * 100 - E)).toBeLessThan(1e-9 * E);
+    // peak = ramp for 60 s at 2 %/s (33.6 MW > 10 MW: reached at 17.9 s), then down at 2 %/s for 40 s
+    const P = Math.max(0, 2 * DRIVE_P_ENGINE - REACTOR_RAMP * REACTOR_P_RATED * 40);
+    expect(Math.abs(a.st.reactorP - P)).toBeLessThan(1e3);
+  });
+
+  it('the interlock sets the reactor back at SETBACK_RAMP; a scram drives it to zero at SCRAM_RAMP and blocks the drive', () => {
+    const { st, inp, o } = setup(1);
+    inp.driveArmed = 1; inp.demand.fill(0); st.soc = 1;
+    for (let k = 0; k < 300; k++) powerStep(st, inp, o, 0.1);
+    expect(o.driveReady).toBe(true);
+    const P0 = st.reactorP;
+    inp.inhibit = 1;
+    powerStep(st, inp, o, 1);
+    expect(o.driveReady).toBe(false);
+    expect(P0 - st.reactorP).toBeCloseTo(SETBACK_RAMP * REACTOR_P_RATED, 3);
+    inp.inhibit = 0; st.scram = 1;
+    powerStep(st, inp, o, 0.1);
+    expect(st.reactorP).toBe(Math.max(0, P0 - SETBACK_RAMP * REACTOR_P_RATED - SCRAM_RAMP * REACTOR_P_RATED * 0.1));
+    powerStep(st, inp, o, 1);
+    expect(st.reactorP).toBe(0);
+    expect(o.driveReady).toBe(false);
+  });
+
+  it('non-finite inputs read as zero; h ≤ 0 is a no-op', () => {
+    const { st, inp, o } = setup(1);
+    inp.demand[L_GALLEY] = NaN; inp.demand[L_AVIONICS] = Infinity; inp.fault[3] = NaN; inp.lit = NaN; inp.driveArmed = NaN;
+    for (let k = 0; k < 10; k++) powerStep(st, inp, o, 0.1);
+    expect(Number.isFinite(st.soc) && Number.isFinite(o.V) && Number.isFinite(st.reactorP)).toBe(true);
+    const before = JSON.stringify(savePower(st));
+    powerStep(st, inp, o, 0); powerStep(st, inp, o, NaN); powerStep(st, inp, o, -5);
+    expect(JSON.stringify(savePower(st))).toBe(before);
+  });
+
   it('with the reactor lever down the drive never becomes ready', () => {
     const { st, inp, o } = setup(0);
     inp.driveArmed = 1;
@@ -145,7 +207,7 @@ describe('state', () => {
         if (k === 300) st.breakers[3] = 1;
         powerStep(st, inp, o, k % 3 ? 0.1 : 17);
       }
-      return [st.soc, st.reactorP, ...st.i2t, ...st.breakers, st.tripped];
+      return [st.soc, st.reactorP, ...st.i2t, ...st.breakers, st.tripped, st.standbyS, st.scram];
     };
     const a = run(-1), b = run(230);
     expect(b).toEqual(a);

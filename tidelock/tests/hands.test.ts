@@ -9,7 +9,7 @@ import {
   ARM_LEN, ARM_PUSH_F, ARM_PUSH_T, BODY_MASS, consumeReaction, createGrip, createPush, createReachCache, createReachResult, createReaction, flickEffort,
   grab, GRIP_FMAX, GRIP_HELD, GRIP_LOST, GRIP_SLIDING, gripEquilibrium, LEG_PUSH_F, LEG_PUSH_T, LIMB_ARMS, LIMB_LEGS, loadGrip, pickHandhold, PUSH_CLAMPED,
   PUSH_CONE, PUSH_IN_CONE, PUSH_MU_MATCHES_BOOTS, PUSH_NONE, pushPeel, pushTick, RAIL_SLIDE_F, reachCached, reachPoint, REACH_LEAN_HELM, REACH_LEAN_STAND,
-  release, saveGrip, setGripPull, shoulderPoint, startPush, stepGrip, yawQuat,
+  recordImpulse, release, saveGrip, setGripPull, shoulderPoint, startPush, stepGrip, yawQuat, GRIP_OMEGA,
 } from '../src/world/hands';
 
 const Q = 1 / 120;
@@ -89,23 +89,94 @@ describe('grip', () => {
     expect(len(v3(0, 0.6 + off.y - 1, zMin))).toBeLessThan(ARM_LEN);
   });
 
-  it('momentum exchange on a hand pull: the ship takes exactly what the body gets (linear and angular)', () => {
+  /**
+   * Independent reference: the body as a free point mass under the physical hand force law
+   * F = m·clamp(−ω²(p − target) − 2ωv − f, 350 N / m), integrated by RK4 at 2 µs, with ∫F dt and ∫p × F dt
+   * accumulated alongside. The module's ledger must equal −∫F dt and −∫p × F dt (the ship as a separate body).
+   */
+  function reference(p0: V3, v0: V3, target: V3, f: V3, T: number): { p: V3; v: V3; J: V3; L: V3 } {
+    const amax = GRIP_FMAX / BODY_MASS, w = GRIP_OMEGA, n = Math.round(T / 2e-6), h = T / n;
+    let y = [p0.x, p0.y, p0.z, v0.x, v0.y, v0.z, 0, 0, 0, 0, 0, 0];
+    const der = (s: number[]): number[] => {
+      let ax = -w * w * (s[0] - target.x) - 2 * w * s[3] - f.x, ay = -w * w * (s[1] - target.y) - 2 * w * s[4] - f.y, az = -w * w * (s[2] - target.z) - 2 * w * s[5] - f.z;
+      const a = Math.hypot(ax, ay, az);
+      if (a > amax) { ax *= amax / a; ay *= amax / a; az *= amax / a; }
+      const Fx = BODY_MASS * ax, Fy = BODY_MASS * ay, Fz = BODY_MASS * az;
+      return [s[3], s[4], s[5], ax + f.x, ay + f.y, az + f.z, Fx, Fy, Fz, s[1] * Fz - s[2] * Fy, s[2] * Fx - s[0] * Fz, s[0] * Fy - s[1] * Fx];
+    };
+    for (let i = 0; i < n; i++) {
+      const k1 = der(y), k2 = der(y.map((q, j) => q + 0.5 * h * k1[j])), k3 = der(y.map((q, j) => q + 0.5 * h * k2[j])), k4 = der(y.map((q, j) => q + h * k3[j]));
+      y = y.map((q, j) => q + (h / 6) * (k1[j] + 2 * k2[j] + 2 * k3[j] + k4[j]));
+    }
+    return { p: v3(y[0], y[1], y[2]), v: v3(y[3], y[4], y[5]), J: v3(y[6], y[7], y[8]), L: v3(y[9], y[10], y[11]) };
+  }
+
+  it('momentum exchange on a hand pull: the ledger equals the integrated hand force law (linear and angular)', () => {
     const H = hold(v3(1, 0.5, -2), v3(1, 0.5, -2));
-    const g = createGrip(), led = createReaction();
-    const p = v3(1.2, 0.2, -1.6), v = v3(0.05, 0, 0), off = v3(0, 0.3, 0);
-    grab(g, H, 0, p, off);
-    setGripPull(g, 0.25); // pull in: the body is drawn to the handle
-    const P0 = { x: BODY_MASS * v.x, y: BODY_MASS * v.y, z: BODY_MASS * v.z };
-    const L0 = { x: BODY_MASS * (p.y * v.z - p.z * v.y), y: BODY_MASS * (p.z * v.x - p.x * v.z), z: BODY_MASS * (p.x * v.y - p.y * v.x) };
-    for (let k = 0; k < 120; k++) stepGrip(g, H, p, v, null, Q, led);
+    // unsaturated: the body drifts at 6 cm/s and the arm draws it back toward where it caught on, under a felt load
+    const g = createGrip(), led = createReaction(), f = v3(0.3, -0.2, 0.1);
+    const p = v3(1.2, 0.2, -1.6), v = v3(0.06, 0.02, -0.03), off = v3(0, 0.3, 0);
+    expect(grab(g, H, 0, p, off)).toBe(true);
+    const target = v3(g.g.x + g.tgt.x - g.off.x, g.g.y + g.tgt.y - g.off.y, g.g.z + g.tgt.z - g.off.z);
+    const ref = reference(p, v, target, f, 1);
+    for (let k = 0; k < 120; k++) stepGrip(g, H, p, v, f, Q, led);
     const J = v3(), L = v3();
     consumeReaction(led, J, L);
-    const dP = v3(BODY_MASS * v.x - P0.x, BODY_MASS * v.y - P0.y, BODY_MASS * v.z - P0.z);
-    const dL = v3(BODY_MASS * (p.y * v.z - p.z * v.y) - L0.x, BODY_MASS * (p.z * v.x - p.x * v.z) - L0.y, BODY_MASS * (p.x * v.y - p.y * v.x) - L0.z);
-    expect(len(dP)).toBeGreaterThan(1); // a real pull: > 1 N·s
-    expect(len(v3(J.x + dP.x, J.y + dP.y, J.z + dP.z))).toBeLessThan(1e-12 * (1 + len(dP)));
-    expect(len(v3(L.x + dL.x, L.y + dL.y, L.z + dL.z))).toBeLessThan(1e-11 * (1 + len(dL)));
+    const eJ = len(v3(J.x + ref.J.x, J.y + ref.J.y, J.z + ref.J.z)), eL = len(v3(L.x + ref.L.x, L.y + ref.L.y, L.z + ref.L.z));
+    const ep = len(v3(p.x - ref.p.x, p.y - ref.p.y, p.z - ref.p.z));
+    console.log(`[hands] hand pull vs RK4 of the force law over 1 s: |J| ${len(ref.J).toFixed(3)} N·s, error ${eJ.toExponential(1)} N·s; |L| ${len(ref.L).toFixed(3)}, error ${eL.toExponential(1)} N·m·s; position ${ep.toExponential(1)} m`);
+    expect(len(ref.J)).toBeGreaterThan(4); // a real exchange (felt load carried + the stop)
+    // (the reference's own rounding over 5e5 RK4 steps is ~1e-9; the ledger's felt-load moment uses the sub-step's
+    // mean position, O(a·hs²) — 2e-8 of |L|)
+    expect(eJ).toBeLessThan(1e-8);
+    expect(eL).toBeLessThan(1e-7 * len(ref.L));
+    expect(ep).toBeLessThan(1e-11);
     expect(len(led.J)).toBe(0); // consumed
+  });
+
+  it('a saturated catch (1 m/s) matches the force law to the sub-step: the ledger is the hand force, not a bookkeeping', () => {
+    const H = hold(v3(0, 1, 0), v3(0, 1, 0));
+    const g = createGrip(), led = createReaction();
+    const p = v3(0, 0.6, -0.15), v = v3(0.2, 0, -1), off = v3(0, 0.4, 0);
+    grab(g, H, 0, p, off);
+    const target = v3(g.g.x + g.tgt.x - g.off.x, g.g.y + g.tgt.y - g.off.y, g.g.z + g.tgt.z - g.off.z);
+    const ref = reference(p, v, target, v3(), 1);
+    for (let k = 0; k < 120; k++) stepGrip(g, H, p, v, null, Q, led);
+    const eJ = len(v3(led.J.x + ref.J.x, led.J.y + ref.J.y, led.J.z + ref.J.z));
+    console.log(`[hands] 1 m/s catch vs RK4 of the capped force law: |J| ${len(ref.J).toFixed(3)} N·s, error ${eJ.toExponential(1)} N·s`);
+    expect(eJ).toBeLessThan(1e-9 + 1e-3 * len(ref.J));
+  });
+
+  it('push off one wall, fly across, stop at the far wall: with every contact in the ledger the ship keeps Δv = 0', () => {
+    // the cabin's walls at z = 0 (aft) and z = −6 (fore); the ship a free 5e4 kg body; crew.ts' wall stop is an
+    // inelastic contact impulse J = −m·v_n, recorded with recordImpulse (THE RULE in hands.ts)
+    const run = (wallInLedger: boolean): { V: number; v: number } => {
+      const Ms = 5e4, ps = createPush(), led = createReaction(), a = v3(), J = v3(), L = v3(), jump = v3(), Jw = v3();
+      const p = v3(0, 0, -0.3), v = v3();
+      let V = v3(), stopped = false;
+      startPush(ps, v3(0, 0, -1), v3(0, 0, -1), 1, LIMB_LEGS);
+      for (let k = 0; k < 120 * 10; k++) {
+        if (ps.on) pushTick(ps, p, Q, led, a); else { a.x = a.y = a.z = 0; }
+        p.x += v.x * Q + 0.5 * a.x * Q * Q; p.y += v.y * Q + 0.5 * a.y * Q * Q; p.z += v.z * Q + 0.5 * a.z * Q * Q;
+        v.x += a.x * Q; v.y += a.y * Q; v.z += a.z * Q;
+        if (!stopped && p.z <= -5.7) {
+          Jw.x = -BODY_MASS * v.x; Jw.y = -BODY_MASS * v.y; Jw.z = -BODY_MASS * v.z; // the far wall stops the body
+          v.x = v.y = v.z = 0; p.z = -5.7; stopped = true;
+          if (wallInLedger) recordImpulse(led, p, Jw);
+        }
+        consumeReaction(led, J, L);
+        const dV = v3(J.x / Ms, J.y / Ms, J.z / Ms);
+        V = v3(V.x + dV.x, V.y + dV.y, V.z + dV.z);
+        shipJumpAt(p, dV, v3(), jump); // the free body keeps its inertial velocity
+        if (!stopped) { v.x += jump.x; v.y += jump.y; v.z += jump.z; }
+        else if (len(jump) > 0) { const Jb = v3(BODY_MASS * -jump.x, BODY_MASS * -jump.y, BODY_MASS * -jump.z); if (wallInLedger) recordImpulse(led, p, Jb); } // pressed on the wall, it rides along
+      }
+      return { V: V.z, v: v.z };
+    };
+    const closed = run(true), leaky = run(false);
+    console.log(`[hands] push off, fly 5.4 m, stop at the far wall: ship Δv ${closed.V.toExponential(1)} m/s with the wall in the ledger, ${(leaky.V * 1e3).toFixed(3)} mm/s without (the reactionless drive)`);
+    expect(Math.abs(closed.V)).toBeLessThan(1e-15);
+    expect(leaky.V).toBeCloseTo((LEG_PUSH_F * LEG_PUSH_T) / 5e4, 4);
   });
 
   it('coupled with a free 2e5 kg ship through the ledger, total momentum is conserved to rounding', () => {
@@ -146,6 +217,56 @@ describe('grip', () => {
     expect(p.x).toBeLessThan(3);
     // slid ≈ v²/(2a) = 0.6 m along the rail before sticking
     expect(g.g.x + 2).toBeGreaterThan(0.5);
+  });
+
+  it('sliding along a rail with velocity across it, the whole hand force (across + friction) stays ≤ 350 N', () => {
+    const H = hold(v3(-3, 1, 0), v3(3, 1, 0), 'rail');
+    const g = createGrip(), p = v3(-2, 0.6, 0.2), v = v3(1.5, 0, -1.0);
+    grab(g, H, 0, p, v3(0, 0.3, 0));
+    let pk = 0, slid = false;
+    for (let k = 0; k < 60 && g.on; k++) { if (stepGrip(g, H, p, v, null, Q, null) === GRIP_SLIDING) slid = true; pk = Math.max(pk, g.fPeak); }
+    console.log(`[hands] rail slide with 1 m/s across: peak hand force ${pk.toFixed(2)} N`);
+    expect(slid).toBe(true);
+    expect(pk).toBeLessThanOrEqual(GRIP_FMAX * (1 + 1e-9));
+  });
+
+  it('a non-finite felt load counts as none (no poisoned state); a zero step does nothing', () => {
+    const H = hold(v3(0, 1, 0), v3(0, 1, 0)), off = v3(0, 0.4, 0);
+    const a = createGrip(), b = createGrip(), pa = v3(0, 0.6, -0.2), pb = v3(0, 0.6, -0.2), va = v3(0, 0, -0.3), vb = v3(0, 0, -0.3);
+    grab(a, H, 0, pa, off); grab(b, H, 0, pb, off);
+    for (let k = 0; k < 10; k++) { stepGrip(a, H, pa, va, v3(NaN, Infinity, 0), Q, null); stepGrip(b, H, pb, vb, null, Q, null); }
+    expect(pa).toEqual(pb); expect(va).toEqual(vb);
+    expect(stepGrip(a, H, pa, va, null, 0, null)).toBe(GRIP_HELD);
+    expect(pa).toEqual(pb);
+    const ps = createPush(), out = v3(1, 1, 1);
+    startPush(ps, v3(0, 1, 0), v3(0, 1, 0), 1, LIMB_LEGS);
+    expect(pushTick(ps, v3(), 0, null, out)).toBe(0);
+    expect(out).toEqual(v3());
+  });
+
+  it('warp and 1× pass the ship the same momentum: gripEquilibrium records the entry stop and the felt load carried', () => {
+    const H = hold(v3(0, 1, 0), v3(0, 1, 0)), off = v3(0, 0.4, 0), f = v3(0, 0, 2); // 160 N felt load
+    // 1×: settle, then one second of steady hold
+    const g1 = createGrip(), l1 = createReaction(), p1 = v3(0, 0.6, -0.2), w1 = v3(), J1 = v3(), L1 = v3();
+    grab(g1, H, 0, p1, off);
+    for (let k = 0; k < 1200; k++) stepGrip(g1, H, p1, w1, f, Q, l1);
+    consumeReaction(l1, J1, L1);
+    for (let k = 0; k < 120; k++) stepGrip(g1, H, p1, w1, f, Q, l1);
+    consumeReaction(l1, J1, L1);
+    // warp: one 1 s quantum from the same held state
+    const g2 = createGrip(), l2 = createReaction(), p2 = { ...p1 }, w2 = v3(), J2 = v3(), L2 = v3();
+    grab(g2, H, 0, p2, off);
+    g2.tgt = { ...g1.tgt }; g2.g = { ...g1.g };
+    expect(gripEquilibrium(g2, H, p2, w2, f, 1, l2)).toBe(GRIP_HELD);
+    consumeReaction(l2, J2, L2);
+    console.log(`[hands] steady hold under 160 N: ship J per second at 1× ${J1.z.toFixed(6)} N·s, under warp ${J2.z.toFixed(6)} N·s`);
+    expect(J1.z).toBeCloseTo(160, 6);
+    expect(J2.z).toBeCloseTo(J1.z, 6);
+    // entering warp while moving: the body's momentum goes to the ship, not nowhere
+    const g3 = createGrip(), l3 = createReaction(), p3 = v3(0, 0.6, -0.2), w3 = v3(0.1, 0, 0);
+    grab(g3, H, 0, p3, off);
+    gripEquilibrium(g3, H, p3, w3, v3(), 0.5, l3);
+    expect(l3.J.x).toBeCloseTo(BODY_MASS * 0.1, 12);
   });
 
   it('lets go when the arm is pulled past full extension, or when the felt load is beyond the grip under warp', () => {
@@ -196,7 +317,7 @@ describe('push-off', () => {
     expect(run(LIMB_ARMS, v3(0, 0, 1), v3(0, 0, 1), 1).v.z).toBeCloseTo((ARM_PUSH_F * ARM_PUSH_T) / BODY_MASS, 12);
     expect(run(LIMB_ARMS, v3(0, 0, 1), v3(0, 0, 1), flickEffort(0.5, 2)).v.z).toBeCloseTo(0.28125, 12);
   });
-  it('inside the 35° cone the push goes where wished; outside it is clamped to the cone edge; into the wall, none', () => {
+  it('inside the 35° cone the push goes where wished; outside it is clamped to the cone edge with the force the friction allows; into the wall, none', () => {
     expect(PUSH_MU_MATCHES_BOOTS).toBe(true);
     const a = (30 * Math.PI) / 180, inside = run(LIMB_ARMS, v3(0, 0, 1), v3(Math.sin(a), 0, Math.cos(a)), 1);
     expect(inside.res).toBe(PUSH_IN_CONE);
@@ -204,7 +325,10 @@ describe('push-off', () => {
     const b = (70 * Math.PI) / 180, out = run(LIMB_ARMS, v3(0, 0, 1), v3(Math.sin(b), 0, Math.cos(b)), 1);
     expect(out.res).toBe(PUSH_CLAMPED);
     expect(Math.atan2(out.v.x, out.v.z)).toBeCloseTo(PUSH_CONE, 12);
-    expect(len(out.v)).toBeCloseTo(1.125, 12);
+    // the surface carries only F·cos 70°, so friction passes the cone edge's F·cos 70°/cos 35°
+    expect(len(out.v)).toBeCloseTo(1.125 * Math.cos(b) / Math.cos(PUSH_CONE), 12);
+    const c89 = (89 * Math.PI) / 180, graze = run(LIMB_ARMS, v3(0, 0, 1), v3(Math.sin(c89), 0, Math.cos(c89)), 1);
+    expect(len(graze.v)).toBeLessThan(0.03); // almost along the wall: almost no push
     expect(run(LIMB_ARMS, v3(0, 0, 1), v3(0, 0, -1), 1).res).toBe(PUSH_NONE);
   });
   it('the ship takes the push: ledger J = −m·Δv and L = −p × J', () => {

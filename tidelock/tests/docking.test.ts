@@ -4,9 +4,9 @@ import type { Quat, V3 } from '../src/core/types';
 import { SHIP_LAYOUTS } from '../src/data/shipLayouts';
 import { STATION_LAYOUTS } from '../src/data/stationLayouts';
 import {
-  CAP_BREAK, CAP_CAPTURE, CAP_CONTACT, CAP_HARD, CAP_RETRACT, captureHarden, captureMaxStep, captureStep, HARD_OFFSET, latchBreakSpeed,
-  latchLoad, loadCapture, makeCaptureState, makeLatchLoad, makeRingGeom, makeRingIO, Q, RING_EXT, RING_STROKE, ringGeom, ringPhase,
-  saveCapture, RING_K, RING_KT, RING_ZETA, type CaptureState,
+  CAP_BREAK, CAP_CAPTURE, CAP_CONTACT, CAP_HARD, CAP_NONE, CAP_RETRACT, captureHarden, captureMaxStep, capturePotential, captureStep,
+  HARD_OFFSET, latchBreakSpeed, latchLoad, loadCapture, makeCaptureState, makeLatchLoad, makeRingGeom, makeRingIO, Q, RING_EXT,
+  RING_STROKE, ringGeom, ringPhase, saveCapture, RING_K, RING_ZETA, type CaptureState,
 } from '../src/world/capture';
 import { compoundGyration, hullCompound, type ContactBody } from '../src/world/compound';
 import { gyrostatFree, stationMassProps } from '../src/world/stations';
@@ -16,7 +16,7 @@ const WHEEL = STATION_LAYOUTS.ringHabitat;
 const MP = stationMassProps(WHEEL);
 const H_ROTOR = MP.rotor!.I * MP.rotor!.omega0;
 const IT = 0.5 * (MP.inertia.x + MP.inertia.z);
-const SHIP_M = 60e3;
+let SHIP_M = 60e3;
 const GYR = compoundGyration(hullCompound('wren')!, v3());
 const COLLAR = SHIP_LAYOUTS.wren.dockingPort;
 const SEAT = v3(-0.55, 0.25, -13.45);
@@ -44,7 +44,8 @@ interface Scene { A: ContactBody; B: ContactBody; s: CaptureState }
  * opposed to the port axis (turned by `tilt` about the port's up), its collar `gap` m outside the ring face and
  * `lateral` m off the axis along the port's up, closing at `speed`.
  */
-function scene(speed: number, gap = 0.02, lateral = 0, tilt = 0): Scene {
+function scene(speed: number, gap = 0.02, lateral = 0, tilt = 0, mass = 60e3): Scene {
+  SHIP_M = mass;
   const d = PORT.dir, up = PORT.up;
   // ship +Y (collar) -> −d : rotate ŷ onto −d
   const t = v3(-d.x, -d.y, -d.z), ax = cross(v3(0, 1, 0), t), s = len(ax);
@@ -101,43 +102,49 @@ function kinetic(sc: Scene): number {
 
 interface Run {
   codes: number[]; maxComp: number; peakAcc: number; dP: number; dL: number; L0: number; P0: number;
-  energyUp: number; sepSpeed: number; sc: Scene; t: number; dLstep: number;
+  energyUp: number; sepSpeed: number; sc: Scene; t: number; dLstep: number; E0: number; E1: number; stopE: number; heat: number; maxLat: number;
 }
 
-/** Step the pair at the ring's own step limit (Q while engaged, 0.5 s retracting) for `T` seconds. */
-function run(sc: Scene, T: number, armed = true, onStep?: (sc: Scene, t: number) => void): Run {
+/** Ring energy check: KE + the ring's stored energy, at the poses after each drift. */
+const totalE = (sc: Scene, g: ReturnType<typeof makeRingGeom>): number => kinetic(sc) + capturePotential(g, sc.s, sc.A, sc.B);
+
+/**
+ * Step the pair at the ring's own step limit (Q while engaged, 0.5 s retracting) for `T` seconds: captureStep at the
+ * START of each span (io.h = the span), then both bodies drift over it. `hOf` overrides the span.
+ */
+function run(sc: Scene, T: number, armed = true, onStep?: (sc: Scene, t: number) => void, hOf?: (sc: Scene, t: number) => number): Run {
   const g = ringGeom(makeRingGeom(), PORT, COLLAR), io = makeRingIO();
   io.armed = armed;
   const m0 = momenta(sc);
-  const out: Run = { codes: [], maxComp: 0, peakAcc: 0, dP: 0, dL: 0, L0: m0.Lship, P0: len(m0.P), energyUp: 0, sepSpeed: 0, sc, t: 0, dLstep: 0 };
-  let t = 0, prevE = NaN;
+  const E0 = totalE(sc, g);
+  const out: Run = { codes: [], maxComp: 0, peakAcc: 0, dP: 0, dL: 0, L0: m0.Lship, P0: len(m0.P), energyUp: 0, sepSpeed: 0, sc, t: 0, dLstep: 0, E0, E1: E0, stopE: 0, heat: 0, maxLat: 0 };
+  let t = 0, prevE = E0;
   while (t < T) {
-    const hh = sc.s.latched && sc.s.phase !== 'soft' ? 0.5 : Q;
-    drift(sc, hh);
-    t += hh;
+    const lim = captureMaxStep(sc.s);
+    const hh = hOf ? hOf(sc, t) : lim === Infinity ? Q : lim;
     io.h = hh;
     const v0 = v3(sc.A.v.x, sc.A.v.y, sc.A.v.z), w0 = rot(sc.A.q, sc.A.w);
-    const ke = kinetic(sc);
     const mb = momenta(sc).L;
     const code = captureStep(g, sc.s, sc.A, sc.B, io);
     const ma = momenta(sc).L;
     out.dLstep = Math.max(out.dLstep, len(v3(ma.x - mb.x, ma.y - mb.y, ma.z - mb.z)));
+    out.stopE += io.energy; out.heat += io.heat;
     if (code) out.codes.push(code);
     if (code === CAP_HARD) captureHarden(g, sc.s, sc.A, sc.B, io);
-    if (sc.s.latched && sc.s.phase === 'soft') {
-      const st = sc.s.stroke, r = sc.s.rot;
-      const E = ke + 0.5 * RING_K * (st.x * st.x + st.y * st.y + st.z * st.z) + 0.5 * RING_KT * (r.x * r.x + r.y * r.y + r.z * r.z);
-      if (Number.isFinite(prevE) && E > prevE) out.energyUp = Math.max(out.energyUp, (E - prevE) / prevE);
-      prevE = E;
-    } else prevE = NaN;
-    if (sc.s.engaged || sc.s.latched) out.maxComp = Math.max(out.maxComp, sc.s.stroke.z);
-    if (hh === Q) {
+    if (hh <= 2 * Q) {
       // felt at the seat: (Δv + Δω × r)/h
       const w1 = rot(sc.A.q, sc.A.w), r = rot(sc.A.q, SEAT);
       const dw = v3(w1.x - w0.x, w1.y - w0.y, w1.z - w0.z), dwr = cross(dw, r);
       const a = len(v3(sc.A.v.x - v0.x + dwr.x, sc.A.v.y - v0.y + dwr.y, sc.A.v.z - v0.z + dwr.z)) / hh;
       out.peakAcc = Math.max(out.peakAcc, a);
     }
+    drift(sc, hh);
+    t += hh;
+    // the hook motor (retract) and the hardening do work on the pair: the check covers the bumper and attenuation
+    const E = totalE(sc, g);
+    if (E > prevE && !(sc.s.latched && sc.s.phase !== 'soft')) out.energyUp = Math.max(out.energyUp, (E - prevE) / prevE);
+    prevE = E;
+    if (sc.s.engaged || sc.s.latched) { out.maxComp = Math.max(out.maxComp, sc.s.stroke.z); out.maxLat = Math.max(out.maxLat, Math.hypot(sc.s.stroke.x, sc.s.stroke.y)); }
     onStep?.(sc, t);
     const m = momenta(sc);
     out.dP = Math.max(out.dP, len(v3(m.P.x - m0.P.x, m.P.y - m0.P.y, m.P.z - m0.P.z)));
@@ -146,6 +153,7 @@ function run(sc: Scene, T: number, armed = true, onStep?: (sc: Scene, t: number)
   const d = PORT.dir;
   out.sepSpeed = (sc.A.v.x - sc.B.v.x) * d.x + (sc.A.v.y - sc.B.v.y) * d.y + (sc.A.v.z - sc.B.v.z) * d.z;
   out.t = t;
+  out.E1 = prevE;
   return out;
 }
 
@@ -202,9 +210,10 @@ describe('soft capture', () => {
     let t = 0;
     while (t < 400 && !(sc.s.latched && sc.s.phase === 'hard')) {
       const h = captureMaxStep(sc.s) === Infinity ? Q : captureMaxStep(sc.s);
-      drift(sc, h); t += h; io.h = h;
+      io.h = h;
       const c = captureStep(g, sc.s, sc.A, sc.B, io);
       if (c === CAP_HARD) captureHarden(g, sc.s, sc.A, sc.B, io);
+      drift(sc, h); t += h;
       const ph = ringPhase(sc.s);
       if (phases[phases.length - 1] !== ph) phases.push(ph);
     }
@@ -229,7 +238,7 @@ describe('soft capture', () => {
     const steps = (sc: Scene, n: number): void => {
       const g = ringGeom(makeRingGeom(), PORT, COLLAR), io = makeRingIO();
       io.armed = true;
-      for (let i = 0; i < n; i++) { drift(sc, Q); io.h = Q; captureStep(g, sc.s, sc.A, sc.B, io); }
+      for (let i = 0; i < n; i++) { io.h = Q; captureStep(g, sc.s, sc.A, sc.B, io); drift(sc, Q); }
     };
     const a = scene(0.25, 0.02, 0.1, 0.05);
     steps(a, 300);
@@ -271,12 +280,94 @@ describe('latch loads while docked', () => {
     io.armed = true;
     let broke = false;
     for (let i = 0; i < 600 && !broke; i++) {
-      drift(sc, Q); io.h = Q;
+      io.h = Q;
       // after capture, shove the ship sideways at 4 m/s (a collision while latched)
       if (i === 240) { sc.A.v.y += 4; }
       broke = captureStep(g, sc.s, sc.A, sc.B, io) === CAP_BREAK;
+      drift(sc, Q);
     }
     expect(broke).toBe(true);
     expect(sc.s.latched).toBe(false);
+  });
+});
+
+describe('review fixes: bumper, envelope corners, step changes, bad steps, stop energy, old saves', () => {
+  it('an off-axis touch outside the envelope (0.35–0.55 m) is a gentle bumper: no energy gained, no kick', () => {
+    for (const [sp, lat, armed] of [[0.1, 0.35, true], [0.1, 0.45, true], [0.1, 0.55, true], [0.05, 0.45, false]] as const) {
+      const r = run(scene(sp, 0.02, lat), 25, armed);
+      expect(r.codes).toContain(CAP_CONTACT);
+      expect(r.codes).not.toContain(CAP_CAPTURE);
+      expect(r.energyUp).toBeLessThan(1e-9);
+      expect(r.E1).toBeLessThan(r.E0);
+      expect(r.peakAcc).toBeLessThan(0.5);
+      expect(r.dP / r.P0).toBeLessThan(1e-9);
+      expect(r.dL / r.L0).toBeLessThan(1e-9);
+      console.log(`bumper ${sp} m/s at ${lat} m (armed ${armed}): E ${r.E0.toFixed(0)} -> ${r.E1.toFixed(0)} J, peak seat ${r.peakAcc.toFixed(3)} m/s²`);
+    }
+  });
+
+  it('captures at the corners of the envelope stay under 0.5 m/s² at the seat for 43, 60 and 67 t and go hard', () => {
+    for (const m of [43e3, 60e3, 67e3]) {
+      for (const tilt of [9.9, -9.9]) {
+        const sc = scene(0.299, 0.02, 0.299, (tilt * Math.PI) / 180, m);
+        let tHard = NaN;
+        const r = run(sc, 160, true, (x, t) => { if (Number.isNaN(tHard) && x.s.phase === 'hard') tHard = t; });
+        expect(r.codes[0]).toBe(CAP_CAPTURE);
+        expect(r.codes).toContain(CAP_HARD);
+        expect(r.peakAcc).toBeLessThan(0.5);
+        expect(r.codes).not.toContain(CAP_BREAK);
+        console.log(`corner ${m / 1e3} t, 0.299 m/s, 0.299 m, ${tilt}°: peak seat ${r.peakAcc.toFixed(3)} m/s², hard at ${tHard.toFixed(0)} s`);
+      }
+    }
+    SHIP_M = 60e3;
+  });
+
+  it('kick-then-drift never gains energy while attenuating, whatever the step sequence (Q, 0.5, 2, 17 s)', () => {
+    for (const lat of [0, 0.1]) {
+      for (const seq of [[Q, 0.5], [Q, 2], [Q, 17], [Q, 0.5, 2, 17, Q, 5, 0.01]]) {
+        let i = 0;
+        const r = run(scene(0.2, 0.02, lat), 200, true, undefined, (_sc, t) => (t < 1 ? Q : seq[i++ % seq.length]));
+        expect(r.codes[0]).toBe(CAP_CAPTURE);
+        expect(r.energyUp).toBeLessThan(1e-9);
+        expect(r.dP / r.P0).toBeLessThan(1e-9);
+      }
+    }
+  });
+
+  it('a step of 0, NaN, < 0 or ∞ does nothing and writes no NaN', () => {
+    const sc = scene(0.1);
+    const g = ringGeom(makeRingGeom(), PORT, COLLAR), io = makeRingIO();
+    io.armed = true;
+    for (let i = 0; i < 300; i++) { io.h = Q; captureStep(g, sc.s, sc.A, sc.B, io); drift(sc, Q); }
+    expect(sc.s.latched).toBe(true);
+    const before = JSON.stringify({ A: sc.A, B: sc.B, s: saveCapture(sc.s) });
+    for (const h of [0, NaN, -1, Infinity]) {
+      io.h = h;
+      expect(captureStep(g, sc.s, sc.A, sc.B, io)).toBe(CAP_NONE);
+      expect(io.J.x).toBe(0); expect(io.L.y).toBe(0); expect(io.energy).toBe(0);
+    }
+    expect(JSON.stringify({ A: sc.A, B: sc.B, s: saveCapture(sc.s) })).toBe(before);
+  });
+
+  it('a ram into the hard stop reports the energy the structure took (io.energy), and the books balance', () => {
+    for (const sp of [2, 3]) {
+      const r = run(scene(sp), 20, true);
+      expect(r.stopE).toBeGreaterThan(0);
+      expect(Math.abs(r.stopE + r.heat - (r.E0 - r.E1)) / (r.E0 - r.E1)).toBeLessThan(0.01);
+      console.log(`${sp} m/s ram: structure ${(r.stopE / 1e3).toFixed(1)} kJ + ring heat ${(r.heat / 1e3).toFixed(1)} kJ vs ${((r.E0 - r.E1) / 1e3).toFixed(1)} kJ lost`);
+    }
+    const c = run(scene(0.3), 15, true);
+    expect(c.stopE).toBe(0);
+  });
+
+  it('an old save of a docked ship loads hard-latched and stays put', () => {
+    const d = loadCapture(undefined, true);
+    expect(d.phase).toBe('hard'); expect(d.latched).toBe(true); expect(d.ext).toBe(0);
+    expect(captureMaxStep(d)).toBe(Infinity);
+    const sc = scene(0.1);
+    const io = makeRingIO(); io.h = Q;
+    expect(captureStep(ringGeom(makeRingGeom(), PORT, COLLAR), d, sc.A, sc.B, io)).toBe(CAP_NONE);
+    // a save that has capture fields wins over the hint
+    expect(loadCapture(saveCapture(makeCaptureState()), true).latched).toBe(false);
   });
 });
