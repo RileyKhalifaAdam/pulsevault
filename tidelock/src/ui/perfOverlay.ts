@@ -2,6 +2,7 @@
 // "Copy performance report" button — the owner's phone is the only real test device.
 import type { UiHost } from './host';
 import { h, onTap } from './kit';
+import { renderInfo, rtInfoText } from '../app/perf';
 
 const CSS = `
 .pf{position:absolute;z-index:60;right:max(8px,env(safe-area-inset-right,0px));top:calc(var(--pf-top,206px) + env(safe-area-inset-top,0px));width:184px;pointer-events:none;
@@ -92,6 +93,8 @@ export function createPerfOverlay(host: UiHost, extra: () => string[]): PerfOver
         `sim    ${s.simP50.toFixed(2)} / ${s.simP95.toFixed(2)} ms\n` +
         `render ${s.renderP50.toFixed(1)} / ${s.renderP95.toFixed(1)} ms\n` +
         `steps ${s.steps.toFixed(1)} · draws ${s.drawCalls}\n` +
+        `${rtInfoText()}\n` +
+        `gpu mem ${(renderInfo.totalBytes / 1048576).toFixed(0)} MB · msaa ${renderInfo.msaa}x\n` +
         `(p50 / p95 of ${s.samples} frames)`;
     },
   };

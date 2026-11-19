@@ -15,6 +15,11 @@
 //   ex ey ez            eye override, ship-local m               yaw pitch  look override, deg
 //   lights=0|1          cabin lights          q=low|medium|high|ultra      interior=proxy (default) | real
 //   frames=N            frames to settle (default 40; auto exposure adapts over ~1 s of frame time)
+//   rt=off|low|medium|high   ray-traced sunlight (default high, as the game)
+//   turn=deg            head yaw per frame over the last `moving` frames (ghosting check)
+//   spin=deg            ship yaw per frame over the last `moving` frames (the sun sweeps in ship space)
+//   moving=N            frames of motion at the end (default 2)
+//   fx=SBR              tracer effects on/off: sun, bounce, reflections (e.g. fx=100)
 //
 // interior=proxy builds a stand-in from src/data/interiors.ts with MeshStandardMaterial walls, window and
 // door openings, furniture boxes and userData.room tags (the contract of the interior being rebuilt), so the
@@ -29,6 +34,7 @@ import { INTERIORS, type Box, type InteriorLayout } from '../../src/data/interio
 import type { CraftView } from '../../src/game/api';
 import type { InteriorOptions, InteriorUpdate, InteriorVisual } from '../../src/render/space/interior';
 import { renderInfoText } from '../../src/app/perf';
+import type { RayTracer, RtQuality } from '../../src/render/rt';
 
 const params = new URLSearchParams(location.search);
 const has = (k: string): boolean => params.has(k) && params.get(k) !== '';
@@ -95,6 +101,12 @@ const lights = has('lights') ? num('lights', 1) === 1 : preset.lights;
 const sunL: V3 = { x: num('sx', preset.sun.x), y: num('sy', preset.sun.y), z: num('sz', preset.sun.z) };
 const nadirL: V3 = { x: num('nx', preset.nadir.x), y: num('ny', preset.nadir.y), z: num('nz', preset.nadir.z) };
 const frames = num('frames', 40);
+const rtTier = (params.get('rt') ?? 'high') as RtQuality;
+const turnDeg = num('turn', 0);
+const spinDeg = num('spin', 0);
+const moving = num('moving', 2);
+let spin = 0; // ship yaw added so far, rad
+let headYaw = 0;
 
 // ------------------------------------------------------------------------------------------- proxy interior
 
@@ -316,6 +328,7 @@ function craftViews(): { craft: CraftView[]; playerId: string } {
     return new THREE.Matrix4().makeBasis(e1, e2, new THREE.Vector3().crossVectors(e1, e2));
   };
   const rot = frameOf(up.clone().negate(), sunDir).multiply(frameOf(nl, sl).transpose());
+  if (spin !== 0) rot.multiply(new THREE.Matrix4().makeRotationY(spin));
   const q = new THREE.Quaternion().setFromRotationMatrix(rot);
   const moved: CraftView = { ...player, r: { x: r.x, y: r.y, z: r.z }, v: { ...primary.v }, q: { x: q.x, y: q.y, z: q.z, w: q.w }, throttle: 0 };
   return { craft: craft.map((c) => (c === player ? moved : c)), playerId: player.id };
@@ -331,7 +344,7 @@ function fill(dt: number): void {
   frame.camera.eye.x = eye.x;
   frame.camera.eye.y = eye.y;
   frame.camera.eye.z = eye.z;
-  frame.camera.lookYaw = lookYaw;
+  frame.camera.lookYaw = lookYaw + headYaw;
   frame.camera.lookPitch = lookPitch;
   frame.camera.lookAtId = null;
   frame.cabinLights = lights;
@@ -339,9 +352,22 @@ function fill(dt: number): void {
 
 async function main(): Promise<void> {
   const t0 = performance.now();
+  scene.setRayTracing(rtTier);
+  // fx=SBR: per-effect switches of the tracer (sun, bounce, reflections), e.g. fx=100 for the sun alone
+  const fxp = params.get('fx');
+  if (fxp && fxp.length >= 3) {
+    const tr = (scene as unknown as { rt: RayTracer }).rt;
+    tr.effects.sun = fxp[0] === '1';
+    tr.effects.bounce = fxp[1] === '1';
+    tr.effects.reflections = fxp[2] === '1';
+  }
   await scene.setSystem(session.system, (f, label) => (info.textContent = `loading ${(f * 100).toFixed(0)}% ${label}`), { nearBodyId: session.flight().primaryId });
   const t1 = performance.now();
   for (let i = 0; i < frames || (i < 120 && scene.busy()); i++) {
+    if (i >= frames - moving) {
+      spin += spinDeg * DEG;
+      headYaw += turnDeg * DEG;
+    }
     fill(1 / 30);
     scene.render(frame);
     if (i % 4 === 3) await new Promise((r) => setTimeout(r, 0));
@@ -350,6 +376,7 @@ async function main(): Promise<void> {
   const ps = pipeline.stats();
   const li = st.lighting;
   const mb = (b: number): string => (b / 1048576).toFixed(1);
+  const rti = scene.rayTracing();
   info.textContent =
     `lighting ${view} · ${quality} · ${useProxy ? 'proxy' : 'real'} interior · lights ${lights ? 'on' : 'off'} · cam ${scene.camera.mode} fov ${(scene.camera.fovY / DEG).toFixed(0)}\n` +
     `frame: draw calls ${st.drawCalls} · triangles ${st.triangles} · msaa ${ps.msaa} · auto exposure ${ps.autoExposure ? 'on' : 'off'} · ${ps.width}x${ps.height}\n` +
@@ -357,6 +384,8 @@ async function main(): Promise<void> {
     `textures ${mb(st.textureBytes)} MB · targets ${mb(st.targetBytes)} MB · programs ${pipeline.renderer.info.programs?.length ?? 0} · load ${((t1 - t0) / 1000).toFixed(1)} s\n` +
     `${(globalThis as { __tlInterior?: string }).__tlInterior ?? ''}\n` +
     `load: ${(globalThis as { __tlLoad?: string }).__tlLoad ?? ''}\n` +
+    `rt ${rti.tier} active ${rti.active} · BVH ${rti.triangles} tris ${rti.buildMs.toFixed(0)} ms · ${mb(rti.bytes)} MB · ${(rti.rays / 1e6).toFixed(2)}M rays · est ${rti.msEstimate.toFixed(1)} ms${rti.disabled ? ` · ${rti.disabled}` : ''}${turnDeg || spinDeg ? ` · moving: head ${turnDeg}°/f ship ${spinDeg}°/f over ${moving} f` : ''}\n` +
+    `gpu memory: textures ${mb(st.textureBytes)} + targets ${mb(st.targetBytes)} + rt ${mb(st.rtBytes)} = ${mb(st.textureBytes + st.targetBytes + st.rtBytes)} MB\n` +
     renderInfoText();
   ready();
 }

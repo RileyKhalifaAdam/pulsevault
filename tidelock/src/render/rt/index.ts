@@ -6,42 +6,32 @@
 // sun direction and the lamps change per frame. Lamp light stays baked; only the sun is traced.
 //
 // ---------------------------------------------------------------------------------------------- integration
+// (as wired in src/render/scene.ts)
 //
-// Loader (once per interior build, behind the progress bar):
-//   const rt = createRayTracer(pipeline.renderer, { quality: rt.recommendedTier() /* or 'low' */ });
-//   await rt.setStaticScene(meshes, toShip, { exterior: [hullObject] });   // compiles its programs too
-//     meshes  = the OPAQUE static meshes: interior mesh (not 'interior-glass'), cockpit shell/console meshes,
-//               and the player's hull channel 0 mesh (wings/nose shadow the windows). Transparent, additive
-//               and depthWrite:false materials are skipped automatically; userData.rt = { skip: true } skips a
-//               mesh, userData.rt = { role: 'exterior' } (or opts.exterior) marks hull meshes.
-//     toShip  = inverse of the interior root's matrixWorld at that moment (identity when they are built at the
-//               origin, as interior.ts / cockpit.ts / ships.ts do). Positions become toShip × matrixWorld × v.
-//     Moving parts (stick, levers, screens) must not be passed: the BVH never changes after the build.
+// Loader (behind the progress bar, once per interior build, after its lightmaps are decoded):
+//   const rt = createRayTracer(renderer, { quality });
+//   rt.patchMaterials(interiorRoot)  // BEFORE the interior's materials compile (InteriorLighting.warmUp)
+//   await rt.setStaticScene(meshes, toShip, { exterior: [hullLod1Mesh], rasterKey: roomOfMesh });  // + its programs
+//     meshes  = the static opaque meshes of the interior and the cockpit (not the moving controls: their position
+//               attribute is DynamicDrawUsage; not instanced meshes; not glass), plus the hull's cheapest LOD
+//               marked exterior (front faces only: wings, nose and pods shadow the windows; never rasterised).
+//     Material data per vertex comes from mesh.userData.rt (surfaces.ts header: per-tile albedo / roughness /
+//     metalness, cockpit colour+pbr, hull tint x livery), else the three.js material.
+//     rasterKey: the room of a mesh — the G-buffer draws only the rooms the forward pass draws (frame.rooms).
 //
-// scene.ts, per frame while inside (after interior.update / InteriorLighting.update, before the interior pass):
-//   rt.render({ camera: insideCam, shipMatrixWorld: interior.object3d.matrixWorld,
-//               sun: { dirShip: <c.sunDir, ship-local>, color: keyColor, intensity: key.intensity,
-//                      angularRadius: Math.asin(starRadius / starDistance) },
-//               envMap: <cube of the outside, world axes> , lamps: cabinLights ? 1 : 0, bakedGain: 2^-EV,
-//               time, frame, width, height /* size of the interior HDR target */ });
-//   if (rt.active) the interior's forward materials must NOT receive the sun:
-//     - the shadow-mapped sun DirectionalLight: exclude interior + cockpit meshes from it (layers, or intensity 0
-//       for the inside pass); the current interior.ts shader: pass sunColor = 0 in InteriorUpdate;
-//     - reflection probes / envMap specular on interior materials with roughness < 0.5: set envMapIntensity 0
-//       when the 'reflections' effect is on (rays + env fallback replace them; rough surfaces keep the probes);
-//     - nothing else changes: baked lamp lightmaps (uv1), emissives, planetshine through the windows, the
-//       hull outside, glass, effects all stay in the forward pass.
-//   Then draw the interior pass into the HDR target as now, and before bloom / exposure metering:
-//   pipeline.ts: rt.composite(hdrTarget.texture, hdrTarget)  — IN PLACE, with the interior pass's depth still in
-//     hdrTarget (it uses LEQUAL + polygon offset against it). With MSAA this is the multisampled target before
-//     resolve; if that is not possible, pass a different target and it copies hdrColor first (dynamic objects
-//     such as levers then get the sun of the static surface behind them).
-//   It adds, linear HDR, three.js light units: sun direct (Lambert + GGX × N·L × traced disc visibility), sun
-//   bounce (albedo × mean incoming sun-bounce radiance) and glossy reflections (× split-sum env BRDF), and
-//   multiplies the existing colour by near-field AO at 'ultra'.
+// Per frame while inside, before the pipeline renders:
+//   if (rt.willRun) the interior sun light gets intensity 0 (so InteriorLighting renders no sun shadow map);
+//   rt.render({ camera, shipMatrixWorld, sun: { dirShip, color, intensity, angularRadius }, envMap: <raw outside
+//              cube, world axes>, lamps, bakedGain: 2^-EV, rooms: <visible room ids>, width/height of the HDR target });
+//   otherwise rt.skip().
+//   The patched materials (forward.ts) then take the traced light in their own forward pass: the sun as an extra
+//   RE_Direct light × traced visibility, the sun bounce as irradiance, and traced reflections replacing the probe
+//   radiance below roughness ~0.32 — multiplied by each pixel's own albedo, normal and roughness (photo scans,
+//   normal maps and lightmaps show in the sun: the "demodulated" fix of the first composite).
+//   composite() (adding light onto a finished image with per-vertex albedo) is kept for experiments only.
 //
-// Perf overlay: rt.stats() (rays, bvhNodes, triangles, buildMs, msGpuEstimate, bytes, tier) — measure real GPU
-// time with EXT_disjoint_timer_query_webgl2 where it exists (iOS does not expose it: use frame-time deltas
-// with RT on/off) and drop the tier when the budget is exceeded.
+// Perf overlay: rt.stats() (rays, bvhNodes, triangles, buildMs, msGpuEstimate, msGpu — measured with
+// EXT_disjoint_timer_query_webgl2 where it exists, -1 on iOS — bytes, drawCalls, tier); rt.bytesAt(tier, w, h).
 export { createRayTracer, RT_TIERS, type RayTracer, type RtEffects, type RtFrame, type RtQuality, type RtStats, type RtSun } from './tracer';
-export { mergeStatic, buildPacked, trace, traceBrute, measureWork, type MergeOptions, type MergedScene, type VertexSurface, type SurfaceReader } from './bvh';
+export { createForwardUniforms, patchMaterialForRt, patchTreeForRt, RT_FORWARD_KEY, type RtForwardUniforms } from './forward';
+export { mergeStatic, buildPacked, trace, traceBrute, measureWork, type MergeOptions, type MergedScene, type VertexSurface, type SurfaceReader, type RtRecord, type RasterIndex } from './bvh';

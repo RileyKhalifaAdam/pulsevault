@@ -2,6 +2,10 @@
 import { h, icon, onTap, Button, SegmentedControl, Slider, Toggle, confirmDialog } from '../kit';
 import type { UiHost, UiScreen } from '../host';
 import { screenRoot, SETTING_KEYS, VERSION_LINE } from './shared';
+import { RT_DEFAULT, renderInfo, type RtTier } from '../../app/perf';
+
+/** Settings key of the ray-tracing tier (tidelock.settings.v1). */
+const RT_KEY = 'rt';
 
 /** The pause overlay. `onResume` (if set) is called when the player resumes; a 'tl-resume' event also bubbles from `el`. */
 export interface PauseMenu extends UiScreen {
@@ -35,6 +39,13 @@ const HELP = `
 <h3>If it goes wrong</h3>
 <p>A wrecked ship fades out and you start again beside the Wheel. <b>Reset to starting orbit</b> does the same on request. A three-finger tap opens this menu at any time.</p>
 `;
+
+const rtValue = (v: string): RtTier => (v === 'off' || v === 'low' || v === 'medium' || v === 'high' ? v : RT_DEFAULT);
+function rtHint(chosen: RtTier): string {
+  const now = renderInfo.rt;
+  const lowered = chosen !== 'off' && now !== chosen && now !== 'building' && (now === 'off' || now === 'low' || now === 'medium') ? ` Lowered to ${now} for now: the frames were too slow.` : '';
+  return 'Traces the star’s light through the windows: exact shadows, its bounce off the walls and true reflections. High aims at 30 frames a second; Low keeps 60. If the frame time stays too long the game steps it down by itself.' + lowered;
+}
 
 export function createPauseMenu(host: UiHost): PauseMenu {
   const el = screenRoot(host, 'tls-pause');
@@ -84,6 +95,13 @@ export function createPauseMenu(host: UiHost): PauseMenu {
         onChange: (v) => { s.set(SETTING_KEYS.quality, v); el.dataset.fx = v === 'low' ? 'lite' : 'full'; },
       }).el,
       h('p.tl-small', { text: 'Auto measures the frame time and lowers the resolution first, then the detail, to stay smooth. The resolution adapts at every setting.' }),
+      h('div.tl-label', { text: 'Ray-traced sunlight' }),
+      SegmentedControl<RtTier>({
+        items: [{ id: 'off', label: 'Off' }, { id: 'low', label: 'Low' }, { id: 'medium', label: 'Med' }, { id: 'high', label: 'High' }],
+        value: rtValue(s.get<string>(RT_KEY, RT_DEFAULT)), block: true,
+        onChange: (v) => { s.set(RT_KEY, v); },
+      }).el,
+      h('p.tl-small', { text: rtHint(rtValue(s.get<string>(RT_KEY, RT_DEFAULT))) }),
       Slider({
         label: 'Hand and look sensitivity', value: Math.min(2, Math.max(0.5, Number(s.get<number>(SETTING_KEYS.sensitivity, 1)) || 1)), min: 0.5, max: 2, step: 0.1, ticks: 15,
         format: (v) => `${v.toFixed(1)}×`, onChange: (v) => s.set(SETTING_KEYS.sensitivity, Math.round(v * 10) / 10),

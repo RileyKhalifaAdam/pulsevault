@@ -28,6 +28,15 @@
 // everywhere but the window openings, so the nose, wings and engine pods show only through the glass. The
 // hull reflects a live capture of the sky and the worlds (medium and up).
 //
+// Ray tracing (src/render/rt, the system menu's RT tier): while the player is inside, the star's light in the
+// cabin is traced instead of shadow-mapped. At load the interior, the cockpit shell and the hull's cheap LOD are
+// merged into one ship-space BVH (static in ship space; the ship's attitude only turns the star direction, which
+// goes into ship axes every frame). Per frame, before the pipeline: the tracer's room-culled G-buffer, sun
+// visibility over the star's disc, one sun bounce and glossy reflections, temporal accumulation in ship space and
+// à-trous; the interior's own materials (patched at load, src/render/rt/forward.ts) then take that light in their
+// forward pass, so the photo scans, normal maps and baked lamp lightmaps show through in the sun. While it runs
+// the shadow-mapped interior sun is off (intensity 0, no shadow map render); planetshine, lamps and probes stay.
+//
 // The module allocates nothing per frame; the only heavy work is in setSystem (bakes and station geometry).
 
 import * as THREE from 'three';
@@ -51,6 +60,7 @@ import type { DeviceView } from '../game/api';
 import { createCockpitVisual, type CockpitPick, type CockpitUpdate, type CockpitVisual } from './space/cockpit';
 import { InteriorLighting, OutsideEnvironment, textureBytesOf, type InteriorLightingFrame } from './probes';
 import { TIER_SETTINGS, renderInfo } from '../app/perf';
+import { createRayTracer, type RayTracer, type RtFrame, type RtQuality } from './rt';
 
 /**
  * Cabin light level against the sun (interior lightmaps, probes, emitters and the cockpit glass). Tried at 0.45
@@ -99,6 +109,26 @@ export interface SceneStats {
   /** Estimated GPU texture memory: interior + cockpit + player hull + lighting, and the pipeline's targets, bytes. */
   textureBytes: number;
   targetBytes: number;
+  /** The ray tracer: BVH + its targets, bytes (0 before it is built). */
+  rtBytes: number;
+}
+
+/** Ray-tracing state for the overlay and the report. */
+export interface RayTracingInfo {
+  /** Tier asked for (setRayTracing) and whether a traced frame was drawn last frame. */
+  tier: RtQuality;
+  active: boolean;
+  /** BVH being built (async, after load or when switched on). */
+  building: boolean;
+  rays: number;
+  msEstimate: number;
+  /** Measured GPU ms of the tracer's passes, -1 where the browser has no timer queries (iOS). */
+  msGpu: number;
+  triangles: number;
+  bytes: number;
+  /** Why it does not run ('' = fine). */
+  disabled: string;
+  buildMs: number;
 }
 
 export interface SceneManagerOptions {
@@ -138,6 +168,12 @@ export interface SceneManager {
   refKind(id: string): SceneRefKind | null;
   /** Change the quality tier (also the pipeline's). Rebuilds the current system's visuals; resolves when done. */
   setQuality(q: Quality): Promise<void>;
+  /**
+   * Ray-tracing tier for the cabin (no recompile: every program exists from load). Switching on when the BVH has
+   * not been built yet builds it in the background (about a second); until then the cabin keeps its shadow-mapped sun.
+   */
+  setRayTracing(tier: RtQuality): void;
+  rayTracing(): RayTracingInfo;
   /** Rebuild the current system's visuals (after a restored WebGL context). */
   rebuild(): Promise<void>;
   /** True while worlds are still baking sharper textures. */
@@ -453,6 +489,21 @@ class Manager implements SceneManager {
   private hullTexBytes = -1;
   private extraCalls = 0;
   private extraTris = 0;
+  // ray tracing
+  private readonly rt: RayTracer;
+  private rtTier: RtQuality = 'off';
+  /** The interior visual the BVH was built from (null: none built). */
+  private rtBuiltFor: InteriorVisual | null = null;
+  private rtBuilding: Promise<void> | null = null;
+  private rtError = '';
+  private rtActive = false;
+  private readonly rtRooms: string[] = [];
+  private readonly rtSun = { dirShip: new THREE.Vector3(0, 1, 0), color: new THREE.Color(0, 0, 0), angularRadius: 0.005, intensity: 0 };
+  private readonly rtFrame: RtFrame = { camera: new THREE.PerspectiveCamera(), shipMatrixWorld: new THREE.Matrix4(), sun: this.rtSun, envMap: null, envIntensity: 1, lamps: 1, bakedGain: 1, time: 0, frame: 0, width: 1, height: 1, rooms: this.rtRooms };
+  private readonly rtInfo: RayTracingInfo = { tier: 'off', active: false, building: false, rays: 0, msEstimate: 0, msGpu: -1, triangles: 0, bytes: 0, disabled: '', buildMs: 0 };
+  private texAge = 1e9;
+  private texBytesCache = 0;
+  private msaaCapped = false;
   private readonly lightFrame: InteriorLightingFrame = {
     eye: { x: 0, y: 0, z: 0 },
     sunDir: new THREE.Vector3(0, 1, 0),
@@ -551,7 +602,7 @@ class Manager implements SceneManager {
   private readonly tv2 = new THREE.Vector3();
   private readonly projOut: Projection = { x: 0, y: 0, visible: false, behind: false, distance: 0, radiusPx: 0, occluded: false };
   private readonly pickOut: Projection = { x: 0, y: 0, visible: false, behind: false, distance: 0, radiusPx: 0, occluded: false };
-  private readonly statsOut: SceneStats = { drawCalls: 0, triangles: 0, interior: null, cockpit: null, lighting: null, textureBytes: 0, targetBytes: 0 };
+  private readonly statsOut: SceneStats = { drawCalls: 0, triangles: 0, interior: null, cockpit: null, lighting: null, textureBytes: 0, targetBytes: 0, rtBytes: 0 };
   private readonly lightingStats = { rooms: 0, roomsTotal: 0, room: '', drawCalls: 0, probeBytes: 0, shadowBytes: 0, pending: 0 };
   private readonly focus: CameraFocus = { id: '', kind: 'ship', radius: 10, q: { x: 0, y: 0, z: 0, w: 1 }, chaseDistance: 34, chaseHeight: 8, cockpit: v3(), throttle: 0 };
   private readonly dockEnv = { pos: v3(), dir: v3(), up: v3() };
@@ -576,6 +627,8 @@ class Manager implements SceneManager {
     ];
     this.layersInside = [...this.layers, { scene: this.insideScene, camera: this.insideCam, clearDepth: true }];
     this.camEnv.collide = this.collideCamera;
+    this.rt = createRayTracer(pipeline.renderer, { quality: 'off' });
+    this.rtFrame.camera = this.insideCam;
     // Shadows: only the interior's sun and planetshine cast them. Their maps are rendered by the interior
     // lighting before the pipeline binds its HDR target (never from inside a layer's render).
     const sm = pipeline.renderer.shadowMap;
@@ -725,6 +778,13 @@ class Manager implements SceneManager {
     this.nearCam.updateMatrixWorld();
     renderer.compile(this.nearScene, this.nearCam);
     warm.object3d.removeFromParent();
+    warm.object3d.position.set(0, 0, 0);
+    // the ray tracer's BVH of the ship (interior, cockpit shell, the hull's cheap LOD) and its programs
+    if (this.rtTier !== 'off') {
+      if (!(await step('Tracing the light'))) return;
+      await this.buildRayTracing();
+      if (gen !== this.generation || this.disposed) return;
+    }
     this.fx = new EffectsManager({ quality: q });
     this.nearScene.add(this.fx.object3d);
     this.rig.cut();
@@ -734,6 +794,133 @@ class Manager implements SceneManager {
     lap('ready');
     (globalThis as { __tlLoad?: string }).__tlLoad = loadTimes.join(' · ');
     onProgress?.(1, 'Ready');
+  }
+
+  // ---------------------------------------------------------------------------------------------- ray tracing
+
+  setRayTracing(tier: RtQuality): void {
+    this.rtTier = tier;
+    this.rt.setQuality(tier);
+    if (tier !== 'off' && !this.loading) void this.buildRayTracing();
+    this.planMemory();
+  }
+
+  rayTracing(): RayTracingInfo {
+    const s = this.rt.stats();
+    const o = this.rtInfo;
+    o.tier = this.rtTier;
+    o.active = this.rtActive;
+    o.building = this.rtBuilding !== null;
+    o.rays = this.rtActive ? s.rays : 0;
+    o.msEstimate = this.rtActive ? s.msGpuEstimate : 0;
+    o.msGpu = s.msGpu;
+    o.triangles = s.triangles;
+    o.bytes = this.rtBuiltFor ? s.bytes : 0;
+    o.disabled = this.rtError || s.disabled;
+    o.buildMs = s.buildMs;
+    return o;
+  }
+
+  /**
+   * Build the ray tracer's static scene from the current (or prebuilt) interior once its lightmaps are in (their
+   * light is what reflections and bounces see). Async; at most one at a time; also compiles the tracer's programs.
+   */
+  private buildRayTracing(): Promise<void> {
+    if (this.rtBuilding) return this.rtBuilding;
+    const it = this.interior ?? this.prebuilt;
+    if (!it || this.rtBuiltFor === it.visual || this.rtTier === 'off') return Promise.resolve();
+    const gen = this.generation;
+    const run = async (): Promise<void> => {
+      const visual = it.visual;
+      await Promise.race([visual.ready.catch(() => false), new Promise((r) => setTimeout(r, 4000))]);
+      if (gen !== this.generation || this.disposed) return;
+      const root = visual.object3d;
+      root.updateMatrixWorld(true);
+      const toShip = root.matrixWorld.clone().invert();
+      const meshes: THREE.Mesh[] = [];
+      root.traverse((o) => {
+        const m = o as THREE.Mesh;
+        if (!m.isMesh || (m as THREE.InstancedMesh).isInstancedMesh || !m.geometry) return;
+        const pos = m.geometry.getAttribute('position') as THREE.BufferAttribute | undefined;
+        if (!pos || pos.usage === THREE.DynamicDrawUsage) return; // moving controls: not in a static BVH
+        const rec = m.userData.rt as { glass?: boolean; skip?: boolean } | undefined;
+        if (rec?.glass || rec?.skip) return;
+        meshes.push(m);
+      });
+      // the hull's cheap LOD, front faces only: wings, nose and pods shadow the windows; it rides with the interior
+      const exterior: THREE.Object3D[] = [];
+      const hull = this.hullForRt();
+      if (hull) {
+        hull.matrixAutoUpdate = false;
+        hull.matrix.copy(root.matrixWorld);
+        hull.matrixWorld.copy(root.matrixWorld);
+        meshes.push(hull);
+        exterior.push(hull);
+      }
+      const roomOf = (m: THREE.Object3D): string => {
+        let room = '';
+        for (let p: THREE.Object3D | null = m; p && p !== root; p = p.parent) if (typeof p.userData.room === 'string') room = p.userData.room as string;
+        return room;
+      };
+      try {
+        await this.rt.setStaticScene(meshes, toShip, { exterior, rasterKey: roomOf });
+        if (gen !== this.generation || this.disposed) return;
+        this.rtBuiltFor = visual;
+        this.rtError = '';
+      } catch (err) {
+        this.rtError = err instanceof Error ? err.message : String(err);
+      }
+      this.planMemory();
+    };
+    this.rtBuilding = run().finally(() => {
+      this.rtBuilding = null;
+    });
+    return this.rtBuilding;
+  }
+
+  /** A stand-alone mesh of the player hull's lowest level of detail (shared geometry), or null. */
+  private hullForRt(): THREE.Mesh | null {
+    let best: THREE.Mesh | null = null;
+    let bestN = Infinity;
+    for (const w of this.warmShips)
+      w.object3d.traverse((o) => {
+        const m = o as THREE.Mesh;
+        const rec = m.userData?.rt as { perVertex?: string } | undefined;
+        if (!m.isMesh || !rec?.perVertex?.startsWith('aTint')) return;
+        const n = m.geometry.index ? m.geometry.index.count : m.geometry.getAttribute('position').count;
+        if (n < bestN) {
+          bestN = n;
+          best = m;
+        }
+      });
+    if (!best) return null;
+    const src = best as THREE.Mesh;
+    const mesh = new THREE.Mesh(src.geometry, src.material);
+    mesh.userData.rt = { ...(src.userData.rt as object), role: 'exterior' };
+    return mesh;
+  }
+
+  /**
+   * GPU memory plan (iPhone 15 budget: 300 MB in all on the default tier). With the ray tracer's buffers on top of
+   * 4x MSAA the total can pass it: then MSAA drops to 2x (the tracer's own temporal resolve keeps the cabin's
+   * edges calm). Hysteresis so it does not flip.
+   */
+  private planMemory(): void {
+    const p = this.pipeline;
+    const tierMsaa = TIER_SETTINGS[this.quality].msaa;
+    if (tierMsaa <= 2) {
+      if (this.msaaCapped) p.setMsaaLimit(Infinity);
+      this.msaaCapped = false;
+      return;
+    }
+    const ps = p.stats();
+    const rtB = this.rtTier !== 'off' && this.rtBuiltFor ? this.rt.bytesAt(this.rtTier, ps.outputWidth, ps.outputHeight) : 0;
+    const total4 = this.textureBytes() + p.targetBytesAt(tierMsaa) + rtB;
+    const cap = this.msaaCapped ? total4 > MEMORY_BUDGET - 15 * 1048576 : total4 > MEMORY_BUDGET;
+    if (cap !== this.msaaCapped) {
+      this.msaaCapped = cap;
+      p.setMsaaLimit(cap ? 2 : Infinity);
+    }
   }
 
   async setQuality(q: Quality): Promise<void> {
@@ -780,6 +967,7 @@ class Manager implements SceneManager {
     } else this.statsOut.lighting = null;
     this.statsOut.textureBytes = this.textureBytes();
     this.statsOut.targetBytes = s.targetBytes;
+    this.statsOut.rtBytes = this.rtBuiltFor ? this.rt.stats().bytes : 0;
     return this.statsOut;
   }
 
@@ -787,7 +975,12 @@ class Manager implements SceneManager {
   private textureBytes(): number {
     const it = this.interior ?? this.prebuilt;
     let b = 0;
-    if (it) b += it.lighting.stats.textureBytes + it.lighting.stats.probeBytes + it.lighting.stats.shadowBytes;
+    // the interior's textures grow after load (the full-size atlas, the photo scans): re-measured every ~2 s
+    if (it && this.texAge > 2) {
+      this.texAge = 0;
+      this.texBytesCache = it.lighting.refreshTextureBytes();
+    }
+    if (it) b += Math.max(this.texBytesCache, it.lighting.stats.textureBytes) + it.lighting.stats.probeBytes + it.lighting.stats.shadowBytes;
     if (this.hullTexBytes > 0) b += this.hullTexBytes;
     if (this.outsideEnv) b += this.outsideEnv.bytes;
     return b;
@@ -828,6 +1021,9 @@ class Manager implements SceneManager {
     }
     const lighting = new InteriorLighting(this.pipeline.renderer, this.insideScene, visual.object3d, layout, this.quality);
     lighting.attach();
+    // every lit material takes the traced light when the tracer runs (uniform-driven: one program, compiled now)
+    this.rt.patchMaterials(visual.object3d);
+    this.texAge = 1e9;
     // compile every program (shadow variants included) and capture the probes now, from the helm
     visual.object3d.visible = true;
     visual.object3d.position.set(0, 0, 0);
@@ -881,6 +1077,9 @@ class Manager implements SceneManager {
   }
 
   private disposeSystem(): void {
+    this.rtBuiltFor = null;
+    this.rtActive = false;
+    this.rt.skip();
     for (const e of this.shipList) this.disposeShip(e);
     this.shipList.length = 0;
     this.ships.clear();
@@ -935,6 +1134,7 @@ class Manager implements SceneManager {
     this.disposed = true;
     this.generation++;
     this.disposeSystem();
+    this.rt.dispose();
     this.markers.geo.dispose();
     (this.markers.mesh.material as THREE.Material).dispose();
     this.system = null;
@@ -1849,6 +2049,9 @@ class Manager implements SceneManager {
         c.windowColor.g = this.shine.color.g * sh + c.sunColor.g * 0.1;
         c.windowColor.b = this.shine.color.b * sh + c.sunColor.b * 0.1;
         interior.update(c);
+        // the traced sun replaces the shadow-mapped one (and its shadow-map render) when the tracer will run
+        const rt = this.rt;
+        const traced = !!li && this.rtBuiltFor === interior && rt.willRun;
         if (li) {
           ic.position.set(0, 0, 0);
           ic.updateMatrixWorld();
@@ -1858,7 +2061,7 @@ class Manager implements SceneManager {
           lf.eye.z = c.eye.z;
           lf.sunDir.copy(this.sunDirFocus);
           lf.sunColor.copy(this.keyColor);
-          lf.sunIntensity = this.key.intensity;
+          lf.sunIntensity = traced ? 0 : this.key.intensity;
           lf.shineDir.copy(this.shine.position);
           if (lf.shineDir.lengthSq() > 1e-12) lf.shineDir.normalize();
           lf.shineColor.copy(this.shine.color);
@@ -1869,6 +2072,32 @@ class Manager implements SceneManager {
           this.extraCalls += li.stats.drawCalls;
           this.extraTris += li.stats.triangles;
         }
+        if (traced && li) {
+          // ship space: the star direction in the ship's axes (c.sunDir), the camera and the rooms in view
+          li.visibleRooms(this.rtRooms);
+          const f = this.rtFrame;
+          const sun = this.rtSun;
+          sun.dirShip.set(c.sunDir.x, c.sunDir.y, c.sunDir.z);
+          sun.color.copy(this.keyColor);
+          sun.intensity = this.key.intensity;
+          sun.angularRadius = Math.asin(Math.min(1, star.def.radius / Math.max(star.dist, star.def.radius)));
+          f.shipMatrixWorld = obj.matrixWorld;
+          f.envMap = this.outsideEnv ? this.outsideEnv.cubeTexture : null;
+          f.envIntensity = 1;
+          f.lamps = c.lights ? 1 : 0;
+          f.bakedGain = c.gain;
+          f.time = this.clock;
+          f.frame = this.frameNo;
+          f.width = ps.width;
+          f.height = ps.height;
+          const info = pipeline.renderer.info.render;
+          const c0 = info.calls;
+          const t0 = info.triangles;
+          rt.render(f);
+          this.extraCalls += info.calls - c0;
+          this.extraTris += info.triangles - t0;
+        } else rt.skip();
+        this.rtActive = traced && rt.active;
         const cockpit = this.interior?.cockpit;
         if (cockpit) {
           const k = this.cockpitCtx;
@@ -1889,6 +2118,8 @@ class Manager implements SceneManager {
         }
         layers = this.layersInside;
       } else if (this.frameNo % 2 === 0) {
+        this.rt.skip();
+        this.rtActive = false;
         // outside (the title orbit, a chase view): the interior is hidden, but its time-sliced texture work
         // (the full-size surface atlas) keeps going so it is done before the player steps inside
         const c = this.interiorCtx;
@@ -1896,6 +2127,11 @@ class Manager implements SceneManager {
         interior.update(c);
       }
     }
+    if (!inside && this.rtActive) {
+      this.rt.skip();
+      this.rtActive = false;
+    }
+    this.texAge += dt;
     pipeline.render(layers, dt);
     this.publishInfo(inside);
   }
@@ -1921,6 +2157,14 @@ class Manager implements SceneManager {
     ri.roomsTotal = inside && li ? li.stats.roomsTotal : 0;
     ri.room = inside && li ? li.stats.room : '';
     ri.exposure = ps.autoExposure ? 'auto' : this.ev.toFixed(2);
+    const rti = this.rayTracing();
+    ri.rt = rti.active ? rti.tier : rti.building ? 'building' : 'off';
+    ri.rtRays = rti.rays;
+    ri.rtMsEstimate = rti.msEstimate;
+    ri.rtMsGpu = rti.msGpu;
+    ri.rtBytes = rti.bytes;
+    ri.totalBytes = ri.textureBytes + ri.targetBytes + rti.bytes;
+    if (this.frameNo % 120 === 0) this.planMemory();
   }
 
   private readonly dockPort: { pos: V3; dir: V3; up: V3 } = { pos: v3(), dir: v3(), up: v3() };
@@ -2069,6 +2313,8 @@ class Manager implements SceneManager {
 const NO_DEVICES: readonly DeviceView[] = [];
 /** Inside the ship: key 0.16 on the mean log luminance, -2.5..+3 stops. */
 const AUTO_EXPOSURE = { key: 0.16, minEv: -2.5, maxEv: 3, compensation: 0 };
+/** GPU memory budget of the whole page on an iPhone 15 (docs/ARCHITECTURE.md §4), bytes. */
+const MEMORY_BUDGET = 300 * 1048576;
 
 export function createSceneManager(pipeline: RenderPipeline, opts: SceneManagerOptions): SceneManager {
   return new Manager(pipeline, opts);

@@ -8,6 +8,7 @@
 // adds sun direct (GGX + Lambert × traced visibility), sun bounce and reflections, in linear HDR.
 import * as THREE from 'three';
 import { buildPacked, measureWork, mergeStatic, TEX_W, type MergeOptions, type MergedScene, type TraceCounters } from './bvh';
+import { createForwardUniforms, patchTreeForRt, type RtForwardUniforms } from './forward';
 import { ATROUS_FRAG, COMPOSITE_FRAG, COMPOSITE_VERT, COPY_FRAG, DEPTH_FRAG, FULLSCREEN_VERT, GBUF_FRAG, GBUF_VERT, TEMPORAL_FRAG, TRACE_FRAG } from './glsl';
 
 export type RtQuality = 'off' | 'low' | 'medium' | 'high' | 'ultra';
@@ -41,6 +42,11 @@ export interface RtFrame {
   /** Full-resolution size the composite target has (default: the renderer's drawing buffer). */
   width?: number;
   height?: number;
+  /**
+   * Raster keys (rooms) the forward pass draws this frame: the G-buffer draws only these (plus the untagged '').
+   * Omitted: everything. Keys are what MergeOptions.rasterKey returned.
+   */
+  rooms?: readonly string[];
 }
 
 export interface RtEffects {
@@ -69,6 +75,11 @@ export interface RtStats {
   frames: number;
   /** Why the tracer is off ('' when it runs). */
   disabled: string;
+  /** Measured GPU time of the tracer's passes (EXT_disjoint_timer_query_webgl2), ms; -1 where the extension is missing. */
+  msGpu: number;
+  /** Draw calls and triangles of the tracer's own passes last frame (the room-culled G-buffer). */
+  drawCalls: number;
+  drawTriangles: number;
   /** Mean traversal work per ray, from JS rays over the built BVH (for the cost model). */
   work: { closest: TraceCounters; any: TraceCounters };
 }
@@ -93,6 +104,19 @@ export interface RayTracer {
   debugView: number;
   /** Is the traced sun in this frame (false: the forward pass must keep its own sun on the interior). */
   readonly active: boolean;
+  /** Would render() produce a traced frame now (scene built, tier on, context alive, sun effect on)? Known before render(). */
+  readonly willRun: boolean;
+  /**
+   * Uniforms of the forward-shader patch (forward.ts): render() fills them, skip() turns them off. The traced
+   * light reaches the image only through materials patched with patchMaterials (before they compile).
+   */
+  readonly forward: RtForwardUniforms;
+  /** Patch every lit material under `root` to take the traced light (call before the materials compile). */
+  patchMaterials(root: THREE.Object3D): number;
+  /** No traced frame this frame (outside the ship): the patched materials fall back to their own lights. */
+  skip(): void;
+  /** GPU memory a tier would hold at a full-resolution size (static scene + its targets), bytes. */
+  bytesAt(tier: RtQuality, width: number, height: number): number;
   /** Restart accumulation (teleport, interior rebuilt). */
   resetHistory(): void;
   stats(): RtStats;
@@ -130,7 +154,7 @@ const NS_FETCH = 0.02;
 const GLOSSY_FRACTION = 0.5; // share of pixels below the reflection roughness cut (for the estimate)
 const IPHONE_W = 393 * 2;
 const IPHONE_H = 852 * 2;
-const REFL_MAX_ROUGH = 0.5;
+const REFL_MAX_ROUGH = 0.32;
 
 const tri = new Float32Array([-1, -1, 0, 3, -1, 0, -1, 3, 0]);
 
@@ -266,6 +290,7 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
     return m;
   };
   const gbufMesh = shipMesh(gbufMat);
+  gbufMesh.material = [gbufMat]; // drawn by geometry groups: the visible rooms' runs of the raster index
   const depthMesh = shipMesh(depthMat);
   const compMesh = shipMesh(compMat);
   const gbufScene = new THREE.Scene();
@@ -334,16 +359,79 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
   const BLACK = new THREE.Color(0, 0, 0);
   let frameCam: THREE.Camera | null = null;
   let lastRays = 0;
-  const statsObj: RtStats = { tier: quality, rays: 0, bvhNodes: 0, triangles: 0, buildMs: 0, msGpuEstimate: 0, width: 0, height: 0, bytes: 0, frames: 0, disabled, work };
+  const statsObj: RtStats = { tier: quality, rays: 0, bvhNodes: 0, triangles: 0, buildMs: 0, msGpuEstimate: 0, width: 0, height: 0, bytes: 0, frames: 0, disabled, work, msGpu: -1, drawCalls: 0, drawTriangles: 0 };
+  const fu = createForwardUniforms(REFL_MAX_ROUGH);
+  // the room-culled G-buffer: the merged scene's raster index (interior triangles grouped by room)
+  let rasterGeo: THREE.BufferGeometry | null = null;
+  let rasterRanges: { key: string; start: number; count: number }[] = [];
+  const groupPool: { start: number; count: number; materialIndex: number }[] = [];
+  let rasterTris = 0;
+  let sunWasOff = true;
+  const viewToShip = new THREE.Matrix4();
+  // GPU timing where the browser has it (desktop Chrome; iOS Safari does not)
+  type TimerExt = { TIME_ELAPSED_EXT: number; GPU_DISJOINT_EXT: number };
+  let timer: TimerExt | null = null;
+  try {
+    timer = gl.getExtension('EXT_disjoint_timer_query_webgl2') as TimerExt | null;
+  } catch {
+    timer = null;
+  }
+  const gl2 = gl as WebGL2RenderingContext;
+  const queries: { q: WebGLQuery; busy: boolean }[] = [];
+  let activeQuery: { q: WebGLQuery; busy: boolean } | null = null;
+  let gpuMs = -1;
+  function timerBegin(): void {
+    if (!timer || lost) return;
+    let slot: { q: WebGLQuery; busy: boolean } | null = null;
+    for (let i = 0; i < queries.length; i++) if (!queries[i].busy) slot = queries[i];
+    if (!slot && queries.length < 4) {
+      const q = gl2.createQuery();
+      if (!q) return;
+      slot = { q, busy: false };
+      queries.push(slot);
+    }
+    if (!slot) return;
+    gl2.beginQuery(timer.TIME_ELAPSED_EXT, slot.q);
+    slot.busy = true;
+    activeQuery = slot;
+  }
+  function timerEnd(): void {
+    if (!timer || !activeQuery) return;
+    gl2.endQuery(timer.TIME_ELAPSED_EXT);
+    activeQuery = null;
+  }
+  function timerPoll(): void {
+    if (!timer || lost) return;
+    const disjoint = gl2.getParameter(timer.GPU_DISJOINT_EXT) as boolean;
+    for (let i = 0; i < queries.length; i++) {
+      const s = queries[i];
+      if (!s.busy || s === activeQuery) continue;
+      if (!gl2.getQueryParameter(s.q, gl2.QUERY_RESULT_AVAILABLE)) continue;
+      const ns = gl2.getQueryParameter(s.q, gl2.QUERY_RESULT) as number;
+      s.busy = false;
+      if (disjoint) continue;
+      const ms = ns / 1e6;
+      gpuMs = gpuMs < 0 ? ms : gpuMs + (ms - gpuMs) * 0.1;
+    }
+  }
 
   const onLost = (e: Event): void => {
     e.preventDefault();
     lost = true;
     valid = false;
+    fu.uRtOn.value = 0;
+    queries.length = 0;
+    activeQuery = null;
   };
   const onRestored = (): void => {
     lost = false;
     valid = false;
+    try {
+      timer = gl.getExtension('EXT_disjoint_timer_query_webgl2') as TimerExt | null; // extension objects die with the context
+    } catch {
+      timer = null;
+    }
+    gpuMs = -1;
     // three re-creates GL objects lazily; data textures need re-upload, history is gone
     for (const t of [texNodes, texTris, texSurf]) if (t) t.needsUpdate = true;
     disposeTargets();
@@ -395,14 +483,18 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
     return est;
   }
 
-  function bytes(): number {
+  /** Bytes per traced pixel: 2 G-buffers (2 x RGBA8 + float depth), 2 histories (3 x RGBA16F), raw and denoised (2 x RGBA16F). */
+  const PX_BYTES = 2 * (8 + 4) + 2 * 24 + 16 + 16;
+  function staticBytes(): number {
     let b = 0;
-    for (const t of [texNodes, texTris]) if (t) b += t.image.width * t.image.height * 16;
+    if (texNodes) b += texNodes.image.width * texNodes.image.height * 16;
+    if (texTris) b += texTris.image.width * texTris.image.height * 16;
     if (texSurf) b += texSurf.image.width * texSurf.image.height * 8;
-    const px = tw * th;
-    b += px * (2 * (8 + 4) + 2 * 24 + 16 + 16);
-    if (packed) b += packed.vertices * (12 + 12 + 8) + packed.triangles * 12;
+    if (packed) b += packed.vertices * (12 + 12 + 8) + packed.triangles * 12 + rasterTris * 12;
     return b;
+  }
+  function bytes(): number {
+    return staticBytes() + tw * th * PX_BYTES;
   }
 
   async function compile(): Promise<void> {
@@ -413,7 +505,7 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
       mesh.frustumCulled = false;
       cs.add(mesh);
     }
-    const geo = packed ? packed.geometry : fsGeo;
+    const geo = rasterGeo ?? (packed ? packed.geometry : fsGeo);
     for (const m of [gbufMat, depthMat, compMat]) {
       const mesh = new THREE.Mesh(geo, m);
       mesh.frustumCulled = false;
@@ -431,12 +523,31 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
     get active() {
       return valid && quality !== 'off' && !disabled && fx()[0] === 1;
     },
+    get willRun() {
+      return !lost && quality !== 'off' && !!packed && !disabled && fx()[0] === 1;
+    },
+    forward: fu,
+    patchMaterials(root) {
+      return patchTreeForRt(root, fu);
+    },
+    skip() {
+      valid = false;
+      fu.uRtOn.value = 0;
+      lastRays = 0;
+    },
+    bytesAt(tier, width, height) {
+      const k = TIERS[tier].pixels;
+      if (!k) return 0;
+      const s = Math.sqrt(k);
+      return staticBytes() + Math.round(width * s) * Math.round(height * s) * PX_BYTES;
+    },
 
     async setStaticScene(meshes, shipSpace, o = {}) {
       const prog = o.onProgress ?? ((): void => undefined);
       prog(0, 'ray tracing: merge');
       await yieldFrame();
       const merged = mergeStatic(meshes, shipSpace, o);
+      const raster = merged.raster;
       if (merged.geometry.index!.count < 3) throw new Error('rt: no opaque triangles in the static scene');
       prog(0.2, 'ray tracing: BVH');
       await yieldFrame();
@@ -463,7 +574,18 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
       shared.uNodes.value = texNodes;
       shared.uTris.value = texTris;
       shared.uSurf.value = texSurf;
-      gbufMesh.geometry = depthMesh.geometry = compMesh.geometry = p.geometry;
+      depthMesh.geometry = compMesh.geometry = p.geometry;
+      // the G-buffer draws the same vertices through the raster index, one group per run of visible rooms
+      rasterGeo?.dispose();
+      rasterGeo = new THREE.BufferGeometry();
+      for (const name of ['position', 'normal', 'aSurf', 'aSurf2']) rasterGeo.setAttribute(name, p.geometry.getAttribute(name));
+      rasterGeo.setIndex(new THREE.BufferAttribute(raster.index, 1));
+      rasterRanges = [];
+      for (const [key, [start, count]] of raster.ranges) rasterRanges.push({ key, start, count });
+      rasterRanges.sort((x, y) => x.start - y.start);
+      while (groupPool.length < rasterRanges.length + 1) groupPool.push({ start: 0, count: 0, materialIndex: 0 });
+      rasterTris = raster.index.length / 3;
+      gbufMesh.geometry = rasterGeo;
       packed = p;
       buildMs = p.mergeMs + p.buildMs + p.packMs;
       const w = measureWork(p, 1024);
@@ -480,6 +602,10 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
 
     render(input) {
       valid = false;
+      fu.uRtOn.value = 0;
+      statsObj.drawCalls = 0;
+      statsObj.drawTriangles = 0;
+      timerPoll();
       if (lost || quality === 'off' || !packed || disabled) {
         lastRays = 0;
         return;
@@ -518,6 +644,11 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
       traceMat.uniforms.uCosSun.value = Math.cos(ang);
       cu.uSunAng.value = ang;
       const f = fx();
+      // eclipse (or a star too faint to matter): no sun rays at all; the history restarts when it comes back
+      const sunOff = uSunE.value.x + uSunE.value.y + uSunE.value.z < 1e-7;
+      if (sunOff) f[0] = f[1] = 0;
+      else if (sunWasOff) resetPending = true;
+      sunWasOff = sunOff;
       uFx.value.set(f[0], f[1], f[2], f[3]);
       uSize.value.set(tw, th);
       shared.uLamps.value = input.lamps ?? 1;
@@ -533,9 +664,10 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
       const lumE = 0.2126 * se.x + 0.7152 * se.y + 0.0722 * se.z;
       tu.uClampL.value = Math.max(1e-3, 2 * (lumE / Math.PI) + 4 * (input.bakedGain ?? 1));
 
-      // motion → history clamp; the sun turning in ship space → minimum blend weight
-      const moved = eye.distanceTo(prevEye) / 0.003 + Math.acos(Math.min(1, Math.max(-1, fwd.dot(prevFwd)))) / 0.002;
+      // motion → history clamp; the sun turning in ship space (the ship rotating) → clamp too, and a minimum
+      // blend weight, so a sun patch sliding over the floor leaves no trail
       const sunTurn = Math.acos(Math.min(1, Math.max(-1, uSunDir.value.dot(prevSun))));
+      const moved = eye.distanceTo(prevEye) / 0.003 + Math.acos(Math.min(1, Math.max(-1, fwd.dot(prevFwd)))) / 0.002 + sunTurn / (ang * 0.25);
       const reset = resetPending;
       resetPending = false;
 
@@ -545,10 +677,42 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
       renderer.getClearColor(clearC);
       const prevAlpha = renderer.getClearAlpha();
       renderer.autoClear = false;
+      timerBegin();
+      const info = renderer.info.render;
+      const calls0 = info.calls;
+      const tris0 = info.triangles;
 
       const G = gbuf[cur];
       const Gp = gbuf[1 - cur];
-      // 1. G-buffer
+      // 1. G-buffer: only the rooms the forward pass draws (runs of consecutive ranges merge into one draw)
+      if (rasterGeo) {
+        const rooms = input.rooms;
+        let n = 0;
+        let s0 = -1;
+        let s1 = -1;
+        for (let i = 0; i < rasterRanges.length; i++) {
+          const r = rasterRanges[i];
+          if (rooms && r.key !== '' && rooms.indexOf(r.key) < 0) continue;
+          if (r.start === s1) s1 += r.count;
+          else {
+            if (s1 > s0) {
+              groupPool[n].start = s0;
+              groupPool[n].count = s1 - s0;
+              n++;
+            }
+            s0 = r.start;
+            s1 = r.start + r.count;
+          }
+        }
+        if (s1 > s0) {
+          groupPool[n].start = s0;
+          groupPool[n].count = s1 - s0;
+          n++;
+        }
+        const groups = rasterGeo.groups;
+        groups.length = 0;
+        for (let i = 0; i < n; i++) groups.push(groupPool[i]);
+      }
       renderer.setRenderTarget(G);
       renderer.setClearColor(BLACK, 0);
       renderer.clear(true, true, false);
@@ -604,9 +768,31 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
       cu.uLowG0.value = G.textures[0];
       (cu.uLowSize.value as THREE.Vector2).set(tw, th);
 
+      statsObj.drawCalls = info.calls - calls0;
+      statsObj.drawTriangles = info.triangles - tris0;
+      timerEnd();
       renderer.setRenderTarget(prevTarget);
       renderer.setClearColor(clearC, prevAlpha);
       renderer.autoClear = prevAuto;
+
+      // the forward-shader patch (forward.ts) reads the denoised signals at full resolution
+      fu.uRtOn.value = 1;
+      fu.uRtFx.value.set(f[0], f[1], f[2], f[3]);
+      fu.uRtA.value = src.textures[0];
+      fu.uRtB.value = src.textures[1];
+      fu.uRtDepth.value = G.depthTexture;
+      fu.uRtG0.value = G.textures[0];
+      fu.uRtLow.value.set(tw, th);
+      fu.uRtTarget.value.set(W, H);
+      const pcam = cam as THREE.PerspectiveCamera;
+      fu.uRtNF.value.set(pcam.near ?? 0.05, pcam.far ?? 80);
+      const pe = cam.projectionMatrix.elements;
+      fu.uRtProj.value.set(1 / pe[0], 1 / pe[5]);
+      // star direction: ship → world → view
+      fu.uRtSunDir.value.copy(uSunDir.value).transformDirection(shipM).transformDirection(cam.matrixWorldInverse);
+      fu.uRtSunE.value.copy(uSunE.value);
+      viewToShip.multiplyMatrices(invShip, cam.matrixWorld);
+      fu.uRtViewToShip.value.setFromMatrix4(viewToShip);
 
       prevVP.copy(vp);
       prevInvVP.copy(uInvVP.value);
@@ -616,7 +802,7 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
       cur = 1 - cur;
       valid = true;
       const px = tw * th;
-      lastRays = px * (f[0] + 2 * f[1] + 2 * f[2] + f[3]);
+      lastRays = px * (f[0] + 2 * f[1] + GLOSSY_FRACTION * (2 * f[2]) + f[3]);
     },
 
     composite(hdrColor, target) {
@@ -648,6 +834,9 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
       quality = tier;
       resetPending = true;
       valid = false;
+      fu.uRtOn.value = 0;
+      // off: give the targets back (about 35 MB at iPhone 15 portrait); the BVH stays for switching on again
+      if (tier === 'off') disposeTargets();
     },
 
     resetHistory() {
@@ -675,6 +864,7 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
       s.bytes = bytes();
       s.frames = frames;
       s.disabled = lost ? 'WebGL context lost' : disabled;
+      s.msGpu = timer ? gpuMs : -1;
       return s;
     },
 
@@ -687,6 +877,9 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
       texSurf?.dispose();
       packed?.geometry.dispose();
       packed = null;
+      rasterGeo?.dispose();
+      rasterGeo = null;
+      fu.uRtOn.value = 0;
       fsGeo.dispose();
       for (const m of [traceMat, temporalMat, atrousMat, copyMat, gbufMat, depthMat, compMat]) m.dispose();
       disabled = 'disposed';

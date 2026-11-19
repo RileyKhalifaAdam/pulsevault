@@ -176,16 +176,31 @@ function textureBytes(t: THREE.Texture): number {
   if (!img) return 0;
   const faces: Img[] = Array.isArray(img) ? img : [img];
   let px = 0;
-  for (const f of faces) px += (f?.width ?? 0) * (f?.height ?? 0);
+  // array / 3D textures (the photo-scan sets): every layer
+  const layers = (t as THREE.DataArrayTexture).isDataArrayTexture || (t as THREE.Data3DTexture).isData3DTexture ? Math.max(1, (img as { depth?: number }).depth ?? 1) : 1;
+  for (const f of faces) px += (f?.width ?? 0) * (f?.height ?? 0) * layers;
   const bpp = t.type === THREE.HalfFloatType ? 8 : t.type === THREE.FloatType ? 16 : 4;
   const mips = t.generateMipmaps && t.minFilter !== THREE.LinearFilter && t.minFilter !== THREE.NearestFilter;
   return px * bpp * (mips ? 4 / 3 : 1);
 }
 
-/** Estimated GPU bytes of every texture the materials under `root` use (each texture counted once). */
+/**
+ * Estimated GPU bytes of every texture the materials under `root` use (each texture counted once), including the
+ * photo-scan arrays a mesh's ray-tracer record points at (userData.rt.demodulate.photo: they are bound in
+ * onBeforeCompile, so the material itself does not show them).
+ */
 export function textureBytesOf(root: THREE.Object3D, seen: Set<THREE.Texture> = new Set()): number {
   let bytes = 0;
   root.traverse((o) => {
+    const photo = (o.userData as { rt?: { demodulate?: { photo?: Record<string, { value?: unknown }> | null } | null } }).rt?.demodulate?.photo;
+    if (photo)
+      for (const k of Object.keys(photo)) {
+        const v = photo[k]?.value;
+        if (v instanceof THREE.Texture && !seen.has(v)) {
+          seen.add(v);
+          bytes += textureBytes(v);
+        }
+      }
     const m = (o as THREE.Mesh).material;
     if (!m) return;
     const list = Array.isArray(m) ? m : [m];
@@ -974,6 +989,12 @@ export class InteriorLighting {
     return best;
   }
 
+  /** Re-measure the interior's textures (they grow after load: the full-size atlas, the photo scans). Not per frame. */
+  refreshTextureBytes(): number {
+    this.stats.textureBytes = textureBytesOf(this.root);
+    return this.stats.textureBytes;
+  }
+
   /** Visible rooms right now (for tests and the harness). */
   visibleRooms(out: string[] = []): string[] {
     out.length = 0;
@@ -1049,6 +1070,10 @@ export class OutsideEnvironment {
   readonly bytes: number;
   private readonly renderer: THREE.WebGLRenderer;
   private readonly cube: THREE.WebGLCubeRenderTarget;
+  /** The raw capture (world axes, linear HDR, no mips): what a reflection ray leaving through a window sees. */
+  get cubeTexture(): THREE.CubeTexture {
+    return this.cube.texture;
+  }
   private readonly cam: THREE.CubeCamera;
   private readonly pmrem: THREE.PMREMGenerator;
   private readonly rt: THREE.WebGLRenderTarget;

@@ -159,6 +159,13 @@ export interface RenderPipeline {
    * It stays off under a software rasteriser.
    */
   setDynamicResolution(enabled: boolean, fixedScale?: number): void;
+  /**
+   * Cap the MSAA samples below the tier's (memory: the ray tracer's buffers on top of 4x MSAA). Infinity = the
+   * tier's own. Never recompiles (the composite only knows MSAA on or off); 0 switches to the FXAA path.
+   */
+  setMsaaLimit(samples: number): void;
+  /** GPU bytes the targets would hold at full resolution (scale 1) with `samples` MSAA (estimate, as targetBytes). */
+  targetBytesAt(samples: number): number;
   /** Live counters. Returns the same object every call — copy it if you keep it. */
   stats(): PipelineStats;
   onContextLost: (() => void) | null;
@@ -244,6 +251,7 @@ class Pipeline implements RenderPipeline {
 
   private _quality: Quality;
   private tier: Tier;
+  private msaaLimit = Infinity;
   private lost = false;
   private disposed = false;
 
@@ -512,7 +520,7 @@ class Pipeline implements RenderPipeline {
   /** Everything that depends on the tier but not on the size. */
   private configureTier(): void {
     const tier = this.tier;
-    this.msaa = this.hdrType === THREE.HalfFloatType ? this.supportedSamples(tier.msaa) : 0;
+    this.msaa = this.hdrType === THREE.HalfFloatType ? this.supportedSamples(Math.min(tier.msaa, this.msaaLimit)) : 0;
     this.applyDefines();
   }
 
@@ -579,6 +587,26 @@ class Pipeline implements RenderPipeline {
     this.configureTier();
     this.outW = this.outH = 0; // force reallocation
     this.resize(this.cssW, this.cssH, this.dpr);
+  }
+
+  setMsaaLimit(samples: number): void {
+    const lim = Number.isFinite(samples) ? Math.max(0, Math.floor(samples)) : Infinity;
+    if (lim === this.msaaLimit) return;
+    this.msaaLimit = lim;
+    const before = this.msaa;
+    this.configureTier();
+    if (this.msaa === before) return;
+    if (before > 0) this.releaseMsaa();
+    this.outW = this.outH = 0; // force reallocation (the LDR target exists only on the FXAA path)
+    this.resize(this.cssW, this.cssH, this.dpr);
+  }
+
+  targetBytesAt(samples: number): number {
+    const px = this.outW * this.outH;
+    const hdrBpp = this.hdrType === THREE.HalfFloatType ? 8 : 4;
+    let bytes = samples > 0 ? px * (samples * (hdrBpp + 4) + hdrBpp) : px * (hdrBpp + 4) + px * 4;
+    for (let i = 0; i < this.bloomLevels; i++) bytes += this.bloomRT[i].width * this.bloomRT[i].height * hdrBpp;
+    return bytes + px * 4;
   }
 
   setDynamicResolution(enabled: boolean, fixedScale = 1): void {

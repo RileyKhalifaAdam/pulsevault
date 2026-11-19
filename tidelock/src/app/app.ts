@@ -6,8 +6,13 @@
 // quality, sensitivity, performance overlay); a destroyed ship fades to black and starts again. The client
 // talks to the Session contract (src/game) and nothing else.
 //
-// URL parameters: q=low|medium|high|ultra (pin the quality tier for this run), fresh=1 (ignore the saved flight),
-// perf=1 (open the perf overlay).
+// URL parameters: q=low|medium|high|ultra (pin the quality tier for this run), rt=off|low|medium|high (ray tracing
+// for this run), fresh=1 (ignore the saved flight), perf=1 (open the perf overlay).
+//
+// Ray tracing (the menu's RT setting, saved as settings.rt): High by default — the owner's choice, ~30 fps — with
+// a safety governor (perf.ts RtGovernor): p95 frame time over 40 ms for 3 s steps it down one notch (recorded in
+// the performance report), never automatically above the owner's choice. While RT is medium or high the
+// resolution controller works to a 33 ms budget instead of 16.7 ms.
 import { createPipeline, type Quality, type RenderPipeline } from '../render/pipeline';
 import { createSceneManager, type SceneManager } from '../render/scene';
 import { addStationExtra, beginFrame, createSceneFrame, setDockingGuide } from '../render/frame';
@@ -16,7 +21,7 @@ import { createRoot, Splash } from '../ui/kit';
 import type { UiHost, UiScreen } from '../ui/host';
 import { createPauseMenu, createTitleScreen, type PauseMenu } from '../ui/screens';
 import { createPerfOverlay } from '../ui/perfOverlay';
-import { PerfMonitor, startTier } from './perf';
+import { PerfMonitor, RT_CHOICES, RT_DEFAULT, RtGovernor, frameBudgetFor, rtInfoText, renderInfo, startTier, type RtTier } from './perf';
 import { noteForReport, showFatal, showPlainMessage } from './errors';
 import { createInstrumentData, readInstruments } from '../render/space/instruments';
 import { createPlayInput, type DevicePick, type PlayInput } from './input';
@@ -97,6 +102,14 @@ export async function boot(): Promise<void> {
   const perf = new PerfMonitor(quality);
   perf.autoTier = !urlQuality && !chosen;
   noteForReport(`quality ${quality}${perf.autoTier ? ' (auto)' : ''}`);
+  // ray tracing: the URL pins it for this run, else the saved choice, else High
+  const asRt = (v: unknown): RtTier | null => (typeof v === 'string' && (RT_CHOICES as readonly string[]).includes(v) ? (v as RtTier) : null);
+  const urlRt = asRt(params.get('rt'));
+  const rtChoice: RtTier = urlRt ?? asRt(settingsData.rt) ?? RT_DEFAULT;
+  if (settingsData.rt === undefined) settingsData.rt = rtChoice;
+  const rtGov = new RtGovernor(rtChoice);
+  perf.budgetMs = frameBudgetFor(rtChoice);
+  noteForReport(`ray tracing ${rtChoice}`);
 
   // ---------------------------------------------------------------------------------------------- canvas, pipeline, scene
   const canvas = document.createElement('canvas');
@@ -133,6 +146,13 @@ export async function boot(): Promise<void> {
   }
 
   const scene: SceneManager = createSceneManager(pipeline, { quality });
+  scene.setRayTracing(rtChoice); // before the system loads: the BVH and its programs are built behind the loading bar
+  const applyRt = (t: RtTier, why: string): void => {
+    scene.setRayTracing(t);
+    perf.budgetMs = frameBudgetFor(t);
+    perf.clear(4);
+    noteForReport(`ray tracing ${t} (${why})`);
+  };
 
   // iOS: never rubber-band, pinch-zoom or double-tap zoom. Scrollable lists opt out by scrolling themselves.
   const scrollable = (t: EventTarget | null): boolean => {
@@ -247,6 +267,11 @@ export async function boot(): Promise<void> {
         } catch {
           /* ignore */
         }
+        if (key === 'rt') {
+          const t = asRt(value) ?? RT_DEFAULT;
+          rtGov.choose(t);
+          applyRt(t, 'menu');
+        }
         if (key === 'quality' && !urlQuality) {
           const q = asQuality(value);
           perf.autoTier = !q;
@@ -279,7 +304,15 @@ export async function boot(): Promise<void> {
   const overlay = createPerfOverlay(host, () => {
     const st = pipeline.stats();
     const w = session.warp();
-    return [`view ${lastW}×${lastH} css px · internal ${st.width}×${st.height}`, `time acceleration asked ×${w.requested} achieved ×${w.achieved.toFixed(1)}${w.limitedBy ? ` (${w.limitedBy})` : ''}`, `screen ${current ?? '-'} · sim time ${session.time().toFixed(0)} s`];
+    const ri = scene.rayTracing();
+    return [
+      `view ${lastW}×${lastH} css px · internal ${st.width}×${st.height}`,
+      `time acceleration asked ×${w.requested} achieved ×${w.achieved.toFixed(1)}${w.limitedBy ? ` (${w.limitedBy})` : ''}`,
+      `screen ${current ?? '-'} · sim time ${session.time().toFixed(0)} s`,
+      `ray tracing: chosen ${rtGov.choice} · in effect ${rtGov.tier} · ${rtInfoText()} · BVH ${ri.triangles} tris built in ${ri.buildMs.toFixed(0)} ms${ri.disabled ? ` · off: ${ri.disabled}` : ''}`,
+      rtGov.note ? `ray tracing governor: ${rtGov.note}` : 'ray tracing governor: no change',
+      `GPU memory est: textures ${(renderInfo.textureBytes / 1048576).toFixed(0)} MB + targets ${(renderInfo.targetBytes / 1048576).toFixed(0)} MB + ray tracer ${(renderInfo.rtBytes / 1048576).toFixed(0)} MB = ${(renderInfo.totalBytes / 1048576).toFixed(0)} MB`,
+    ];
   });
   if (params.get('perf') === '1' || settingsData.perfOverlay === true) overlay.setVisible(true);
 
@@ -422,6 +455,7 @@ export async function boot(): Promise<void> {
   };
 
   let lastMode: string | null = null;
+  let rtAcc = 0;
   let last = performance.now();
   let raf = 0;
   let failed = false;
@@ -486,6 +520,14 @@ export async function boot(): Promise<void> {
           pipeline.setDynamicResolution(false, ch.scale);
           if (ch.tier) applyTier(ch.tier);
           noteForReport(`auto quality: ${perf.snapshot().note}`);
+          rtGov.settle(4);
+        }
+        // the ray-tracing governor, twice a second
+        rtAcc += dt;
+        if (rtAcc >= 0.5) {
+          const next = rtGov.update(rtAcc, perf.p95(), perf.samples);
+          rtAcc = 0;
+          if (next) applyRt(next, `governor: ${rtGov.note}`);
         }
       }
       if (overlay.visible()) {

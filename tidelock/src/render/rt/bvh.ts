@@ -60,6 +60,34 @@ export interface MergeOptions {
   /** Meshes that are the exterior hull: front-face-only for rays, never drawn by the G-buffer or composite. */
   exterior?: readonly THREE.Object3D[];
   surface?: SurfaceReader;
+  /**
+   * Raster grouping key of a mesh (the room it is drawn with). The merged geometry keeps a second, raster index of
+   * the non-exterior triangles grouped by this key (in first-seen order), so the G-buffer can draw only the rooms
+   * the forward pass draws. Default: '' for every mesh (one group).
+   */
+  rasterKey?: (mesh: THREE.Mesh) => string;
+}
+
+/** The material record a mesh may carry for the ray tracer (src/render/space/surfaces.ts header). */
+export interface RtRecord {
+  albedo?: readonly number[];
+  roughness?: number;
+  metalness?: number;
+  tiles?: readonly { albedo: readonly number[]; roughness: number; metalness: number }[] | null;
+  perVertex?: string | null;
+  livery?: { primary: readonly number[]; secondary: readonly number[]; accent: readonly number[] };
+  emissive?: boolean;
+  glass?: boolean;
+  screen?: boolean;
+  skip?: boolean;
+  role?: string;
+}
+
+/** Raster index of the merged scene: triangles grouped by rasterKey, exterior hull left out. */
+export interface RasterIndex {
+  index: Uint32Array;
+  /** key -> [first index, index count] */
+  ranges: Map<string, [number, number]>;
 }
 
 export interface MergedScene {
@@ -132,8 +160,11 @@ function sampleMap(m: CpuMap, u: number, v: number, out: [number, number, number
 }
 
 const lmTmp: [number, number, number] = [0, 0, 0];
-/** Built-in surface reader: the current interior's baked attributes, then standard/basic three.js materials. */
-function readSurface(geo: THREE.BufferGeometry, i: number, mat: THREE.Material, out: VertexSurface): void {
+/**
+ * Built-in surface reader: the current interior's baked attributes, then standard/basic three.js materials, with
+ * the per-mesh material record (mesh.userData.rt: per-tile, per-vertex PBR, livery) taking precedence where given.
+ */
+function readSurface(geo: THREE.BufferGeometry, i: number, mat: THREE.Material, out: VertexSurface, rec: RtRecord | null = null): void {
   const a = geo.attributes;
   out.metalness = 0;
   out.alt[0] = out.alt[1] = out.alt[2] = 0;
@@ -176,19 +207,48 @@ function readSurface(geo: THREE.BufferGeometry, i: number, mat: THREE.Material, 
   if (tileA) {
     const tv = tileA.getX(i) + 0.25;
     const ti = Math.floor(tv) % 16;
-    const alb = TILE_ALBEDO[TILE_IDS[ti]] ?? [0.5, 0.5, 0.5];
+    const rt = rec?.tiles?.[ti];
+    const alb = rt ? rt.albedo : (TILE_ALBEDO[TILE_IDS[ti]] ?? [0.5, 0.5, 0.5]);
     r *= alb[0];
     g *= alb[1];
     b *= alb[2];
-    tileRough = TILE_ROUGH[ti] ?? 0.6;
-    tileMetal = TILE_METAL[ti] ?? 0;
+    tileRough = rt ? rt.roughness : (TILE_ROUGH[ti] ?? 0.6);
+    tileMetal = rt ? rt.metalness : (TILE_METAL[ti] ?? 0);
     if (col.r + col.g + col.b < 1e-4 && vc) glow = Math.floor(tv / 16); // the 'glow' material: black base, emissive vertex colour
   }
   const tint = a.aTint as THREE.BufferAttribute | undefined; // ships.ts hull: sqrt(linear) tint, u8n
+  let recRough = -1;
+  let recMetal = -1;
   if (tint && !vc) {
     r *= tint.getX(i) ** 2;
     g *= tint.getY(i) ** 2;
     b *= tint.getZ(i) ** 2;
+    // hull record: x livery colour of slot round(aFx.w * 3); roughness aSurf.z, metalness aSurf.y
+    if (rec?.perVertex?.startsWith('aTint')) {
+      const fx = a.aFx as THREE.BufferAttribute | undefined;
+      const sf = a.aSurf as THREE.BufferAttribute | undefined;
+      const slot = fx ? Math.round(fx.getW(i) * 3) : 0;
+      const liv = rec.livery;
+      const lc = liv ? (slot === 1 ? liv.primary : slot === 2 ? liv.secondary : slot === 3 ? liv.accent : null) : null;
+      if (lc) {
+        r *= lc[0];
+        g *= lc[1];
+        b *= lc[2];
+      }
+      if (sf) {
+        recRough = sf.getZ(i);
+        recMetal = sf.getY(i);
+      }
+    }
+  }
+  const pbr = a.pbr as THREE.BufferAttribute | undefined; // cockpit.ts: vertex colour + pbr (rough, metal)
+  if (pbr && rec?.perVertex === 'color+pbr') {
+    recRough = pbr.getX(i);
+    recMetal = pbr.getY(i);
+  }
+  if (recRough < 0 && rec && !tileA && !rec.perVertex && typeof rec.roughness === 'number') {
+    recRough = rec.roughness;
+    recMetal = rec.metalness ?? 0;
   }
   if ((mat as THREE.MeshBasicMaterial).isMeshBasicMaterial) {
     // unlit: the colour already is the exitant radiance (the cockpit's baked vertex colours)
@@ -204,8 +264,11 @@ function readSurface(geo: THREE.BufferGeometry, i: number, mat: THREE.Material, 
   out.albedo[0] = r;
   out.albedo[1] = g;
   out.albedo[2] = b;
-  out.roughness = tileRough >= 0 ? tileRough * (std.roughness ?? 1) : (std.roughness ?? 0.8);
-  out.metalness = tileRough >= 0 ? tileMetal * (std.metalness ?? 1) : (std.metalness ?? 0);
+  out.roughness = tileRough >= 0 ? tileRough * (std.roughness ?? 1) : recRough >= 0 ? recRough : (std.roughness ?? 0.8);
+  out.metalness = tileRough >= 0 ? tileMetal * (std.metalness ?? 1) : recMetal >= 0 ? recMetal : (std.metalness ?? 0);
+  out.albedo[0] = Math.min(0.95, out.albedo[0]);
+  out.albedo[1] = Math.min(0.95, out.albedo[1]);
+  out.albedo[2] = Math.min(0.95, out.albedo[2]);
   out.lit[0] = out.lit[1] = out.lit[2] = 0;
   if (glow >= 0 && vc && tileA) {
     const tv = Math.floor(tileA.getX(i) + 0.25) % 16;
@@ -222,7 +285,9 @@ function readSurface(geo: THREE.BufferGeometry, i: number, mat: THREE.Material, 
     const uv = (a[`uv${std.lightMap.channel || ''}`] ?? a.uv1 ?? a.uv) as THREE.BufferAttribute | undefined;
     if (m && uv) {
       sampleMap(m, uv.getX(i), std.lightMap.flipY ? 1 - uv.getY(i) : uv.getY(i), lmTmp);
-      const k = (std.lightMapIntensity ?? 1) / Math.PI; // three: indirect diffuse = albedo / pi * irradiance
+      // three: indirect diffuse = albedo / pi * irradiance. Corvane surfaces (a record with tiles) are designed at
+      // lightMapIntensity = pi x display gain, and the gain is applied per frame (RtFrame.bakedGain): use pi here.
+      const k = rec?.tiles ? 1 : (std.lightMapIntensity ?? 1) / Math.PI;
       for (let c = 0; c < 3; c++) out.lit[c] = out.albedo[c] * lmTmp[c] * k;
     }
   }
@@ -238,13 +303,16 @@ function readSurface(geo: THREE.BufferGeometry, i: number, mat: THREE.Material, 
  * Merge `meshes` into one ship-space geometry. Vertex positions go through `toShip × mesh.matrixWorld`
  * (toShip = inverse of the ship root's world matrix; identity when the meshes already live in ship-local m).
  */
-export function mergeStatic(meshes: readonly THREE.Mesh[], toShip: THREE.Matrix4, opts: MergeOptions = {}): { geometry: THREE.BufferGeometry; surf: Float32Array; ms: number } {
+export function mergeStatic(meshes: readonly THREE.Mesh[], toShip: THREE.Matrix4, opts: MergeOptions = {}): { geometry: THREE.BufferGeometry; surf: Float32Array; ms: number; raster: RasterIndex } {
   const t0 = now();
   interface Part {
     mesh: THREE.Mesh;
     geo: THREE.BufferGeometry;
     tris: [number, number, THREE.Material][]; // index range (start, count) and its material
     ext: boolean;
+    key: string;
+    start: number;
+    end: number;
   }
   const parts: Part[] = [];
   let nv = 0;
@@ -268,10 +336,14 @@ export function mergeStatic(meshes: readonly THREE.Mesh[], toShip: THREE.Matrix4
       ranges.push([s, Math.min(count - s, Number.isFinite(dr.count) ? dr.count : count), mats[0]]);
     }
     if (!ranges.length) continue;
-    parts.push({ mesh, geo, tris: ranges, ext: isExterior(mesh, opts.exterior) });
+    parts.push({ mesh, geo, tris: ranges, ext: isExterior(mesh, opts.exterior), key: opts.rasterKey ? opts.rasterKey(mesh) : '', start: 0, end: 0 });
     nv += geo.attributes.position.count;
     for (const r of ranges) ni += r[1] - (r[1] % 3);
   }
+  // group the parts by raster key (stable): each key's triangles end up contiguous in the raster index
+  const keyOrder = new Map<string, number>();
+  for (const pt of parts) if (!keyOrder.has(pt.key)) keyOrder.set(pt.key, keyOrder.size);
+  parts.sort((x, y) => (keyOrder.get(x.key) as number) - (keyOrder.get(y.key) as number));
   const pos = new Float32Array(nv * 3);
   const nrm = new Float32Array(nv * 3);
   const aSurf = new Uint8Array(nv * 4);
@@ -307,6 +379,7 @@ export function mergeStatic(meshes: readonly THREE.Mesh[], toShip: THREE.Matrix4
     }
     const idx = geo.index;
     const ib0 = ib;
+    const rec = ((mesh.userData as { rt?: RtRecord }).rt ?? null) as RtRecord | null;
     for (const [start, cnt, mat] of part.tris) {
       const n = cnt - (cnt % 3);
       for (let k = 0; k < n; k++) {
@@ -314,7 +387,7 @@ export function mergeStatic(meshes: readonly THREE.Mesh[], toShip: THREE.Matrix4
         index[ib++] = vb + v;
         if (seen[vb + v]) continue;
         seen[vb + v] = 1;
-        if (!opts.surface || !opts.surface(mesh, v, mat, s)) readSurface(geo, v, mat, s);
+        if (!opts.surface || !opts.surface(mesh, v, mat, s)) readSurface(geo, v, mat, s, rec);
         const o = (vb + v) * 12;
         surf[o] = s.albedo[0];
         surf[o + 1] = s.albedo[1];
@@ -352,6 +425,8 @@ export function mergeStatic(meshes: readonly THREE.Mesh[], toShip: THREE.Matrix4
         }
       }
     }
+    part.start = ib0;
+    part.end = ib;
     vb += vc;
   }
   const geometry = new THREE.BufferGeometry();
@@ -360,7 +435,21 @@ export function mergeStatic(meshes: readonly THREE.Mesh[], toShip: THREE.Matrix4
   geometry.setAttribute('aSurf', new THREE.BufferAttribute(aSurf, 4, true));
   geometry.setAttribute('aSurf2', new THREE.BufferAttribute(aSurf2, 4, true));
   geometry.setIndex(new THREE.BufferAttribute(index, 1));
-  return { geometry, surf, ms: now() - t0 };
+  // the raster index (before the BVH build reorders `index`): interior triangles only, grouped by key
+  const ranges = new Map<string, [number, number]>();
+  let rn = 0;
+  for (const pt of parts) if (!pt.ext) rn += pt.end - pt.start;
+  const rindex = new Uint32Array(rn);
+  let ro = 0;
+  for (const pt of parts) {
+    if (pt.ext || pt.end <= pt.start) continue;
+    rindex.set(index.subarray(pt.start, pt.end), ro);
+    const r = ranges.get(pt.key);
+    if (r) r[1] += pt.end - pt.start;
+    else ranges.set(pt.key, [ro, pt.end - pt.start]);
+    ro += pt.end - pt.start;
+  }
+  return { geometry, surf, ms: now() - t0, raster: { index: rindex, ranges } };
 }
 
 /** Build the BVH over a merged geometry (reorders its index in place) and pack everything into texture arrays. */

@@ -12,6 +12,9 @@ const N = 240;
  */
 const OVER_MS = 17;
 const UNDER_MS = 12;
+/** The 60 fps frame budget, and the 30 fps one used while ray tracing at medium / high (the owner's choice). */
+export const BUDGET_60 = 1000 / 60;
+export const BUDGET_30 = 1000 / 30;
 const VSYNC_MS = 17.4;
 const VSYNC_WORK_MS = 7;
 /** A tier the controller had to leave is not tried again for this long, s (no up/down oscillation). */
@@ -19,6 +22,24 @@ const RETRY_SECONDS = 180;
 const OVER_SECONDS = 3;
 const UNDER_SECONDS = 10;
 export const MIN_SCALE = 0.6;
+
+// ---------------------------------------------------------------------------------------------- ray tracing
+
+export type RtTier = 'off' | 'low' | 'medium' | 'high';
+export const RT_CHOICES: readonly RtTier[] = ['off', 'low', 'medium', 'high'];
+/** Ray tracing in the system menu: the owner wants it, so the phone starts on High (~30 fps). */
+export const RT_DEFAULT: RtTier = 'high';
+/** The safety governor: p95 frame time above this for RT_OVER_SECONDS steps the ray tracing down one notch. */
+export const RT_OVER_MS = 40;
+const RT_OVER_SECONDS = 3;
+/** Back up one notch (never above the owner's choice) after this long well inside budget, and not sooner than RT_RETRY_SECONDS after a drop. */
+const RT_UNDER_MS = 28;
+const RT_UNDER_SECONDS = 30;
+const RT_RETRY_SECONDS = 180;
+/** Frame budget the resolution controller works to for a ray-tracing tier. */
+export function frameBudgetFor(rt: RtTier): number {
+  return rt === 'high' || rt === 'medium' ? BUDGET_30 : BUDGET_60;
+}
 
 // ---------------------------------------------------------------------------------------------- tiers
 
@@ -81,6 +102,14 @@ export interface RenderInfo {
   room: string;
   /** Exposure: 'auto' (metered on the GPU) or the manual EV. */
   exposure: string;
+  /** Ray tracing: tier in effect ('off' when not drawn), rays traced last frame, GPU ms (estimate; measured, -1 if not available). */
+  rt: string;
+  rtRays: number;
+  rtMsEstimate: number;
+  rtMsGpu: number;
+  /** GPU memory of the ray tracer (BVH + its targets), and the sum of textures + targets + ray tracer, bytes. */
+  rtBytes: number;
+  totalBytes: number;
 }
 
 export const renderInfo: RenderInfo = {
@@ -98,6 +127,12 @@ export const renderInfo: RenderInfo = {
   roomsTotal: 0,
   room: '',
   exposure: '',
+  rt: 'off',
+  rtRays: 0,
+  rtMsEstimate: 0,
+  rtMsGpu: -1,
+  rtBytes: 0,
+  totalBytes: 0,
 };
 
 const mb = (b: number): string => (b / 1048576).toFixed(0);
@@ -109,8 +144,86 @@ export function renderInfoText(): string {
     `${r.tier} · msaa ${r.msaa}x · shadow ${r.shadow}${r.shineShadow ? `+${r.shineShadow}` : ''} · probe ${r.probe} · env ${r.envProbe || 'sky'}\n` +
     `draws ${r.drawCalls} · tris ${(r.triangles / 1000).toFixed(0)}k · tex ${mb(r.textureBytes)} MB · rt ${mb(r.targetBytes)} MB` +
     (r.roomsTotal ? ` · rooms ${r.rooms}/${r.roomsTotal} ${r.room}` : '') +
-    (r.exposure ? ` · ev ${r.exposure}` : '')
+    (r.exposure ? ` · ev ${r.exposure}` : '') +
+    `\n${rtInfoText()} · gpu mem ${mb(r.totalBytes)} MB (rt ${mb(r.rtBytes)})`
   );
+}
+
+/** One line for the overlay: ray-tracing tier, rays per frame, GPU ms (estimate, and measured where possible). */
+export function rtInfoText(): string {
+  const r = renderInfo;
+  if (r.rt === 'off') return 'RT off';
+  return `RT ${r.rt} · ${(r.rtRays / 1e6).toFixed(2)}M rays · ~${r.rtMsEstimate.toFixed(1)} ms est${r.rtMsGpu >= 0 ? ` · ${r.rtMsGpu.toFixed(1)} ms gpu` : ''}`;
+}
+
+/**
+ * The ray-tracing safety governor: p95 frame time above RT_OVER_MS for 3 s steps the tier down one notch;
+ * after a long calm it may climb back, never above the owner's choice. Call once per frame; returns the tier
+ * to switch to, or null. No allocation.
+ */
+export class RtGovernor {
+  /** The owner's choice (the ceiling) and the tier in effect. */
+  choice: RtTier;
+  tier: RtTier;
+  /** What it last did, for the report ('' = nothing yet). */
+  note = '';
+  private over = 0;
+  private under = 0;
+  private retry = 0;
+  private hold = 2;
+  constructor(choice: RtTier) {
+    this.choice = choice;
+    this.tier = choice;
+  }
+  /** The owner picked a tier in the menu: it is in effect at once and is the new ceiling. */
+  choose(t: RtTier): void {
+    this.choice = t;
+    this.tier = t;
+    this.over = this.under = this.retry = 0;
+    this.hold = 4;
+  }
+  /** Ignore the next seconds (a tier change, a pause: those frames say nothing). */
+  settle(seconds: number): void {
+    this.hold = Math.max(this.hold, seconds);
+    this.over = this.under = 0;
+  }
+  update(dt: number, p95: number, samples: number): RtTier | null {
+    if (this.retry > 0) this.retry -= dt;
+    if (this.hold > 0) {
+      this.hold -= dt;
+      return null;
+    }
+    if (samples < 45 || (this.tier === 'off' && this.choice === 'off')) {
+      this.over = this.under = 0;
+      return null;
+    }
+    if (this.tier !== 'off' && p95 > RT_OVER_MS) {
+      this.under = 0;
+      this.over += dt;
+      if (this.over < RT_OVER_SECONDS) return null;
+      this.over = 0;
+      const i = RT_CHOICES.indexOf(this.tier);
+      this.tier = RT_CHOICES[i - 1];
+      this.retry = RT_RETRY_SECONDS;
+      this.hold = 4;
+      this.note = `ray tracing down to ${this.tier} (p95 ${p95.toFixed(1)} ms > ${RT_OVER_MS})`;
+      return this.tier;
+    }
+    this.over = 0;
+    if (this.tier !== this.choice && this.retry <= 0 && p95 < RT_UNDER_MS) {
+      this.under += dt;
+      if (this.under < RT_UNDER_SECONDS) return null;
+      this.under = 0;
+      const i = RT_CHOICES.indexOf(this.tier);
+      this.tier = RT_CHOICES[Math.min(i + 1, RT_CHOICES.indexOf(this.choice))];
+      this.retry = RT_RETRY_SECONDS;
+      this.hold = 4;
+      this.note = `ray tracing back up to ${this.tier} (p95 ${p95.toFixed(1)} ms)`;
+      return this.tier;
+    }
+    this.under = 0;
+    return null;
+  }
 }
 
 export interface PerfSnapshot {
@@ -164,6 +277,11 @@ export class PerfMonitor {
   /** Highest tier the controller may climb back to, and whether it may change the tier at all. */
   maxTier: PerfTier;
   autoTier = true;
+  /**
+   * Frame budget the resolution / tier controller works to, ms: 16.7 (60 fps) normally, 33.3 while ray tracing at
+   * medium or high (the owner's ~30 fps choice). The thresholds scale with it.
+   */
+  budgetMs = BUDGET_60;
   /** Free-form lines for the report (device, renderer). */
   device: string[] = [];
 
@@ -251,10 +369,13 @@ export class PerfMonitor {
     const p50 = this.pct(this.frame, 0.5, 120);
     // Low Power Mode caps rAF at 30 fps: steady 33 ms frames with little work are not a reason to cut quality.
     const work = this.pct(this.sim, 0.95, 120) + this.pct(this.render, 0.95, 120);
-    const capped = p50 > 30 && p50 < 36.5 && p95 < 40 && work < UNDER_MS;
+    const k = this.budgetMs / BUDGET_60;
+    const overMs = OVER_MS * k;
+    const underMs = UNDER_MS * k;
+    const capped = k < 1.5 && p50 > 30 && p50 < 36.5 && p95 < 40 && work < UNDER_MS;
     const ch = this.change;
     ch.tier = null;
-    if (p95 > OVER_MS && !capped) {
+    if (p95 > overMs && !capped) {
       this.under = this.calm = 0;
       this.over += step;
       if (this.over < OVER_SECONDS) return null;
@@ -280,8 +401,8 @@ export class PerfMonitor {
       return null;
     }
     this.over = 0;
-    const vsync = p95 < VSYNC_MS && work < VSYNC_WORK_MS;
-    if (p95 < UNDER_MS || capped || vsync) {
+    const vsync = p95 < VSYNC_MS * k && work < VSYNC_WORK_MS * k;
+    if (p95 < underMs || capped || vsync) {
       this.under += step;
       if (this.under < UNDER_SECONDS) return null;
       this.under = 0;
@@ -307,6 +428,14 @@ export class PerfMonitor {
     return null;
   }
 
+  /** p95 frame time over the last `n` frames (the governor's input). */
+  p95(n = 120): number {
+    return this.pct(this.frame, 0.95, n);
+  }
+  get samples(): number {
+    return this.count;
+  }
+
   /** The text behind "Copy performance report". */
   report(extra: string[] = []): string {
     const s = this.snapshot();
@@ -319,7 +448,7 @@ export class PerfMonitor {
       `sim ms p50 ${s.simP50.toFixed(2)} p95 ${s.simP95.toFixed(2)} · steps/frame ${f(s.steps)}`,
       `render cpu ms p50 ${f(s.renderP50)} p95 ${f(s.renderP95)}`,
       `draw calls ${s.drawCalls} · triangles ${s.triangles}`,
-      `tier ${s.tier} · resolution scale ${s.scale.toFixed(2)} · auto tier ${this.autoTier ? 'on' : 'off'}`,
+      `tier ${s.tier} · resolution scale ${s.scale.toFixed(2)} · auto tier ${this.autoTier ? 'on' : 'off'} · frame budget ${this.budgetMs.toFixed(1)} ms`,
       ...renderInfoText().split('\n'),
       s.note ? `last auto change: ${s.note}` : 'no auto change yet',
       ...extra,

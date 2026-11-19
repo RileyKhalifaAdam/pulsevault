@@ -5,8 +5,10 @@
 //   dev/rt.html?view=lounge&q=medium&split=1&frames=24
 //
 //   view    lounge (default: starboard window + skylight) | cockpit | cabin
-//   q       off | low | medium | high | ultra                split=1   left RT off (the forward shader's own
-//   sun bounce refl ao = 0|1  per-effect switches                      sun), right RT on
+//   q       off | low | medium | high | ultra                split=1   left RT off (no sun at all here: the game's
+//   sun bounce refl ao = 0|1  per-effect switches                      shadow-mapped sun lives in scene.ts), right RT on
+// The traced light reaches the image the way the game applies it: the interior's own materials are patched
+// (rt.patchMaterials, src/render/rt/forward.ts) and take it in their forward pass.
 //   frames  frames accumulated before the shot (default 24)   turn=deg  yaw turned per frame over the last 6 frames
 //   debug   0 final | 1 visibility | 2 bounce | 3 reflections | 4 AO | 5 sun direct
 //   res     render scale of the whole page (default 1)       ev  exposure stops (default 0)
@@ -119,6 +121,7 @@ async function main(): Promise<void> {
     statics.push(hull);
   }
   const rt = createRayTracer(renderer, { quality: tier });
+  rt.patchMaterials(inside);
   rt.effects.sun = num('sun', 1) === 1;
   rt.effects.bounce = num('bounce', 1) === 1;
   rt.effects.reflections = num('refl', 1) === 1;
@@ -182,15 +185,17 @@ async function main(): Promise<void> {
   for (let f = 0; f < frames; f++) {
     const time = f / 30;
     if (turn && f >= frames - 6) aim(yaw0 + turn * DEG * (f - (frames - 7)));
-    drawInside(hdrOn, tier === 'off' || !rt.effects.sun, time);
     const ts = performance.now();
     rt.render({ camera, shipMatrixWorld: ship, sun: rtSun, lamps: 1, bakedGain: 1, time, frame: f, width: W, height: H });
-    rt.composite(hdrOn.texture, hdrOn);
     traceMs += performance.now() - ts;
+    drawInside(hdrOn, tier === 'off' || !rt.effects.sun, time);
     renderer.readRenderTargetPixels(hdrOn, 0, 0, 1, 1, px1); // wait for the GPU (keeps SwiftShader's queue short)
     if (f % 2 === 1) await new Promise((r) => setTimeout(r, 0));
   }
-  if (hdrOff) drawInside(hdrOff, true, frames / 30);
+  if (hdrOff) {
+    rt.skip();
+    drawInside(hdrOff, true, frames / 30);
+  }
   renderer.setRenderTarget(null);
   renderer.autoClear = true;
   renderer.render(outScene, ortho);
