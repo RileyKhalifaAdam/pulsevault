@@ -12,11 +12,38 @@
 // the same padded fabric is blue in the suit room and charcoal in a cabin).
 //
 // ORM: R = ambient occlusion, G = roughness, B = metalness (three.js convention). Albedo <= 0.8, metals have no
-// diffuse. Sizes: 2048 high/ultra (64 MB with mips), 1024 medium (16 MB), 512 low (4 MB). The atlas is shared and
-// reference counted: the cockpit and exterior can adopt it with acquireSurfaceAtlas + surfaceMaterial.
+// diffuse. Sizes: 2048 ultra (64 MB with mips), 1024 high and medium (16 MB), 512 low (4 MB). The atlas is shared
+// and reference counted: the cockpit and exterior can adopt it with acquireSurfaceAtlas + surfaceMaterial.
+//
+// PHOTO DETAIL (photo/detail.ts): on top of the trim, every tile that has a photo-scanned counterpart (TILE_PHOTO)
+// blends it in the same shader — detail uv = metres / photo tileMetres; colour = trim x (photo / photo mean albedo);
+// normal = whiteout blend of the photo normal into the trim normal; AO x= photo AO; roughness += photo roughness -
+// photo mean roughness; metalness stays the trim's. A second lookup of the same photo, 5.8x larger and rotated,
+// modulates the colour at low frequency so big surfaces do not repeat. Cut-out sets (grating, netting) REPLACE the
+// trim (their own colour, normal, roughness and opacity). PHOTO_GLSL / photoConstsGlsl() let the cockpit, hull and
+// props shaders sample the same arrays with their own projections.
+//
+// RAY-TRACER RECORD (read by the lighting engineer's src/render/rt): every mesh built on these materials carries
+//   mesh.userData.rt = {
+//     albedo: [r, g, b],      linear, area-weighted mean over the mesh (vertex colour x tile mean), for a quick read
+//     roughness, metalness,   area-weighted means
+//     tiles: RT_TILE,         per tile index (vertex attribute `tile` % 16): { albedo, roughness, metalness } of the
+//                             surface as shaded (trim + photo calibrated: the photo blend preserves the mean)
+//     perVertex: 'tile+color' albedo of a hit = RT_TILE[tile % 16].albedo x vertex `color` (barycentric)
+//     demodulate: { map, uv: 'uv', tileRect: 'uTiles', photo }  the textures that carry the surface's colour detail:
+//                             the atlas albedo (uv wrapped into the tile rect, see tileRect) and the photo albedo
+//                             arrays (photo.uniforms.uPhAlbB / uPhAlbS, layer TILE_PHOTO, uv x TILE_PHOTO scale).
+//                             Trace light only, divide nothing: multiply the traced irradiance by the albedo the
+//                             raster pass already shaded (or by these maps) so sunlit texture detail survives.
+//   }
+// The cockpit sets the same record with tiles: null and perVertex: 'color+pbr' (albedo = vertex colour, roughness
+// = pbr.x, metalness = pbr.y), the hull (hullMaterials.ts) per material with perVertex: 'aTint^2 x livery'.
 
 import * as THREE from 'three';
 import type { Quality } from '../pipeline';
+import { PHOTO_MATERIAL_IDS, type PhotoMaterialId } from './photo/index';
+import { PHOTO_PACK } from './photo/pack.generated';
+import { PHOTO_LAYER, acquirePhotoDetail, releasePhotoDetail, type PhotoDetail } from './photo/detail';
 
 export type P3 = [number, number, number];
 
@@ -39,9 +66,9 @@ export const TILE_METRES: Record<TileId, [number, number]> = {
 
 /** Mean linear albedo seen by diffuse bounces (metals: a fraction of F0), for the light bake. */
 export const TILE_ALBEDO: Record<TileId, P3> = {
-  whitePanel: [0.6, 0.6, 0.58], brushed: [0.3, 0.24, 0.18], gunmetal: [0.12, 0.12, 0.13], tread: [0.06, 0.06, 0.06],
+  whitePanel: [0.66, 0.655, 0.64], brushed: [0.25, 0.24, 0.23], gunmetal: [0.12, 0.12, 0.13], tread: [0.075, 0.075, 0.077],
   grating: [0.08, 0.08, 0.08], padded: [0.5, 0.5, 0.5], leather: [0.45, 0.45, 0.45], veneer: [0.09, 0.05, 0.03],
-  warmPanel: [0.25, 0.21, 0.17], fabric: [0.55, 0.55, 0.55], darkFloor: [0.06, 0.06, 0.06], netting: [0.06, 0.06, 0.06],
+  warmPanel: [0.25, 0.21, 0.17], fabric: [0.55, 0.55, 0.55], darkFloor: [0.15, 0.142, 0.132], netting: [0.05, 0.05, 0.045],
   hazard: [0.3, 0.22, 0.03], seam: [0.12, 0.12, 0.13], vent: [0.08, 0.08, 0.08], stencil: [0.5, 0.5, 0.5],
 };
 
@@ -85,7 +112,8 @@ export function tileRect(i: number): [number, number, number, number] {
 }
 
 export function surfaceSize(q: Quality): number {
-  return q === 'low' ? 512 : q === 'medium' ? 1024 : 2048;
+  // 'high' stays at 1024: the photo arrays (47.6 MB) carry the close-up detail now, the trim only shapes it
+  return q === 'low' ? 512 : q === 'ultra' ? 2048 : 1024;
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -229,7 +257,8 @@ const GEN: Partial<Record<TileId, Gen>> = {
     let h = -0.0018 * (1 - seam) + 0.0022 * step + 0.00006 * fine;
     const grime = (1 - sm(0.0, 0.05, e)) * 0.5 + (1 - sm(0.0, 0.012, Math.abs(e - 0.05))) * 0.35;
     const sc = scratch(u, v, 9, 11, 0.025) + scratch(u + 0.37, v + 0.21, 14, 12, 0.02);
-    const base = 0.62 * (0.95 + 0.1 * n1) * (1 - grime * 0.22) * (1 + sc * 0.06);
+    // off-white clear-coated paint: albedo ~0.69 (0.65-0.75), satin
+    const base = 0.69 * (0.95 + 0.1 * n1) * (1 - grime * 0.22) * (1 + sc * 0.06);
     set(o, base, base * 0.99, base * 0.965, 0.4 + 0.14 * nz(u, v, 3, 3) + grime * 0.12 - sc * 0.12, 0);
     // corner screws
     const sx = Math.min(Math.abs(u - 0.032), Math.abs(u - 0.968));
@@ -248,7 +277,8 @@ const GEN: Partial<Record<TileId, Gen>> = {
     const n1 = nz(u, v, 2, 6);
     const sc = scratch(u, v, 7, 21, 0.015);
     const k = 0.95 + 0.07 * st + 0.04 * n1 + sc * 0.08;
-    set(o, 0.72 * k, 0.58 * k, 0.43 * k, 0.24 + 0.1 * st + 0.08 * n1 - sc * 0.08, 1);
+    // brushed stainless: F0 ~0.56, faintly warm, roughness 0.3-0.45 (smoother read as a mirror catching the probe)
+    set(o, 0.58 * k, 0.56 * k, 0.53 * k, 0.34 + 0.1 * st + 0.06 * n1 - sc * 0.06, 1);
     o.h = 0.000008 * st;
     o.ao = 1;
   },
@@ -276,8 +306,9 @@ const GEN: Partial<Record<TileId, Gen>> = {
     const dust = nz(u, v, 3, 9);
     const wear = nz(u, v, 6, 10);
     let h = loz * 0.0014 + 0.00003 * nz(u, v, 24, 11);
-    let al = 0.045 + loz * 0.02 * wear + (1 - loz) * 0.025 * dust;
-    let ro = 0.82 - loz * 0.14 * wear;
+    // dark rubber: albedo 0.05-0.08, roughness ~0.7 (polished where the boots wear the lozenges)
+    let al = 0.062 + loz * 0.018 * wear + (1 - loz) * 0.02 * dust;
+    let ro = 0.72 - loz * 0.14 * wear;
     let me = 0;
     if (rim > 0) {
       h = h * (1 - rim) + rim * 0.0022;
@@ -377,7 +408,7 @@ const GEN: Partial<Record<TileId, Gen>> = {
     const t = (Math.floor(u * 90) + Math.floor(v * 90)) & 1 ? wa : wb;
     const k = 0.55 * (0.85 + 0.15 * t) * (0.9 + 0.2 * fz);
     set(o, k, k, k, 0.88, 0);
-    o.h = t * 0.0002 + fz * 0.0003;
+    o.h = t * 0.0005 + fz * 0.0007;
     o.ao = 0.85 + 0.15 * t;
   },
   darkFloor(u, v, o) {
@@ -386,8 +417,9 @@ const GEN: Partial<Record<TileId, Gen>> = {
     const seam = sm(0.497, 0.493, Math.max(eu, ev));
     const sp = nz(u, v, 40, 21);
     const sc = nz(u, v * 3, 3, 22);
-    const k = 0.055 * (0.9 + 0.2 * sp) + 0.008 * sm(0.62, 0.8, sc);
-    set(o, k, k * 0.98, k * 0.95, 0.46 + 0.1 * sc - 0.06 * sp, 0);
+    // satin warm-grey composite deck (albedo ~0.15, roughness ~0.35): bright enough that a sun patch reads on it
+    const k = 0.15 * (0.92 + 0.16 * sp) + 0.012 * sm(0.62, 0.8, sc);
+    set(o, k, k * 0.95, k * 0.88, 0.33 + 0.08 * sc - 0.05 * sp, 0);
     o.h = -0.001 * (1 - seam) + 0.00003 * sp;
     o.ao = 0.5 + 0.5 * seam;
   },
@@ -783,6 +815,161 @@ export function createReflectionCube(warm: boolean): THREE.CubeTexture | null {
 // ---------------------------------------------------------------------------------------------------------
 // materials
 
+// ---------------------------------------------------------------------------------------------------------
+// photo detail: which photo set each tile blends, and how strongly
+
+export interface TilePhoto {
+  id: PhotoMaterialId;
+  /** colour, normal, roughness strength (0 = none, 1 = as scanned) and the low-frequency anti-repeat lookup */
+  colour: number;
+  normal: number;
+  rough: number;
+  macro: number;
+  /** the photo replaces the trim (cut-out sets): its colour, normal, roughness, opacity; metalness `metal` */
+  replace?: { metal: number };
+}
+export const TILE_PHOTO: Partial<Record<TileId, TilePhoto>> = {
+  whitePanel: { id: 'whitePanel', colour: 1, normal: 1, rough: 1, macro: 0.35 },
+  brushed: { id: 'brushed', colour: 0.8, normal: 0.8, rough: 0.8, macro: 0.25 },
+  gunmetal: { id: 'gunmetal', colour: 1, normal: 1, rough: 1, macro: 0.3 },
+  tread: { id: 'tread', colour: 1, normal: 1, rough: 0.8, macro: 0.25 },
+  grating: { id: 'grating', colour: 1, normal: 1, rough: 1, macro: 0.2, replace: { metal: 0.9 } },
+  padded: { id: 'fabric', colour: 0.8, normal: 0.8, rough: 0.8, macro: 0.2 },
+  leather: { id: 'leather', colour: 1, normal: 1.1, rough: 1, macro: 0.3 },
+  // walnut under a clear coat: the scan's raw-wood roughness only faintly shows through the lacquer
+  veneer: { id: 'veneer', colour: 1, normal: 0.5, rough: 0.25, macro: 0.3 },
+  warmPanel: { id: 'whitePanel', colour: 0.8, normal: 0.8, rough: 0.8, macro: 0.35 },
+  fabric: { id: 'fabric', colour: 1, normal: 1.5, rough: 1, macro: 0.3 },
+  darkFloor: { id: 'whitePanel', colour: 0.9, normal: 0.8, rough: 0.8, macro: 0.4 },
+  netting: { id: 'netting', colour: 1, normal: 1, rough: 1, macro: 0, replace: { metal: 0 } },
+  hazard: { id: 'hullPaint', colour: 0.7, normal: 0.8, rough: 0.7, macro: 0 },
+  seam: { id: 'gunmetal', colour: 0.8, normal: 0.6, rough: 0.8, macro: 0 },
+  vent: { id: 'gunmetal', colour: 0.6, normal: 0.5, rough: 0.6, macro: 0 },
+};
+
+/** Per photo set, the constants a shader needs: (albedo layer, linear layer, 1/tileU, 1/tileV), (1/mean rgb, mean roughness). */
+export function photoSetConsts(id: PhotoMaterialId): { a: [number, number, number, number]; b: [number, number, number, number] } {
+  const L = PHOTO_LAYER[id];
+  const set = PHOTO_PACK[id];
+  const t = set.tileMetres;
+  const m = set.meanAlbedo;
+  return { a: [L.alb, L.lin, 1 / t[0], 1 / t[1]], b: [1 / Math.max(m[0], 0.01), 1 / Math.max(m[1], 0.01), 1 / Math.max(m[2], 0.01), set.meanRoughness] };
+}
+
+/**
+ * GLSL constants for every photo set: `PH_A_<id>` = vec4(albedo layer, linear layer, 1/tileU m, 1/tileV m),
+ * `PH_B_<id>` = vec4(1 / mean albedo rgb, mean roughness). For shaders that pick a set themselves.
+ */
+export function photoConstsGlsl(): string {
+  const f = (x: number): string => x.toFixed(5);
+  return PHOTO_MATERIAL_IDS.map((id) => {
+    const c = photoSetConsts(id);
+    return `const vec4 PH_A_${id} = vec4(${c.a.map(f).join(', ')});\nconst vec4 PH_B_${id} = vec4(${c.b.map(f).join(', ')});`;
+  }).join('\n');
+}
+
+/** Samplers and helpers of the photo arrays (pair with photoDetail.uniforms). */
+export const PHOTO_GLSL = /* glsl */ `
+uniform mediump sampler2DArray uPhAlbB;
+uniform mediump sampler2DArray uPhAlbS;
+uniform mediump sampler2DArray uPhLin;
+uniform float uPhOn;
+vec4 phAlbedo(float alb, vec2 uv, vec2 dx, vec2 dy) {
+  if (alb < 15.5) return textureGrad(uPhAlbB, vec3(uv, alb), dx, dy);
+  return textureGrad(uPhAlbS, vec3(uv, alb - 16.0), dx, dy);
+}
+vec4 phLinear(float lin, vec2 uv, vec2 dx, vec2 dy) {
+  return textureGrad(uPhLin, vec3(uv, lin), dx, dy);
+}
+// the same photo 5.8x larger and turned 37 deg: its luminance relative to the mean, to break the repeat
+float phMacro(float alb, vec2 uv, vec2 dx, vec2 dy, vec3 invMean) {
+  const mat2 R = mat2(0.8, 0.6, -0.6, 0.8);
+  vec3 c = phAlbedo(alb, R * uv * 0.173 + vec2(0.37, 0.71), R * dx * 0.173, R * dy * 0.173).rgb * invMean;
+  return clamp(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.4, 1.8);
+}
+vec3 phNormal(vec4 lin, float k) {
+  vec2 xy = (lin.rg * 2.0 - 1.0) * k;
+  return vec3(xy, sqrt(max(0.0, 1.0 - min(dot(xy, xy), 0.96))));
+}
+// whiteout blend of a detail normal into a base normal (tangent space)
+vec3 phWhiteout(vec3 a, vec3 b) {
+  return normalize(vec3(a.xy + b.xy, a.z * b.z));
+}
+// alpha of a cut-out set kept from thinning out in the mips (log2 of texels per pixel at 512)
+float phCoverage(float a, vec2 dx, vec2 dy) {
+  float lod = max(0.0, 0.5 * log2(max(dot(dx, dx), dot(dy, dy))) + 9.0);
+  return clamp(a * (1.0 + 0.3 * lod), 0.0, 1.0);
+}
+`;
+
+/** Per-tile shaded means (trim + photo calibrated), linear, for bakes and the ray tracer. */
+export interface RtSurface {
+  albedo: P3;
+  roughness: number;
+  metalness: number;
+}
+const TILE_ROUGH: Record<TileId, number> = {
+  whitePanel: 0.45, brushed: 0.38, gunmetal: 0.55, tread: 0.68, grating: 0.36, padded: 0.86, leather: 0.52, veneer: 0.3,
+  warmPanel: 0.52, fabric: 0.88, darkFloor: 0.36, netting: 0.65, hazard: 0.56, seam: 0.45, vent: 0.5, stencil: 0.47,
+};
+const TILE_METAL: Record<TileId, number> = {
+  whitePanel: 0.02, brushed: 1, gunmetal: 1, tread: 0.08, grating: 0.9, padded: 0, leather: 0, veneer: 0,
+  warmPanel: 0, fabric: 0, darkFloor: 0, netting: 0, hazard: 0.2, seam: 1, vent: 0.6, stencil: 0,
+};
+/** RT_TILE[tile index]: albedo (metals: F0), roughness, metalness. */
+export const RT_TILE: readonly RtSurface[] = TILE_IDS.map((id) => {
+  const metal = TILE_METAL[id];
+  const a = TILE_ALBEDO[id];
+  // TILE_ALBEDO holds what diffuse bounces see (metals: a fraction of F0); give the ray tracer F0 for metals
+  const k = metal > 0.5 ? 2.2 : 1;
+  return { albedo: [Math.min(0.95, a[0] * k), Math.min(0.95, a[1] * k), Math.min(0.95, a[2] * k)] as P3, roughness: TILE_ROUGH[id], metalness: metal };
+});
+
+/** The ray-tracer record of a mesh on the surface materials (see the header). Area-weighted over its triangles. */
+export function surfaceRtRecord(geo: THREE.BufferGeometry, atlas: SurfaceAtlas, shared: SurfaceShared): Record<string, unknown> {
+  const pos = geo.getAttribute('position') as THREE.BufferAttribute | undefined;
+  const tile = geo.getAttribute('tile') as THREE.BufferAttribute | undefined;
+  const col = geo.getAttribute('color') as THREE.BufferAttribute | undefined;
+  const idx = geo.getIndex();
+  const acc = [0, 0, 0, 0, 0];
+  let area = 0;
+  if (pos && tile && idx) {
+    const a = new THREE.Vector3();
+    const b = new THREE.Vector3();
+    const c = new THREE.Vector3();
+    for (let i = 0; i < idx.count; i += 3) {
+      const i0 = idx.getX(i);
+      a.fromBufferAttribute(pos, i0);
+      b.fromBufferAttribute(pos, idx.getX(i + 1));
+      c.fromBufferAttribute(pos, idx.getX(i + 2));
+      const ar = b.sub(a).cross(c.sub(a)).length() * 0.5;
+      if (!(ar > 0)) continue;
+      const t = RT_TILE[Math.round(tile.getX(i0)) % 16] ?? RT_TILE[0];
+      const tr = col ? col.getX(i0) : 1;
+      const tg = col ? col.getY(i0) : 1;
+      const tb = col ? col.getZ(i0) : 1;
+      acc[0] += ar * Math.min(0.95, t.albedo[0] * tr);
+      acc[1] += ar * Math.min(0.95, t.albedo[1] * tg);
+      acc[2] += ar * Math.min(0.95, t.albedo[2] * tb);
+      acc[3] += ar * t.roughness;
+      acc[4] += ar * t.metalness;
+      area += ar;
+    }
+  }
+  const k = area > 0 ? 1 / area : 0;
+  return {
+    albedo: area > 0 ? [acc[0] * k, acc[1] * k, acc[2] * k] : [0.5, 0.5, 0.5],
+    roughness: area > 0 ? acc[3] * k : 0.5,
+    metalness: area > 0 ? acc[4] * k : 0,
+    tiles: RT_TILE,
+    perVertex: 'tile+color',
+    demodulate: { map: atlas.map, uv: 'uv', tileRect: shared.uTiles.value, photo: shared.photo ? shared.photo.uniforms : null, tilePhoto: TILE_PHOTO },
+  };
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// materials
+
 export interface SurfaceShared {
   uTiles: { value: THREE.Vector4[] };
   /** Lights-off lightmap (linear half float), and the on/off blend (1 = on). */
@@ -795,11 +982,42 @@ export interface SurfaceShared {
   /** Glow levels per group: main, always, emergency, blink. */
   uGlow: { value: THREE.Vector4 };
   uGain: { value: number };
+  /** Photo detail per tile: (u scale, v scale, linear layer or -1, albedo layer), (1/mean rgb, mean roughness),
+   * (colour, normal, roughness, macro strength), (replace, replace metalness, 0, 0). */
+  uPhA: { value: THREE.Vector4[] };
+  uPhB: { value: THREE.Vector4[] };
+  uPhC: { value: THREE.Vector4[] };
+  uPhD: { value: THREE.Vector4[] };
+  /** The shared photo arrays (null: trim only). */
+  photo: PhotoDetail | null;
 }
 
 export const RGBM_RANGE = 8;
 
-export function createSurfaceShared(): SurfaceShared {
+/** Shared uniforms of one set of surface materials. With a quality, the photo detail is acquired (release with
+ * releaseSurfaceShared). */
+export function createSurfaceShared(q?: Quality): SurfaceShared {
+  const uPhA: THREE.Vector4[] = [];
+  const uPhB: THREE.Vector4[] = [];
+  const uPhC: THREE.Vector4[] = [];
+  const uPhD: THREE.Vector4[] = [];
+  TILE_IDS.forEach((tid) => {
+    const tp = TILE_PHOTO[tid];
+    if (!tp) {
+      uPhA.push(new THREE.Vector4(0, 0, -1, 0));
+      uPhB.push(new THREE.Vector4(1, 1, 1, 0.5));
+      uPhC.push(new THREE.Vector4(0, 0, 0, 0));
+      uPhD.push(new THREE.Vector4(0, 0, 0, 0));
+      return;
+    }
+    const c = photoSetConsts(tp.id);
+    const tm = TILE_METRES[tid];
+    // the mesh uv is in repeats of the tile: metres = uv * TILE_METRES; photo uv = metres / photo tileMetres
+    uPhA.push(new THREE.Vector4(tm[0] * c.a[2], tm[1] * c.a[3], c.a[1], c.a[0]));
+    uPhB.push(new THREE.Vector4(...c.b));
+    uPhC.push(new THREE.Vector4(tp.colour, tp.normal, tp.rough, tp.macro));
+    uPhD.push(new THREE.Vector4(tp.replace ? 1 : 0, tp.replace?.metal ?? 0, 0, 0));
+  });
   return {
     uTiles: { value: TILE_IDS.map((_, i) => new THREE.Vector4(...tileRect(i))) },
     uLmB: { value: null },
@@ -808,7 +1026,17 @@ export function createSurfaceShared(): SurfaceShared {
     uSpecK: { value: 1.0 },
     uGlow: { value: new THREE.Vector4(1, 1, 0.3, 1) },
     uGain: { value: 1 },
+    uPhA: { value: uPhA },
+    uPhB: { value: uPhB },
+    uPhC: { value: uPhC },
+    uPhD: { value: uPhD },
+    photo: q ? acquirePhotoDetail(q) : null,
   };
+}
+
+export function releaseSurfaceShared(s: SurfaceShared): void {
+  if (s.photo) releasePhotoDetail(s.photo);
+  s.photo = null;
 }
 
 export type SurfaceKind = 'main' | 'cut' | 'glow';
@@ -816,7 +1044,8 @@ export type SurfaceKind = 'main' | 'cut' | 'glow';
 /**
  * A MeshStandardMaterial that samples the atlas by the `tile` attribute. With `lightMap` (linear, uv channel 1)
  * the baked light replaces ambient and scales the reflections; without it the material is lit by scene lights
- * and the env map as usual (cockpit / exterior adoption).
+ * and the env map as usual (cockpit / exterior adoption). With `shared.photo`, the photo detail blends in
+ * (main and cut kinds).
  */
 export function surfaceMaterial(
   atlas: SurfaceAtlas,
@@ -845,7 +1074,9 @@ export function surfaceMaterial(
     m.lightMap = lm;
     m.lightMapIntensity = Math.PI;
   }
-  m.onBeforeCompile = (sh) => {
+  const photo = kind !== 'glow' ? shared.photo : null;
+  if (photo) (m as unknown as { defines: Record<string, string> }).defines = kind === 'cut' ? { TL_PHOTO: '', TL_CUT: '' } : { TL_PHOTO: '' };
+  m.onBeforeCompile = (sh, renderer) => {
     sh.uniforms.uTiles = shared.uTiles;
     sh.uniforms.uLmB = shared.uLmB;
     sh.uniforms.uLmMix = shared.uLmMix;
@@ -853,19 +1084,30 @@ export function surfaceMaterial(
     sh.uniforms.uSpecK = shared.uSpecK;
     sh.uniforms.uGlow = shared.uGlow;
     sh.uniforms.uGain = shared.uGain;
+    if (photo) {
+      photo.noteRenderer(renderer);
+      Object.assign(sh.uniforms, photo.uniforms, { uPhA: shared.uPhA, uPhB: shared.uPhB, uPhC: shared.uPhC, uPhD: shared.uPhD });
+    }
     sh.vertexShader = sh.vertexShader
       .replace(
         '#include <common>',
-        '#include <common>\nattribute float tile;\nuniform vec4 uTiles[16];\nuniform vec4 uGlow;\nvarying vec4 vTile;\nvarying vec3 vUpV;\nvarying float vGlowK;',
+        '#include <common>\nattribute float tile;\nuniform vec4 uTiles[16];\nuniform vec4 uGlow;\nvarying vec4 vTile;\nvarying vec3 vUpV;\nvarying float vGlowK;\nvarying float vTileI;',
       )
       .replace(
         '#include <uv_vertex>',
-        '#include <uv_vertex>\nfloat tlI = mod(tile + 0.25, 16.0);\nfloat tlG = floor((tile + 0.25) / 16.0);\nvTile = uTiles[int(tlI)];\nvGlowK = dot(uGlow, vec4(equal(vec4(tlG), vec4(0.0, 1.0, 2.0, 3.0))));\nvUpV = normalize((viewMatrix * vec4(normalize((modelMatrix * vec4(0.0, 1.0, 0.0, 0.0)).xyz), 0.0)).xyz);',
+        '#include <uv_vertex>\nfloat tlI = mod(tile + 0.25, 16.0);\nfloat tlG = floor((tile + 0.25) / 16.0);\nvTileI = floor(tlI);\nvTile = uTiles[int(tlI)];\nvGlowK = dot(uGlow, vec4(equal(vec4(tlG), vec4(0.0, 1.0, 2.0, 3.0))));\nvUpV = normalize((viewMatrix * vec4(normalize((modelMatrix * vec4(0.0, 1.0, 0.0, 0.0)).xyz), 0.0)).xyz);',
       );
     let f = sh.fragmentShader
       .replace(
         '#include <common>',
-        `#include <common>\nvarying vec4 vTile;\nvarying vec3 vUpV;\nvarying float vGlowK;\nuniform sampler2D uLmB;\nuniform float uLmMix;\nuniform float uUpK;\nuniform float uSpecK;\nuniform float uGain;`,
+        `#include <common>\nvarying vec4 vTile;\nvarying vec3 vUpV;\nvarying float vGlowK;\nvarying float vTileI;\nuniform sampler2D uLmB;\nuniform float uLmMix;\nuniform float uUpK;\nuniform float uSpecK;\nuniform float uGain;
+#ifdef TL_PHOTO
+${PHOTO_GLSL}
+uniform vec4 uPhA[16];
+uniform vec4 uPhB[16];
+uniform vec4 uPhC[16];
+uniform vec4 uPhD[16];
+#endif`,
       )
       .replace(
         'void main() {',
@@ -873,23 +1115,86 @@ export function surfaceMaterial(
   vec2 tlR = vMapUv;
   vec2 tlUV = vTile.xy + fract(tlR) * vTile.zw;
   float tlCap = min(vTile.z, vTile.w) * 0.125;
-  vec2 tlDx = dFdx(tlR) * vTile.zw;
-  vec2 tlDy = dFdy(tlR) * vTile.zw;
+  vec2 tlRdx = dFdx(tlR);
+  vec2 tlRdy = dFdy(tlR);
+  vec2 tlDx = tlRdx * vTile.zw;
+  vec2 tlDy = tlRdy * vTile.zw;
   tlDx *= min(1.0, tlCap / max(length(tlDx), 1e-6));
   tlDy *= min(1.0, tlCap / max(length(tlDy), 1e-6));
-  vec4 tlMapS = textureGrad(map, tlUV, tlDx, tlDy);`,
+  vec4 tlMapS = textureGrad(map, tlUV, tlDx, tlDy);
+#ifdef TL_PHOTO
+  int phI = int(vTileI + 0.5);
+  vec4 phA = uPhA[phI];
+  vec4 phB = uPhB[phI];
+  vec4 phC = uPhC[phI];
+  bool phRepl = uPhD[phI].x > 0.5;
+  bool phUse = uPhOn > 0.5 && phA.z > -0.5;
+  vec4 phAlb = vec4(1.0);
+  vec4 phLin = vec4(0.5, 0.5, 1.0, phB.w);
+  float phMac = 1.0;
+  if (phUse) {
+    vec2 phUV = tlR * phA.xy;
+    vec2 phDx = tlRdx * phA.xy;
+    vec2 phDy = tlRdy * phA.xy;
+    phAlb = phAlbedo(phA.w, phUV, phDx, phDy);
+    phLin = phLinear(phA.z, phUV, phDx, phDy);
+    if (phC.w > 0.0) phMac = mix(1.0, phMacro(phA.w, phUV, phDx, phDy, phB.rgb), phC.w);
+    if (phRepl) phAlb.a = phCoverage(phAlb.a, phDx, phDy);
+  }
+#endif`,
       )
-      .replace('#include <map_fragment>', 'diffuseColor *= tlMapS;')
+      .replace(
+        '#include <map_fragment>',
+        `diffuseColor *= tlMapS;
+#ifdef TL_PHOTO
+  if (phUse) {
+    if (phRepl) {
+      diffuseColor = vec4(phAlb.rgb * phMac, phAlb.a);
+#ifndef TL_CUT
+      diffuseColor.rgb *= mix(0.03, 1.0, phAlb.a);
+#endif
+    } else {
+      diffuseColor.rgb *= mix(vec3(1.0), clamp(phAlb.rgb * phB.rgb, 0.0, 3.0), phC.x) * phMac;
+    }
+    diffuseColor.rgb = min(diffuseColor.rgb, vec3(0.9));
+  }
+#endif`,
+      )
       .replace(
         '#include <roughnessmap_fragment>',
-        'vec4 tlOrm = textureGrad(roughnessMap, tlUV, tlDx, tlDy);\nfloat roughnessFactor = roughness * tlOrm.g;',
+        `vec4 tlOrm = textureGrad(roughnessMap, tlUV, tlDx, tlDy);
+float roughnessFactor = roughness * tlOrm.g;
+float tlAo = tlOrm.r;
+float tlMetal = tlOrm.b;
+#ifdef TL_PHOTO
+  if (phUse) {
+    if (phRepl) {
+      roughnessFactor = mix(0.92, phLin.a, phAlb.a);
+      tlMetal = uPhD[phI].y * step(0.5, phAlb.a);
+      tlAo = mix(0.25, phLin.b, phAlb.a);
+    } else {
+      roughnessFactor = clamp(roughnessFactor + phC.z * (phLin.a - phB.w), 0.05, 1.0);
+      tlAo *= phLin.b;
+    }
+  }
+#endif`,
       )
-      .replace('#include <metalnessmap_fragment>', 'float metalnessFactor = metalness * tlOrm.b;')
+      .replace('#include <metalnessmap_fragment>', 'float metalnessFactor = metalness * tlMetal;')
       .replace(
         '#include <normal_fragment_maps>',
-        THREE.ShaderChunk.normal_fragment_maps.replaceAll('texture2D( normalMap, vNormalMapUv )', 'textureGrad( normalMap, tlUV, tlDx, tlDy )'),
+        `#ifdef USE_NORMALMAP_TANGENTSPACE
+  vec3 mapN = textureGrad( normalMap, tlUV, tlDx, tlDy ).xyz * 2.0 - 1.0;
+  mapN.xy *= normalScale;
+#ifdef TL_PHOTO
+  if (phUse) {
+    vec3 phN = phNormal(phLin, phC.y);
+    mapN = phRepl ? phN : phWhiteout(mapN, phN);
+  }
+#endif
+  normal = normalize( tbn * mapN );
+#endif`,
       )
-      .replace('#include <aomap_fragment>', THREE.ShaderChunk.aomap_fragment.replace('texture2D( aoMap, vAoMapUv ).r', 'tlOrm.r'));
+      .replace('#include <aomap_fragment>', THREE.ShaderChunk.aomap_fragment.replace('texture2D( aoMap, vAoMapUv ).r', 'tlAo'));
     if (kind === 'glow') f = f.replace('#include <emissivemap_fragment>', 'totalEmissiveRadiance = vColor.rgb * tlMapS.rgb * vGlowK * uGain;');
     if (lm) {
       f = f.replace(
@@ -909,6 +1214,6 @@ export function surfaceMaterial(
     }
     sh.fragmentShader = f;
   };
-  m.customProgramCacheKey = () => `corvane-surface-${kind}-${lm ? 'lm' : 'lit'}`;
+  m.customProgramCacheKey = () => `corvane-surface-2-${kind}-${lm ? 'lm' : 'lit'}${photo ? '-ph' : ''}`;
   return m;
 }

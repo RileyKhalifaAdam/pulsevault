@@ -1,16 +1,24 @@
-// Contact: craft against station colliders (impulses with restitution and friction, damage by the energy
-// lost), craft against the ground (wrecked above LAND_MAX_SPEED, otherwise resting contact on the rotating
-// surface until thrust lifts it), and docking latches (joints that close inside the tolerances below and are
-// released by undock() with a spring impulse). Ships collide as their bounding sphere.
+// Contact: craft against stations and against each other with their real shapes (compound hulls of
+// src/data/hullColliders.ts and the stations' colliders, src/world/compound.ts): bounding spheres first, then the
+// narrow phase into a persistent manifold and a sequential-impulse solve with restitution and friction; the
+// energy the solve dissipates damages both hulls. Craft against the ground: the hull's lowest point meets the
+// rotating surface, the touchdown is solved against the spinning ground (wrecked above LAND_MAX_SPEED), then the
+// craft rests on its hull as a joint on the rotating surface until thrust lifts it. Docking latches are joints that
+// close inside the tolerances below and are released by undock() with a spring impulse. The manifolds (warm-start
+// impulses) are part of the saved world (world.contacts), so save -> load -> continue stays bit-identical in contact.
 //
 // Docking tolerances (chosen for a phone): the ship's collar within DOCK_DISTANCE of the port's mating point,
 // relative speed under DOCK_SPEED, collar axis within DOCK_ANGLE of the reversed port axis, port free and
 // large enough, latch armed. The latch keeps the relative pose it closed at; linear momentum is conserved.
 // While latched the ship's drive and RCS are interlocked (they produce no force).
 
-import type { DockingPortDef, Quat, StationCollider, V3 } from '../core/types';
+import type { DockingPortDef, Quat, V3 } from '../core/types';
 import { PAD_ORDER } from '../data/stationLayouts';
-import { CONTACT_HEIGHT, WHY_CONTACT, WHY_FREE, WHY_PROXIMITY } from './dynamics';
+import {
+  bodyFromCraft, collide, collidePlanet, compoundSupport, craftCompound, DEFAULT_CONTACT, makeContactBody, makeContactResult, Manifold,
+  manifoldState, planetBody, setManifoldState, solveManifold, type Compound, type ContactParams,
+} from './compound';
+import { WHY_CONTACT, WHY_FREE, WHY_PROXIMITY } from './dynamics';
 import { qAxisTo, qConjMulTo, qMulTo, qRot, qRotInv, rotAxis } from './math';
 import { bodyIndex, destroyCraft, findCraft, pushEvent, type Craft, type World } from './state';
 
@@ -23,42 +31,119 @@ export const FRICTION = 0.4;
 /** Fastest touchdown (relative to the rotating ground) a hull survives, m/s. */
 export const LAND_MAX_SPEED = 5;
 
-const A = { x: 0, y: 0, z: 0 }, B = { x: 0, y: 0, z: 0 }, C = { x: 0, y: 0, z: 0 }, E = { x: 0, y: 0, z: 0 };
-const PL = { x: 0, y: 0, z: 0 }, NL = { x: 0, y: 0, z: 0 }, CL = { x: 0, y: 0, z: 0 }, CP = { x: 0, y: 0, z: 0 };
+/** Impacts faster than this (approach speed along the contact normal, m/s) raise an 'impact' event. */
+export const IMPACT_EVENT_SPEED = 0.2;
+/** Gap below which proximityLimit() looks at the real shapes (narrow phase with this margin), m. */
+const NEAR_MARGIN = 3;
+
+const A = { x: 0, y: 0, z: 0 }, B = { x: 0, y: 0, z: 0 };
+const PL = { x: 0, y: 0, z: 0 };
 const Q1: Quat = { x: 0, y: 0, z: 0, w: 1 };
+const ORIGIN: V3 = { x: 0, y: 0, z: 0 };
 let _pDist = 0, _pCos = 0, _pSpeed = 0, _syncWhy = WHY_FREE;
 
 const mass = (c: Craft): number => c.dryMass + c.propellant;
 
-function closestOnCollider(col: StationCollider, p: V3, out: V3): void {
-  const a = col.a, b = col.b;
-  if (col.kind === 'sphere' || !b) { out.x = a.x; out.y = a.y; out.z = a.z; return; }
-  const ex = b.x - a.x, ey = b.y - a.y, ez = b.z - a.z;
-  let t = ((p.x - a.x) * ex + (p.y - a.y) * ey + (p.z - a.z) * ez) / (ex * ex + ey * ey + ez * ez);
-  t = t < 0 ? 0 : t > 1 ? 1 : t;
-  out.x = a.x + t * ex; out.y = a.y + t * ey; out.z = a.z + t * ez;
+/** Solver parameters: the world's restitution and friction on the compound solver's defaults. */
+const PARAMS: ContactParams = { ...DEFAULT_CONTACT, restitution: RESTITUTION, friction: FRICTION };
+const CA = makeContactBody(), CB = makeContactBody();
+const RES = makeContactResult();
+const SCRATCH = new Manifold();
+
+// ------------------------------------------------------------------------------------------------ manifolds
+
+/** Persistent manifolds of one world, per ordered pair of craft ids; pairs not looked at in a pass are dropped. */
+class PairCache {
+  readonly map = new Map<string, Map<string, Manifold>>();
+  pass = 0;
+  get(a: string, b: string): Manifold {
+    let inner = this.map.get(a);
+    if (!inner) { inner = new Map(); this.map.set(a, inner); }
+    let m = inner.get(b);
+    if (!m) { m = new Manifold(); inner.set(b, m); }
+    m.used = this.pass + 1;
+    return m;
+  }
+  sweep(): void {
+    this.pass++;
+    this.map.forEach(sweepInner, this);
+  }
+}
+function sweepInner(this: PairCache, inner: Map<string, Manifold>, a: string): void {
+  inner.forEach(dropStale, this);
+  if (inner.size === 0) this.map.delete(a);
+}
+function dropStale(this: PairCache, m: Manifold, b: string, inner: Map<string, Manifold>): void {
+  if (m.used < this.pass) inner.delete(b);
+}
+const CACHES = new WeakMap<World, PairCache>();
+function cacheOf(world: World): PairCache {
+  let c = CACHES.get(world);
+  if (!c) {
+    c = new PairCache();
+    CACHES.set(world, c);
+    // A loaded world brings its manifolds (warm-start impulses) along.
+    const saved = world.contacts;
+    if (saved) for (const s of saved) { const m = c.get(s.a, s.b); setManifoldState(m, s.m); m.used = c.pass; }
+  }
+  return c;
+}
+
+/** The persistent contact state of a world as plain data (saveWorld stores it in world.contacts). */
+export function contactsForSave(world: World): { a: string; b: string; m: number[] }[] {
+  const out: { a: string; b: string; m: number[] }[] = [];
+  const c = CACHES.get(world);
+  if (!c) return world.contacts ?? out;
+  for (const [a, inner] of c.map) for (const [b, m] of inner) if (m.n > 0) out.push({ a, b, m: manifoldState(m) });
+  return out;
+}
+
+/** World-axes centre of a craft's compound bounding sphere relative to the craft centre -> out. */
+function boundCentre(c: Craft, k: Compound, out: V3): V3 {
+  return qRot(out, c.q, k.cx, k.cy, k.cz);
 }
 
 // ------------------------------------------------------------------------------------------------ ground
 
-/** A craft has reached the ground of its primary at time t: wreck it or rest it, and pin it to the surface. */
+/** How far the craft's hull reaches toward the centre of its primary (from the craft centre), m: its belly when level. */
+export function groundReach(c: Craft): number {
+  const k = craftCompound(c), r = c.rel, l = Math.sqrt(r.x * r.x + r.y * r.y + r.z * r.z) || 1;
+  qRotInv(A, c.q, -r.x / l, -r.y / l, -r.z / l);
+  return compoundSupport(k, A.x, A.y, A.z);
+}
+
+/**
+ * The hull of a craft has reached the ground of its primary at time t: the touchdown is solved against the
+ * rotating ground with the real hull shape (impulses, energy -> hull damage), a crash (faster than LAND_MAX_SPEED
+ * relative to the ground, or a broken hull) is a wreck, and the craft is pinned to the surface resting on its hull
+ * (its lowest point on the ground, attitude as it touched) until thrust lifts it.
+ */
 export function surfaceContact(world: World, c: Craft, t: number): void {
   const b = world.bodies[c.primary], n = b.spinAxis, wr = b.spinRate;
   const rel = c.rel, rv = c.relV;
   const vx = rv.x - wr * (n.y * rel.z - n.z * rel.y), vy = rv.y - wr * (n.z * rel.x - n.x * rel.z), vz = rv.z - wr * (n.x * rel.y - n.y * rel.x);
   const speed = Math.sqrt(vx * vx + vy * vy + vz * vz);
+  const ang = b.spinAngle0 + wr * t;
   if (!c.destroyed) {
-    if (!b.solid || speed > LAND_MAX_SPEED) {
+    const k = craftCompound(c);
+    bodyFromCraft(CA, c);
+    planetBody(CB, ORIGIN, n, wr, ang);
+    SCRATCH.clear();
+    if (collidePlanet(k, CA, CB, b.radius, SCRATCH) > 0) {
+      solveManifold(SCRATCH, CA, CB, 0, PARAMS, RES);
+      c.hull -= RES.energy / c.hullStrength;
+    }
+    if (!b.solid || speed > LAND_MAX_SPEED || c.hull <= 0) {
       pushEvent(world, { type: 'impact', t, craftId: c.id, with: b.id, speed });
       destroyCraft(world, c, b.solid ? 'impact' : 'crushed', t);
     } else {
       pushEvent(world, { type: 'landed', t, craftId: c.id, bodyId: b.id });
     }
   }
-  const ang = b.spinAngle0 + wr * t;
+  const reach = groundReach(c);
   const lp = rotAxis({ x: 0, y: 0, z: 0 }, n, -ang, rel.x, rel.y, rel.z);
-  const k = (b.radius + CONTACT_HEIGHT * c.radius) / Math.sqrt(lp.x * lp.x + lp.y * lp.y + lp.z * lp.z);
-  lp.x *= k; lp.y *= k; lp.z *= k;
+  const kk = (b.radius + reach) / Math.sqrt(lp.x * lp.x + lp.y * lp.y + lp.z * lp.z);
+  lp.x *= kk; lp.y *= kk; lp.z *= kk;
   const lq = qMulTo({ x: 0, y: 0, z: 0, w: 1 }, qAxisTo(Q1, n, -ang), c.q);
   world.joints.push({ kind: 'landed', craftId: c.id, otherId: b.id, portId: '', localPos: lp, localQ: lq });
   c.landedOn = b.id;
@@ -265,102 +350,98 @@ export function dockingStatus(world: World, craftId: string, out: DockingStatus 
 
 // ------------------------------------------------------------------------------------------------ impacts
 
-/** Apply impulse J (world axes) at offset `r` (world axes, from the centre of mass) to a craft. */
-function applyImpulse(c: Craft, jx: number, jy: number, jz: number, rx: number, ry: number, rz: number): void {
-  const m = mass(c), g = c.gyration;
-  c.relV.x += jx / m; c.relV.y += jy / m; c.relV.z += jz / m;
-  qRotInv(E, c.q, ry * jz - rz * jy, rz * jx - rx * jz, rx * jy - ry * jx);
-  c.w.x += E.x / (m * g.x); c.w.y += E.y / (m * g.y); c.w.z += E.z / (m * g.z);
+/** Can a craft take part in free contact (not latched, not resting on the ground)? */
+const free = (c: Craft): boolean => c.dockedTo === null && c.landedOn === null;
+
+/** Narrow phase + solve of one pair (s on A, o on B) with their compounds; damage, impact event. */
+function contactPair(world: World, cache: PairCache, s: Craft, ks: Compound, o: Craft, ko: Compound, t: number, dtNext: number): void {
+  const m = cache.get(s.id, o.id);
+  bodyFromCraft(CA, s);
+  bodyFromCraft(CB, o);
+  if (collide(ks, CA, ko, CB, m) === 0) return;
+  solveManifold(m, CA, CB, dtNext, PARAMS, RES);
+  if (RES.points === 0) return;
+  if (RES.approachSpeed > IMPACT_EVENT_SPEED) pushEvent(world, { type: 'impact', t, craftId: s.id, with: o.id, speed: RES.approachSpeed });
+  if (RES.energy > 0) {
+    for (let h = 0; h < 2; h++) {
+      const c = h === 0 ? s : o;
+      if (c.destroyed) continue;
+      c.hull -= RES.energy / c.hullStrength;
+      if (c.hull <= 0) destroyCraft(world, c, 'impact', t);
+    }
+  }
 }
 
-/** (r × d)ᵀ I⁻¹ (r × d) for a craft: the rotational part of its inverse effective mass along d at offset r. */
-function angularTerm(c: Craft, rx: number, ry: number, rz: number, dx: number, dy: number, dz: number): number {
-  const m = mass(c), g = c.gyration;
-  qRotInv(E, c.q, ry * dz - rz * dy, rz * dx - rx * dz, rx * dy - ry * dx);
-  return (E.x * E.x) / (m * g.x) + (E.y * E.y) / (m * g.y) + (E.z * E.z) / (m * g.z);
+/** Do the bounding spheres of two craft (compounds ka, kb) overlap, with `extra` metres to spare? */
+function spheresMeet(a: Craft, ka: Compound, b: Craft, kb: Compound, extra: number): boolean {
+  boundCentre(a, ka, A);
+  boundCentre(b, kb, B);
+  const dx = a.rel.x + A.x - b.rel.x - B.x, dy = a.rel.y + A.y - b.rel.y - B.y, dz = a.rel.z + A.z - b.rel.z - B.z;
+  const reach = ka.radius + kb.radius + extra;
+  return dx * dx + dy * dy + dz * dz <= reach * reach;
 }
 
-/** Resolve ship-against-station contacts and close docking latches, with both at time t. */
-export function resolveContacts(world: World, t: number): void {
-  const craft = world.craft;
+/**
+ * Resolve ship–station and ship–ship contacts with the real shapes and close docking latches, all craft at time t.
+ * `dtNext` is the expected time to the next call (the span just taken), for speculative contacts and warm starts.
+ */
+export function resolveContacts(world: World, t: number, dtNext = 0): void {
+  const craft = world.craft, cache = cacheOf(world);
   for (let i = 0; i < craft.length; i++) {
     const s = craft[i];
-    if (s.kind === 'station' || s.dockedTo !== null || s.landedOn !== null) continue;
+    if (s.kind === 'station' || !free(s)) continue;
+    const ks = craftCompound(s);
     for (let k = 0; k < craft.length; k++) {
-      const st = craft[k];
-      if (st.kind !== 'station' || st.primary !== s.primary) continue;
-      const dx = s.rel.x - st.rel.x, dy = s.rel.y - st.rel.y, dz = s.rel.z - st.rel.z;
-      const reach = st.radius + s.radius + DOCK_DISTANCE;
-      if (dx * dx + dy * dy + dz * dz > reach * reach) continue;
-      qRotInv(PL, st.q, dx, dy, dz);
-      if (s.dockingArmed && !s.destroyed && s.dockPort && tryLatch(world, s, st, PL, t)) break;
-      // Deepest penetration of the ship's sphere into the station's colliders.
-      let pen = 0;
-      const cols = st.colliders;
-      for (let c = 0; c < cols.length; c++) {
-        closestOnCollider(cols[c], PL, CP);
-        const ex = PL.x - CP.x, ey = PL.y - CP.y, ez = PL.z - CP.z;
-        const d = Math.sqrt(ex * ex + ey * ey + ez * ez);
-        const p = s.radius + cols[c].radius - d;
-        if (p > pen && d > 1e-9) {
-          pen = p;
-          NL.x = ex / d; NL.y = ey / d; NL.z = ez / d;
-          CL.x = CP.x + NL.x * cols[c].radius; CL.y = CP.y + NL.y * cols[c].radius; CL.z = CP.z + NL.z * cols[c].radius;
+      const o = craft[k];
+      if (o === s || o.primary !== s.primary) continue;
+      if (o.kind === 'station') {
+        if (!spheresMeet(s, ks, o, craftCompound(o), DOCK_DISTANCE)) continue;
+        if (s.dockingArmed && !s.destroyed && s.dockPort) {
+          qRotInv(PL, o.q, s.rel.x - o.rel.x, s.rel.y - o.rel.y, s.rel.z - o.rel.z);
+          if (tryLatch(world, s, o, PL, t)) break;
         }
-      }
-      if (pen <= 0) continue;
-      const m = mass(s), M = mass(st);
-      qRot(A, st.q, NL.x, NL.y, NL.z); // normal, world (station -> ship)
-      const nx = A.x, ny = A.y, nz = A.z;
-      qRot(B, st.q, CL.x, CL.y, CL.z); // contact offset from the station's centre, world
-      const tx = B.x, ty = B.y, tz = B.z;
-      const sx = -nx * s.radius, sy = -ny * s.radius, sz = -nz * s.radius; // offset from the ship's centre
-      qRot(C, s.q, s.w.x, s.w.y, s.w.z);
-      let vx = s.relV.x + (C.y * sz - C.z * sy), vy = s.relV.y + (C.z * sx - C.x * sz), vz = s.relV.z + (C.x * sy - C.y * sx);
-      qRot(C, st.q, st.w.x, st.w.y, st.w.z);
-      vx -= st.relV.x + (C.y * tz - C.z * ty); vy -= st.relV.y + (C.z * tx - C.x * tz); vz -= st.relV.z + (C.x * ty - C.y * tx);
-      const vn = vx * nx + vy * ny + vz * nz;
-      if (vn < 0) {
-        const kn = 1 / m + 1 / M + angularTerm(st, tx, ty, tz, nx, ny, nz);
-        const e = vn < -0.05 ? RESTITUTION : 0;
-        const jn = (-(1 + e) * vn) / kn;
-        let jx = jn * nx, jy = jn * ny, jz = jn * nz;
-        const ux = vx - vn * nx, uy = vy - vn * ny, uz = vz - vn * nz;
-        const ut = Math.sqrt(ux * ux + uy * uy + uz * uz);
-        if (ut > 1e-6) {
-          const dxx = ux / ut, dyy = uy / ut, dzz = uz / ut;
-          const kt = 1 / m + 1 / M + angularTerm(s, sx, sy, sz, dxx, dyy, dzz) + angularTerm(st, tx, ty, tz, dxx, dyy, dzz);
-          let jt = ut / kt;
-          if (jt > FRICTION * jn) jt = FRICTION * jn;
-          jx -= jt * dxx; jy -= jt * dyy; jz -= jt * dzz;
-        }
-        applyImpulse(s, jx, jy, jz, sx, sy, sz);
-        applyImpulse(st, -jx, -jy, -jz, tx, ty, tz);
-        // Energy lost along the normal does the damage.
-        const lost = (0.5 * (1 - e * e) * vn * vn) / kn;
-        if (vn < -0.2) pushEvent(world, { type: 'impact', t, craftId: s.id, with: st.id, speed: -vn });
-        for (let h = 0; h < 2; h++) {
-          const c = h === 0 ? s : st;
-          if (c.destroyed) continue;
-          c.hull -= lost / c.hullStrength;
-          if (c.hull <= 0) destroyCraft(world, c, 'impact', t);
-        }
-      }
-      if (pen > 0.01) {
-        const push = pen - 0.01, fs = M / (M + m), ft = m / (M + m);
-        s.rel.x += nx * push * fs; s.rel.y += ny * push * fs; s.rel.z += nz * push * fs;
-        st.rel.x -= nx * push * ft; st.rel.y -= ny * push * ft; st.rel.z -= nz * push * ft;
+        contactPair(world, cache, s, ks, o, craftCompound(o), t, dtNext);
+      } else if (k > i && free(o)) {
+        const ko = craftCompound(o);
+        if (spheresMeet(s, ks, o, ko, 0)) contactPair(world, cache, s, ks, o, ko, t, dtNext);
       }
     }
   }
+  cache.sweep();
 }
 
 /** Why the last proximityLimit() was what it was: WHY_CONTACT, WHY_PROXIMITY or WHY_FREE. */
 export const proximityWhy = (): number => _syncWhy;
 
 /**
- * Longest time all craft may be advanced before ship/station pairs must be looked at together again: half the
- * earliest possible time for the gap between them (to the nearest collider, or to an armed latch) to close.
+ * Lower bound of the gap between two craft's shapes, m (0 when touching): bounding spheres while they are apart
+ * by NEAR_MARGIN or more, else the narrow phase with that margin (its speculative depths are the gaps).
+ */
+function shapeGap(a: Craft, ka: Compound, b: Craft, kb: Compound): number {
+  boundCentre(a, ka, A);
+  boundCentre(b, kb, B);
+  const g = Math.hypot(a.rel.x + A.x - b.rel.x - B.x, a.rel.y + A.y - b.rel.y - B.y, a.rel.z + A.z - b.rel.z - B.z) - ka.radius - kb.radius;
+  if (g >= NEAR_MARGIN) return g;
+  bodyFromCraft(CA, a);
+  bodyFromCraft(CB, b);
+  const n = collide(ka, CA, kb, CB, SCRATCH, NEAR_MARGIN);
+  if (n === 0) return NEAR_MARGIN;
+  let deepest = -Infinity;
+  for (let p = 0; p < n; p++) { const d = SCRATCH.depth(p); if (d > deepest) deepest = d; }
+  return deepest >= 0 ? 0 : -deepest;
+}
+
+/** Shortest time for a gap to close at relative speed v with at most the craft's thrust (and a little more). */
+function closeTime(s: Craft, gap: number, v: number): number {
+  const thrusting = !s.destroyed && s.propellant > 0 && (s.throttle > 0 || s.rcs.x !== 0 || s.rcs.y !== 0 || s.rcs.z !== 0);
+  const a = 0.05 + (thrusting ? (s.mainThrust + s.rcsThrust) / mass(s) : 0);
+  const dt = gap > 0 ? (0.5 * (Math.sqrt(v * v + 2 * a * gap) - v)) / a : 0;
+  return dt < 1 / 120 ? 1 / 120 : dt;
+}
+
+/**
+ * Longest time all craft may be advanced before ship/station and ship/ship pairs must be looked at together again:
+ * half the earliest possible time for the gap between their shapes (or to an armed latch) to close.
  */
 export function proximityLimit(world: World): number {
   const craft = world.craft;
@@ -368,36 +449,31 @@ export function proximityLimit(world: World): number {
   _syncWhy = WHY_FREE;
   for (let i = 0; i < craft.length; i++) {
     const s = craft[i];
-    if (s.kind === 'station' || s.dockedTo !== null || s.landedOn !== null) continue;
+    if (s.kind === 'station' || !free(s)) continue;
+    const ks = craftCompound(s);
     for (let k = 0; k < craft.length; k++) {
-      const st = craft[k];
-      if (st.kind !== 'station' || st.primary !== s.primary) continue;
-      const dx = s.rel.x - st.rel.x, dy = s.rel.y - st.rel.y, dz = s.rel.z - st.rel.z;
-      const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
-      let gap = d - st.radius - s.radius;
-      let near = false;
-      if (gap <= 0) {
-        near = true;
-        gap = Infinity;
-        qRotInv(PL, st.q, dx, dy, dz);
-        const cols = st.colliders;
-        for (let c = 0; c < cols.length; c++) {
-          closestOnCollider(cols[c], PL, CP);
-          const g = Math.hypot(PL.x - CP.x, PL.y - CP.y, PL.z - CP.z) - cols[c].radius - s.radius;
-          if (g < gap) gap = g;
-        }
-        if (s.dockingArmed && s.dockPort && !s.destroyed) {
-          for (let p = 0; p < st.ports.length; p++) {
-            portCheck(s, st, st.ports[p], PL);
+      const o = craft[k];
+      if (o === s || o.primary !== s.primary) continue;
+      const station = o.kind === 'station';
+      if (!station && (k < i || !free(o))) continue;
+      const ko = craftCompound(o);
+      const dx = s.rel.x - o.rel.x, dy = s.rel.y - o.rel.y, dz = s.rel.z - o.rel.z;
+      let gap: number, near = false;
+      if (Math.sqrt(dx * dx + dy * dy + dz * dz) - o.radius - s.radius > NEAR_MARGIN + DOCK_DISTANCE) {
+        gap = Math.sqrt(dx * dx + dy * dy + dz * dz) - o.radius - s.radius;
+      } else {
+        gap = shapeGap(s, ks, o, ko);
+        near = gap < NEAR_MARGIN;
+        if (station && s.dockingArmed && s.dockPort && !s.destroyed) {
+          qRotInv(PL, o.q, dx, dy, dz);
+          for (let p = 0; p < o.ports.length; p++) {
+            portCheck(s, o, o.ports[p], PL);
             if (_pDist - 0.5 * DOCK_DISTANCE < gap) gap = _pDist - 0.5 * DOCK_DISTANCE;
           }
         }
       }
-      const v = Math.hypot(s.relV.x - st.relV.x, s.relV.y - st.relV.y, s.relV.z - st.relV.z);
-      const thrusting = !s.destroyed && s.propellant > 0 && (s.throttle > 0 || s.rcs.x !== 0 || s.rcs.y !== 0 || s.rcs.z !== 0);
-      const a = 0.05 + (thrusting ? (s.mainThrust + s.rcsThrust) / mass(s) : 0);
-      let dt = gap > 0 ? (0.5 * (Math.sqrt(v * v + 2 * a * gap) - v)) / a : 0;
-      if (dt < 1 / 120) dt = 1 / 120;
+      const v = Math.hypot(s.relV.x - o.relV.x, s.relV.y - o.relV.y, s.relV.z - o.relV.z);
+      const dt = closeTime(s, gap, v);
       if (dt < best) { best = dt; _syncWhy = near && gap < 5 ? WHY_CONTACT : WHY_PROXIMITY; }
     }
   }

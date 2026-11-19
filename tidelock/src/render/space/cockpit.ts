@@ -10,9 +10,12 @@
 //   const hit = ck.pick(rayOriginLocal, rayDirLocal, tolerance);   // -> { id, x, y } | null
 //
 // Physically based (art direction, docs/ARCHITECTURE.md): one MeshStandardMaterial for all the hardware, whose
-// albedo, roughness, metalness, wear-detail kind and cavity occlusion ride in vertex attributes, with procedural
-// micro-detail in the fragment shader (paint grime and orange peel, brushed metal, leather grain, webbing), so
-// white clear-coat panels, gunmetal, rubber, leather and amber padding all draw in one call. It is lit by the
+// albedo, roughness, metalness, wear-detail kind and cavity occlusion ride in vertex attributes, with the SAME
+// photo-scanned detail as the interior and hull surfaces (surfaces.ts / photo/detail.ts: white panel, gunmetal,
+// brushed steel, leather, rubber, fabric; projected on the dominant axis of the cockpit-frame position in metres,
+// blended by the shared rule colour x photo/mean, whiteout normal, roughness offset) plus procedural grime, so
+// white clear-coat panels, gunmetal, rubber, leather and amber padding all draw in one call and read as the same
+// materials as the rooms behind the pilot. mesh.userData.rt carries the ray tracer's record (surfaces.ts header). It is lit by the
 // interior's sun (shadows) and room probe (patched by probes.ts) like the rooms around it.
 //
 // Draw calls (cockpit room): dashboard shell · stations, seats and fittings · moving parts · glow (legends, lamps,
@@ -25,6 +28,8 @@ import type { DeviceView } from '../../game/api';
 import type { Quality } from '../pipeline';
 import { SCREEN_H, SCREEN_W, drawAuxScreen, drawFlightScreen, drawNavScreen, drawNoData, type InstrumentData } from './instruments';
 import { createHologram } from './hologram';
+import { PHOTO_GLSL, photoConstsGlsl } from './surfaces';
+import { acquirePhotoDetail, releasePhotoDetail, type PhotoDetail } from './photo/detail';
 
 export interface CockpitUpdate {
   devices: readonly DeviceView[];
@@ -82,16 +87,16 @@ const WHITE = B(0xd6d8da, 0.32, 0, 1);
 const WHITE2 = B(0xc4c6c8, 0.5, 0, 1);
 const GUN = B(0x6e737a, 0.34, 0.85, 2);
 const GUND = B(0x474b51, 0.42, 0.8, 2);
-const CHAR = B(0x2a2c2f, 0.74, 0, 1);
-const MAT = B(0x232427, 0.86, 0, 3);
+const CHAR = B(0x323438, 0.72, 0, 1);
+const MAT = B(0x3a3b3e, 0.8, 0, 3); // rubber mat, albedo ~0.045
 const FACE = B(0x34373b, 0.52, 0, 1);
-const BLACK = B(0x151618, 0.55, 0, 1);
+const BLACK = B(0x222427, 0.55, 0, 1);
 const GLOSS = B(0x0d0e10, 0.15, 0, 0);
-const RUBBER = B(0x1b1c1e, 0.84, 0, 3);
-const LEATHER = B(0x1f1f21, 0.46, 0, 3);
+const RUBBER = B(0x3d3e41, 0.74, 0, 3); // dark rubber ~0.05
+const LEATHER = B(0x343337, 0.52, 0, 3); // black leather ~0.035, roughness 0.45-0.6
 const AMBERP = B(0xcf6419, 0.55, 0, 3);
 const BLUEP = B(0x3b6c9c, 0.62, 0, 4);
-const METAL = B(0xc9ccd0, 0.22, 1, 2);
+const METAL = B(0xc4c6c9, 0.32, 1, 2); // brushed steel F0 ~0.56, roughness 0.3-0.45
 const STEEL = B(0x9ea2a8, 0.36, 1, 2);
 const DMETAL = B(0x55585e, 0.3, 1, 2);
 const REDP = B(0xb0241a, 0.16, 0, 0);

@@ -147,7 +147,11 @@ async function main(): Promise<void> {
     if (i % 4 === 3) await new Promise((r) => setTimeout(r, 0));
   }
   // let the interior finish swapping in its full-size atlas (generated in time slices)
-  for (let i = 0; i < 2000 && ((globalThis as { __tlInterior?: string }).__tlInterior ?? '').includes('upgrading'); i++) {
+  const pending = (): boolean => {
+    const st = (globalThis as { __tlInterior?: string }).__tlInterior ?? '';
+    return st.includes('upgrading') || st.includes('photo pending');
+  };
+  for (let i = 0; i < 2000 && pending(); i++) {
     fill(1 / 30);
     scene.render(frame);
     if (i % 4 === 3) await new Promise((r) => setTimeout(r, 0));

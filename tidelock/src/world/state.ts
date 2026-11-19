@@ -79,7 +79,7 @@ export interface Craft {
   /** Impact energy that destroys the hull, J. */
   hullStrength: number;
 
-  /** Collision shapes in craft-local metres (stations). Ships collide as their bounding sphere. */
+  /** Collision shapes in craft-local metres (stations). Ships collide with their hull compound (data/hullColliders.ts). */
   colliders: StationCollider[];
   /** Docking ports offered to others (stations). */
   ports: DockingPortDef[];
@@ -157,6 +157,11 @@ export interface World {
   joints: Joint[];
   /** Queue of things that happened; drained by the owner with drainEvents(). */
   events: WorldEvent[];
+  /**
+   * Persistent contact manifolds (warm-start impulses) per ordered pair of craft ids, written by saveWorld and read
+   * back on the first contact pass after a load (contact.ts). Absent in older saves (costs one step of warm start).
+   */
+  contacts?: { a: string; b: string; m: number[] }[];
 }
 
 export function pushEvent(world: World, e: WorldEvent): void {

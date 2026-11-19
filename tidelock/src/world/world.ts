@@ -3,7 +3,7 @@
 import type { Craft, World, WorldEvent } from './state';
 import { ephemerisOf } from './ephemeris';
 import { integrateCraft, lastStop, stepEstimate, STOP_SURFACE, takeSteps, WHY_CONTACT, WHY_FREE } from './dynamics';
-import { proximityLimit, proximityWhy, resolveContacts, surfaceContact, updateJoints } from './contact';
+import { contactsForSave, proximityLimit, proximityWhy, resolveContacts, surfaceContact, updateJoints } from './contact';
 import { perfNow } from './math';
 
 export type LimitedBy = '' | 'thrust' | 'rotation' | 'contact' | 'atmosphere' | 'proximity' | 'cpu';
@@ -97,7 +97,7 @@ export function advance(world: World, simDt: number, opts: AdvanceOptions = NO_O
     }
     world.t = t1;
     updateJoints(world, t1, t1 - t);
-    resolveContacts(world, t1);
+    resolveContacts(world, t1, t1 - t);
     if (world.t < tEnd && now() - start > budget) { limited = true; break; }
   }
   refreshWorld(world);
@@ -132,6 +132,7 @@ export function saveWorld(world: World): string {
   const seed = ephemerisOf(world).seed(world.t);
   world.ephStep = seed.step;
   world.ephState = seed.state;
+  world.contacts = contactsForSave(world);
   return JSON.stringify(world);
 }
 

@@ -12,6 +12,7 @@
 //                                                    compound (worst place, share of the surface beyond it)
 //   node tools/fit-hull-colliders.mjs --ascii    print top / side silhouettes (# hull only, @ both, + compound only)
 //   --close 0.3   flood the outside with a ball of this radius (open tubes and bells read as solid)
+//   --mirror   after fitting, make the compound mirror-symmetric (port parts copy their -stbd twins)
 //   --section -12,4.5   print cross-sections at these z (with --gaps)
 //   --tol 0.3   allowed protrusion (m)      --vox 0.15   voxel size (m, grows for big hulls)   --gap-tol 0.3 (m)
 //
@@ -575,6 +576,27 @@ for (const id of ids) {
     }
     if (has('--ascii')) ascii(V, g.inC);
     for (const zs of opt('--section', '').split(',').filter(Boolean)) section(V, g.inC, Number(zs));
+  }
+  if (has('--mirror') && !skip.has(id)) {
+    // Keep the compound symmetric (the voxel grid is not): port parts mirror their starboard twins, and centred boxes
+    // that do not yaw or roll keep the smaller of their two half-widths, centred.
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i];
+      if (p.name.endsWith('-port')) {
+        const st = parts.find((o) => o.name === p.name.slice(0, -5) + '-stbd');
+        if (!st) continue;
+        const m = JSON.parse(JSON.stringify(st));
+        m.name = p.name;
+        for (const k of ['c', 'a', 'b']) if (m[k]) m[k][0] = -m[k][0];
+        if (m.q) m.q = [m.q[0], -m.q[1], -m.q[2], m.q[3]];
+        parts[i] = m;
+      } else if (!p.name.endsWith('-stbd') && p.kind === 'box' && (!p.q || (p.q[1] === 0 && p.q[2] === 0))) {
+        const h = Math.min(p.h[0] - p.c[0], p.c[0] + p.h[0]);
+        p.c[0] = 0; p.h[0] = h;
+      }
+    }
+    m = measure(V, parts, interior);
+    show('mirrored', m);
   }
   if (has('--parts')) parts.forEach((p, i) => console.log(`    ${p.name.padEnd(14)} protrusion ${m.partMax[i].toFixed(2)} m  ${partLine(p)}`));
   worst = Math.max(worst, m.maxProtrusion);

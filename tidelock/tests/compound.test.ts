@@ -7,7 +7,7 @@ import { INTERIORS } from '../src/data/interiors';
 import { SHIP_LAYOUTS } from '../src/data/shipLayouts';
 import { STATION_LAYOUTS } from '../src/data/stationLayouts';
 import {
-  collide, collidePlanet, compileCompound, compoundContains, compoundGyration, DEFAULT_CONTACT, hullCompound, kineticEnergy,
+  collide, collidePlanet, compileCompound, compoundContains, compoundGyration, compoundSupport, DEFAULT_CONTACT, hullCompound, kineticEnergy,
   makeContactResult, Manifold, planetBody, solveManifold, stationCompound, type Compound, type ContactBody, type ContactParams,
 } from '../src/world/compound';
 
@@ -126,9 +126,9 @@ describe('narrow phase against analytic cases', () => {
 });
 
 describe('hull compounds', () => {
-  it('every hull has at most 24 parts and a sane bounding sphere', () => {
+  it('every hull has at most 24 parts (the Wren, the hull the player lives in and touches, 72) and a sane bounding sphere', () => {
     for (const [id, parts] of Object.entries(HULL_COLLIDERS)) {
-      expect(parts.length, id).toBeLessThanOrEqual(24);
+      expect(parts.length, id).toBeLessThanOrEqual(id === 'wren' ? 72 : 24);
       const c = hullCompound(id)!;
       expect(c.n, id).toBe(parts.length);
       expect(c.radius, id).toBeLessThan(SHIP_LAYOUTS[id as keyof typeof SHIP_LAYOUTS].radius * 1.15);
@@ -143,7 +143,15 @@ describe('hull compounds', () => {
     const L = SHIP_LAYOUTS.wren;
     expect(x1 - x0).toBeCloseTo(L.width, 0);
     expect(z1 - z0).toBeCloseTo(L.length, 0);
-    expect(Math.abs(y1 - y0 - L.height)).toBeLessThan(0.1);
+    expect(Math.abs(y1 - y0 - L.height)).toBeLessThan(0.4); // the 32 m exterior stands 6.3 m (layout 6.6 with the lights)
+    // mirror-symmetric about the centre plane
+    for (const p of HULL_COLLIDERS.wren) {
+      if (!p.name.endsWith('-stbd')) continue;
+      const q = HULL_COLLIDERS.wren.find((o) => o.name === p.name.slice(0, -5) + '-port')!;
+      expect(q, p.name).toBeDefined();
+      const c = p.kind === 'capsule' ? p.a : p.c, d = q.kind === 'capsule' ? q.a : q.c;
+      expect(d[0]).toBeCloseTo(-c[0], 6);
+    }
     for (const e of L.engines) expect(compoundContains(WREN, e.pos.x, e.pos.y, e.pos.z - 0.05)).toBe(true);
     for (const r of INTERIORS.wren!.rooms) {
       const b = r.box;
@@ -159,13 +167,18 @@ describe('hull compounds', () => {
 describe('rigid-body response', () => {
   it('a wing-tip strike yaws the ship toward the struck side, angular momentum = r × J', () => {
     const A = wren(v3(), v3(0, 0, -1));
-    const B = station(v3(8.8, -0.2, 4.3 - 1 + 0.02));
+    // A post just ahead of the starboard wing's swept leading edge, 8 m out: moved in along the edge normal until it
+    // overlaps by 1 cm.
+    const nrm = v3(0.4432, 0, -0.8965), edge = v3(8, -0.415, 2.6 + ((8 - 4.8) * 2.2) / 4.45);
     const ball = one({ name: 'post', kind: 'sphere', c: [0, 0, 0], r: 1 });
     const m = new Manifold(), res = makeContactResult();
+    let off = 2;
+    while (off > 0 && (collide(WREN, A, ball, fixed(v3(edge.x + nrm.x * off, edge.y, edge.z + nrm.z * off)), m) === 0 || m.depth(0) < 0.01)) off -= 0.002;
+    const B = station(v3(edge.x + nrm.x * off, edge.y, edge.z + nrm.z * off));
     const before = momenta([A, B]);
     const w0 = { ...A.w };
     expect(collide(WREN, A, ball, B, m)).toBe(1);
-    expect(WREN.names[m.partA(0)]).toBe('wing-out-stbd');
+    expect(WREN.names[m.partA(0)]).toBe('wing-lead-stbd');
     const pc = m.point(0, A, v3());
     // (No position correction here, so the momenta are compared at the same poses.)
     solveManifold(m, A, B, 1 / 60, { ...DEFAULT_CONTACT, positionIterations: 0 }, res);
@@ -197,14 +210,17 @@ describe('rigid-body response', () => {
     expect(B.v.x - A.v.x).toBeCloseTo(-0.5 * (1 - -3), 9);
     expect(e0 - kineticEnergy(A) - kineticEnergy(B)).toBeCloseTo(loss, 3);
     expect(res.energy).toBeCloseTo(loss, 3);
-    // The Wren nose-first into a station (central: through the centre of mass): same law, now with the real hull.
-    const W = wren(v3(), v3(0, 0, -2));
-    const S = station(v3(0, 0, -16.4 - 3 + 0.01));
-    const ball = one({ name: 'post', kind: 'sphere', c: [0, 0, 0], r: 3 });
-    const k0 = kineticEnergy(W) + kineticEnergy(S), p0 = WREN_MASS * -2;
+    // The Wren broadside into a post level with its centre of mass (central: the normal runs through it): same law,
+    // now with the real hull — the flat flank of the pressure hull at x = 3.6 m takes it.
+    const W = wren(v3(), v3(2, 0, 0));
+    const side = compoundSupport(WREN, 1, 0, 0) > 3.6 ? 3.6 : compoundSupport(WREN, 1, 0, 0);
+    const S = station(v3(side + 0.3 - 0.01, 0, 0));
+    const ball = one({ name: 'post', kind: 'sphere', c: [0, 0, 0], r: 0.3 });
+    const k0 = kineticEnergy(W) + kineticEnergy(S), p0 = WREN_MASS * 2;
     expect(collide(WREN, W, ball, S, m)).toBe(1);
+    expect(WREN.names[m.partA(0)]).toBe('hull');
     solveManifold(m, W, S, 1 / 60, prm, res);
-    expect((WREN_MASS * W.v.z + 5e8 * S.v.z) / p0).toBeCloseTo(1, 9);
+    expect((WREN_MASS * W.v.x + 5e8 * S.v.x) / p0).toBeCloseTo(1, 9);
     const mu2 = (WREN_MASS * 5e8) / (WREN_MASS + 5e8), loss2 = 0.5 * mu2 * 0.75 * 4;
     expect((k0 - kineticEnergy(W) - kineticEnergy(S)) / loss2).toBeCloseTo(1, 4);
     expect(res.energy / loss2).toBeCloseTo(1, 4);
@@ -214,8 +230,9 @@ describe('rigid-body response', () => {
   it('a slow approach comes to rest against a station collider without jitter for 60 s', () => {
     const hull = one({ name: 'hull', kind: 'capsule', a: [0, 0, -30], b: [0, 0, 30], r: 20 });
     // 0.1 m above the hull at 0.15 m/s, pressed on by 0.1 m/s² (thrusters): it touches at ~0.2 m/s, below restSpeed.
+    const belly = compoundSupport(WREN, 0, -1, 0);
     const A = wren(v3(), v3(0, -0.15, 0));
-    const B = station(v3(0, -22.3, 0));
+    const B = station(v3(0, -(20 + belly + 0.1), 0));
     const m = new Manifold(), res = makeContactResult(), dt = 1 / 60, push = v3(0, -0.1, 0);
     let maxV = 0, maxW = 0, yMin = Infinity, yMax = -Infinity, maxEnergyGain = 0, bounced = false;
     for (let i = 0; i < 3600; i++) {
@@ -235,19 +252,19 @@ describe('rigid-body response', () => {
     expect(maxV).toBeLessThan(1e-3);
     expect(maxW).toBeLessThan(1e-4);
     expect(yMax - yMin).toBeLessThan(2e-3);
-    // Resting on the inner bottom edges of the skids (x = ±1.95, y = -2.2) on the r = 20 m hull.
-    const rest = Math.sqrt(400 - 1.95 * 1.95) + 2.2;
+    // Resting on the flat bottom of the belly (its keel line on the top of the r = 20 m hull).
+    const rest = 20 + belly;
     expect(yMin).toBeGreaterThan(rest - 0.03);
     expect(yMax).toBeLessThan(rest + 0.001);
     console.log(`resting 50 s: max |v| ${maxV.toExponential(2)} m/s, max |w| ${maxW.toExponential(2)} rad/s, height range ${(yMax - yMin).toExponential(2)} m, max energy gain per step ${maxEnergyGain.toExponential(2)} J`);
     expect(maxEnergyGain).toBeLessThan(1e-6);
-    for (let i = 0; i < m.n; i++) expect(WREN.names[m.partA(i)].startsWith('skid')).toBe(true);
+    for (let i = 0; i < m.n; i++) expect(WREN.names[m.partA(i)]).toBe('belly');
   });
 
   it('a glancing scrape slows the ship by Coulomb friction', () => {
     const hull = one({ name: 'hull', kind: 'capsule', a: [0, 0, -300], b: [0, 0, 300], r: 20 });
     const A = wren(v3(0, 0, 0), v3(0, 0, -5));
-    const B = body(0, v3(1, 1, 1), v3(0, -22.2 + 0.001, 0));
+    const B = body(0, v3(1, 1, 1), v3(0, -20 - compoundSupport(WREN, 0, -1, 0) + 0.001, 0));
     const m = new Manifold(), res = makeContactResult(), dt = 1 / 120, a = 2;
     let maxRatio = 0, minRatio = Infinity;
     for (let i = 0; i < 120; i++) {
@@ -289,7 +306,8 @@ describe('rigid-body response', () => {
   });
 
   it('a touchdown on a planet rests on the hull’s lowest points', () => {
-    const R = 1e6, C = v3(0, -R - 2.6, 0), g = 3;
+    const belly = compoundSupport(WREN, 0, -1, 0);
+    const R = 1e6, C = v3(0, -R - belly - 0.4, 0), g = 3;
     const A = wren(v3(), v3(0, -1, 0));
     const P = planetBody({ p: v3(), v: v3(), q: ID(), w: v3(), invMass: 0, invI: v3() }, C, v3(0, 1, 0), 0, 0);
     const m = new Manifold(), res = makeContactResult(), dt = 1 / 60;
@@ -305,10 +323,10 @@ describe('rigid-body response', () => {
     expect(len(A.v)).toBeLessThan(1e-3);
     expect(len(A.w)).toBeLessThan(1e-4);
     const alt = Math.hypot(A.p.x - C.x, A.p.y - C.y, A.p.z - C.z) - R;
-    expect(alt).toBeGreaterThan(2.2 - 0.03);
-    expect(alt).toBeLessThan(2.2 + 0.001);
+    expect(alt).toBeGreaterThan(belly - 0.03);
+    expect(alt).toBeLessThan(belly + 0.001);
     expect(m.n).toBeGreaterThanOrEqual(4);
-    for (let i = 0; i < m.n; i++) expect(WREN.names[m.partA(i)].startsWith('skid')).toBe(true);
+    for (let i = 0; i < m.n; i++) expect(WREN.names[m.partA(i)]).toBe('belly'); // its four bottom corners
   });
 });
 
@@ -325,7 +343,7 @@ describe('cost', () => {
     const k = (up.x * ax.x + up.y * ax.y + up.z * ax.z) / (al * al);
     up = v3(up.x - k * ax.x, up.y - k * ax.y, up.z - k * ax.z);
     const ul = len(up); up = v3(up.x / ul, up.y / ul, up.z / ul);
-    const h = col.radius + 2.2;
+    const h = col.radius + compoundSupport(WREN, 0, -1, 0);
     const A = wren(v3(mid.x + up.x * h, mid.y + up.y * h, mid.z + up.z * h), v3(), qFromTo(v3(0, 1, 0), up));
     const B = station(v3());
     const m = new Manifold(), res = makeContactResult(), dt = 1 / 60, push = v3(-up.x * 0.3, -up.y * 0.3, -up.z * 0.3);

@@ -13,7 +13,8 @@ import { destroyCraft, pushEvent } from './state';
 import type { Ephemeris } from './ephemeris';
 import { YC1, YC2, YD1, YD2 } from './ephemeris';
 import { airDensity, HEAT_FLUX_COEFF } from './atmosphere';
-import { clamp1, qRot } from './math';
+import { clamp1, qRot, qRotInv } from './math';
+import { compoundSupport, craftCompound } from './compound';
 
 /** Step as a fraction of the dynamical time √(r³/μ) of the primary (≈209 steps per circular orbit). */
 export const ETA = 0.03;
@@ -24,7 +25,10 @@ export const DT_ATMOSPHERE_MIN = 1 / 120;
 export const DT_SURFACE_MIN = 1 / 60;
 /** Rotation sub-step: at most this many radians per step. */
 export const ROT_ANGLE = 0.05;
-/** A craft touches the ground when its centre is this fraction of its radius above the surface. */
+/**
+ * A craft without a collision shape touches the ground when its centre is this fraction of its radius above the
+ * surface; every other craft touches it with its hull (the support of its compound toward the primary's centre).
+ */
 export const CONTACT_HEIGHT = 0.35;
 
 /** Why a step was as short as it was (index into the tally array handed to integrateCraft). */
@@ -54,7 +58,10 @@ export class Particle {
   heatArea = 0;
   heatCap = 1;
   heatDiss = 0;
+  /** Height of the craft centre above the ground when its hull touches (the hull's reach toward the primary), m. */
   contactH = 0;
+  /** Largest reach of the hull in any direction (its compound's bounding sphere about the craft centre), m. */
+  reachMax = 0;
   /** Set by chooseDt: inside the primary's atmosphere. */
   inAtm = false;
   /** Set by a forced step: peak drag deceleration and proper acceleration, m/s². */
@@ -352,11 +359,21 @@ export function loadParticle(P: Particle, c: Craft): void {
   P.heatArea = c.heatArea;
   P.heatCap = c.heatCapacity;
   P.heatDiss = c.heatDissipation;
-  P.contactH = CONTACT_HEIGHT * c.radius;
+  const k = craftCompound(c);
+  P.reachMax = Math.sqrt(k.cx * k.cx + k.cy * k.cy + k.cz * k.cz) + k.radius;
+  P.contactH = hullReach(c, P.x, P.y, P.z);
   P.fx = P.fy = P.fz = 0;
   P.mdot = 0;
   P.drag = 0;
   P.load = c.load;
+}
+
+const RD = { x: 0, y: 0, z: 0 };
+/** How far the craft's hull reaches from its centre toward the primary's centre (the craft at primary-relative x, y, z), m. */
+function hullReach(c: Craft, x: number, y: number, z: number): number {
+  const l = Math.sqrt(x * x + y * y + z * z) || 1;
+  qRotInv(RD, c.q, -x / l, -y / l, -z / l);
+  return compoundSupport(craftCompound(c), RD.x, RD.y, RD.z);
 }
 
 function storeParticle(P: Particle, c: Craft): void {
@@ -451,8 +468,13 @@ export function integrateCraft(world: World, eph: Ephemeris, c: Craft, t0: numbe
       if (P.heat >= P.heatCap) destroyCraft(world, c, 'heat', t);
       else if (P.drag > c.maxLoad) destroyCraft(world, c, 'overload', t);
     }
-    const rs = b.radius + P.contactH;
-    if (P.x * P.x + P.y * P.y + P.z * P.z < rs * rs) { _stop = STOP_SURFACE; break; }
+    const r2 = P.x * P.x + P.y * P.y + P.z * P.z, rn = b.radius + P.reachMax;
+    if (r2 < rn * rn) {
+      // Near the ground the hull's reach follows the attitude step by step: it lands on its lowest point.
+      P.contactH = hullReach(c, P.x, P.y, P.z);
+      const rs = b.radius + P.contactH;
+      if (r2 < rs * rs) { _stop = STOP_SURFACE; break; }
+    }
   }
   storeParticle(P, c);
   _steps += n;

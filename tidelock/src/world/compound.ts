@@ -1135,3 +1135,59 @@ export function contactPair(ca: Compound, A: ContactBody, cb: Compound, B: Conta
   solveManifold(m, A, B, dt, prm, out);
   return n;
 }
+
+// ================================================================================================ craft helpers
+
+/**
+ * Support of the compound along the unit craft-local direction (dx, dy, dz): the largest x·d over its points, m
+ * (how far the hull reaches from the craft origin that way — e.g. toward the ground). No allocation.
+ */
+export function compoundSupport(c: Compound, dx: number, dy: number, dz: number): number {
+  const d = c.data;
+  let best = -Infinity;
+  for (let i = 0; i < c.n; i++) {
+    const o = i * PS;
+    let s: number;
+    if (c.kind[i] === PART_BOX) {
+      s = d[o] * dx + d[o + 1] * dy + d[o + 2] * dz +
+        d[o + 3] * Math.abs(d[o + 6] * dx + d[o + 7] * dy + d[o + 8] * dz) +
+        d[o + 4] * Math.abs(d[o + 9] * dx + d[o + 10] * dy + d[o + 11] * dz) +
+        d[o + 5] * Math.abs(d[o + 12] * dx + d[o + 13] * dy + d[o + 14] * dz);
+    } else {
+      const sa = d[o] * dx + d[o + 1] * dy + d[o + 2] * dz, sb = d[o + 3] * dx + d[o + 4] * dy + d[o + 5] * dz;
+      s = (sa > sb ? sa : sb) + d[o + 6];
+    }
+    if (s > best) best = s;
+  }
+  return c.n > 0 ? best : 0;
+}
+
+const SPHERES = new Map<number, Compound>();
+interface CraftShapeLike { kind: string; shipVisual: string | null; colliders: readonly StationCollider[]; radius: number }
+/**
+ * The collision compound of a craft: a ship's hull compound (src/data/hullColliders.ts), a station's colliders,
+ * otherwise its bounding sphere. Cached (compiled once per hull / colliders array / radius).
+ */
+export function craftCompound(c: CraftShapeLike): Compound {
+  if (c.kind !== 'station') {
+    const h = hullCompound(c.shipVisual);
+    if (h) return h;
+  } else if (c.colliders.length > 0) return stationCompound(c.colliders);
+  let s = SPHERES.get(c.radius);
+  if (!s) { s = sphereCompound(c.radius); SPHERES.set(c.radius, s); }
+  return s;
+}
+
+/** Copy the persistent part of a manifold (points 0..18 per point, impulses and anchors; not the scratch). */
+export function manifoldState(m: Manifold): number[] {
+  const out: number[] = [m.n, m.dtPrev];
+  for (let i = 0; i < m.n; i++) for (let k = 0; k < 19; k++) out.push(m.d[i * MS + k]);
+  return out;
+}
+/** Restore what manifoldState() saved. */
+export function setManifoldState(m: Manifold, s: readonly number[]): void {
+  const n = Math.max(0, Math.min(MAX_POINTS, s[0] | 0));
+  m.n = n;
+  m.dtPrev = s[1] ?? 0;
+  for (let i = 0; i < n; i++) for (let k = 0; k < 19; k++) m.d[i * MS + k] = s[2 + i * 19 + k] ?? 0;
+}

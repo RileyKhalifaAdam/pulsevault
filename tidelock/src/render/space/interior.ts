@@ -21,7 +21,8 @@ import type { Box, InteriorDoor, InteriorLayout, InteriorRoom, InteriorSolid, In
 import type { Quality } from '../pipeline';
 import {
   GLOW_ALWAYS, GLOW_BLINK, GLOW_EMERG, GLOW_MAIN, STENCIL, TILE, TILE_METRES,
-  acquireSurfaceAtlas, acquireSurfaceAtlasProgressive, createReflectionCube, createSurfaceShared, releaseSurfaceAtlas, surfaceMaterial, surfaceSize,
+  acquireSurfaceAtlas, acquireSurfaceAtlasProgressive, createReflectionCube, createSurfaceShared, releaseSurfaceAtlas, releaseSurfaceShared,
+  surfaceMaterial, surfaceRtRecord, surfaceSize,
   type P3, type StencilId, type TileId,
 } from './surfaces';
 import { INTERIOR_BAKE } from './interior.bake';
@@ -529,7 +530,8 @@ const ORANGE: P3 = [1.25, 0.55, 0.1];
 const WHITE = mt('whitePanel');
 const GUN = mt('gunmetal');
 const BRUSH = mt('brushed');
-const CHROME = mt('brushed', [1.0, 1.18, 1.4]);
+// polished stainless trim: neutral (a blue-tinted F0 above 0.7 read as a mirror smudge on the wardrobe)
+const CHROME = mt('brushed', [1.12, 1.12, 1.14]);
 const TREAD = mt('tread');
 const RUBBER = mt('tread', [0.6, 0.6, 0.6]);
 const GRATE = mt('grating');
@@ -2068,10 +2070,18 @@ export function createInteriorVisual(layout: InteriorLayout, opts: InteriorOptio
   const want = surfaceSize(q);
   let atlas = acquireSurfaceAtlas(Math.min(want, 512));
   let upgrade = want > atlas.size ? acquireSurfaceAtlasProgressive(want) : null;
+  let photoState = 'photo pending';
   const status = (): string =>
-    `build ${(t1 - t0).toFixed(0)} ms · atlas ${atlas.size} ${atlas.genMs.toFixed(0)} ms${upgrade ? ' (upgrading)' : ''} · bake ${INTERIOR_BAKE.key === B.key ? 'fresh' : 'STALE'}`;
+    `build ${(t1 - t0).toFixed(0)} ms · atlas ${atlas.size} ${atlas.genMs.toFixed(0)} ms${upgrade ? ' (upgrading)' : ''} · bake ${INTERIOR_BAKE.key === B.key ? 'fresh' : 'STALE'} · ${photoState}`;
+  const shared = createSurfaceShared(q);
   (globalThis as { __tlInterior?: string }).__tlInterior = status();
-  const shared = createSurfaceShared();
+  if (shared.photo) {
+    const ph = shared.photo;
+    void ph.ready.then((ok) => {
+      photoState = ok ? `photo ${(ph.bytes / 1048576).toFixed(1)} MB ${ph.decodeMs.toFixed(0)} ms${ph.failed.length ? ` (${ph.failed.length} failed)` : ''}` : 'photo off';
+      (globalThis as { __tlInterior?: string }).__tlInterior = status();
+    });
+  } else photoState = 'photo off';
   const env = createReflectionCube(true);
   let lmA: THREE.DataTexture = flat(0.55);
   let lmB: THREE.DataTexture = flat(0.06);
@@ -2150,6 +2160,13 @@ export function createInteriorVisual(layout: InteriorLayout, opts: InteriorOptio
       mesh.castShadow = kind === 'main' || kind === 'glow';
       mesh.receiveShadow = kind !== 'glass';
       mesh.renderOrder = kind === 'glass' ? 2 : 0;
+      // the ray tracer's material record (surfaces.ts header); glass: clear, smooth dielectric
+      mesh.userData.rt =
+        kind === 'glass'
+          ? { albedo: [0, 0, 0], roughness: 0.04, metalness: 0, tiles: null, perVertex: null, demodulate: null, glass: true }
+          : kind === 'glow'
+            ? { ...surfaceRtRecord(geo, atlas, shared), emissive: true }
+            : surfaceRtRecord(geo, atlas, shared);
       mesh.matrixAutoUpdate = false;
       mesh.updateMatrix();
       g.add(mesh);
@@ -2323,7 +2340,7 @@ export function createInteriorVisual(layout: InteriorLayout, opts: InteriorOptio
     rooms,
     visibleRooms,
     get textureBytes() {
-      return atlas.bytes + lmBytes;
+      return atlas.bytes + lmBytes + (shared.photo ? shared.photo.bytes : 0);
     },
     ready,
     update(o: InteriorUpdate): void {
@@ -2354,6 +2371,11 @@ export function createInteriorVisual(layout: InteriorLayout, opts: InteriorOptio
           }
           releaseSurfaceAtlas(atlas);
           atlas = next;
+          for (const list of roomMeshes)
+            for (const mesh of list) {
+              const d = (mesh.userData.rt as { demodulate?: { map?: THREE.Texture } } | undefined)?.demodulate;
+              if (d) d.map = next.map;
+            }
           (globalThis as { __tlInterior?: string }).__tlInterior = status();
         }
       }
@@ -2370,6 +2392,7 @@ export function createInteriorVisual(layout: InteriorLayout, opts: InteriorOptio
         if (late) releaseSurfaceAtlas(late);
       }
       releaseSurfaceAtlas(atlas);
+      releaseSurfaceShared(shared);
       root.removeFromParent();
     },
   };
