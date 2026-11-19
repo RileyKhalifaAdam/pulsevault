@@ -37,6 +37,22 @@ export const START_CLEARANCE = 200;
 const SAVE_VERSION = 3;
 /** Longest stretch of sim time the attitude controller's command is held while it is working, s. */
 const CONTROL_DT = 1 / 50;
+/**
+ * Flight Assist. With FLT ASSIST lit the DRIVE lever is a speed command: the computer holds the ship's velocity
+ * relative to the reference at nose x lever x FA_SPEED, plus FA_NUDGE per axis of the translation controller,
+ * using only the real RCS and (armed) the main drive. Reference: the target if it is a craft, else the nearest
+ * station within FA_RANGE. The loop is proportional (time constant FA_TAU) with saturation; each axis goes quiet
+ * below FA_DB_OFF and wakes above FA_DB_ON, so a held velocity costs nothing and the jets never chatter. The
+ * main drive takes over the forward component above FA_MAIN_ON and hands back to the RCS below FA_MAIN_OFF.
+ */
+export const FA_SPEED = 50;
+export const FA_NUDGE = 3;
+export const FA_RANGE = 100e3;
+const FA_TAU = 0.6;
+const FA_DB_ON = 0.05;
+const FA_DB_OFF = 0.01;
+const FA_MAIN_ON = 1;
+const FA_MAIN_OFF = 0.25;
 /** Stick below this is no input. */
 const STICK_DEADZONE = 0.02;
 /** Rate a full stick deflection asks for while a hold is on (fly-by-wire through real torque), rad/s. */
@@ -101,6 +117,7 @@ interface SessionState {
   mode?: PlayerMode;
   crew?: CrewState | null;
   lights?: boolean;
+  assist?: boolean;
   devices?: DeviceState[];
   pages?: number[];
   head?: number[];
@@ -156,6 +173,12 @@ class WorldSession implements Session {
   private roll = 0;
   private throttle = 0;
   private readonly translate = v3();
+  /** Flight Assist latched on; which RCS axes it is working (x, y, z), whether it has the main drive, and whether it fires now. */
+  private assist = false;
+  private readonly faOn = [false, false, false];
+  private faMain = false;
+  private faFiring = false;
+  private readonly FV = v3();
   private hold: HoldMode = 'stability';
   private holdQ: Quat = { x: 0, y: 0, z: 0, w: 1 };
   private holdQValid = false;
@@ -197,7 +220,7 @@ class WorldSession implements Session {
   };
   private readonly playerView: PlayerView = {
     craftId: PLAYER_ID, name: '', mass: 0, propellant: 0, propellantFraction: 0, deltaV: 0, maxAccel: 0, throttle: 0, hold: 'stability', heat: 0, hull: 1,
-    destroyed: false, destroyedBy: '', dockedTo: null, spin: 0,
+    destroyed: false, destroyedBy: '', dockedTo: null, spin: 0, assist: 'off', assistRef: '', assistSpeed: 0, assistCmd: 0,
   };
   private readonly targetView: TargetView = { id: '', name: '', kind: 'craft', distance: 0, relSpeed: 0, closing: 0, direction: v3(), relVelocity: v3() };
   private readonly dockView: DockingView = {
@@ -234,7 +257,7 @@ class WorldSession implements Session {
   private devSeen: number[] = [];
   private devPage: number[] = [];
   private readonly hands = new Map<number, number>();
-  private readonly ix = { rot: -1, roll: -1, trans: -1, transZ: -1, throttle: -1, arm: -1, lights: -1, harness: -1 };
+  private readonly ix = { rot: -1, roll: -1, trans: -1, transZ: -1, throttle: -1, arm: -1, lights: -1, harness: -1, assist: -1 };
   private cmdThrottle = 0;
   private readonly walk = { moveX: 0, moveZ: 0 };
   private readonly motion = createShipMotion();
@@ -260,6 +283,7 @@ class WorldSession implements Session {
       this.rearmBlock = state.rearmBlock;
       this.settled = state.settled;
       this.lights = state.lights !== false;
+      this.assist = state.assist === true;
       const num = (x: unknown): number => (typeof x === 'number' && x === x ? x : 0);
       if (Array.isArray(state.devices)) {
         for (const sd of state.devices) {
@@ -320,7 +344,7 @@ class WorldSession implements Session {
     this.cmdThrottle = 0;
     const ix = this.ix, at = (role: DeviceRole): number => defs.findIndex((d) => d.role === role);
     ix.rot = at('rotation'); ix.roll = at('roll'); ix.trans = at('translation'); ix.transZ = at('translationZ');
-    ix.throttle = at('throttle'); ix.arm = at('driveArm'); ix.lights = at('cabinLights'); ix.harness = at('harness');
+    ix.throttle = at('throttle'); ix.arm = at('driveArm'); ix.lights = at('cabinLights'); ix.harness = at('harness'); ix.assist = at('flightAssist');
   }
 
   /** The start: on foot in the cockpit beside the pilot seat (or strapped in, in a ship with no interior). */
@@ -352,7 +376,7 @@ class WorldSession implements Session {
     for (let guard = 0; guard < 1e6; guard++) {
       const left = want - info.simDt;
       if (!(left > 1e-7)) break;
-      const active = this.command();
+      const active = this.command() || this.faFiring; // the assist loop is closed at the control rate too
       this.advOpts.budgetMs = budget - (now() - start);
       const res = advance(world, active && left > CONTROL_DT ? CONTROL_DT : left, this.advOpts);
       info.simDt += res.simDt;
@@ -418,12 +442,44 @@ class WorldSession implements Session {
       if (hm) this.setHold(hm);
       else if (role === 'targetNext') this.nextTarget();
       else if (role === 'undock') this.undock();
+      else if (role === 'flightAssist') { this.assist = !this.assist; this.faIdle(); } // alternate action: each press latches the other way
     }
     const li = this.ix.lights;
     if (li >= 0 && ds[li].made !== this.lights) {
       this.lights = ds[li].made;
       this.events.emit('cabinLights', { on: this.lights });
     }
+  }
+
+  /** Flight Assist's reference frame: the target if it is a craft, else the nearest station within FA_RANGE. */
+  private assistRef(): Craft | null {
+    const cs = this.world.craft, c = this.ship, id = this.targetId;
+    let best: Craft | null = null, bd = FA_RANGE * FA_RANGE;
+    for (let i = 0; i < cs.length; i++) {
+      const o = cs[i];
+      if (o === c || o.destroyed) continue;
+      if (id !== null && o.id === id) return o;
+      if (o.kind !== 'station') continue;
+      const dx = o.r.x - c.r.x, dy = o.r.y - c.r.y, dz = o.r.z - c.r.z, d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 < bd) { bd = d2; best = o; }
+    }
+    return best;
+  }
+  private faIdle(): void {
+    this.faOn[0] = this.faOn[1] = this.faOn[2] = false;
+    this.faMain = false;
+    this.faFiring = false;
+  }
+  /** One RCS axis of the assist: thruster command (-1..1) for a velocity error e (m/s) with a m/s² available. */
+  private faAxis(i: number, e: number, a: number): number {
+    const on = this.faOn, mag = e < 0 ? -e : e;
+    if (on[i]) { if (mag < FA_DB_OFF) on[i] = false; } else if (mag > FA_DB_ON) on[i] = true;
+    return on[i] && a > 0 ? clamp(e / (a * FA_TAU), -1, 1) : 0;
+  }
+  /** The DRIVE lever as the assist reads it (speed command, whatever DRIVE ARM says). */
+  private faLever(): number {
+    const i = this.ix.throttle, l = i >= 0 ? leverValue(this.devs[i]) : 0;
+    return l > this.throttle ? l : this.throttle;
   }
 
   /** TARGET: the next station, then the bodies, round again. */
@@ -472,6 +528,32 @@ class WorldSession implements Session {
     if (ix.arm >= 0 && ix.throttle >= 0 && ds[ix.arm].made) thr = Math.max(thr, leverValue(ds[ix.throttle]));
     p = clamp(p, -1, 1); y = clamp(y, -1, 1); r = clamp(r, -1, 1);
     tx = clamp(tx, -1, 1); ty = clamp(ty, -1, 1); tz = clamp(tz, -1, 1);
+    this.faFiring = false;
+    if (this.assist) {
+      // Flight Assist: lever and translation controller command a velocity relative to the reference, in ship
+      // axes (so it turns with the nose); the computer works the same thrusters the hand would.
+      const ref = c.dockedTo === null && c.propellant > 0 ? this.assistRef() : null;
+      thr = 0;
+      if (ref === null) {
+        tx = ty = tz = 0; // no reference (or latched, or dry): the computer fires nothing
+        this.faIdle();
+      } else {
+        const m = c.dryMass + c.propellant, aR = c.rcsThrust / m, aM = c.mainThrust / m;
+        const vl = qRotInv(this.FV, c.q, c.v.x - ref.v.x, c.v.y - ref.v.y, c.v.z - ref.v.z);
+        const ez = tz * FA_NUDGE - this.faLever() * FA_SPEED - vl.z; // forward is -Z
+        tx = this.faAxis(0, tx * FA_NUDGE - vl.x, aR);
+        ty = this.faAxis(1, ty * FA_NUDGE - vl.y, aR);
+        const armed = ix.arm >= 0 && ds[ix.arm].made && aM > 0;
+        if (!armed || -ez < FA_MAIN_OFF) this.faMain = false;
+        else if (-ez > FA_MAIN_ON) this.faMain = true;
+        if (this.faMain) {
+          thr = clamp(-ez / (aM * FA_TAU), 0, 1);
+          tz = 0;
+          this.faOn[2] = false;
+        } else tz = this.faAxis(2, ez, aR);
+        this.faFiring = thr > 0 || tx !== 0 || ty !== 0 || tz !== 0;
+      }
+    }
     if (thr > 0 && this.cmdThrottle === 0) this.settled = false; // point properly before the drive lights
     this.cmdThrottle = thr;
     const tq = c.torque;
@@ -771,6 +853,11 @@ class WorldSession implements Session {
     o.destroyedBy = c.destroyedBy;
     o.dockedTo = c.dockedTo;
     o.spin = Math.sqrt(c.w.x * c.w.x + c.w.y * c.w.y + c.w.z * c.w.z);
+    const ref = this.assist ? this.assistRef() : null;
+    o.assist = !this.assist ? 'off' : ref ? 'on' : 'noRef';
+    o.assistRef = ref ? ref.name : '';
+    o.assistSpeed = ref ? Math.hypot(c.v.x - ref.v.x, c.v.y - ref.v.y, c.v.z - ref.v.z) : 0;
+    o.assistCmd = this.assist ? this.faLever() * FA_SPEED : 0;
     return o;
   }
   flight(): FlightView {
@@ -1141,6 +1228,7 @@ class WorldSession implements Session {
     if (hm) return this.hold === hm;
     switch (role) {
       case 'driveArm': return d.made;
+      case 'flightAssist': return this.assist && (this.assistRef() !== null || this.clock % 0.7 < 0.35); // blinks with no reference
       case 'throttle': return ix.arm >= 0 && this.devs[ix.arm].made && leverValue(d) > 0;
       case 'cabinLights': return this.lights;
       case 'harness': return this.playerMode === 'helm';
@@ -1215,6 +1303,8 @@ class WorldSession implements Session {
     this.bind(buildWorld(this.system));
     this.startPilot();
     this.lights = true;
+    this.assist = false;
+    this.faIdle();
     this.pitch = this.yaw = this.roll = this.throttle = 0;
     this.translate.x = this.translate.y = this.translate.z = 0;
     this.hold = 'stability';
@@ -1232,7 +1322,7 @@ class WorldSession implements Session {
     const state: SessionState = {
       seed: this.seed, hold: this.hold, holdQ: this.holdQValid ? { ...this.holdQ } : null, targetId: this.targetId, predFrame: this.predFrame,
       burns: this.burnList, burnSeq: this.burnSeq, throttle: this.throttle, rearmBlock: this.rearmBlock, settled: this.settled,
-      mode: this.playerMode, crew: this.playerMode === 'onFoot' ? this.body : null, lights: this.lights,
+      mode: this.playerMode, crew: this.playerMode === 'onFoot' ? this.body : null, lights: this.lights, assist: this.assist,
       devices: this.devs, pages: this.devPage, head: [this.headYaw, this.headPitch],
     };
     return JSON.stringify({ tidelock: SAVE_VERSION, session: state, world: saveWorld(this.world) });
@@ -1262,7 +1352,7 @@ export function loadSession(json: string, opts: SessionOptions = {}): Session | 
     return new WorldSession(system, world, opts, s.seed, {
       seed: s.seed, hold: s.hold ?? 'stability', holdQ: s.holdQ ?? null, targetId: s.targetId ?? null, predFrame: s.predFrame ?? null,
       burns: Array.isArray(s.burns) ? s.burns : [], burnSeq: s.burnSeq ?? 0, throttle: s.throttle ?? 0, rearmBlock: !!s.rearmBlock, settled: !!s.settled,
-      mode: s.mode === 'helm' ? 'helm' : 'onFoot', crew: s.crew ?? null, lights: s.lights !== false, devices: s.devices, pages: s.pages, head: s.head,
+      mode: s.mode === 'helm' ? 'helm' : 'onFoot', crew: s.crew ?? null, lights: s.lights !== false, assist: s.assist === true, devices: s.devices, pages: s.pages, head: s.head,
     });
   } catch {
     return null;

@@ -571,4 +571,156 @@ describe('the pilot, hands on the physical controls', () => {
     expect(s.cabinLights()).toBe(true);
     expect(s.player().hold).toBe('stability');
   });
+  // ---- Flight Assist: everything through the physical devices
+  const wheel = (s: Session) => s.craft().find((c) => c.id === START_STATION_ID)!;
+  /** Velocity relative to Chandler's Wheel, world axes. */
+  const relWheel = (s: Session): V3 => { const c = me(s), w = wheel(s); return { x: c.v.x - w.v.x, y: c.v.y - w.v.y, z: c.v.z - w.v.z }; };
+  const speedRel = (s: Session): number => { const r = relWheel(s); return Math.hypot(r.x, r.y, r.z); };
+  const along = (a: V3, n: V3): number => a.x * n.x + a.y * n.y + a.z * n.z;
+  const until = (s: Session, done: () => boolean, limit: number): number => {
+    let t = 0;
+    for (; t < limit && !done(); t += 0.1) run(s, 0.1);
+    return t;
+  };
+  /** Put the DRIVE lever where it reads `value` (0..1). */
+  const setLever = (s: Session, value: number): void => {
+    expect(s.grabDevice(idOf(s, 'throttle'), 7)).toBe(true);
+    s.moveDevice(7, value > 0 ? 0.05 + value * 0.95 : 0, 0);
+    run(s, 1);
+    s.releaseDevice(7);
+    run(s, 0.2);
+  };
+  const quiet = (s: Session): boolean => { const c = me(s); return c.throttle === 0 && c.rcs.x === 0 && c.rcs.y === 0 && c.rcs.z === 0; };
+
+  it('FLT ASSIST off leaves a drift alone; on, it nulls 5 m/s sideways beside the Wheel with the RCS (about 1 m/s²) and then goes quiet', () => {
+    const s = createSession(FREE);
+    strapIn(s);
+    expect(STATS.rcsThrust / (STATS.dryMass + STATS.fuelCapacity)).toBeGreaterThan(0.9);
+    expect(STATS.rcsThrust / (STATS.dryMass + STATS.fuelCapacity)).toBeLessThan(1.1);
+    expect(dev(s, 'flightAssist').lit).toBe(false);
+    expect(s.player().assist).toBe('off');
+    // a drift by hand: translation controller to starboard until 5 m/s, assist off
+    expect(s.grabDevice(idOf(s, 'translation'), 4)).toBe(true);
+    s.moveDevice(4, 1, 0);
+    const tUp = until(s, () => speedRel(s) >= 5, 20);
+    s.releaseDevice(4);
+    run(s, 0.5);
+    expect(tUp).toBeGreaterThan(4);
+    expect(tUp).toBeLessThan(6.5); // 1 m/s² of RCS
+    const drift = speedRel(s);
+    expect(drift).toBeGreaterThan(4.9);
+    const p0 = s.player().propellant;
+    run(s, 10);
+    expect(Math.abs(speedRel(s) - drift)).toBeLessThan(0.02); // off: nobody touches it
+    expect(s.player().propellant).toBe(p0);
+    expect(quiet(s)).toBe(true);
+    // on: the computer stops the ship relative to the station
+    tap(s, 'flightAssist');
+    expect(dev(s, 'flightAssist').lit).toBe(true);
+    expect(s.player().assist).toBe('on');
+    expect(s.player().assistRef).toBe(wheel(s).name);
+    expect(s.player().assistCmd).toBe(0);
+    const tStop = 0.3 + until(s, () => speedRel(s) < 0.1, 30);
+    console.log(`flight assist: 5 m/s sideways nulled to < 0.1 m/s in ${tStop.toFixed(1)} s`);
+    expect(tStop).toBeLessThan(8);
+    expect(s.player().propellant).toBeLessThan(p0);
+    run(s, 6);
+    expect(speedRel(s)).toBeLessThan(0.06);
+    expect(quiet(s)).toBe(true); // inside the dead-band: no chatter
+    const p1 = s.player().propellant;
+    run(s, 5);
+    expect(s.player().propellant).toBe(p1);
+    // off again by the same button
+    tap(s, 'flightAssist');
+    expect(dev(s, 'flightAssist').lit).toBe(false);
+    expect(s.player().assist).toBe('off');
+  });
+
+  it('FLT ASSIST: the lever commands speed along the nose, the velocity follows the nose through a 90 degree turn, lever to zero stops the ship', () => {
+    const s = createSession(FREE);
+    strapIn(s);
+    tap(s, 'flightAssist');
+    // lever at 20 %: 10 m/s along the nose, drive safe -> RCS does it
+    setLever(s, 0.2);
+    expect(s.player().assistCmd).toBeCloseTo(10, 1);
+    expect(me(s).throttle).toBe(0);
+    const tGo = until(s, () => Math.abs(along(relWheel(s), nose(me(s).q)) - 10) < 0.1, 40);
+    expect(tGo).toBeLessThan(16);
+    run(s, 4);
+    let n = nose(me(s).q);
+    expect(along(relWheel(s), n)).toBeGreaterThan(9.9);
+    expect(along(relWheel(s), n)).toBeLessThan(10.1);
+    expect(Math.abs(speedRel(s) - 10)).toBeLessThan(0.1);
+    expect(s.player().assistSpeed).toBeCloseTo(speedRel(s), 6);
+    // armed, the main drive takes the forward part: yaw the nose 90 degrees with the rotation controller
+    tap(s, 'driveArm');
+    const n0 = n;
+    expect(s.grabDevice(idOf(s, 'rotation'), 3)).toBe(true);
+    s.moveDevice(3, 1, 0);
+    const tTurn = until(s, () => angle(nose(me(s).q), n0) >= Math.PI / 2, 120);
+    s.releaseDevice(3);
+    expect(tTurn).toBeLessThan(120);
+    run(s, 40);
+    n = nose(me(s).q);
+    expect(angle(n, n0)).toBeGreaterThan(1.4);
+    expect(Math.abs(along(relWheel(s), n) - 10)).toBeLessThan(0.15); // the velocity is along the new nose
+    expect(angle(relWheel(s), n)).toBeLessThan(0.02);
+    expect(Math.abs(speedRel(s) - 10)).toBeLessThan(0.15);
+    // lever back to zero: the ship comes to rest relative to the station (RCS braking, 1 m/s²)
+    setLever(s, 0);
+    const tStop = 1.2 + until(s, () => speedRel(s) < 0.1, 60);
+    console.log(`flight assist: 10 m/s forward stopped in ${tStop.toFixed(1)} s after the lever went to zero`);
+    expect(tStop).toBeLessThan(16);
+    run(s, 6);
+    expect(speedRel(s)).toBeLessThan(0.06);
+    expect(quiet(s)).toBe(true);
+    // the translation controller adds up to 3 m/s while held, and letting go stops that motion
+    expect(s.grabDevice(idOf(s, 'translation'), 4)).toBe(true);
+    s.moveDevice(4, 1, 0);
+    run(s, 8);
+    expect(Math.abs(speedRel(s) - 3)).toBeLessThan(0.1);
+    s.releaseDevice(4);
+    run(s, 8);
+    expect(speedRel(s)).toBeLessThan(0.1);
+  });
+
+  it('FLT ASSIST with no reference (no craft targeted, no station within 100 km): the lamp blinks and nothing fires', () => {
+    const a = createSession(FREE);
+    strapIn(a);
+    // the same ship 500 km from the station, with nothing targeted
+    const j = JSON.parse(a.save());
+    const w = JSON.parse(j.world);
+    const pc = w.craft.find((c: { id: string }) => c.id === a.player().craftId);
+    pc.rel.x += 500e3; // (relative to the primary: the integrated state of record)
+    pc.r.x += 500e3;
+    j.world = JSON.stringify(w);
+    j.session.targetId = null;
+    const s = loadSession(JSON.stringify(j), FREE)!;
+    expect(s).not.toBe(null);
+    expect(s.mode()).toBe('helm');
+    tap(s, 'flightAssist');
+    expect(s.player().assist).toBe('noRef');
+    expect(s.player().assistRef).toBe('');
+    const seen = new Set<boolean>();
+    for (let i = 0; i < 30; i++) { run(s, 0.05); seen.add(dev(s, 'flightAssist').lit); }
+    expect(seen.size).toBe(2); // blinking
+    const p0 = s.player().propellant, v0 = { ...me(s).v };
+    tap(s, 'driveArm');
+    setLever(s, 0.5);
+    expect(s.grabDevice(idOf(s, 'translation'), 4)).toBe(true);
+    s.moveDevice(4, 1, 1);
+    run(s, 10);
+    expect(quiet(s)).toBe(true);
+    expect(s.player().propellant).toBe(p0);
+    expect(s.player().throttle).toBe(0);
+    expect(v0).toBeDefined();
+    // a craft target is a reference at any range: the assist wakes up
+    s.setTarget(START_STATION_ID);
+    run(s, 0.2);
+    expect(s.player().assist).toBe('on');
+    expect(dev(s, 'flightAssist').lit).toBe(true);
+    // and the latch is saved
+    const again = loadSession(s.save(), FREE)!;
+    expect(again.player().assist).toBe('on');
+  });
 });

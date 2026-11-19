@@ -26,6 +26,7 @@ export type DeviceRole =
   | 'translationZ' // rocker: +1 = RCS forward
   | 'throttle' // lever: main-drive throttle
   | 'driveArm' // toggle: main-drive valves armed (the throttle does nothing while safe)
+  | 'flightAssist' // button, alternate action: Flight Assist on / off (lamp lit = on, blinking = no reference)
   | 'holdOff'
   | 'holdStability'
   | 'holdPrograde'
@@ -210,6 +211,12 @@ const WREN: CockpitLayout = {
       id: 'drive-arm', kind: 'toggle', role: 'driveArm', label: 'DRIVE ARM', room: 'cockpit',
       pos: face(PX - 0.25, -0.18), normal: FACE, up: FACE_UP, radius: 0.028, reach: 'pilotSeat',
     },
+    // Flight Assist: an alternate-action lamp button on the desk beside the DRIVE lever it changes the meaning
+    // of (lit: the lever commands speed along the nose and the computer holds it; dark: the lever is raw thrust)
+    {
+      id: 'flt-assist', kind: 'button', role: 'flightAssist', label: 'FLT ASSIST', room: 'cockpit',
+      pos: desk(PX + 0.083, -4.452), normal: TOP, up: FWD, radius: 0.026, reach: 'pilotSeat',
+    },
     {
       id: 'undock', kind: 'handle', role: 'undock', label: 'LATCH RELEASE', room: 'cockpit',
       pos: face(PX + 0.25, -0.222), normal: FACE, up: FACE_UP, radius: 0.03, reach: 'pilotSeat',
@@ -222,7 +229,7 @@ const WREN: CockpitLayout = {
     // around the house
     {
       id: 'lights', kind: 'toggle', role: 'cabinLights', label: 'LIGHTS', room: 'cabin',
-      pos: v(-0.62, 0.45, -2.58), normal: AFT, up: TOP, radius: 0.05, reach: 'arm',
+      pos: v(-0.62, 0.45, -2.598), normal: AFT, up: TOP, radius: 0.05, reach: 'arm',
     },
     {
       id: 'bunk', kind: 'rest', role: 'bunk', label: 'BUNK', room: 'bunks',

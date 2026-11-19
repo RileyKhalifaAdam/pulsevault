@@ -131,6 +131,13 @@ export interface PlayerView {
   dockedTo: string | null;
   /** Angular rate, rad/s. */
   spin: number;
+  /** Flight Assist: off, on (holding a velocity relative to `assistRef`), or on with no reference in range (it fires nothing). */
+  assist: 'off' | 'on' | 'noRef';
+  /** Name of the reference craft ('' without one). */
+  assistRef: string;
+  /** Speed relative to the reference and the speed the DRIVE lever commands along the nose, m/s. */
+  assistSpeed: number;
+  assistCmd: number;
 }
 
 export interface TargetView {

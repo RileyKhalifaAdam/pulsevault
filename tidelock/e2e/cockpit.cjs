@@ -7,7 +7,9 @@
 // turns prograde -> DRIVE ARM -> throttle lever up: thrust, apoapsis rises -> lever back, disarm -> rotation
 // controller: the ship turns, the stick centres -> NAV pages -> pinch on a screen leans in -> unstrap -> walk
 // aft to the bunk -> lie down, sleep, time runs -> a touch wakes -> three fingers: system menu -> landscape.
-//   node e2e/cockpit.cjs [--no-build]      screenshots: shots/deck-*.png (at most 10)
+// Touch roles (src/app/input.ts): walk + look together never zooms, a touch that starts in the walk zone never
+// turns the head, a pinch is two head fingers; FLT ASSIST lights and names its reference on the FLIGHT screen.
+//   node e2e/cockpit.cjs [--no-build] [--deck-shots]      screenshots: shots/fix-*.png (4); with --deck-shots also shots/deck-*.png
 const { execSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -15,7 +17,8 @@ const { launch, serveDist, ROOT } = require('../tools/pw.cjs');
 const { tap, pump, settle, sleep, BTN } = require('./artifact.cjs');
 
 const CONSOLE = ['screen-flight', 'screen-nav', 'hold-off', 'hold-stab', 'hold-pro', 'hold-retro', 'hold-tgt', 'hold-nml', 'hold-anml', 'hold-rout', 'hold-rin', 'hold-dock',
-  'target-next', 'thc', 'thc-z', 'rhc', 'roll', 'throttle', 'drive-arm', 'undock'];
+  'target-next', 'thc', 'thc-z', 'rhc', 'roll', 'throttle', 'drive-arm', 'undock', 'flt-assist'];
+const DECK_SHOTS = process.argv.includes('--deck-shots');
 const wrap = (a) => Math.atan2(Math.sin(a), Math.cos(a));
 const LOOK_RATE = 0.0042;
 const qAngle = (a, b) => 2 * Math.acos(Math.min(1, Math.abs(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w)));
@@ -33,7 +36,8 @@ const st = (f) => f.evaluate(() => {
   return { screen: t.screen, mode: g.mode(), posture: c.posture, asleep: c.asleep, room: c.roomId, x: c.pos.x, y: c.pos.y, z: c.pos.z, eye: { x: c.eye.x, y: c.eye.y, z: c.eye.z },
     yaw: c.yaw, pitch: c.pitch, speed: Math.hypot(c.vel.x, c.vel.y, c.vel.z), time: g.time(), hold: p.hold, throttle: p.throttle, destroyed: p.destroyed, docked: p.dockedTo,
     apo: fl.apoapsisAlt, peri: fl.periapsisAlt, accel: fl.accel, q: cr ? { x: cr.q.x, y: cr.q.y, z: cr.q.z, w: cr.q.w } : null, dev, zoom: t.input.zoom, lights: g.cabinLights(),
-    warp: g.warp().achieved, cam: t.frame.camera.mode,
+    warp: g.warp().achieved, cam: t.frame.camera.mode, assist: p.assist, assistRef: p.assistRef,
+    scr: ins ? { assist: ins.flight.assist, ref: ins.flight.assistRef, rel: ins.flight.assistSpeed, cmd: ins.flight.assistCmd } : null,
     fl: ins ? { armed: ins.flight.armed, throttle: ins.flight.throttle, hold: ins.flight.hold, accelG: ins.flight.accelG, spin: ins.flight.spin, apo: ins.flight.apoapsisAlt,
       markers: ins.flight.markers.map((m) => ({ kind: m.kind, x: +m.x.toFixed(3), y: +m.y.toFixed(3), z: +m.z.toFixed(3) })) } : null,
     stick: !!ring && ring.style.display !== 'none' && ring.getClientRects().length > 0, menu: !!menu && !menu.hidden && menu.getClientRects().length > 0,
@@ -126,7 +130,7 @@ async function fingers(page, f = page.mainFrame()) {
         if (d < tol * 0.7) break;
         const fx = -Math.sin(c.yaw), fz = -Math.cos(c.yaw), rx = Math.cos(c.yaw), rz = -Math.sin(c.yaw);
         const m = Math.min(1, Math.max(0.1, d / 1.6)) / d;
-        await move(1, stick.x + (dx * rx + dz * rz) * m * 46, stick.y - (dx * fx + dz * fz) * m * 46);
+        await move(1, stick.x + (dx * rx + dz * rz) * m * 58, stick.y - (dx * fx + dz * fz) * m * 58);
         await settle(f);
         if (d > 1.6) await pump(f, 5);
       }
@@ -209,12 +213,50 @@ async function run() {
   if (only !== 'landscape') {
     const { browser, page, errors } = await launch('iphone15', { deviceScaleFactor: 2 });
     const f = page.mainFrame();
-    const shot = async (name) => { await settle(f); await sleep(350); await settle(f); await page.screenshot({ path: path.join(shots, `deck-${name}.png`) }); };
+    const shot = async (name) => {
+      const fix = name.startsWith('fix-');
+      if (!fix && !DECK_SHOTS) return;
+      await settle(f); await sleep(350); await settle(f);
+      await page.screenshot({ path: path.join(shots, fix ? `${name}.png` : `deck-${name}.png`) });
+    };
+    const free = (pts) => f.evaluate((q) => q.every(([x, y]) => !window.__tidelock.scene.pickDevice(x, y)), pts);
     try {
       const h = await fingers(page);
       let map = await boardAndSit(page, f, h, '', shot);
       let s = await st(f);
       await shot('02-seated');
+
+      // ---- FLT ASSIST: a latching lamp button on the desk; lit = on, the FLIGHT screen names the reference
+      check(s.assist === 'off' && !s.dev['flt-assist'].lit && !!s.scr && s.scr.assist === 'OFF', `Flight Assist is off to begin with (lamp dark, screen says ${s.scr ? s.scr.assist : '?'})`);
+      await h.tapAt(map['flt-assist'].x, map['flt-assist'].y);
+      await pump(f, 12);
+      await settle(f);
+      s = await st(f);
+      check(s.dev['flt-assist'].lit && s.assist === 'on' && !!s.scr && s.scr.assist === 'ON' && /chandler/i.test(s.scr.ref) && s.scr.rel < 3 && s.scr.cmd === 0 && s.throttle === 0,
+        `tapped FLT ASSIST: lamp lit, FLIGHT screen shows ASSIST ${s.scr ? s.scr.assist : '?'}, reference "${s.scr ? s.scr.ref : '?'}", ${s.scr ? s.scr.rel.toFixed(2) : '?'} -> ${s.scr ? s.scr.cmd.toFixed(1) : '?'} m/s`);
+      await shot('fix-2-console-assist');
+      {
+        // lever at zero: the computer brings the ship to rest relative to the station with the RCS
+        const rel0 = s.scr.rel;
+        for (let i = 0; i < 40 && s.scr.rel >= 0.08; i++) { await pump(f, 30); await settle(f); s = await st(f); }
+        check(s.scr.rel < 0.1 && s.throttle === 0, `Flight Assist nulled the drift relative to the station: ${rel0.toFixed(2)} -> ${s.scr.rel.toFixed(2)} m/s`);
+      }
+      {
+        // lean in on the FLIGHT screen to read the ASSIST line (the zoom is set directly: this is only a picture)
+        const scr = await f.evaluate(() => window.__tidelock.session.cockpit().devices.find((d) => d.id === 'screen-flight').pos);
+        const look = { yaw: s.yaw, pitch: s.pitch };
+        await h.aimAt(scr);
+        await f.evaluate(() => { window.__tidelock.input.zoom = 2.6; });
+        await shot('fix-3-flight-screen');
+        await f.evaluate(() => { window.__tidelock.input.zoom = 1; });
+        await h.lookTo(look.yaw, look.pitch);
+        await settle(f);
+        map = await pickMap(f);
+      }
+      await h.tapAt(map['flt-assist'].x, map['flt-assist'].y);
+      await pump(f, 12);
+      s = await st(f);
+      check(!s.dev['flt-assist'].lit && s.assist === 'off', 'tapped FLT ASSIST again: off, lamp dark');
 
       // ---- attitude hold: PRO
       const q0 = s.q;
@@ -306,7 +348,7 @@ async function run() {
       await h.tapAt(nav.x, nav.y);
       await h.tapAt(nav.x, nav.y);
       await pump(f, 6);
-      // ---- pinch on a screen: lean in
+      // ---- two fingers that start on a screen are two hands on a control: no zoom, no look, no page turn
       s = await st(f);
       const before = { yaw: s.yaw, pitch: s.pitch, page: s.dev['screen-nav'].page };
       await h.down(1, nav.x - 22, nav.y);
@@ -314,12 +356,21 @@ async function run() {
       for (let i = 1; i <= 6; i++) { await h.move(1, nav.x - 22 - 6 * i, nav.y); await h.move(2, nav.x + 22 + 6 * i, nav.y); }
       await h.up(2);
       await h.up(1);
+      await settle(f);
+      s = await st(f);
+      check(s.zoom === 1 && s.yaw === before.yaw && s.pitch === before.pitch && s.dev['screen-nav'].page === before.page, `two fingers spread on the NAV screen (hands, not the head): zoom x${s.zoom}, head still, page ${s.dev['screen-nav'].page}`);
+      // ---- pinch on the glass above the console: lean in
+      const py = nav.y - 200;
+      check(await free([[nav.x - 70, py], [nav.x + 70, py], [nav.x - 22, py], [nav.x + 22, py]]), 'the glass above the console is free of devices');
+      await h.down(1, nav.x - 22, py);
+      await h.down(2, nav.x + 22, py);
+      for (let i = 1; i <= 6; i++) { await h.move(1, nav.x - 22 - 6 * i, py); await h.move(2, nav.x + 22 + 6 * i, py); }
+      await h.up(2);
+      await h.up(1);
       await sleep(600);
       await settle(f);
       s = await st(f);
-      const under = await f.evaluate(([x, y]) => (window.__tidelock.scene.pickDevice(x, y) || {}).id, [nav.x, nav.y]);
-      check(s.zoom > 2 && s.dev['screen-nav'].page === before.page && under === 'screen-nav',
-        `pinched out on the NAV screen: leaned in x${s.zoom.toFixed(2)} toward it (under the fingers: ${under}; head ${((s.yaw - before.yaw) * 57.3).toFixed(1)}, ${((s.pitch - before.pitch) * 57.3).toFixed(1)} deg), the page did not turn (${s.dev['screen-nav'].page})`);
+      check(s.zoom > 2 && s.dev['screen-nav'].page === before.page, `pinched out with two head fingers: leaned in x${s.zoom.toFixed(2)}`);
       await shot('06-lean-systems');
       await h.down(1, nav.x - 70, nav.y - 200);
       await h.down(2, nav.x + 70, nav.y - 200);
@@ -342,6 +393,80 @@ async function run() {
       await h.lookTo(0, 0);
       const stick = { x: 100, y: 640 };
       await h.walkTo(stick, 0, -3.1);
+
+      // ---- touch roles on foot: the left thumb walks, the right finger looks, and nothing zooms
+      await h.lookTo(0, 0);
+      s = await st(f);
+      const a0 = s;
+      await h.down(1, 100, 640);
+      await h.slide(1, 100, 700, 4); // back, through the door into the cabin
+      await h.down(2, 300, 250);
+      await h.slide(2, 230, 250, 6);
+      await pump(f, 24);
+      await settle(f);
+      s = await st(f);
+      const walked = Math.hypot(s.x - a0.x, s.z - a0.z);
+      check(walked > 0.15 && Math.abs(wrap(s.yaw - a0.yaw)) > 0.2 && s.zoom === 1 && s.stick,
+        `walk (left thumb) + look (right finger) together: moved ${walked.toFixed(2)} m, head turned ${(wrap(s.yaw - a0.yaw) * 57.3).toFixed(1)} deg, zoom x${s.zoom}`);
+      await shot('fix-4-walk-and-look');
+      await h.up(2);
+      await h.up(1);
+      for (let i = 0; i < 20; i++) { await settle(f); if ((await st(f)).speed < 0.02) break; }
+      // a touch that starts in the walk zone never turns the head, even when it wanders out; a second one there does nothing
+      s = await st(f);
+      const b0 = s;
+      await h.down(1, 150, 600);
+      await h.slide(1, 360, 180, 8);
+      await h.down(2, 60, 760);
+      await h.slide(2, 190, 500, 6);
+      await pump(f, 6);
+      s = await st(f);
+      check(s.yaw === b0.yaw && s.pitch === b0.pitch && s.zoom === 1 && Math.hypot(s.x - b0.x, s.z - b0.z) > 0.02,
+        `two touches that began in the walk zone, dragged across the screen: head ${((s.yaw - b0.yaw) * 57.3).toFixed(2)}, ${((s.pitch - b0.pitch) * 57.3).toFixed(2)} deg, zoom x${s.zoom}, walked ${Math.hypot(s.x - b0.x, s.z - b0.z).toFixed(2)} m`);
+      await h.up(2);
+      await h.up(1);
+      await pump(f, 4);
+      s = await st(f);
+      check(s.stick && Math.abs(s.yaw - b0.yaw) < 1e-9, 'lifted: the stick is back at rest, the head still has not moved');
+      // two fingers on the right pinch: zoom changes; walking still works with the view narrowed; pinch back
+      check(await free([[250, 170], [330, 170], [210, 170], [370, 170]]), 'the right-hand glass is free of devices');
+      await h.down(1, 250, 170);
+      await h.down(2, 330, 170);
+      for (let i = 1; i <= 5; i++) { await h.move(1, 250 - 8 * i, 170); await h.move(2, 330 + 8 * i, 170); }
+      await settle(f);
+      s = await st(f);
+      const z1 = s.zoom;
+      await h.up(1);
+      await h.slide(2, 372, 172, 2); // the finger that stays does not jump the view
+      await settle(f);
+      const c1 = await st(f);
+      await h.up(2);
+      check(z1 > 1.6 && Math.abs(wrap(c1.yaw - s.yaw)) < 0.01 && Math.abs(c1.pitch - s.pitch) < 0.01 && Math.abs(c1.zoom - z1) < 0.05, `two right-side fingers pinched out: zoom x${z1.toFixed(2)}; one lifts, the other stays: view moved ${(wrap(c1.yaw - s.yaw) * 57.3).toFixed(2)} deg`);
+      s = await st(f);
+      const c0 = s;
+      await h.down(1, 100, 640);
+      await h.slide(1, 100, 590, 4);
+      await pump(f, 16);
+      s = await st(f);
+      await h.up(1);
+      check(Math.hypot(s.x - c0.x, s.z - c0.z) > 0.08 && s.zoom === c0.zoom && s.zoom > 1.6 && s.yaw === c0.yaw, `walking still works after the pinch: ${Math.hypot(s.x - c0.x, s.z - c0.z).toFixed(2)} m, zoom still x${s.zoom.toFixed(2)}`);
+      await h.down(1, 210, 170);
+      await h.down(2, 370, 170);
+      for (let i = 1; i <= 6; i++) { await h.move(1, 210 + 10 * i, 170); await h.move(2, 370 - 10 * i, 170); }
+      await h.up(2);
+      await h.up(1);
+      await settle(f);
+      s = await st(f);
+      check(s.zoom === 1, `pinched back in: zoom x${s.zoom}`);
+      for (let i = 0; i < 20; i++) { await settle(f); if ((await st(f)).speed < 0.02) break; }
+
+      // ---- the cabin bulkhead beside the cockpit door, from where the owner's picture was taken
+      await h.lookTo(0, 0);
+      await h.walkTo(stick, 0, -2.0);
+      await h.walkTo(stick, -0.25, -1.45);
+      await h.aimAt({ x: -0.85, y: 0.05, z: -2.6 });
+      await shot('fix-1-bulkhead');
+      await h.lookTo(0, 0);
       await h.walkTo(stick, 0, -2.0);
       await h.walkTo(stick, 0, 1.4);
       await h.walkTo(stick, 0, 3.05);
@@ -406,7 +531,7 @@ async function run() {
   if (only !== 'portrait') {
     const { browser, page, errors } = await launch('iphone15l', { deviceScaleFactor: 2 });
     const f = page.mainFrame();
-    const shot = async (name) => { await settle(f); await sleep(350); await settle(f); await page.screenshot({ path: path.join(shots, `deck-${name}.png`) }); };
+    const shot = async (name) => { if (!DECK_SHOTS) return; await settle(f); await sleep(350); await settle(f); await page.screenshot({ path: path.join(shots, `deck-${name}.png`) }); };
     try {
       const h = await fingers(page);
       h.setLook({ x: 640, y: 90 });

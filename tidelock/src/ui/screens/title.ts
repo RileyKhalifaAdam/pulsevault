@@ -7,7 +7,7 @@ import { screenRoot, VERSION_LINE } from './shared';
 const HANDS: [string, string][] = [
   ['Touch a control', 'your hand is on it: drag a stick or a lever, tap a button, a switch, the buckle'],
   ['Touch anywhere else', 'drag to look · pinch to lean in · flick up to jump or push off'],
-  ['Left thumb', 'walks, while you are on your feet'],
+  ['Lower left', 'is the walk stick while you are on your feet: that thumb only walks'],
   ['Three fingers', 'tap for the system menu'],
 ];
 

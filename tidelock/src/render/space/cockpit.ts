@@ -319,7 +319,10 @@ function makeAtlas(layout: CockpitLayout, aniso: number): Atlas {
       else c.roundRect(x + 9, y + 9, 110, 110, 12);
       c.fill();
       c.stroke();
-      fit(round ? 'NEXT' : d.label, x + 64, y + 64, round ? 80 : 96, 46, '#fff');
+      if (d.role === 'flightAssist') {
+        fit('FLT', x + 64, y + 44, 92, 38, '#fff');
+        fit('ASSIST', x + 64, y + 86, 92, 38, '#fff');
+      } else fit(round ? 'NEXT' : d.label, x + 64, y + 64, round ? 80 : 96, 46, '#fff');
       lamp.set(d.id, uvr(x + 2, y + 2, 124, 124));
       if (round) addPlacard(d.label);
     } else if (d.kind !== 'rest') addPlacard(d.label);
@@ -516,16 +519,16 @@ export function createCockpitVisual(layout: CockpitLayout, opts: { quality: Qual
       case 'button': {
         const round = def.role === 'targetNext';
         const uv = atlas.lamp.get(def.id) ?? atlas.white;
-        d.lampC = def.role === 'holdOff' || def.role === 'holdStability' ? [1.5, 0.95, 0.3] : def.role === 'holdDock' || def.role === 'holdTarget' ? [0.45, 1.25, 1.5] : round ? [1.3, 1.3, 1.2] : [0.5, 1.5, 0.7];
+        d.lampC = def.role === 'holdOff' || def.role === 'holdStability' ? [1.5, 0.95, 0.3] : def.role === 'holdDock' || def.role === 'holdTarget' ? [0.45, 1.25, 1.5] : round ? [1.3, 1.3, 1.2] : def.role === 'flightAssist' ? [0.35, 0.95, 1.6] : [0.5, 1.5, 0.7];
         if (round) {
           S.lathe([[0.027, 0], [0.027, 0.003], [0.0225, 0.005], [0.0225, 0.011], [0.02, 0.013], [0, 0.013]], seg, [STEEL, STEEL, CAP, CAP, CAP]);
           d.lampV = eRect(0, 0, 0.0138, 0.042, 0.042, LAMP_OFF, uv);
           placardAt(def.label, 0, 0.0345, 0.0008, 0.0105);
         } else {
-          const h = 0.027;
+          const h = def.role === 'flightAssist' ? 0.022 : 0.027; // the desk button is a little smaller than the face lamps
           S.box(0, 0, 0.001, h + 0.003, h + 0.003, 0.001, BLACK);
           S.box(0, 0, 0.005, h - 0.001, h - 0.001, 0.004, CAP);
-          d.lampV = eRect(0, 0, 0.0098, 0.052, 0.052, LAMP_OFF, uv);
+          d.lampV = eRect(0, 0, 0.0098, 2 * h - 0.002, 2 * h - 0.002, LAMP_OFF, uv);
         }
         d.lampN = 4;
         break;

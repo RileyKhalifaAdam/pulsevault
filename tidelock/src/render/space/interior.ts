@@ -14,6 +14,7 @@
 
 import * as THREE from 'three';
 import type { Box, InteriorDoor, InteriorLayout, InteriorRoom, InteriorSolid, InteriorWindow } from '../../data/interiors';
+import { COCKPITS } from '../../data/cockpit';
 import type { Quality } from '../pipeline';
 
 export interface InteriorUpdate {
@@ -2481,7 +2482,8 @@ function buildInterior(layout: InteriorLayout, R: Record<string, UVR>, white: [n
           g.box(0.22, 0.03, -0.03, 0.26, 0.04, 0.03, glow(0x58f0a0, 1.4), { occ: false });
         }, Math.PI);
         g.at(it.pos.x, C - 0.002, it.pos.z - 0.62, Math.PI, () => panel(0.5, 0.125, R.hatch, TEX, 0, 0, 0), HP);
-      } else if (it.kind === 'lights') {
+      } else if (it.kind === 'lights' && !(COCKPITS[layout.shipId]?.devices.some((d) => d.role === 'cabinLights'))) {
+        // (only in a ship whose light switch is not a device: there the cockpit visual draws the real, working one)
         // on the nearest bulkhead
         const b = r.box;
         const cand: [number, number, number, number, number][] = [
@@ -2567,12 +2569,16 @@ function buildInterior(layout: InteriorLayout, R: Record<string, UVR>, white: [n
         );
         g.ball([0.29, 0.07, 0.065], 0.045, 0.054, 0.045, S(0x2f6f73, 0.3, 0.6), 10);
       });
-      // extinguisher on the fore bulkhead
-      onWall(0, 1, -0.84, -0.28, b.min.z, () => {
-        g.cyl([0, -0.2, 0.06], [0, 0.16, 0.06], 0.05, 0.05, S(0xc0392b, 0.35, 0.6), CS, 1);
-        g.ball([0, 0.16, 0.06], 0.05, 0.03, 0.05, S(0xc0392b, 0.35, 0.6), 8);
-        g.cyl([0, 0.18, 0.06], [0, 0.23, 0.06], 0.014, 0.014, DARK, 6, 2);
-        g.box(-0.06, -0.02, 0, 0.06, 0.01, 0.07, METAL, { occ: false });
+      // extinguisher in a wall bracket on the fore bulkhead, in the corner by the galley: above the dado rail,
+      // midway between two panel seams, well clear of the floor guide strip, the door and the light switch
+      onWall(0, 1, -1.2, 0.22, b.min.z, () => {
+        const red = S(0xc0392b, 0.35, 0.6);
+        g.box(-0.04, -0.19, 0, 0.04, 0.17, 0.012, METAL, { bevel: 0.003, occ: false, skip: 16 });
+        g.box(-0.058, -0.2, 0.012, 0.058, -0.182, 0.124, METAL, { occ: false });
+        g.cyl([0, -0.182, 0.068], [0, 0.13, 0.068], 0.05, 0.05, red, CS, 1);
+        g.ball([0, 0.13, 0.068], 0.05, 0.03, 0.05, red, 8);
+        g.cyl([0, 0.15, 0.068], [0, 0.2, 0.068], 0.014, 0.014, DARK, 6, 2);
+        g.box(-0.054, 0.0, 0.012, 0.054, 0.024, 0.122, DARK, { occ: false });
       });
       // conduit along the overhead to starboard
       const C = b.max.y;

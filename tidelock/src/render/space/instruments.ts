@@ -42,6 +42,11 @@ export interface FlightScreenView {
   accelG: number;
   /** Spin rate, rad/s. */
   spin: number;
+  /** Flight Assist as shown: OFF, ON or NO REF; the reference's name; speed relative to it and the commanded speed, m/s. */
+  assist: 'OFF' | 'ON' | 'NO REF';
+  assistRef: string;
+  assistSpeed: number;
+  assistCmd: number;
   markers: AttitudeMarker[];
 }
 
@@ -115,7 +120,7 @@ export function createInstrumentData(): InstrumentData {
     flight: {
       primaryName: '', situation: 'orbit', altitude: 0, speed: 0, verticalSpeed: 0, apoapsisAlt: 0, periapsisAlt: 0,
       timeToApoapsis: 0, timeToPeriapsis: 0, propellantFraction: 1, deltaV: 0, armed: false, throttle: 0, hold: 'OFF',
-      accelG: 0, spin: 0, markers: [],
+      accelG: 0, spin: 0, assist: 'OFF', assistRef: '', assistSpeed: 0, assistCmd: 0, markers: [],
     },
     orbit: {
       bodyName: '', bodyRadius: 1, path: new Float32Array(PATH_MAX * 2), pathCount: 0, targetPath: new Float32Array(PATH_MAX * 2),
@@ -198,6 +203,10 @@ export function readInstruments(session: Session, out: InstrumentData, devices?:
   fl.hold = HOLD_TEXT[p.hold] ?? String(p.hold).toUpperCase();
   fl.accelG = f.accel / 9.80665;
   fl.spin = p.spin;
+  fl.assist = p.assist === 'on' ? 'ON' : p.assist === 'noRef' ? 'NO REF' : 'OFF';
+  fl.assistRef = p.assistRef;
+  fl.assistSpeed = p.assistSpeed;
+  fl.assistCmd = p.assistCmd;
   let n = 0;
   const mark = (kind: AttitudeMarkerKind, x: number, y: number, z: number): void => {
     if (!me || !toLocal(tmpM, me.q, x, y, z)) return;
@@ -585,16 +594,32 @@ export function drawFlightScreen(c: Ctx, w: number, h: number, v: FlightScreenVi
   line(c, 8, 223, w - 8, 223, DIM, 2);
 
   // hold, felt acceleration, spin
-  text(c, 'HOLD', 12, 251, 20, DIM);
-  text(c, v.hold, 72, 251, 26, v.hold === 'OFF' ? DIM : AMBER);
+  text(c, 'HOLD', 12, 249, 20, DIM);
+  text(c, v.hold, 72, 249, 26, v.hold === 'OFF' ? DIM : AMBER);
   const g = Number.isFinite(v.accelG) ? v.accelG : 0;
-  text(c, `${g.toFixed(2)} g`, 372, 251, 24, g > 0.005 ? AMBER : WHITE, 'right');
+  text(c, `${g.toFixed(2)} g`, 372, 249, 24, g > 0.005 ? AMBER : WHITE, 'right');
   const spin = ((Number.isFinite(v.spin) ? v.spin : 0) * 180) / Math.PI;
-  text(c, `${spin.toFixed(spin < 10 ? 1 : 0)}°/s`, w - 12, 251, 24, spin > 3 ? AMBER : WHITE, 'right');
+  text(c, `${spin.toFixed(spin < 10 ? 1 : 0)}°/s`, w - 12, 249, 24, spin > 3 ? AMBER : WHITE, 'right');
+
+  // flight assist: state, reference, speed relative to it -> commanded speed
+  if (v.assist === 'NO REF') text(c, 'ASSIST · NO REF', 12, 277, 22, AMBER);
+  else {
+    text(c, 'ASSIST', 12, 277, 20, DIM);
+    if (v.assist === 'ON') {
+      const num = (x: number): string => (Number.isFinite(x) ? x : 0).toFixed(Math.abs(x) < 100 ? 1 : 0);
+      const sw = text(c, `${num(v.assistSpeed)} → ${num(v.assistCmd)} m/s`, w - 12, 277, 22, WHITE, 'right');
+      text(c, 'ON', 92, 277, 22, GREEN);
+      let nm = (v.assistRef || '---').toUpperCase();
+      c.font = `700 19px ${FONT}`;
+      const room = w - 12 - sw - 14 - 130;
+      while (nm.length > 3 && c.measureText(nm).width > room) nm = nm.slice(0, -1);
+      text(c, nm, 130, 277, 19, CYAN);
+    } else text(c, 'OFF', 92, 277, 22, DIM);
+  }
 
   // propellant
   const pf = v.propellantFraction;
-  bar(c, 12, 264, w - 24, 24, pf, pf < 0.1 ? RED : pf < 0.25 ? AMBER : GREEN);
+  bar(c, 12, 287, w - 24, 9, pf, pf < 0.1 ? RED : pf < 0.25 ? AMBER : GREEN);
   text(c, 'PROP', 12, 322, 20, DIM);
   text(c, `${Math.round(pf * 100)}%`, 72, 322, 27, WHITE);
   const dv = fmtSpeed(v.deltaV);

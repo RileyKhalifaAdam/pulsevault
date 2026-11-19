@@ -354,15 +354,15 @@ const MODULE_LIST: ModuleDef[] = [
   mod('eng_cruise_3', ILMARIN, 'Longwake', 'engine', 3, 4, 18900, 300000, 30, { thrust: 1.14e6, exhaustVelocity: 58000 }, D_CRUISE),
 
   // ---------------------------------------------------------------- RCS + reaction wheels
-  mod('rcs_std_1', CALDER, 'Tern', 'rcs', 1, 1, 600, 2400, 0.3, { rcsThrust: 4000, rcsExhaustVelocity: 2400, torque: 4.6e5 }, D_RCS),
-  mod('rcs_std_2', CALDER, 'Tern', 'rcs', 2, 1, 1700, 7500, 0.7, { rcsThrust: 12000, rcsExhaustVelocity: 2400, torque: 2.4e6 }, D_RCS),
-  mod('rcs_std_3', CALDER, 'Tern', 'rcs', 3, 1, 4500, 24000, 1.6, { rcsThrust: 36000, rcsExhaustVelocity: 2400, torque: 1.0e7 }, D_RCS),
-  mod('rcs_std_4', CALDER, 'Tern', 'rcs', 4, 2, 11000, 75000, 3.5, { rcsThrust: 110000, rcsExhaustVelocity: 2400, torque: 3.6e7 }, D_RCS),
-  mod('rcs_agile_1', CALDER, 'Dervish', 'rcs', 1, 3, 800, 9500, 0.8, { rcsThrust: 7000, rcsExhaustVelocity: 2900, torque: 7.6e5 }, D_RCS_AGILE),
-  mod('rcs_agile_2', CALDER, 'Dervish', 'rcs', 2, 3, 2300, 28000, 1.8, { rcsThrust: 20000, rcsExhaustVelocity: 2900, torque: 4.0e6 }, D_RCS_AGILE),
-  mod('rcs_agile_3', CALDER, 'Dervish', 'rcs', 3, 3, 6000, 88000, 4, { rcsThrust: 60000, rcsExhaustVelocity: 2900, torque: 1.7e7 }, D_RCS_AGILE),
-  mod('rcs_arc_1', OSEI, 'Whisper', 'rcs', 1, 2, 650, 6800, 1.2, { rcsThrust: 2200, rcsExhaustVelocity: 6500, torque: 4.4e5 }, D_RCS_ARC),
-  mod('rcs_arc_2', OSEI, 'Whisper', 'rcs', 2, 2, 1850, 20000, 2.6, { rcsThrust: 6500, rcsExhaustVelocity: 6500, torque: 2.3e6 }, D_RCS_ARC),
+  mod('rcs_std_1', CALDER, 'Tern', 'rcs', 1, 1, 600, 2400, 0.3, { rcsThrust: 34000, rcsExhaustVelocity: 2400, torque: 4.6e5 }, D_RCS),
+  mod('rcs_std_2', CALDER, 'Tern', 'rcs', 2, 1, 1700, 7500, 0.7, { rcsThrust: 100000, rcsExhaustVelocity: 2400, torque: 2.4e6 }, D_RCS),
+  mod('rcs_std_3', CALDER, 'Tern', 'rcs', 3, 1, 4500, 24000, 1.6, { rcsThrust: 300000, rcsExhaustVelocity: 2400, torque: 1.0e7 }, D_RCS),
+  mod('rcs_std_4', CALDER, 'Tern', 'rcs', 4, 2, 11000, 75000, 3.5, { rcsThrust: 920000, rcsExhaustVelocity: 2400, torque: 3.6e7 }, D_RCS),
+  mod('rcs_agile_1', CALDER, 'Dervish', 'rcs', 1, 3, 800, 9500, 0.8, { rcsThrust: 60000, rcsExhaustVelocity: 2900, torque: 7.6e5 }, D_RCS_AGILE),
+  mod('rcs_agile_2', CALDER, 'Dervish', 'rcs', 2, 3, 2300, 28000, 1.8, { rcsThrust: 170000, rcsExhaustVelocity: 2900, torque: 4.0e6 }, D_RCS_AGILE),
+  mod('rcs_agile_3', CALDER, 'Dervish', 'rcs', 3, 3, 6000, 88000, 4, { rcsThrust: 510000, rcsExhaustVelocity: 2900, torque: 1.7e7 }, D_RCS_AGILE),
+  mod('rcs_arc_1', OSEI, 'Whisper', 'rcs', 1, 2, 650, 6800, 1.2, { rcsThrust: 19000, rcsExhaustVelocity: 6500, torque: 4.4e5 }, D_RCS_ARC),
+  mod('rcs_arc_2', OSEI, 'Whisper', 'rcs', 2, 2, 1850, 20000, 2.6, { rcsThrust: 55000, rcsExhaustVelocity: 6500, torque: 2.3e6 }, D_RCS_ARC),
 
   // ---------------------------------------------------------------- reactors
   mod('rct_std_1', HEARTH, 'Cinderbed', 'reactor', 1, 1, 1800, 4800, 0, {}, D_RCT, { powerOutput: 14 }),
