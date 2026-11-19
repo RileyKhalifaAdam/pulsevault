@@ -45,7 +45,9 @@ console on that phone, and it cannot be tested on a real device before the owner
 
 ## Rules
 
-- No external assets, fonts, CDNs or new npm dependencies: everything is procedural or inline.
+- No external assets, fonts, CDNs or new npm dependencies: everything is procedural or inline. One exception:
+  `three-mesh-bvh` (MIT, pinned 0.9.18) for the ray tracer's BVH build (`src/render/rt`), bundled into the page — no
+  network at run time.
 - The simulation (`src/sim`, `src/data`, `src/core`) must not import three.js or touch the DOM, and must not
   call `Math.random()` / `Date.now()` — use `core/rng.ts`. It has to run under vitest in plain node.
 - SI units and the axis conventions in the architecture doc are not negotiable; convert only when formatting

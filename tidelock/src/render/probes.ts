@@ -278,7 +278,7 @@ export class InteriorLighting {
     sun.shadow.mapSize.set(this.shadowSize, this.shadowSize);
     sun.shadow.bias = -0.0004;
     sun.shadow.normalBias = 0.025;
-    sun.shadow.autoUpdate = this.shadowEvery === 1;
+    sun.shadow.autoUpdate = false;
     scene.add(sun, sun.target);
     this.lightList.push(sun);
     if (this.shineSize > 0) {
@@ -672,18 +672,32 @@ export class InteriorLighting {
     const sunOn = f.sunIntensity > 1e-4;
     this.sun.visible = true; // never toggled: the light count is part of every program
     if (sunOn) this.fit(this.sun, f.sunDir, vis, this.shadowSize);
+    let shineDue = false;
     if (this.shine) {
       this.shine.color.copy(f.shineColor);
       this.shine.intensity = f.shineIntensity;
-      if (f.shineIntensity > 1e-4 && this.frameNo % 3 === 0) {
-        this.fit(this.shine, f.shineDir, vis, this.shineSize);
-        this.shine.shadow.needsUpdate = true;
-      }
+      shineDue = f.shineIntensity > 1e-4 && this.frameNo % 3 === 0;
+      if (shineDue) this.fit(this.shine, f.shineDir, vis, this.shineSize);
     }
-    if (this.shadowEvery > 1 && this.frameNo % this.shadowEvery === 0) this.sun.shadow.needsUpdate = true;
-    this.castersFor(sunOn ? f.sunDir : null, this.shine && f.shineIntensity > 1e-4 ? f.shineDir : null);
     // the shadow maps now, before the pipeline binds its multisampled target
-    if (sunOn || (this.shine && this.shine.shadow.needsUpdate)) this.renderShadows();
+    const sunDue = sunOn && (this.shadowEvery === 1 || this.frameNo % this.shadowEvery === 0);
+    if (sunDue) {
+      // sun: shells, plus the furniture of the visible rooms whose windows face the star
+      this.castersFor(f.sunDir);
+      this.sun.shadow.needsUpdate = true;
+      if (this.shine) this.shine.shadow.needsUpdate = false;
+      this.renderShadows();
+    }
+    if (shineDue && this.shine) {
+      // planetshine (a soft fill, every third frame): the shells alone
+      this.castersFor(null);
+      const au = this.sun.shadow.autoUpdate;
+      this.sun.shadow.autoUpdate = false;
+      this.sun.shadow.needsUpdate = false;
+      this.shine.shadow.needsUpdate = true;
+      this.renderShadows();
+      this.sun.shadow.autoUpdate = au;
+    }
     this.stats.drawCalls = info.calls - c0;
     this.stats.triangles = info.triangles - t0;
   }
@@ -706,12 +720,11 @@ export class InteriorLighting {
     r.setRenderTarget(prev);
   }
 
-  /** Furniture casts only in the visible rooms with a window facing the sun or the planetshine. */
-  private castersFor(sun: THREE.Vector3 | null, shine: THREE.Vector3 | null): void {
+  /** Furniture casts only in the visible, near rooms with a window facing `dir` (world; null = none casts). */
+  private castersFor(dir: THREE.Vector3 | null): void {
     const q = this.rq;
     this.root.getWorldQuaternion(q).invert();
-    const s = sun ? this.tv.copy(sun).applyQuaternion(q) : null;
-    const p = shine ? this.tv2.copy(shine).applyQuaternion(q) : null;
+    const s = dir ? this.tv.copy(dir).applyQuaternion(q) : null;
     for (let i = 0; i < this.rooms.length; i++) {
       const room = this.rooms[i];
       if (room.casters.length === 0) continue;
@@ -720,7 +733,6 @@ export class InteriorLighting {
         for (let k = 0; k < room.windows.length; k++) {
           const n = room.windows[k];
           if (s && n.x * s.x + n.y * s.y + n.z * s.z > 0.02) open = true;
-          if (p && n.x * p.x + n.y * p.y + n.z * p.z > 0.02) open = true;
         }
       for (let k = 0; k < room.casters.length; k++) room.casters[k].castShadow = open;
     }

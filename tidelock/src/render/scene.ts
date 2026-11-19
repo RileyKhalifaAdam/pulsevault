@@ -835,8 +835,14 @@ class Manager implements SceneManager {
       this.interior = null;
     }
     let built = this.prebuilt && this.prebuilt.visualId === e.visualId ? this.prebuilt : null;
-    if (built) this.prebuilt = null;
-    else built = this.buildInterior(e.visualId);
+    if (!built && this.prebuilt) {
+      // built for another hull: its lights must not stay in the inside scene
+      this.prebuilt.lighting.dispose();
+      this.prebuilt.cockpit?.dispose();
+      this.prebuilt.visual.dispose();
+    }
+    this.prebuilt = null;
+    if (!built) built = this.buildInterior(e.visualId);
     if (!built) return null;
     this.interior = { shipId: e.id, ...built };
     return built.visual;

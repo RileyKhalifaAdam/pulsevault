@@ -57,6 +57,8 @@ export interface OrbitPageView {
   path: Float32Array;
   pathCount: number;
   targetPath: Float32Array;
+  /** Out-of-plane offset of each target-path point (along the orbit normal), m: the hologram lifts it in 3D. */
+  targetPathZ: Float32Array;
   targetCount: number;
   shipX: number;
   shipY: number;
@@ -69,6 +71,8 @@ export interface OrbitPageView {
   hasTarget: boolean;
   targetX: number;
   targetY: number;
+  /** The target's out-of-plane offset, m. */
+  targetZ: number;
   targetName: string;
   apoapsisAlt: number;
   periapsisAlt: number;
@@ -124,8 +128,8 @@ export function createInstrumentData(): InstrumentData {
     },
     orbit: {
       bodyName: '', bodyRadius: 1, path: new Float32Array(PATH_MAX * 2), pathCount: 0, targetPath: new Float32Array(PATH_MAX * 2),
-      targetCount: 0, shipX: 0, shipY: 0, hasApo: false, apoX: 0, apoY: 0, hasPeri: false, periX: 0, periY: 0, hasTarget: false,
-      targetX: 0, targetY: 0, targetName: '', apoapsisAlt: 0, periapsisAlt: 0, period: 0, version: -1,
+      targetPathZ: new Float32Array(PATH_MAX), targetCount: 0, shipX: 0, shipY: 0, hasApo: false, apoX: 0, apoY: 0, hasPeri: false, periX: 0, periY: 0, hasTarget: false,
+      targetX: 0, targetY: 0, targetZ: 0, targetName: '', apoapsisAlt: 0, periapsisAlt: 0, period: 0, version: -1,
     },
     docking: { name: '', hasPort: false, range: Infinity, closing: 0, lateralX: 0, lateralY: 0, lateral: 0, alignment: 0, canLatch: false, docked: false },
     systems: { propellantFraction: 1, propellantKg: 0, hull: 1, heat: 0, cabinLights: true, time: 0, asleep: false, warp: 1, warpLimit: '' },
@@ -289,7 +293,7 @@ export function readInstruments(session: Session, out: InstrumentData, devices?:
     const e2x = e3y * e1z - e3z * e1y;
     const e2y = e3z * e1x - e3x * e1z;
     const e2z = e3x * e1y - e3y * e1x;
-    const lay = (src: Float64Array, count: number, dst: Float32Array): number => {
+    const lay = (src: Float64Array, count: number, dst: Float32Array, dz?: Float32Array): number => {
       const step = Math.max(1, Math.ceil(count / PATH_MAX));
       let m = 0;
       for (let i = 0; i < count && m < PATH_MAX; i += step) {
@@ -298,12 +302,13 @@ export function readInstruments(session: Session, out: InstrumentData, devices?:
         const z = src[i * 4 + 2];
         dst[m * 2] = x * e1x + y * e1y + z * e1z;
         dst[m * 2 + 1] = x * e2x + y * e2y + z * e2z;
+        if (dz) dz[m] = x * e3x + y * e3y + z * e3z;
         m++;
       }
       return m;
     };
     o.pathCount = lay(P, cnt, o.path);
-    o.targetCount = lay(pr.targetPoints, pr.targetCount, o.targetPath);
+    o.targetCount = lay(pr.targetPoints, pr.targetCount, o.targetPath, o.targetPathZ);
     o.shipX = cnt >= 1 ? o.path[0] : al;
     o.shipY = cnt >= 1 ? o.path[1] : 0;
     o.hasApo = false;
@@ -327,6 +332,7 @@ export function readInstruments(session: Session, out: InstrumentData, devices?:
       o.hasTarget = true;
       o.targetX = o.targetPath[0];
       o.targetY = o.targetPath[1];
+      o.targetZ = o.targetPathZ[0];
     } else if (tgt && me && frameBody) {
       const tx = me.r.x - frameBody.r.x + tgt.direction.x * tgt.distance;
       const ty = me.r.y - frameBody.r.y + tgt.direction.y * tgt.distance;
@@ -334,6 +340,7 @@ export function readInstruments(session: Session, out: InstrumentData, devices?:
       o.hasTarget = true;
       o.targetX = tx * e1x + ty * e1y + tz * e1z;
       o.targetY = tx * e2x + ty * e2y + tz * e2z;
+      o.targetZ = tx * e3x + ty * e3y + tz * e3z;
     }
   }
 
@@ -386,13 +393,13 @@ export function readInstruments(session: Session, out: InstrumentData, devices?:
 
 // ---- drawing -----------------------------------------------------------------------------------------------
 
-const BG = '#04070a';
-const AMBER = '#ffb53c';
-const CYAN = '#52dcee';
-const GREEN = '#5ee67c';
-const RED = '#ff5744';
-const DIM = '#7f9aa4';
-const WHITE = '#e6eef0';
+const BG = '#010407';
+const AMBER = '#ffb347';
+const CYAN = '#4fe3ff';
+const GREEN = '#58f0a8';
+const RED = '#ff5246';
+const DIM = '#5f97a6';
+const WHITE = '#e9fbff';
 const FONT = 'ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace';
 type Ctx = CanvasRenderingContext2D;
 
@@ -437,13 +444,58 @@ function line(c: Ctx, x0: number, y0: number, x1: number, y1: number, color: str
   c.lineTo(x1, y1);
   c.stroke();
 }
+/** Glass background: near-black with a faint cyan bloom from the top, a fine plotting grid and corner marks.
+ * Draws in logical w x h units whatever the canvas resolution (the canvas may be 1.5x for crisp glass). */
+const bgCache = new WeakMap<Ctx, { w: number; h: number; img: HTMLCanvasElement }>();
+function background(c: Ctx, w: number, h: number): HTMLCanvasElement {
+  const hit = bgCache.get(c);
+  if (hit && hit.w === w && hit.h === h && hit.img.width === c.canvas.width) return hit.img;
+  const img = document.createElement('canvas');
+  img.width = c.canvas.width;
+  img.height = c.canvas.height;
+  const b = img.getContext('2d') as Ctx;
+  b.scale(img.width / w, img.height / h);
+  b.fillStyle = BG;
+  b.fillRect(0, 0, w, h);
+  const g = b.createRadialGradient(w * 0.5, -h * 0.25, 10, w * 0.5, -h * 0.25, h * 1.25);
+  g.addColorStop(0, 'rgba(40,150,190,0.16)');
+  g.addColorStop(1, 'rgba(40,150,190,0)');
+  b.fillStyle = g;
+  b.fillRect(0, 0, w, h);
+  b.strokeStyle = 'rgba(79,227,255,0.055)';
+  b.lineWidth = 1;
+  b.beginPath();
+  for (let x = 16; x < w; x += 16) {
+    b.moveTo(x, 0);
+    b.lineTo(x, h);
+  }
+  for (let y = 16; y < h; y += 16) {
+    b.moveTo(0, y);
+    b.lineTo(w, y);
+  }
+  b.stroke();
+  b.strokeStyle = 'rgba(79,227,255,0.45)';
+  b.lineWidth = 2;
+  const k = 14;
+  b.beginPath();
+  for (const [x, y, sx, sy] of [[3, 3, 1, 1], [w - 3, 3, -1, 1], [3, h - 3, 1, -1], [w - 3, h - 3, -1, -1]]) {
+    b.moveTo(x + sx * k, y);
+    b.lineTo(x, y);
+    b.lineTo(x, y + sy * k);
+  }
+  b.stroke();
+  bgCache.set(c, { w, h, img });
+  return img;
+}
 function clear(c: Ctx, w: number, h: number): void {
   c.setTransform(1, 0, 0, 1, 0, 0);
   c.globalAlpha = 1;
   c.setLineDash([]);
+  c.drawImage(background(c, w, h), 0, 0);
+  c.setTransform(c.canvas.width / w, 0, 0, c.canvas.height / h, 0, 0);
   c.textBaseline = 'alphabetic';
-  c.fillStyle = BG;
-  c.fillRect(0, 0, w, h);
+  c.lineCap = 'round';
+  c.lineJoin = 'round';
 }
 function bar(c: Ctx, x: number, y: number, w: number, h: number, frac: number, color: string): void {
   const f = Math.min(1, Math.max(0, Number.isFinite(frac) ? frac : 0));
@@ -846,4 +898,29 @@ export function drawNoData(c: Ctx, w: number, h: number, label: string): void {
   clear(c, w, h);
   text(c, label, w / 2, h / 2 - 6, 30, DIM, 'center');
   text(c, 'NO DATA', w / 2, h / 2 + 30, 22, DIM, 'center');
+}
+
+/**
+ * The side-console glass (drawn once at load): a power and thermal bus mimic of our own — busbars, breakers,
+ * the radiator loop — static apart from what the cockpit draws over it. `side` -1 port (POWER), +1 starboard
+ * (THERMAL).
+ */
+export function drawAuxScreen(c: Ctx, w: number, h: number, side: number): void {
+  clear(c, w, h);
+  const title = side < 0 ? 'POWER · BUS A/B' : 'THERMAL · LOOP 1/2';
+  text(c, title, 12, 28, 21, CYAN);
+  text(c, side < 0 ? 'NOMINAL' : 'IN LIMITS', w - 12, 28, 18, GREEN, 'right');
+  line(c, 8, 40, w - 8, 40, DIM, 2);
+  const names = side < 0 ? ['REACTOR', 'DRIVE', 'RCS', 'LIFE', 'AVION', 'CABIN'] : ['RAD P', 'RAD S', 'PUMP A', 'PUMP B', 'CABIN', 'AVION'];
+  const vals = side < 0 ? [0.82, 0.64, 0.3, 0.46, 0.38, 0.55] : [0.58, 0.61, 0.72, 0.7, 0.42, 0.36];
+  const top = 62;
+  const pitch = (h - top - 34) / names.length;
+  for (let i = 0; i < names.length; i++) {
+    const y = top + i * pitch;
+    text(c, names[i], 12, y + 17, 17, DIM);
+    bar(c, 120, y + 2, w - 210, 18, vals[i], i === 0 ? CYAN : '#2fb6d6');
+    text(c, `${Math.round(vals[i] * (side < 0 ? 48 : 340))}${side < 0 ? ' kW' : ' K'}`, w - 12, y + 17, 17, WHITE, 'right');
+  }
+  line(c, 8, h - 30, w - 8, h - 30, DIM, 2);
+  text(c, side < 0 ? 'BUS TIE  CLOSED     BATT 97%' : 'COOLANT 312 K     FLOW 1.8 kg/s', 12, h - 9, 16, DIM);
 }

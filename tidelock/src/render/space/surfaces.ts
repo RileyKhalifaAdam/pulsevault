@@ -41,7 +41,7 @@ export const TILE_METRES: Record<TileId, [number, number]> = {
 export const TILE_ALBEDO: Record<TileId, P3> = {
   whitePanel: [0.6, 0.6, 0.58], brushed: [0.3, 0.24, 0.18], gunmetal: [0.12, 0.12, 0.13], tread: [0.06, 0.06, 0.06],
   grating: [0.08, 0.08, 0.08], padded: [0.5, 0.5, 0.5], leather: [0.45, 0.45, 0.45], veneer: [0.09, 0.05, 0.03],
-  warmPanel: [0.38, 0.34, 0.3], fabric: [0.55, 0.55, 0.55], darkFloor: [0.06, 0.06, 0.06], netting: [0.06, 0.06, 0.06],
+  warmPanel: [0.25, 0.21, 0.17], fabric: [0.55, 0.55, 0.55], darkFloor: [0.06, 0.06, 0.06], netting: [0.06, 0.06, 0.06],
   hazard: [0.3, 0.22, 0.03], seam: [0.12, 0.12, 0.13], vent: [0.08, 0.08, 0.08], stencil: [0.5, 0.5, 0.5],
 };
 
@@ -364,7 +364,7 @@ const GEN: Partial<Record<TileId, Gen>> = {
     const n1 = nz(u, v, 2, 18);
     const fine = nz(u, v, 24, 19);
     const k = (0.94 + 0.08 * n1 + 0.04 * fine) * (0.8 + 0.2 * seam);
-    set(o, 0.4 * k, 0.36 * k, 0.315 * k, 0.5 + 0.1 * fine, 0);
+    set(o, 0.27 * k, 0.225 * k, 0.185 * k, 0.48 + 0.12 * fine, 0);
     o.h = -0.0015 * (1 - seam) - 0.001 * groove + 0.00005 * fine;
     o.ao = (0.55 + 0.45 * seam) * (1 - 0.3 * groove);
   },
@@ -730,7 +730,7 @@ export function createReflectionCube(warm: boolean): THREE.CubeTexture | null {
 
 export interface SurfaceShared {
   uTiles: { value: THREE.Vector4[] };
-  /** Lights-off lightmap (RGBM), and the on/off blend (1 = on). */
+  /** Lights-off lightmap (linear half float), and the on/off blend (1 = on). */
   uLmB: { value: THREE.Texture | null };
   uLmMix: { value: number };
   /** How much the normal map tilts the baked light toward "up" (light comes mostly from overhead). */
@@ -759,7 +759,7 @@ export function createSurfaceShared(): SurfaceShared {
 export type SurfaceKind = 'main' | 'cut' | 'glow';
 
 /**
- * A MeshStandardMaterial that samples the atlas by the `tile` attribute. With `lightMap` (RGBM, uv channel 1)
+ * A MeshStandardMaterial that samples the atlas by the `tile` attribute. With `lightMap` (linear, uv channel 1)
  * the baked light replaces ambient and scales the reflections; without it the material is lit by scene lights
  * and the env map as usual (cockpit / exterior adoption).
  */
@@ -842,7 +842,7 @@ export function surfaceMaterial(
         `#if defined( RE_IndirectDiffuse )
   vec4 tlA = texture2D( lightMap, vLightMapUv );
   vec4 tlB = texture2D( uLmB, vLightMapUv );
-  vec3 tlLm = mix( tlB.rgb * tlB.a, tlA.rgb * tlA.a, uLmMix ) * ${RGBM_RANGE.toFixed(1)} * lightMapIntensity;
+  vec3 tlLm = mix( tlB.rgb, tlA.rgb, uLmMix ) * lightMapIntensity;
   float tlUp = 1.0 + uUpK * ( dot( normal, vUpV ) - dot( nonPerturbedNormal, vUpV ) );
   irradiance += tlLm * max( tlUp, 0.2 );
 #endif

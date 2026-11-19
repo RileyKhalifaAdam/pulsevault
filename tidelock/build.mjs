@@ -158,6 +158,15 @@ function serve(port) {
   }).listen(port, () => console.log(`serving dist/ on http://localhost:${port}`));
 }
 
+// the interior's baked lighting (tools/bake-interior.mjs) is rebuilt when its inputs are newer than the output;
+// a failed bake never blocks a build (the game falls back to flat interior light and warns)
+try {
+  const { bakeIfStale } = await import('./tools/bake-interior.mjs');
+  await bakeIfStale();
+} catch (e) {
+  console.warn(`interior bake skipped: ${e instanceof Error ? e.message : e}`);
+}
+
 const harness = valueOf('--harness');
 if (harness) await buildHarness(harness);
 else await buildGame();

@@ -1,14 +1,16 @@
 // Visual harness for the Wren's interior (src/render/space/interior.ts + the 'interior' camera of scene.ts):
 // the real session world, the player ship placed by hand over Wick's day side, the frame filled by hand.
 //
-//   dev/interior.html?view=cockpit
+//   dev/interior.html?view=lounge&q=high
 //
-//   view   cockpit      seated at the helm, looking forward over the console
-//          cabin        standing by the cockpit door, looking aft across galley and table
-//          window       seated at the table, looking out at Wick
-//          bunks        from the corridor into the bunk room
-//          engineering  from the corridor through the engineering door
-//          dark         the cabin view with the cabin lights off
+//   view   lounge       from the companionway door: galley, sofa, the big window
+//          sofa         seated on the sofa, looking across the lounge
+//          corridor     the octagonal corridor looking aft to the cargo door
+//          cabin        the port cabin from its door
+//          cargo        the cargo bay from the corridor door
+//          engineering  engineering, the reactor and the coolant loop
+//          cockpit      seated at the helm
+//          night        the lounge view with the cabin lights off
 //   ex ey ez            eye override, ship-local m          yaw pitch   look override, deg
 //   (each view also fixes where the planet and the star are as seen from the ship; the ship is placed to match)
 //   lights=0|1          cabin lights                        q  low (default) | medium | high | ultra
@@ -25,8 +27,8 @@ const params = new URLSearchParams(location.search);
 const has = (k: string): boolean => params.has(k) && params.get(k) !== '';
 const num = (k: string, d: number): number => (has(k) ? Number(params.get(k)) : d);
 const DEG = Math.PI / 180;
-const view = params.get('view') ?? 'cockpit';
-const quality = (params.get('q') ?? 'low') as Quality;
+const view = params.get('view') ?? 'lounge';
+const quality = (params.get('q') ?? 'medium') as Quality;
 
 document.body.style.cssText = 'margin:0;background:#000;overflow:hidden';
 const canvas = document.createElement('canvas');
@@ -57,16 +59,19 @@ interface Preset {
   sun: V3;
   lights: boolean;
 }
-const cabin: Preset = { eye: { x: 0.0, y: 0.85, z: -2.35 }, yaw: 180, pitch: -10, nadir: { x: 0.8, y: -0.45, z: 0.4 }, sun: { x: -0.8, y: 0.45, z: 0.4 }, lights: true };
+const day = { nadir: { x: 0.85, y: -0.45, z: 0.25 }, sun: { x: -0.5, y: 0.7, z: -0.5 } };
+const lounge: Preset = { eye: { x: 0.25, y: 0.62, z: -10.3 }, yaw: 172, pitch: -14, ...day, lights: true };
 const PRESETS: Record<string, Preset> = {
+  lounge,
+  sofa: { eye: layout.tableEye, yaw: 78, pitch: -9, nadir: { x: 0.6, y: -0.75, z: 0.3 }, sun: { x: -0.6, y: 0.6, z: -0.5 }, lights: true },
+  corridor: { eye: { x: 0.1, y: 0.62, z: -4.35 }, yaw: 180, pitch: -4, ...day, lights: true },
+  cabin: { eye: { x: -1.05, y: 0.6, z: -1.35 }, yaw: 38, pitch: -16, ...day, lights: true },
+  cargo: { eye: { x: 0.0, y: 0.62, z: 3.3 }, yaw: 180, pitch: -10, ...day, lights: true },
+  engineering: { eye: { x: 0.9, y: 0.62, z: 10.25 }, yaw: 200, pitch: -8, ...day, lights: true },
   cockpit: { eye: layout.helmEye, yaw: -6, pitch: -12, nadir: { x: 0, y: -0.857, z: -0.515 }, sun: { x: 0.45, y: 0.6, z: -0.66 }, lights: true },
-  cabin,
-  window: { eye: layout.tableEye, yaw: -138, pitch: -10, nadir: { x: 0.6, y: -0.75, z: 0.3 }, sun: { x: -0.6, y: 0.6, z: -0.5 }, lights: true },
-  bunks: { eye: { x: -0.3, y: 0.8, z: 3.05 }, yaw: -90, pitch: -6, nadir: { x: 0.9, y: -0.4, z: 0 }, sun: { x: -0.5, y: 0.7, z: -0.5 }, lights: true },
-  engineering: { eye: { x: 0, y: 0.85, z: 4.0 }, yaw: 180, pitch: -6, nadir: { x: 0.9, y: -0.4, z: 0 }, sun: { x: -0.5, y: 0.7, z: -0.5 }, lights: true },
-  dark: { ...cabin, lights: false },
+  night: { ...lounge, lights: false },
 };
-const preset = PRESETS[view] ?? PRESETS.cockpit;
+const preset = PRESETS[view] ?? PRESETS.lounge;
 const eye: V3 = { x: num('ex', preset.eye.x), y: num('ey', preset.eye.y), z: num('ez', preset.eye.z) };
 const lookYaw = num('yaw', preset.yaw) * DEG;
 const lookPitch = num('pitch', preset.pitch) * DEG;
@@ -143,7 +148,7 @@ async function main(): Promise<void> {
   info.textContent =
     `view ${view} · ${quality} · lights ${lights ? 'on' : 'off'} · cam ${scene.camera.mode} fov ${(scene.camera.fovY / DEG).toFixed(0)} · ev ${scene.exposure.toFixed(2)} · limb dip ${dipDeg.toFixed(0)}°\n` +
     `frame: draw calls ${st.drawCalls} · triangles ${st.triangles}\n` +
-    `interior: draw calls ${st.interior?.drawCalls ?? '-'} · triangles ${st.interior?.triangles ?? '-'} · system ${((t1 - t0) / 1000).toFixed(1)} s · first frame (interior build + bake) ${((t2 - t1) / 1000).toFixed(2)} s`;
+    `interior: draw calls ${st.interior?.drawCalls ?? '-'} · triangles ${st.interior?.triangles ?? '-'} · system ${((t1 - t0) / 1000).toFixed(1)} s · first frame (interior build) ${((t2 - t1) / 1000).toFixed(2)} s`;
   ready();
 }
 window.addEventListener('resize', () => pipeline.resize(window.innerWidth, window.innerHeight, window.devicePixelRatio));
