@@ -42,30 +42,32 @@ function navLights(tip: V3, tail: V3, extra: { pos: V3; color: RGB; blink: numbe
 }
 
 export const SHIP_LAYOUTS: Record<ShipVisualId, ShipLayout> = {
-  // Corvane CD-7 Wren — arrowhead lifting body, twin side pods, bubble canopy
+  // Corvane Wren — 32 m courier you can live in: smooth white armour over the nose and upper hull, a working
+  // body with exposed machinery along the flanks and stern, engine pods at the wing roots, twin canted fins.
+  // The hull encloses the interior of src/data/interiors.ts (x ±3.2, deck -1.0 to overhead 1.4, z -15.0..13.4).
   wren: {
     id: 'wren',
-    length: 16,
-    width: 12.1,
-    height: 3.1,
-    radius: 9.5,
+    length: 32,
+    width: 19,
+    height: 6.6,
+    radius: 16.5,
     engines: [
-      { pos: v(4.15, 0.12, 8.0), radius: 0.66 },
-      { pos: v(-4.15, 0.12, 8.0), radius: 0.66 },
+      { pos: v(4.8, -0.2, 15.6), radius: 1.15 },
+      { pos: v(-4.8, -0.2, 15.6), radius: 1.15 },
     ],
     rcs: [
-      ...both([{ pos: v(1.45, 0.0, -5.5), dir: PX }], flipDir),
-      { pos: v(0, 0.66, -5.5), dir: PY },
-      { pos: v(0, -0.5, -5.5), dir: NY },
-      ...both([{ pos: v(5.0, 0.12, 2.5), dir: PX }], flipDir),
-      ...both([{ pos: v(4.15, 0.95, 5.2), dir: PY }]),
-      ...both([{ pos: v(4.15, -0.71, 5.2), dir: NY }]),
+      ...both([{ pos: v(3.9, 0.2, -12.0), dir: PX }], flipDir),
+      { pos: v(0, 2.0, -12.5), dir: PY },
+      { pos: v(0, -1.7, -12.5), dir: NY },
+      ...both([{ pos: v(6.0, -0.2, 11.0), dir: PX }], flipDir),
+      ...both([{ pos: v(4.8, 1.1, 12.0), dir: PY }]),
+      ...both([{ pos: v(4.8, -1.5, 12.0), dir: NY }]),
     ],
-    hardpoints: both([{ pos: v(1.6, -0.98, -0.6), size: 1 }]),
-    dockingPort: { pos: v(0, 1.72, 1.15), dir: PY },
-    cockpit: v(0, 1.3, -3.35),
-    chaseCam: { distance: 34, height: 8 },
-    lights: navLights(v(6.02, 0.39, 6.05), v(0, 1.02, 6.5), [{ pos: v(0, -0.86, 0.5), color: RED, blink: 2.2 }]),
+    hardpoints: both([{ pos: v(2.6, -1.7, -6.0), size: 1 }]),
+    dockingPort: { pos: v(0, 1.95, 2.2), dir: PY },
+    cockpit: v(-0.55, 0.25, -13.45),
+    chaseCam: { distance: 64, height: 14 },
+    lights: navLights(v(9.4, 0.0, 6.5), v(0, 4.4, 13.0), [{ pos: v(0, -1.7, 1.0), color: RED, blink: 2.2 }]),
   },
 
   // Ilmarin Drover — crew module, truss spine with six cans, one big bell

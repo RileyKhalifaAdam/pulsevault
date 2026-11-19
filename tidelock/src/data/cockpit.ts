@@ -100,6 +100,10 @@ export interface CockpitLayout {
 }
 
 const v = (x: number, y: number, z: number): V3 => ({ x, y, z });
+/** The cockpit moved forward and down when the Wren grew to 31 m: every cockpit coordinate below adds this
+ * offset (src/data/interiors.ts moved the cockpit room, its solids, windows and helmEye by the same amount). */
+const OY = -0.25;
+const OZ = -9.4;
 /** Instrument face: a panel leaning back 30 degrees, square to the seated pilot's line of sight. */
 const FACE = v(0, 0.5, 0.866);
 const FACE_UP = v(0, 0.866, -0.5);
@@ -109,13 +113,13 @@ const AFT = v(0, 0, 1);
 
 /** Pilot centreline, and the face's origin: the centre line of the two screens. */
 const PX = -0.55;
-const FY = 0.217;
-const FZ = -4.701;
+const FY = 0.217 + OY;
+const FZ = -4.701 + OZ;
 /** A point on the instrument face: x across, s metres up the face from the screens' centre line. */
 const face = (x: number, s: number): V3 => v(x, FY + 0.866 * s, FZ - 0.5 * s);
 /** Desk top (level), y of its surface. */
-const DESK_Y = -0.011;
-const desk = (x: number, z: number): V3 => v(x, DESK_Y, z);
+const DESK_Y = -0.011 + OY;
+const desk = (x: number, z: number): V3 => v(x, DESK_Y, z + OZ);
 
 const WREN_STATION: StationShape = {
   x0: PX - 0.32,
@@ -126,9 +130,9 @@ const WREN_STATION: StationShape = {
   faceTop: 0.108,
   faceBottom: -0.263,
   deskY: DESK_Y,
-  deskNearZ: -4.37,
-  hoodBack: { y: 0.25, z: -5.09 },
-  underBack: { y: -0.16, z: -4.8 },
+  deskNearZ: -4.37 + OZ,
+  hoodBack: { y: 0.25 + OY, z: -5.09 + OZ },
+  underBack: { y: -0.16 + OY, z: -4.8 + OZ },
 };
 
 const LAMP_PITCH_X = 0.076;
@@ -148,7 +152,7 @@ const holdButton = (id: string, role: DeviceRole, label: string, col: number, ro
 });
 
 /**
- * Halcyon Wren, pilot station (left seat; eye at about (-0.55, 0.5, -4.05), looking forward and about 20
+ * Corvane Wren, pilot station (left seat; eye at about (-0.55, 0.5, -4.05), looking forward and about 20
  * degrees down). Laid out for a phone held upright, where the view is 88 degrees tall but only 48 wide:
  * everything sits within about 0.3 m of the pilot's centreline, stacked from the screens (top, 0.7 m from
  * the eye) down to the hand controllers at the near corners of the desk.
@@ -224,20 +228,20 @@ const WREN: CockpitLayout = {
     // the seat harness buckle, in the pilot's lap: tap to strap in from beside the seat, tap again to unstrap
     {
       id: 'harness', kind: 'buckle', role: 'harness', label: 'HARNESS', room: 'cockpit',
-      pos: v(PX, -0.01, -4.285), normal: v(0, 0.866, 0.5), up: v(0, 0.5, -0.866), radius: 0.07, reach: 'arm',
+      pos: v(PX, -0.01 + OY, -4.285 + OZ), normal: v(0, 0.866, 0.5), up: v(0, 0.5, -0.866), radius: 0.07, reach: 'arm',
     },
     // around the house
     {
-      id: 'lights', kind: 'toggle', role: 'cabinLights', label: 'LIGHTS', room: 'cabin',
-      pos: v(-0.62, 0.45, -2.598), normal: AFT, up: TOP, radius: 0.05, reach: 'arm',
+      id: 'lights', kind: 'toggle', role: 'cabinLights', label: 'LIGHTS', room: 'lounge',
+      pos: v(-1.1, 0.2, -10.398), normal: AFT, up: TOP, radius: 0.05, reach: 'arm',
     },
     {
-      id: 'bunk', kind: 'rest', role: 'bunk', label: 'BUNK', room: 'bunks',
-      pos: v(1.27, -0.2, 3.25), normal: TOP, up: FWD, radius: 0.5, halfWidth: 0.32, halfHeight: 1.2, reach: 'arm',
+      id: 'bunk', kind: 'rest', role: 'bunk', label: 'BUNK', room: 'cabin-port',
+      pos: v(-2.6, -0.45, -3.4), normal: TOP, up: FWD, radius: 0.6, halfWidth: 0.55, halfHeight: 1.05, reach: 'arm',
     },
     {
-      id: 'table-seat', kind: 'rest', role: 'tableSeat', label: 'BENCH', room: 'cabin',
-      pos: v(1.17, -0.28, -2.02), normal: TOP, up: FWD, radius: 0.35, halfWidth: 0.4, halfHeight: 0.27, reach: 'arm',
+      id: 'table-seat', kind: 'rest', role: 'tableSeat', label: 'SOFA', room: 'lounge',
+      pos: v(2.2, -0.55, -7.5), normal: TOP, up: FWD, radius: 0.6, halfWidth: 0.45, halfHeight: 1.9, reach: 'arm',
     },
   ],
 };
