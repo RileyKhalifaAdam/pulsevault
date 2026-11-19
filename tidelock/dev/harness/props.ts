@@ -61,7 +61,7 @@ const ALONG_Z: Quat = { x: S2, y: 0, z: 0, w: S2 };
 const T = -0.3, K = -0.08; // table and counter tops
 const d = (id: string, type: PropType, pos: V3, rot: Quat = yaw(0)): PropDef => ({ id, type, room: 'lounge', pos, rot, stow: 'loose', holdN: 0 });
 const DEFS: PropDef[] = [
-  d('mug-1', 'mug', v(0.25, T + 0.057, -0.35)),
+  d('mug-1', 'mug', v(0.5, T + 0.057, -0.35)),
   d('mug-2', 'mug', v(0.38, T + 0.057, 0.25), yaw(40)),
   d('mug-3', 'mug', v(-2.85, K + 0.057, -1.4), yaw(-30)),
   d('book-1', 'book', v(-0.2, T + 0.017, 0.35), yaw(18)),
@@ -124,7 +124,7 @@ if (mode === 'float') {
   const hand = v(mug.p.x, mug.p.y, mug.p.z);
   const ok = grab(state, 'mug-1', hand, eye);
   // lift it to chest height over 0.6 s, then a 0.15 s throwing motion and release toward the far (−X) wall
-  for (let i = 0; i < 36; i++) { hand.x += (0.55 - 0.25) / 36; hand.y += (0.35 - (T + 0.057)) / 36; moveGrab(state, hand, H); step(true); trail.push(new THREE.Vector3(mug.p.x, mug.p.y, mug.p.z)); }
+  for (let i = 0; i < 36; i++) { hand.x += 0.1 / 36; hand.y += (0.35 - (T + 0.057)) / 36; moveGrab(state, hand, H); step(true); trail.push(new THREE.Vector3(mug.p.x, mug.p.y, mug.p.z)); }
   for (let i = 0; i < 9; i++) { hand.x -= 0.04; hand.y += 0.01; moveGrab(state, hand, H); step(true); trail.push(new THREE.Vector3(mug.p.x, mug.p.y, mug.p.z)); }
   release(state, v(-4.5, 0.6, -0.4), crew);
   const t = Number(tParam ?? 0.55);
@@ -203,7 +203,7 @@ if (trail.length > 1) {
 const aspect = window.innerWidth / Math.max(1, window.innerHeight);
 const camera = new THREE.PerspectiveCamera(aspect < 1 ? 72 : 58, aspect, 0.02, 30);
 if (mode === 'thrust') { camera.position.set(-0.4, 1.0, -2.6); camera.lookAt(0.3, -0.6, 2.4); }
-else if (mode === 'float') { camera.position.set(2.9, 0.9, -2.6); camera.lookAt(-0.6, -0.1, 0.5); }
+else if (mode === 'float') { camera.position.set(-0.2, 1.15, -2.75); camera.lookAt(0.2, -0.25, 0.9); }
 else if (mode === 'throw') { camera.position.set(1.0, 0.7, 2.6); camera.lookAt(-1.0, -0.1, -0.4); }
 else { camera.position.set(1.25, 0.35, -1.25); camera.lookAt(-0.2, -0.35, 0.05); }
 

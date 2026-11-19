@@ -9,6 +9,7 @@
 //   lit=id,id          lamps lit            held=id,id   hand on these
 //   page=orbit|docking|systems              NAV page     demo=1  plausible docking numbers on that page
 //   lights=0|1         cabin lights         q  low (default) | medium | high | ultra
+//   info=0             hide the read-out (hero shots)
 //   grid=1             overlay what scene.pickDevice() finds under a grid of touches (one colour per device)
 //   pick=x,y           print the pick at that CSS pixel
 import * as THREE from 'three';
@@ -181,6 +182,7 @@ async function main(): Promise<void> {
     }
     extra += `\npicked: ${[...seen].join(' ')}\nnever picked: ${layout.devices.filter((d) => !seen.has(d.id)).map((d) => d.id).join(' ')}`;
   }
+  if (num('info', 1) === 0) info.style.display = 'none';
   info.textContent =
     `cockpit · ${quality} · look ${(lookYaw / DEG).toFixed(0)} / ${(lookPitch / DEG).toFixed(0)} · zoom ${zoom} · fov ${(scene.camera.fovY / DEG).toFixed(0)} · lights ${lights ? 'on' : 'off'}\n` +
     `frame: draw calls ${st.drawCalls} · triangles ${st.triangles}\n` +

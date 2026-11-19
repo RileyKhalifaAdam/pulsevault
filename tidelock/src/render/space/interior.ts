@@ -685,7 +685,8 @@ function workWall(b: Builder, w: Wall, o: { net?: boolean; padEvery?: number; no
         } else if (band === 'main' && pad > 0 && i % pad === 1) {
           wslab(b, w, r, 0, 0.07, 0.03, mt('padded', BLUE), { fit: true });
         } else if (band === 'upper' && o.net) {
-          wquad(b, w, { u0: r.u0 + 0.01, v0: r.v0, u1: r.u1 - 0.01, v1: r.v1 }, 0.05, NET, { ld: 0.4 });
+          wslab(b, w, r, 0, 0.03, 0.012, WHITE, { fit: true });
+          wquad(b, w, { u0: r.u0 - 0.04, v0: r.v0 - 0.02, u1: r.u1 + 0.04, v1: r.v1 + 0.02 }, 0.068, NET, { ld: 0.4 });
         } else {
           wslab(b, w, r, 0, 0.03, 0.012, WHITE, { fit: true });
           if (r.u1 - r.u0 > 0.24 && r.v1 - r.v0 > 0.3)
@@ -705,7 +706,7 @@ function workWall(b: Builder, w: Wall, o: { net?: boolean; padEvery?: number; no
     wslab(b, w, r, 0, 0.11, 0.01, WHITE, {});
     const g: P3[] = [wpt(w, r.u0 + 0.02, w.v1 - 0.1405, 0.02), wpt(w, r.u1 - 0.02, w.v1 - 0.1405, 0.02), wpt(w, r.u1 - 0.02, w.v1 - 0.1405, 0.075), wpt(w, r.u0 + 0.02, w.v1 - 0.1405, 0.075)];
     b.poly(g, glow(COOL, 5), { n: [0, -1, 0] });
-    b.line(wpt(w, r.u0 + 0.05, w.v1 - 0.15, 0.05), wpt(w, r.u1 - 0.05, w.v1 - 0.15, 0.05), add([0, -1, 0], mul(wnorm(w), 0.6)), COOL, 0.75);
+    b.line(wpt(w, r.u0 + 0.05, w.v1 - 0.15, 0.05), wpt(w, r.u1 - 0.05, w.v1 - 0.15, 0.05), add([0, -1, 0], mul(wnorm(w), 0.6)), COOL, 0.5);
   }
 }
 
@@ -718,7 +719,7 @@ function workCeiling(b: Builder, w: Wall, ribV: number[], stripsAt: number[]): v
     for (const r of subtract({ u0: x - 0.075, v0: w.v0 + 0.16, u1: x + 0.075, v1: w.v1 - 0.16 }, w.holes)) {
       wslab(b, w, r, 0, 0.075, 0.008, GUN);
       wquad(b, w, { u0: x - 0.028, v0: r.v0 + 0.02, u1: x + 0.028, v1: r.v1 - 0.02 }, 0.0755, glow(COOL, 5.5));
-      b.line(wpt(w, x, r.v0 + 0.05, 0.08), wpt(w, x, r.v1 - 0.05, 0.08), [0, -1, 0], COOL, 1.0);
+      b.line(wpt(w, x, r.v0 + 0.05, 0.08), wpt(w, x, r.v1 - 0.05, 0.08), [0, -1, 0], COOL, 0.8);
     }
   }
 }
@@ -1139,6 +1140,8 @@ function crate(b: Builder, x0: number, y0: number, z0: number, x1: number, y1: n
       for (const z of [z0, z1]) bx(b, x - 0.035, y0, z - 0.035, x + 0.035, y1 + 0.005, z + 0.035, GUN, 0.006);
     const fx = faceX > 0 ? x1 + 0.003 : x0 - 0.003;
     const cz = (z0 + z1) / 2;
+    for (const y of [y0 + 0.08, y1 - 0.08]) bx(b, faceX > 0 ? x1 : x0 - 0.012, y - 0.025, z0 + 0.02, faceX > 0 ? x1 + 0.012 : x0, y + 0.025, z1 - 0.02, GUN, 0.004, { noAuto: true });
+    for (const z of [z0 + 0.3, z1 - 0.3]) bx(b, faceX > 0 ? x1 : x0 - 0.008, y0 + 0.1, z - 0.02, faceX > 0 ? x1 + 0.008 : x0, y1 - 0.1, z + 0.02, mt('whitePanel', mul(tint, 0.8)), 0.004, { noAuto: true });
     b.poly([[fx, y1 - 0.2, cz - 0.3], [fx, y1 - 0.2, cz + 0.3], [fx, y1 - 0.11, cz + 0.3], [fx, y1 - 0.11, cz - 0.3]], WHITE, { rect: STENCIL[label], n: [faceX, 0, 0] });
     b.cyl([fx + faceX * 0.03, (y0 + y1) / 2, cz - 0.12], [fx + faceX * 0.03, (y0 + y1) / 2, cz + 0.12], 0.012, 6, GUN);
   }, true);

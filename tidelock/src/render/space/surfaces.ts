@@ -242,12 +242,12 @@ const GEN: Partial<Record<TileId, Gen>> = {
     o.ao = (0.5 + 0.5 * seam) * (1 - 0.18 * (1 - sm(0.0, 0.01, Math.abs(e - 0.05))) * (1 - step));
   },
   brushed(u, v, o) {
-    const st = nz(u, v * 37, 1, 4) * 0.6 + nz(u * 0.5, v * 151, 2, 5) * 0.4;
+    const st = nz(u, v * 90, 1, 4) * 0.6 + nz(u * 0.5, v * 180, 2, 5) * 0.4;
     const n1 = nz(u, v, 2, 6);
     const sc = scratch(u, v, 7, 21, 0.015);
-    const k = 0.92 + 0.12 * st + 0.05 * n1 + sc * 0.08;
-    set(o, 0.7 * k, 0.56 * k, 0.42 * k, 0.26 + 0.16 * st + 0.06 * n1 - sc * 0.08, 1);
-    o.h = 0.00003 * st;
+    const k = 0.95 + 0.07 * st + 0.04 * n1 + sc * 0.08;
+    set(o, 0.72 * k, 0.58 * k, 0.43 * k, 0.24 + 0.1 * st + 0.08 * n1 - sc * 0.08, 1);
+    o.h = 0.000008 * st;
     o.ao = 1;
   },
   gunmetal(u, v, o) {
@@ -350,10 +350,10 @@ const GEN: Partial<Record<TileId, Gen>> = {
     const w = nz(u, v, 2, 15);
     const rings = frac(v * 18 + w * 3.2 + nz(u, v * 4, 1, 16) * 1.5);
     const s = sm(0.0, 0.25, rings) * sm(1.0, 0.55, rings);
-    const pore = nz(u * 0.25, v, 40, 17) > 0.62 ? 1 : 0;
-    const k = 0.75 + 0.5 * s - 0.25 * pore;
-    set(o, 0.105 * k, 0.058 * k, 0.032 * k, 0.3 + 0.08 * w + pore * 0.15, 0);
-    o.h = -pore * 0.00006 + s * 0.00002;
+    const pore = sm(0.6, 0.72, nz(u * 0.25, v, 12, 17));
+    const k = 0.78 + 0.45 * s - 0.12 * pore;
+    set(o, 0.11 * k, 0.062 * k, 0.034 * k, 0.28 + 0.06 * w + pore * 0.06, 0);
+    o.h = -pore * 0.00002 + s * 0.00001;
     o.ao = 1;
   },
   warmPanel(u, v, o) {
@@ -750,7 +750,7 @@ export function createSurfaceShared(): SurfaceShared {
     uLmB: { value: null },
     uLmMix: { value: 1 },
     uUpK: { value: 0.55 },
-    uSpecK: { value: 0.5 },
+    uSpecK: { value: 1.0 },
     uGlow: { value: new THREE.Vector4(1, 1, 0.3, 1) },
     uGain: { value: 1 },
   };
