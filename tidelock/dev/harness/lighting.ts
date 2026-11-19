@@ -18,7 +18,8 @@
 //   rt=off|low|medium|high   ray-traced sunlight (default high, as the game)
 //   turn=deg            head yaw per frame over the last `moving` frames (ghosting check)
 //   spin=deg            ship yaw per frame over the last `moving` frames (the sun sweeps in ship space)
-//   moving=N            frames of motion at the end (default 2)
+//   moving=N            frames of motion at the end (default 2)          settle=0  do not wait for the atlas / photo upgrade
+//   rtdebug=1|2|3|4     forward debug view: traced visibility, bounce, reflections, reflection coverage
 //   fx=SBR              tracer effects on/off: sun, bounce, reflections (e.g. fx=100)
 //
 // interior=proxy builds a stand-in from src/data/interiors.ts with MeshStandardMaterial walls, window and
@@ -355,6 +356,8 @@ async function main(): Promise<void> {
   scene.setRayTracing(rtTier);
   // fx=SBR: per-effect switches of the tracer (sun, bounce, reflections), e.g. fx=100 for the sun alone
   const fxp = params.get('fx');
+  const dbg = num('rtdebug', 0);
+  if (dbg) (scene as unknown as { rt: RayTracer }).rt.debugView = dbg;
   if (fxp && fxp.length >= 3) {
     const tr = (scene as unknown as { rt: RayTracer }).rt;
     tr.effects.sun = fxp[0] === '1';
@@ -363,14 +366,20 @@ async function main(): Promise<void> {
   }
   await scene.setSystem(session.system, (f, label) => (info.textContent = `loading ${(f * 100).toFixed(0)}% ${label}`), { nearBodyId: session.flight().primaryId });
   const t1 = performance.now();
-  for (let i = 0; i < frames || (i < 120 && scene.busy()); i++) {
-    if (i >= frames - moving) {
-      spin += spinDeg * DEG;
-      headYaw += turnDeg * DEG;
-    }
+  // the interior's full-size atlas and photo scans arrive over frames: wait for them so views compare like for like
+  const upgrading = (): boolean => /upgrading|pending/.test((globalThis as { __tlInterior?: string }).__tlInterior ?? '');
+  const settle = num('settle', 1) === 1;
+  for (let i = 0; i < frames || (i < 120 && scene.busy()) || (settle && i < 400 && upgrading()); i++) {
     fill(1 / 30);
     scene.render(frame);
     if (i % 4 === 3) await new Promise((r) => setTimeout(r, 0));
+  }
+  // then the motion frames (ghosting checks): the head or the ship turning, the last frame is the shot
+  for (let k = 0; k < (turnDeg || spinDeg ? moving : 0); k++) {
+    spin += spinDeg * DEG;
+    headYaw += turnDeg * DEG;
+    fill(1 / 30);
+    scene.render(frame);
   }
   const st = scene.stats();
   const ps = pipeline.stats();

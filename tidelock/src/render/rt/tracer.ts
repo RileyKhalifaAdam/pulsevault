@@ -330,7 +330,13 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
     for (const t of [...gbuf, ...hist, rawT, denT!]) t.setSize(w, h);
     resetPending = true;
   }
+  /** The forward patch must never bind a texture that is gone (off, lost, resized away). */
+  function forwardOff(): void {
+    fu.uRtOn.value = 0;
+    fu.uRtA.value = fu.uRtB.value = fu.uRtDepth.value = fu.uRtG0.value = null;
+  }
   function disposeTargets(): void {
+    forwardOff();
     for (const t of [...gbuf, ...hist, rawT, denT]) {
       if (!t) continue;
       t.depthTexture?.dispose();
@@ -532,7 +538,7 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
     },
     skip() {
       valid = false;
-      fu.uRtOn.value = 0;
+      if (fu.uRtOn.value !== 0 || fu.uRtA.value) forwardOff();
       lastRays = 0;
     },
     bytesAt(tier, width, height) {
@@ -777,7 +783,7 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
 
       // the forward-shader patch (forward.ts) reads the denoised signals at full resolution
       fu.uRtOn.value = 1;
-      fu.uRtFx.value.set(f[0], f[1], f[2], f[3]);
+      fu.uRtFx.value.set(f[0], f[1], f[2], api.debugView > 0 && api.debugView < 5 ? 1 + api.debugView : 0);
       fu.uRtA.value = src.textures[0];
       fu.uRtB.value = src.textures[1];
       fu.uRtDepth.value = G.depthTexture;

@@ -25,7 +25,7 @@ export const RT_FORWARD_KEY = '|tl-rt-fwd-1';
 
 export interface RtForwardUniforms {
   uRtOn: THREE.IUniform<number>;
-  /** sun, bounce, reflections, (AO, unused here) — 1 = on */
+  /** sun, bounce, reflections — 1 = on; w: 0/1 normal, 2.. = debug view + 1 */
   uRtFx: THREE.IUniform<THREE.Vector4>;
   uRtA: THREE.IUniform<THREE.Texture | null>;
   uRtB: THREE.IUniform<THREE.Texture | null>;
@@ -155,6 +155,19 @@ if ( uRtOn > 0.5 ) {
 #if defined( RE_IndirectSpecular )
   if ( uRtFx.z > 0.5 ) radiance = mix( radiance, rtB.rgb, rtRK * ( 1.0 - smoothstep( uRtReflMax - 0.12, uRtReflMax, material.roughness ) ) );
 #endif
+  if ( uRtFx.w > 1.5 ) {
+    // debug views (RayTracer.debugView): 1 visibility, 2 bounce, 3 reflections, 4 reflection coverage
+    float dv = uRtFx.w - 1.0;
+    vec3 dc = dv < 1.5 ? vec3( rtA.a ) : dv < 2.5 ? rtA.rgb : dv < 3.5 ? rtB.rgb : vec3( rtRK );
+    reflectedLight.directDiffuse = dc;
+    reflectedLight.directSpecular = vec3( 0.0 );
+#if defined( RE_IndirectDiffuse )
+    irradiance = vec3( 0.0 );
+#endif
+#if defined( RE_IndirectSpecular )
+    radiance = vec3( 0.0 );
+#endif
+  }
 }
 #include <lights_fragment_end>`;
 

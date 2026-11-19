@@ -9,7 +9,8 @@
 //     ──► 1x1 adapted log2 exposure (ping-pong, ~1 s) read by the bloom prefilter and the composite
 //
 // Tiers come from src/app/perf.ts (TIER_SETTINGS): MSAA 4x on high / ultra, 2x on medium, FXAA on low
-// (and wherever multisampled half-float targets are refused).
+// (and wherever multisampled half-float targets are refused). setMsaaLimit caps it below the tier's: the scene
+// drops 4x to 2x when the ray tracer's buffers would take the page past its 300 MB GPU budget.
 //
 // A lean chain of full-screen-triangle passes instead of EffectComposer: no ping-pong copies, no
 // per-pass buffer allocation, and the one colour-space conversion is ours. Everything is linear
