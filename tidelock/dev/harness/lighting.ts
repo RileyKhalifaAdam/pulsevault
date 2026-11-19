@@ -383,32 +383,42 @@ async function main(): Promise<void> {
   }
   // suns=x,y,z;x,y,z;...  one load, several star directions (ship-local), tiled into one picture (per=N frames
   // each; pair=1 renders every direction with RT off, then on, side by side; labels name each tile)
-  const sunsP = params.get('suns');
+  // dbgs=0,1,3  several tracer debug views of the same direction(s) (0 final, 1 visibility, 2 bounce, 3 reflections)
+  // fit=cover    tiles are cropped to fill their cell (side-by-side comparisons keep full height)
+  const sunsP = params.get('suns') ?? (params.get('dbgs') ? `${sunL.x},${sunL.y},${sunL.z}` : null);
   if (sunsP) {
     const list = sunsP.split(';').map((s) => s.split(',').map(Number));
     const pair = num('pair', 0) === 1;
     const per = num('per', 16);
+    const dbgList = (params.get('dbgs') ?? `${dbg}`).split(',').map(Number);
+    const tr = (scene as unknown as { rt: RayTracer }).rt;
     const tiles: { c: HTMLCanvasElement; label: string }[] = [];
     for (const d of list) {
       for (const on of pair ? [false, true] : [true]) {
-        sunL.x = d[0];
-        sunL.y = d[1];
-        sunL.z = d[2];
-        scene.setRayTracing(on ? rtTier : 'off');
-        for (let i = 0; i < per; i++) {
-          if (i % 4 === 3) await new Promise((r) => setTimeout(r, 0));
-          fill(1 / 30);
-          scene.render(frame);
+        for (const dv of on ? dbgList : [0]) {
+          sunL.x = d[0];
+          sunL.y = d[1];
+          sunL.z = d[2];
+          scene.setRayTracing(on ? rtTier : 'off');
+          tr.debugView = dv;
+          for (let i = 0; i < per; i++) {
+            if (i % 4 === 3) await new Promise((r) => setTimeout(r, 0));
+            fill(1 / 30);
+            scene.render(frame);
+          }
+          const c2 = document.createElement('canvas');
+          c2.width = canvas.width;
+          c2.height = canvas.height;
+          c2.getContext('2d')?.drawImage(canvas, 0, 0); // same task as the render: the drawing buffer is still there
+          const dn = ['', ' · visibility', ' · bounce', ' · reflections', ' · refl coverage'][dv] ?? '';
+          tiles.push({ c: c2, label: `sun ${d.join(',')} · RT ${on ? rtTier : 'off'}${dn}` });
         }
-        const c2 = document.createElement('canvas');
-        c2.width = canvas.width;
-        c2.height = canvas.height;
-        c2.getContext('2d')?.drawImage(canvas, 0, 0); // same task as the render: the drawing buffer is still there
-        tiles.push({ c: c2, label: `sun ${d.join(',')} · RT ${on ? rtTier : 'off'}` });
       }
     }
-    const cols = pair ? 2 : Math.ceil(Math.sqrt(tiles.length));
+    tr.debugView = dbg;
+    const cols = num('cols', pair ? 2 : Math.ceil(Math.sqrt(tiles.length)));
     const rows = Math.ceil(tiles.length / cols);
+    const cover = params.get('fit') === 'cover';
     const grid = document.createElement('canvas');
     grid.width = canvas.width;
     grid.height = canvas.height;
@@ -418,14 +428,19 @@ async function main(): Promise<void> {
     g.fillRect(0, 0, grid.width, grid.height);
     const tw = grid.width / cols;
     const th = grid.height / rows;
-    const s = Math.min(tw / canvas.width, th / canvas.height);
+    const s = cover ? Math.max(tw / canvas.width, th / canvas.height) : Math.min(tw / canvas.width, th / canvas.height);
     tiles.forEach((t, i) => {
       const x = (i % cols) * tw;
       const y = Math.floor(i / cols) * th;
-      g.drawImage(t.c, x, y, canvas.width * s, canvas.height * s);
+      // source rect: the centre of the frame that fills the cell at scale s
+      const sw = Math.min(canvas.width, tw / s);
+      const sh = Math.min(canvas.height, th / s);
+      g.drawImage(t.c, (canvas.width - sw) / 2, (canvas.height - sh) / 2, sw, sh, x, y, sw * s, sh * s);
       g.fillStyle = '#ffd34d';
       g.font = `${Math.max(9, Math.round(grid.width / 50))}px monospace`;
       g.fillText(t.label, x + 4, y + th - 6);
+      g.fillStyle = '#000';
+      g.fillRect(x + tw - 1, y, 1, th);
     });
     document.body.appendChild(grid);
     info.style.visibility = 'hidden';

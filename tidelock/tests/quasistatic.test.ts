@@ -7,7 +7,7 @@ import { feltAt } from '../src/world/crew';
 import {
   afterContact, anchorDrift, bodyEvent, createQsState, crewQsHy, DRIFT_SLOP, dragK, dragStep, driftEval, driftToShip, loadQsState, makeQsWorld,
   MODE_CONTACT, MODE_DRIFT, MODE_REST, NEVER, nextBodyEvent, Q, qsStats, restHoldsJump, restMargin, rotSteps, saveQsState, scheduleDrift,
-  serviceBodies, tryRest, WHY_CONTACT, type QsBody, type QsWorld,
+  serviceBodies, supportMargin, tryRest, WHY_CONTACT, type QsBody, type QsWorld,
 } from '../src/world/quasistatic';
 
 const v3 = (x = 0, y = 0, z = 0): V3 => ({ x, y, z });
@@ -318,6 +318,17 @@ describe('scheduler independence and cost', () => {
     console.log(`[qs] µs (node): serviceBodies 30 drifting bodies ${pos.toFixed(3)} (${((pos / 30) * 1000).toFixed(0)} ns/body), one segment end (anchor + bound, 6 boxes + 29 bodies) ${ev.toFixed(3)}, nextBodyEvent(30) ${ne.toFixed(3)}`);
     expect(s).toBeGreaterThan(0);
     expect(pos).toBeLessThan(20);
+    // a triaxial spinning drifter under warp: cost per RK4 attitude step (the rotSteps budget unit)
+    const wr = makeQsWorld(new Float64Array(0), 0, 1, { I: [0.002, 0.006, 0.0075] });
+    const tb: QsBody = { p: v3(0, 1, 0), v: v3(), q: { x: 0, y: 0, z: 0, w: 1 }, w: v3(1.1, -0.4, 2.3), qs: createQsState() };
+    afterContact(tb, 0, [tb], wr, 0, motion(), ID, false, 0, 0, 0);
+    serviceBodies([tb], wr, 1, motion(), ID); // the monodromy (one period, once)
+    const est = rotSteps([tb], 20000);
+    t0 = performance.now();
+    for (let t = 20000; t <= 20000 * 400; t += 20000) serviceBodies([tb], wr, t, motion(), ID); // 1e4×-frames
+    const perEval = ((performance.now() - t0) * 1000) / 400, perStep = perEval / est;
+    console.log(`[qs] µs (node): triaxial drift attitude under warp (20000-tick quanta): ${perEval.toFixed(2)} µs per evaluation, budget ${est} RK4 steps (${perStep.toFixed(3)} µs per budgeted step; period ${tb.qs.rT.toFixed(3)} s, ${tb.qs.rn} steps)`);
+    expect(perStep).toBeLessThan(2);
   });
 });
 
@@ -381,6 +392,33 @@ describe('ship impulses reach drifting and resting bodies (D1)', () => {
     b = mk(g1); serviceBodies([b], w, 1, g1, ID, v3(0, 1, 0), null); expect(b.qs.mode).toBe(MODE_REST);
     b = mk(g1); serviceBodies([b], w, 1, g1, ID, v3(0, -0.1, 0), null); expect(b.qs.mode).toBe(MODE_CONTACT);
     expect(restHoldsJump(v3(0, -0.5, 0.2), v3(0, 1, 0), 0.5, -9.81, Q)).toBe(true); // |0.2| ≤ 0.5·(0.5 + 0.08)
+  });
+});
+
+describe('rest in an edge or a corner', () => {
+  it('a mug in the ceiling–bulkhead corner of a spinning ship rests there (no single face holds it); a jolt wakes it', () => {
+    // spin 0.05 rad/s about +X through the CoM: felt = ω²(0, y, z) at (0.6, 2.35, −2.95)
+    const W = v3(0.05, 0, 0), m = motion(v3(), W), w = world(1);
+    const b = body(v3(0.6, 2.35, -2.95), v3()), up = v3(0, -1, 0), aft = v3(0, 0, 1);
+    const f = feltAt(m, b.p.x, b.p.y, b.p.z, 0, 0, 0, v3());
+    expect(restMargin(f, up, 0.5)).toBeGreaterThan(0); expect(restMargin(f, aft, 0.5)).toBeGreaterThan(0); // neither face alone
+    expect(tryRest(b, 0.5, 0, m, aft.x, aft.y, aft.z)).toBe(false);
+    expect(afterContact(b, 0, [b], w, 0, m, ID, true, aft.x, aft.y, aft.z, up)).toBe(MODE_REST);
+    expect(supportMargin(v3(-f.x, -f.y, -f.z), b.qs, 0.5)).toBeLessThan(0);
+    for (let t = 1; t <= 600; t++) serviceBodies([b], w, t, m, ID);
+    expect(b.qs.mode).toBe(MODE_REST);
+    expect(nextBodyEvent([b], 600, 2048)).toBe(2048); // does not limit warp
+    const c = loadQsState(JSON.parse(JSON.stringify(saveQsState(b.qs))));
+    expect(c).toEqual(b.qs);
+    // a jolt into the corner is held, one out of it wakes the mug with the jump
+    serviceBodies([b], w, 601, m, ID, v3(0, -0.2, 0.2), null); // ship moves down/aft: the mug is pressed in
+    expect(b.qs.mode).toBe(MODE_REST);
+    serviceBodies([b], w, 602, m, ID, v3(0, 0, -0.2), null); // the ship moves forward: the mug leaves the bulkhead
+    expect(b.qs.mode).toBe(MODE_CONTACT); expect(b.v.z).toBeCloseTo(0.2, 15);
+    // three faces (a box corner) under a load into the vertex
+    const d = body(v3(1, 1, 1), v3()), g = motion(v3(0.3, -0.4, 0.5));
+    expect(tryRest(d, 0.1, 0, g, 0, -1, 0, v3(1, 0, 0), v3(0, 0, 1))).toBe(true); // felt (−0.3, 0.4, −0.5)
+    expect(tryRest(d, 0.1, 0, g, 0, -1, 0, v3(1, 0, 0))).toBe(false); // with only two of them the aft push is not held
   });
 });
 
@@ -497,6 +535,35 @@ function gapCapsule(p: V3, r: number, hy: number): number {
   return g;
 }
 
+describe('drag in the co-rotating cabin air', () => {
+  it('pillow released at rest in a ship turning at 0.1 rad/s, r = 2 m: the scheduled drift tracks RK4 for 5 s', () => {
+    const k = dragK(0.19, 0.45), W = v3(0, 0.1, 0), m = motion(v3(), W), qAt = (t: number): Quat => rotY(0.1 * t * Q);
+    const w = makeQsWorld(new Float64Array(0), 0, 1, { k: [k] });
+    const b = body(v3(2, 1.2, 0), v3()), B = [b];
+    afterContact(b, 0, B, w, 0, m, qAt(0), false, 0, 0, 0);
+    let tick = 0, segs = 0, maxErr = 0;
+    while (tick < 600) {
+      tick = Math.min(600, tick + nextBodyEvent(B, tick, 2048)); serviceBodies(B, w, tick, m, qAt(tick)); segs++;
+      const r = rk4Ship(m, k, [2, 1.2, 0, 0, 0, 0], tick * Q, 200 + tick * 10);
+      maxErr = Math.max(maxErr, Math.hypot(b.p.x - r[0], b.p.y - r[1], b.p.z - r[2]));
+    }
+    // the CONTACT path it replaces: semi-implicit Euler at Q with dragStep
+    const e = body(v3(2, 1.2, 0), v3()), F = v3();
+    for (let t = 0; t < 600; t++) {
+      feltAt(m, e.p.x, e.p.y, e.p.z, e.v.x, e.v.y, e.v.z, F);
+      e.v.x += F.x * Q; e.v.y += F.y * Q; e.v.z += F.z * Q; dragStep(e.v, k, Q);
+      e.p.x += e.v.x * Q; e.p.y += e.v.y * Q; e.p.z += e.v.z * Q;
+    }
+    const r = rk4Ship(m, k, [2, 1.2, 0, 0, 0, 0], 5, 20000), eulerErr = Math.hypot(e.p.x - r[0], e.p.y - r[1], e.p.z - r[2]);
+    console.log(`[qs] pillow in a turning ship: ${segs} segments over 5 s, max |Δp| vs RK4 ${(maxErr * 1000).toFixed(3)} mm (Euler at Q ${(eulerErr * 1000).toFixed(3)} mm; drag ignored: 5.1 mm)`);
+    expect(b.qs.mode).toBe(MODE_DRIFT);
+    // per segment ≤ ε_x = 1 mm and ε_v = 5 mm/s; the velocity part carries into later segments. Measured: 2.8 mm,
+    // half the no-drag error, but NOT better than Euler at Q here (0.46 mm) — the turning air is a first-order
+    // correction only (known limit; finer accuracy re-anchors would be the cheap fix)
+    expect(maxErr).toBeLessThan(4e-3);
+  });
+});
+
 describe('the crew drifts as its capsule (D6)', () => {
   it('floating feet-first toward the deck: CONTACT takes over before the feet touch', () => {
     const r = 0.28, hy = crewQsHy(1.75, 0.28);
@@ -549,9 +616,12 @@ const qmulT = (a: Quat, b: Quat): Quat => ({
   z: a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, w: a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
 });
 
+// triaxial: R(nT + τ) = Mⁿ·R(τ) with R(τ) on a fixed RK4 grid of ≤ ROT_STEP = 0.2 rad per step over one polhode
+// period (4th order): ~8e-6 rad of attitude error per rad turned (4.1e-4 rad after 20 s at |ω| ≈ 2.6 rad/s, 52 rad);
+// the props solver's own midpoint step at 0.2 rad is 2nd order.
 describe('drifting rotation (D10)', () => {
   const q0: Quat = (() => { const a = 0.7, s = Math.sin(a / 2) / Math.sqrt(3); return { x: s, y: -s, z: s, w: Math.cos(a / 2) }; })();
-  for (const [name, I, tol] of [['isotropic', [0.02, 0.02, 0.02], 1e-10], ['axisymmetric (mug-like)', [0.004, 0.0025, 0.004], 1e-10], ['triaxial (book)', [0.002, 0.006, 0.0075], 1e-4]] as const) {
+  for (const [name, I, tol] of [['isotropic', [0.02, 0.02, 0.02], 1e-10], ['axisymmetric (mug-like)', [0.004, 0.0025, 0.004], 1e-10], ['triaxial (book)', [0.002, 0.006, 0.0075], 1e-3]] as const) {
     it(`${name}: matches RK4 of the torque-free motion after 20 s in a turning ship; independent of evaluation pattern`, () => {
       const W = v3(0, 0.05, 0), m = motion(v3(), W), qAt = (t: number): Quat => rotY(0.05 * t * Q);
       const w = makeQsWorld(new Float64Array(0), 0, 1, { I: [...I] });
@@ -560,7 +630,13 @@ describe('drifting rotation (D10)', () => {
       afterContact(a, 0, [a], w, 0, m, qAt(0), false, 0, 0, 0);
       afterContact(b, 0, [b], w, 0, m, qAt(0), false, 0, 0, 0);
       const N = 20 * 120;
-      for (let t = 1; t <= N; t++) serviceBodies([a], w, t, m, qAt(t)); // every tick (1×)
+      let c: QsBody | null = null;
+      for (let t = 1; t <= N; t++) {
+        serviceBodies([a], w, t, m, qAt(t)); // every tick (1×)
+        if (c) serviceBodies([c], w, t, m, qAt(t));
+        if (t === 1001) c = { p: { ...a.p }, v: { ...a.v }, q: { ...a.q! }, w: { ...a.w! }, qs: loadQsState(JSON.parse(JSON.stringify(saveQsState(a.qs)))) };
+      }
+      expect(JSON.stringify([c!.q, c!.w, c!.qs])).toBe(JSON.stringify([a.q, a.w, a.qs])); // save → load mid-period
       for (let t = 0; t < N;) { t = Math.min(N, t + Math.min(997, nextBodyEvent([b], t, 2048))); serviceBodies([b], w, t, m, qAt(t)); } // warp quanta
       expect(JSON.stringify([a.q, a.w, a.qs])).toBe(JSON.stringify([b.q, b.w, b.qs]));
       // reference: inertial ω₀ = q·(w + W), L = R I Rᵀ ω₀ (here q = ID at t = 0)

@@ -4,7 +4,8 @@
 //
 // WIRING (wave 1, W1-E; nothing here is called yet):
 //   * hologram.ts rebuild (the `rmap`/`sc` block, "globe at 0.42 R, altitude compressed"): replace with
-//     `const s = holoScale(R, bodyR, ext)` and draw every point at r·s (globe radius bodyR·s). Delete uSpin
+//     `const s = holoScale(R, bodyR, ext)`; `rmap(r)` becomes `holoDisplayRadius(r, s)` and the globe radius `rg`
+//     becomes `holoDisplayRadius(bodyR, s)` (so `sc(r)` is the constant s). Delete uSpin
 //     (`(time * 0.12) % 2π`), the flicker and the dip. Zoom box: `holoZoom(range, boxHalf, out)` gives its scale and
 //     the round-km ring step. Meridians: rotate the globe by `body.spinAngle`; terminator from the star direction.
 //   * effects.ts plasma sheath (EffectsManager plasma / scene.ts setPlasma caller): direction `sheathDir(view.airVelocity,
@@ -13,9 +14,19 @@
 //   * scene.ts far bodies (`b.light = starIntensityAt(...) * starVisibility(...)` and the far point markers):
 //     unresolved worlds use `unresolvedIlluminance(E_sun, albedo, R, d, phaseAngle)`; `lambertPhase(α)` is Φ(α).
 //   * cockpit.ts / instruments.ts screens: one `ScreenGlass` per console; per frame (sim dt)
-//     `stepAutoBrightness(g, E_glass_lux, dtSim)`, then the screen emissive gain = g.L / SCREEN_L_REF and the veil
-//     `veilLuminance(E_glass_lux)` added (cd/m², converted with the pipeline's luminance scale). Glass diffuse
-//     albedo GLASS_RD in the material and in the RT record.
+//     E_glass_lux = glassIlluminance(starIlluminanceLux(star.luminosity, ds, star.temperature), vis, cosIncidence,
+//     windowT) (the star's light on the glass through the canopy); `stepAutoBrightness(g, E_glass_lux, dtSim)`; then
+//     emissive = g.L · renderPerNit(starIntensityAt(ds, lum), E_unshadowed_lux) in render units, and the veil is the
+//     glass's own diffuse term (albedo GLASS_RD in the material and the RT record; veilLuminance is its cd/m² for
+//     tests). renderPerNit is the photometric calibration this pipeline lacked: key level ↔ lux.
+//   * W1-A perf-invisible-instruments: `cockpitScreensVisible(camLocal, planes, room, glass, n)` with room =
+//     the `cockpit` room's box of data/interiors.ts (ship-local, min xyz then max xyz), glass the console screen
+//     quads (cockpit.ts builds them; ship-local), camLocal the camera in ship axes, and
+//     planes from `frustumPlanes(projectionMatrix × (shipWorld⁻¹·cameraWorld)⁻¹ (view matrix in ship axes), planes)`.
+//   * render/frame.ts gets the EyeFrameFields (`eyesClosed`, `lid`) on day 1 (W1-E owns that file; the fields are
+//     defined here so the change is one spread); app.ts sets lid from the crew's sleep state; scene/pipeline call
+//     `eyesTransition(prevClosed, frame.eyesClosed)` and on EYES_WAKE reset RT history; under eyesClosed skip RT,
+//     shadow and probe updates.
 //   * post composite (eyes closed, W1-E 10): multiply by `eyelidTransmission(frame.eyesClosed, out)` per channel.
 //   * every visual relaxation (nozzle glow, glare easing): `relaxExact(x, target, dtSim, tau)`.
 //   * the cloud phase uniform: `phaseNoWrap(t, rate, period)` — doubles, exact, continuous across a rotation.
@@ -163,4 +174,130 @@ export function phaseNoWrap(t: number, rate: number, period = 2 * Math.PI): numb
   const x = t * rate;
   const m = x - period * Math.floor(x / period);
   return m >= period ? 0 : m;
+}
+
+// =============================================================================================== hologram mapping
+
+/** The display radius of a point (or the globe) at distance r from the body centre: linear, r·s. */
+export function holoDisplayRadius(r: number, s: number): number {
+  return r * s;
+}
+
+// =============================================================================================== photometry
+
+const PLANCK_H = 6.62607015e-34, LIGHT_C = 2.99792458e8, BOLTZ_K = 1.380649e-23, STEFAN = 5.670374419e-8;
+/** The solar constant at 1 AU, W/m² (stellarFlux units → W/m²). */
+export const SOLAR_CONSTANT = 1361;
+/** Astronomical unit, m. */
+export const AU_M = 1.495978707e11;
+
+/**
+ * Luminous efficacy of a blackbody at T (lm per radiated W): 683·∫B_λ·V(λ)dλ / (σT⁴/π) over 360–830 nm, with the
+ * Gaussian photopic V(λ) = 1.019·exp(−285.4(λ_µm − 0.559)²). 3482 K → 36.6 lm/W (the plan's 36.7), 5772 K → 92.
+ * O(400): call once per star at load, not per frame.
+ */
+export function blackbodyEfficacy(T: number): number {
+  const N = 400, l0 = 360e-9, dl = (830e-9 - l0) / N;
+  let sum = 0;
+  for (let i = 0; i < N; i++) {
+    const l = l0 + (i + 0.5) * dl;
+    const B = (2 * PLANCK_H * LIGHT_C * LIGHT_C) / (l ** 5 * (Math.exp((PLANCK_H * LIGHT_C) / (l * BOLTZ_K * T)) - 1));
+    const u = l * 1e6 - 0.559;
+    sum += B * 1.019 * Math.exp(-285.4 * u * u) * dl;
+  }
+  return (683 * Math.PI * sum) / (STEFAN * T ** 4);
+}
+
+/** Illuminance (lx) on a surface facing a star of `luminosity` Sols and temperature T at `dist` m (unshadowed). */
+export function starIlluminanceLux(luminosity: number, dist: number, T: number, efficacy = blackbodyEfficacy(T)): number {
+  const au = dist / AU_M;
+  return ((SOLAR_CONSTANT * luminosity) / (au * au)) * efficacy;
+}
+
+/** Illuminance on the console glass (lx): E·visibility·max(0, cos incidence)·window transmission. */
+export function glassIlluminance(eLux: number, vis: number, cosInc: number, windowT: number): number {
+  const c = cosInc > 0 ? cosInc : 0;
+  return eLux * (vis > 0 ? vis : 0) * c * windowT;
+}
+
+/**
+ * The photometric calibration of this pipeline: render units per cd/m². The scene lights a white Lambert surface
+ * to radiance `keyLevel` (starIntensityAt; key.intensity = π·level) where physically it has E/π cd/m², so
+ * 1 cd/m² = π·keyLevel/E render units (keyLevel and E both before the shadow factor, so it stays defined at night).
+ */
+export function renderPerNit(keyLevel: number, eLuxUnshadowed: number): number {
+  return eLuxUnshadowed > 0 ? (Math.PI * keyLevel) / eLuxUnshadowed : 0;
+}
+
+// =============================================================================================== screens visible (item 11)
+
+/**
+ * Six frustum planes (a, b, c, d per plane, inside when a·x + b·y + c·z + d ≥ 0) from a column-major 4×4
+ * view-projection matrix (three.js Matrix4.elements), Gribb–Hartmann. Not normalised (only signs are used).
+ */
+export function frustumPlanes(m: ArrayLike<number>, out: Float64Array): Float64Array {
+  // row i of the matrix: m[i], m[4 + i], m[8 + i], m[12 + i]
+  for (let p = 0; p < 6; p++) {
+    const row = p >> 1, sgn = p & 1 ? -1 : 1;
+    for (let k = 0; k < 4; k++) out[p * 4 + k] = m[k * 4 + 3] + sgn * m[k * 4 + row];
+  }
+  return out;
+}
+
+
+/**
+ * W1-E item 11: true when any console glass quad can be on screen: the camera is inside the cockpit room (outside,
+ * the opaque hull hides every console), the quad faces the camera, and no frustum plane has all four corners
+ * outside. `glass` holds 12 numbers per quad (corners a, b, c, d counter-clockwise seen from the front),
+ * cockpit-local axes like `cam` and the planes. Conservative (may say visible when hidden behind a seat).
+ */
+export function cockpitScreensVisible(cam: V3, planes: Float64Array, room: ArrayLike<number>, glass: ArrayLike<number>, nQuads: number): boolean {
+  if (cam.x < room[0] || cam.y < room[1] || cam.z < room[2] || cam.x > room[3] || cam.y > room[4] || cam.z > room[5]) return false;
+  for (let q = 0; q < nQuads; q++) {
+    const o = q * 12;
+    const ax = glass[o], ay = glass[o + 1], az = glass[o + 2];
+    const ux = glass[o + 3] - ax, uy = glass[o + 4] - ay, uz = glass[o + 5] - az;
+    const vx = glass[o + 6] - ax, vy = glass[o + 7] - ay, vz = glass[o + 8] - az;
+    const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    if (nx * (cam.x - ax) + ny * (cam.y - ay) + nz * (cam.z - az) <= 0) continue; // seen from behind
+    let inside = true;
+    for (let p = 0; p < 6 && inside; p++) {
+      const a = planes[p * 4], b = planes[p * 4 + 1], c = planes[p * 4 + 2], d = planes[p * 4 + 3];
+      let anyIn = false;
+      for (let k = 0; k < 4; k++) {
+        const x = glass[o + k * 3], y = glass[o + k * 3 + 1], z = glass[o + k * 3 + 2];
+        if (a * x + b * y + c * z + d >= 0) { anyIn = true; break; }
+      }
+      inside = anyIn;
+    }
+    if (inside) return true;
+  }
+  return false;
+}
+
+// =============================================================================================== eyes closed (item 10)
+
+/** The frame fields render/frame.ts gains on day 1 (defaults: open). */
+export interface EyeFrameFields {
+  /** The lids are shut: skip RT, shadow and probe updates; the composite multiplies by eyelidTransmission(lid). */
+  eyesClosed: boolean;
+  /** Closedness 0 (open) … 1 (shut). */
+  lid: number;
+}
+export const EYE_FIELDS_DEFAULT: Readonly<EyeFrameFields> = { eyesClosed: false, lid: 0 };
+/** Above this closedness the lids pass < 5% everywhere: the frame counts as eyes-closed. */
+export const LID_SHUT = 0.999;
+export const EYES_SAME = 0, EYES_CLOSING = 1, EYES_WAKE = 2;
+
+/** Write the frame fields from the lid closedness. */
+export function setEyeFields(f: EyeFrameFields, lid: number): EyeFrameFields {
+  const l = lid > 0 ? (lid < 1 ? lid : 1) : 0;
+  f.lid = l;
+  f.eyesClosed = l >= LID_SHUT;
+  return f;
+}
+
+/** The transition between two frames: EYES_WAKE means reset the RT history (its accumulated frames are stale). */
+export function eyesTransition(wasClosed: boolean, isClosed: boolean): number {
+  return wasClosed === isClosed ? EYES_SAME : isClosed ? EYES_CLOSING : EYES_WAKE;
 }

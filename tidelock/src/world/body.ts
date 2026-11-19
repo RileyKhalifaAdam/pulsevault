@@ -30,8 +30,9 @@
 //   sphere (r 0.10 m) never passes through glass.
 // - Save: saveHarnessBody / loadHarnessBody, saveFootBody / loadFootBody (loader defaults for old saves).
 // - Plan W1-C item 2 says "8–10 cm on the head" for a 2 m/s capture; its own parameters (head ω 2π·2 Hz, ζ 0.6,
-//   harness ζ 0.3) give a head lag of 7.95 cm for a rigid stop but 10–11 cm with the harness rebound, and
-//   12–14 cm head-to-seat. Kept at the plan's parameters; the owner decides (tests/body.test.ts proves the split).
+//   harness ζ 0.3) give a head lag of 7.94 cm for a rigid stop but 10–11 cm with the harness rebound, and
+//   12–14 cm head-to-seat. Kept at the plan's parameters; the owner decides (tests/body.test.ts: the rigid-stop check passes, the plan-band
+//   check is it.fails until SIMULATION.md changes the figure or the head ω / ζ).
 //
 // Transcendentals: only at module load (coefficients) and in rare off-tick paths, through the m* wrappers
 // below; wave 1 moves them into src/world/math.ts with the rest of the wrappers (§1.1 rule 6).
@@ -504,6 +505,7 @@ const AX = new Float64Array(3);
 const AV = new Float64Array(3);
 const AF = new Float64Array(3);
 const AV0 = new Float64Array(3);
+const fin = (x: number): number => (x - x === 0 ? x : 0);
 
 function ensureRt(def: HarnessDef, hs: number): void {
   if (def.rtH === hs) return;
@@ -520,7 +522,7 @@ function ensureRt(def: HarnessDef, hs: number): void {
  * lean at its target unless the muscles cannot hold it (|f_d|·LEAN_MASS > LEAN_FMAX: it sags to a stop).
  */
 export function harnessEquilibrium(b: HarnessBody, def: HarnessDef, f: V3, dir: V3 | null, leanMax: number): void {
-  AF[0] = f.x; AF[1] = f.y; AF[2] = f.z;
+  AF[0] = fin(f.x); AF[1] = fin(f.y); AF[2] = fin(f.z);
   AX[0] = b.x.x; AX[1] = b.x.y; AX[2] = b.x.z;
   for (let a = 0; a < 3; a++) {
     const fa = AF[a];
@@ -538,7 +540,7 @@ export function harnessEquilibrium(b: HarnessBody, def: HarnessDef, f: V3, dir: 
 export function leanEquilibrium(b: LeanState, f: V3, dir: V3 | null, leanMax: number): void {
   const lim = leanMax > 0 ? leanMax : 0;
   const t = b.leanT < 0 ? 0 : b.leanT > lim ? lim : b.leanT;
-  const fd = dir ? f.x * dir.x + f.y * dir.y + f.z * dir.z : 0;
+  const fd = dir ? fin(f.x * dir.x + f.y * dir.y + f.z * dir.z) : 0;
   b.lean = LEAN_MASS * (fd < 0 ? -fd : fd) <= LEAN_FMAX ? t : fd < 0 ? 0 : lim;
   b.leanV = 0;
 }
@@ -558,7 +560,8 @@ export function stepHarnessBody(b: HarnessBody, def: HarnessDef, f: V3, dir: V3 
   if (h !== Q) { ensureRt(def, hs); pLo = def.rtLo; pHi = def.rtHi; }
   AX[0] = b.x.x; AX[1] = b.x.y; AX[2] = b.x.z;
   AV[0] = b.v.x; AV[1] = b.v.y; AV[2] = b.v.z;
-  AF[0] = f.x; AF[1] = f.y; AF[2] = f.z;
+  // a non-finite load (a bad ledger tick) counts as none: it must not poison the saved state
+  AF[0] = fin(f.x); AF[1] = fin(f.y); AF[2] = fin(f.z);
   const lo = def.lo, hi = def.hi, wLo = def.wLo, wHi = def.wHi;
   const head = h === Q ? PHI_HEAD : null;
   if (h !== Q && rtBraceH !== hs) { rtBraceE = mexp(-BRACE_BETA * hs); rtBraceH = hs; }
@@ -631,7 +634,7 @@ export function leanTick(b: LeanState, f: V3, dir: V3 | null, leanMax: number, h
 function leanSub(b: LeanState, f: V3, dir: V3 | null, leanMax: number, h: number, L: Float64Array): void {
   const lim = leanMax > 0 ? leanMax : 0;
   const t = b.leanT < 0 ? 0 : b.leanT > lim ? lim : b.leanT;
-  const fd = dir ? f.x * dir.x + f.y * dir.y + f.z * dir.z : 0;
+  const fd = dir ? fin(f.x * dir.x + f.y * dir.y + f.z * dir.z) : 0;
   const hs = h / SUBSTEPS, o = 0;
   const w2 = LEAN_OMEGA * LEAN_OMEGA, amax = LEAN_FMAX / LEAN_MASS;
   let x = b.lean, v = b.leanV;

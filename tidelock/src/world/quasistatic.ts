@@ -5,19 +5,22 @@
 // Three modes per body:
 //   CONTACT  stepped at Q by the existing solver (props.ts `sub`, crew.ts `sub`). Not handled here, except that
 //            serviceBodies applies the tick's ship impulse to its velocity (v_rel += −Δv − Δω×r, ω_rel −= Δω).
-//   REST     at rest on a surface (v_rel < 1e-3 m/s) inside the friction cone of the felt acceleration. It wakes
-//            when the felt acceleration leaves that cone by more than REST_WAKE_A = 1e-4 m/s², or when a ship
-//            impulse leaves the impulse cone (|J_t| ≤ μ(J_n + N·Q), J_n + N·Q ≥ 0). Slow forces (tides, gravity
-//            gradient: ~1e-5 m/s² in the cabin, wave 2) stay inside that margin, so they never keep a body awake;
-//            their rate bound `fDot` only schedules the next re-check (restWakeTicks).
+//   REST     at rest on up to three surfaces (v_rel < 1e-3 m/s), the felt load held by their friction cones
+//            (supportMargin). It wakes when the felt acceleration leaves them by more than REST_WAKE_A = 1e-4 m/s²,
+//            or when a ship impulse needs more than they give (reaction −j − f·Q, the same test). Slow forces
+//            (tides, gravity gradient: ~1e-5 m/s² in the cabin, wave 2) stay inside that margin, so they never
+//            keep a body awake; their rate bound `fDot` only schedules the next re-check (restWakeTicks).
 //   DRIFT    touching nothing, in the ship's CoM-centred inertial frame, in closed form:
 //            - no felt acceleration, or a velocity across it: x = x₀ + v₀t − ½a_s t² − D(t)û₀ with the exact
 //              fixed-direction quadratic drag |u| = |u₀|/(1 + k|u₀|t), D = |u₀|t − ln(1 + k|u₀|t)/k. The drag the
-//              felt part of the velocity would add is bounded and caps the segment (DRAG_EPS_X / _V).
+//              felt part of the velocity would add, and the change of the air-relative velocity as the cabin air
+//              turns with the ship (|ω|·|v| + |α|·|x|), are bounded and cap the segment (DRAG_EPS_X / _V).
 //            - velocity along the felt acceleration (released from rest under thrust or aerobrake): the exact 1-D
-//              solution of s' = A − k s|s| (tanh / coth / tan forms; terminal speed √(A/k)).
-//            - rotation: torque-free, constant inertial L; closed form for isotropic and axisymmetric inertia,
-//              fixed-grid RK4 steps (≤ ROT_STEP rad each) for triaxial bodies (rotSteps gives their cost).
+//              solution of s' = A − k s|s| (tanh / coth / tan forms; terminal speed √(A/k)), and the small cross
+//              velocity decaying as u⊥' = −k|s|u⊥ in closed form (φ = cosh c/cosh y …, its path via gd / asinh).
+//            - rotation: torque-free, constant inertial L; closed form for isotropic and axisymmetric inertia;
+//              triaxial: R(nT + τ) = Mⁿ·R(τ) with T the polhode period (AGM), R(τ) on a fixed RK4 grid (≤ ROT_STEP
+//              rad per step) over one period and M its monodromy: ≤ one period of steps per evaluation (rotSteps).
 //            Segments end at the first tick where a rigorous bound says the body might touch something (or after
 //            5 s, or 0.1/n). A change of the ship's acceleration re-anchors the body at the previous serviced tick
 //            (the ledger mean belongs to the interval since then) — cheap; it re-schedules (the box scan) only
@@ -36,11 +39,12 @@
 //   closed form, re-anchors / re-schedules, hands bodies to CONTACT and wakes RESTing bodies. Then the existing
 //   sub-steps run only over bodies with mode CONTACT (plus those they touch: the awake-island list). After the
 //   contact sub-steps, for each CONTACT body: afterContact(b, i, bodies, qw, tick, motion, craft.q, touching,
-//   supportNormal) — it enters REST or DRIFT. This replaces `asleep`/`still`/SLEEP_* and FLOAT_* and the global
-//   wake tests (WAKE_DA, WAKE_DW, α²). In the CONTACT sub-step, drag: dragStep(b.v, k, h).
+//   supportNormal[, n2, n3]) — it enters REST or DRIFT (pass up to three touching normals: a body in an edge or a
+//   corner rests there under a load no single face holds). This replaces `asleep`/`still`/SLEEP_* and FLOAT_* and
+//   the global wake tests (WAKE_DA, WAKE_DW, α²). In the CONTACT sub-step, drag: dragStep(b.v, k, h).
 // - W1-A's tick loop: q_next = min(warp quantum, nextBodyEvent(bodies, tick, maxTicks)) ticks; a result of 1
 //   with bodyEvent.why === WHY_CONTACT is `limitedBy: 'props'` (or 'crew' for the crew body). Budget a quantum
-//   at C_quantum + rotSteps(bodies, ticks)·0.05 µs (triaxial spinning drifters only).
+//   at C_quantum + rotSteps(bodies, ticks)·0.3 µs (node, warmed; triaxial spinning drifters only: ≤ ~80 steps each).
 // - The crew body uses the same three modes as its own QsWorld entry: p = the capsule CENTRE = crew.pos +
 //   (0, CREW_HEIGHT/2, 0) (crew.pos is the feet), r = CREW_RADIUS, hy = CREW_HEIGHT/2 − CREW_RADIUS (crewQsHy),
 //   k = dragK(0.6, 80), mu 0.7, no q/w (attitude is W2-E), selfJump = 1 (crew.ts applies the jump itself through
@@ -59,6 +63,7 @@ const mcos = (x: number): number => Math.cos(x);
 const msin = (x: number): number => Math.sin(x);
 const mtan = (x: number): number => Math.tan(x);
 const matan = (x: number): number => Math.atan(x);
+const masinh = (x: number): number => Math.asinh(x);
 const mpow = (x: number, y: number): number => Math.pow(x, y);
 
 export const Q = 1 / 120;
@@ -106,13 +111,19 @@ export const DRAG_EPS_V = 5e-3;
 export const ONE_D_REL = 0.02;
 /** Rotation per step of the triaxial RK4 grid, rad (props.ts ROT_STEP). */
 export const ROT_STEP = 0.2;
+/** A triaxial polhode needing more RK4 steps per period than this (near the separatrix) uses one long grid. */
+export const ROT_N_MAX = 4096;
 /** First search radius of the static grid, s of travel (a second pass widens it when nothing is that close). */
 export const GRID_PASS_T = 0.5;
 
 export interface QsState {
   mode: number;
-  /** REST: unit normal of the supporting surface (craft axes, out of the surface). */
+  /** REST: unit normals of the supporting surfaces (craft axes, out of the surface): n, and n2, n3 for an edge or a
+   * corner; nn = how many (1..3). */
   n: V3;
+  n2: V3;
+  n3: V3;
+  nn: number;
   /** DRIFT anchor, inertial axes, origin at the ship's CoM: position, velocity, the ship's proper acceleration
    * (constant on the segment) and the air-relative velocity at the anchor. */
   x0: V3;
@@ -132,12 +143,21 @@ export interface QsState {
   wB: number;
   alB: number;
   tickB: number;
-  /** Rotation anchor: attitude (object → inertial), inertial angular momentum (kg·m²/s), its tick; rn = ticks per
-   * RK4 step (triaxial; 0 = closed form, −1 = no rotation). */
+  /** Rotation anchor: attitude (object → inertial), inertial angular momentum (kg·m²/s), its tick; rn = RK4 steps
+   * per period (triaxial; 0 = closed form, −1 = no rotation). */
   rq: Quat;
   rL: V3;
   rTick: number;
   rn: number;
+  /** Triaxial: polhode period (s; 0 = none, near the separatrix: one long grid), grid step (s), the grid cache
+   * (attitude after rj steps of period rp), and the period's monodromy M = R(T)·R(0)⁻¹ (rMok = 1 once computed). */
+  rT: number;
+  rH: number;
+  rc: Quat;
+  rj: number;
+  rp: number;
+  rM: Quat;
+  rMok: number;
 }
 
 /** Anything that can drift or rest: centre position and velocity relative to the ship (craft axes) and its mode;
@@ -184,8 +204,9 @@ export interface QsWorld {
 const v3 = (): V3 => ({ x: 0, y: 0, z: 0 });
 
 export const createQsState = (): QsState => ({
-  mode: MODE_CONTACT, n: { x: 0, y: 1, z: 0 }, x0: v3(), v0: v3(), aS: v3(), u0: v3(), tick0: 0, tickEnd: 0, tickS: 0,
+  mode: MODE_CONTACT, n: { x: 0, y: 1, z: 0 }, n2: v3(), n3: v3(), nn: 1, x0: v3(), v0: v3(), aS: v3(), u0: v3(), tick0: 0, tickEnd: 0, tickS: 0,
   aR: v3(), dB: 0, dragB: 0, dragD: v3(), wB: 0, alB: 0, tickB: 0, rq: { x: 0, y: 0, z: 0, w: 1 }, rL: v3(), rTick: 0, rn: -1,
+  rT: 0, rH: 0, rc: { x: 0, y: 0, z: 0, w: 1 }, rj: 0, rp: 0, rM: { x: 0, y: 0, z: 0, w: 1 }, rMok: 0,
 });
 
 /** Drag constant k = ρ·C_dA/(2m), 1/m: the air-relative speed e-folds every 1/k of path (v = v₀/(1 + k v₀ t)). */
@@ -328,18 +349,79 @@ export function restWakeTicks(margin: number, fDot: number): number {
   return k < NEVER ? k : NEVER;
 }
 
+const NS: V3[] = [v3(), v3(), v3()];
+const RP: V3 = v3();
+
+/** Single-surface margin of a required reaction P (per unit mass) against the cone of n: |P_t| − μ·max(0, P·n) + max(0, −P·n). */
+function coneMargin(P: V3, n: V3, mu: number): number {
+  const pn = P.x * n.x + P.y * n.y + P.z * n.z, tx = P.x - pn * n.x, ty = P.y - pn * n.y, tz = P.z - pn * n.z;
+  return Math.sqrt(tx * tx + ty * ty + tz * tz) - mu * (pn > 0 ? pn : 0) + (pn < 0 ? -pn : 0);
+}
+
+/**
+ * Can the supports of a resting body (its nn normals) supply the reaction P (per unit mass: −f for a steady felt f,
+ * m/s²; −j − f·h for a jump j over a tick, m/s)? Returns a margin, ≤ 0 = held. Sufficient test, closed form: each
+ * single surface; each pair with the frictionless split P = λ₁n₁ + λ₂n₂ + r (λ ≥ 0, r ∥ n₁ × n₂ is tangential to
+ * both: |r| ≤ μ(λ₁ + λ₂)); the triple with P = Σλᵢnᵢ (λ ≥ 0). The smallest margin wins.
+ */
+export function supportMargin(P: V3, s: QsState, mu: number): number {
+  NS[0] = s.n; NS[1] = s.n2; NS[2] = s.n3;
+  const nn = s.nn >= 3 ? 3 : s.nn >= 2 ? s.nn : 1;
+  let best = coneMargin(P, s.n, mu);
+  for (let a = 1; a < nn; a++) { const g = coneMargin(P, NS[a], mu); if (g < best) best = g; }
+  for (let a = 0; a < nn; a++) for (let b = a + 1; b < nn; b++) {
+    const A = NS[a], B = NS[b], c = A.x * B.x + A.y * B.y + A.z * B.z, det = 1 - c * c;
+    if (!(det > 1e-9)) continue;
+    const pa = P.x * A.x + P.y * A.y + P.z * A.z, pb = P.x * B.x + P.y * B.y + P.z * B.z;
+    const la = (pa - c * pb) / det, lb = (pb - c * pa) / det;
+    let g: number;
+    if (la >= 0 && lb >= 0) {
+      RP.x = P.x - la * A.x - lb * B.x; RP.y = P.y - la * A.y - lb * B.y; RP.z = P.z - la * A.z - lb * B.z;
+      g = Math.sqrt(RP.x * RP.x + RP.y * RP.y + RP.z * RP.z) - mu * (la + lb);
+    } else g = la < lb ? -la : -lb;
+    if (g < best) best = g;
+  }
+  if (nn === 3) {
+    const A = NS[0], B = NS[1], C = NS[2];
+    // Cramer: λ = [A B C]⁻¹ P
+    const cx = B.y * C.z - B.z * C.y, cy = B.z * C.x - B.x * C.z, cz = B.x * C.y - B.y * C.x;
+    const det = A.x * cx + A.y * cy + A.z * cz;
+    if (Math.abs(det) > 1e-9) {
+      const la = (P.x * cx + P.y * cy + P.z * cz) / det;
+      const lb = (A.x * (P.y * C.z - P.z * C.y) + A.y * (P.z * C.x - P.x * C.z) + A.z * (P.x * C.y - P.y * C.x)) / det;
+      const lc = (A.x * (B.y * P.z - B.z * P.y) + A.y * (B.z * P.x - B.x * P.z) + A.z * (B.x * P.y - B.y * P.x)) / det;
+      const g = la >= 0 && lb >= 0 && lc >= 0 ? -mu * (la + lb + lc) : -Math.min(la, lb, lc);
+      if (g < best) best = g;
+    }
+  }
+  return best;
+}
+
 /** Felt acceleration at a point fixed in the ship (v = 0), with the motion's terms. */
 function feltFixed(m: BodyMotion, p: V3): V3 {
   return feltAt(m, p.x, p.y, p.z, 0, 0, 0, F);
 }
 
-/** Put a body that came to rest on a surface (unit normal n, craft axes) into REST if the cone holds. */
-export function tryRest(b: QsBody, mu: number, tick: number, m: BodyMotion, nx: number, ny: number, nz: number): boolean {
+const NF: V3 = v3();
+/** Margin of the felt load at the resting body against its supports (supportMargin with P = −f), m/s². */
+function feltMargin(s: QsState, f: V3, mu: number): number {
+  NF.x = -f.x; NF.y = -f.y; NF.z = -f.z;
+  return supportMargin(NF, s, mu);
+}
+
+/**
+ * Put a body that came to rest on a surface (unit normal n, craft axes) into REST if the cone holds. An edge or a
+ * corner: pass the other contact normals as n2, n3 (unit, craft axes; null = none).
+ */
+export function tryRest(b: QsBody, mu: number, tick: number, m: BodyMotion, nx: number, ny: number, nz: number, n2: V3 | null = null, n3: V3 | null = null): boolean {
   const v = b.v;
   if (v.x * v.x + v.y * v.y + v.z * v.z >= REST_V * REST_V) return false;
   const s = b.qs;
   s.n.x = nx; s.n.y = ny; s.n.z = nz;
-  const g = restMargin(feltFixed(m, b.p), s.n, mu);
+  s.nn = 1;
+  if (n2) { s.n2.x = n2.x; s.n2.y = n2.y; s.n2.z = n2.z; s.nn = 2; } else { s.n2.x = s.n2.y = s.n2.z = 0; }
+  if (n2 && n3) { s.n3.x = n3.x; s.n3.y = n3.y; s.n3.z = n3.z; s.nn = 3; } else { s.n3.x = s.n3.y = s.n3.z = 0; }
+  const g = feltMargin(s, feltFixed(m, b.p), mu);
   if (!(g <= REST_ENTER_A)) return false;
   s.mode = MODE_REST;
   v.x = v.y = v.z = 0;
@@ -376,6 +458,8 @@ const lnsinh = (y: number): number => y + mlog(-mexpm1(-2 * y)) - Math.LN2;
 /** tanh y, y ≥ 0. */
 const tanhP = (y: number): number => { const e = mexp(-2 * y); return -mexpm1(-2 * y) / (1 + e); };
 const atanhP = (x: number): number => 0.5 * mlog1p((2 * x) / (1 - x));
+/** Gudermannian gd y = atan(sinh y) = 2·atan(tanh(y/2)) (overflow-free). */
+const gd = (y: number): number => 2 * matan(tanhP(0.5 * y));
 
 /** Closed-form drift state at `tick`, inertial axes (CoM-centred): position into x, velocity into vOut. */
 export function driftEval(s: QsState, tick: number, k: number, x: V3, vOut: V3): void {
@@ -383,23 +467,39 @@ export function driftEval(s: QsState, tick: number, k: number, x: V3, vOut: V3):
   const a = s.aS, u = s.u0, x0 = s.x0, v0 = s.v0;
   const mode = t > 0 ? dragMode(s, k) : 0;
   if (mode === 2) {
-    // 1-D along ê = −â_s: s' = A − k s|s|; v = v₀ + (s − s₀)ê, x = x₀ + v₀t + (S − s₀t)ê
+    // 1-D along ê = −â_s: s' = A − k s|s|; the cross velocity u⊥ = u₀ − s₀ê decays as u⊥' = −k|s|u⊥ (|u| ≈ |s|):
+    // u⊥(t) = φ(t)u⊥₀ with φ = exp(−k∫|s|), and its path Φ(t) = ∫φ, both closed form on each branch (k·v_t = g).
+    // v = v₀ + (s − s₀)ê + (φ − 1)u⊥₀, x = x₀ + v₀t + (S − s₀t)ê + (Φ − t)u⊥₀
     const A = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z), ex = -a.x / A, ey = -a.y / A, ez = -a.z / A;
-    const s0 = u.x * ex + u.y * ey + u.z * ez, vt = Math.sqrt(A / k), g = Math.sqrt(A * k), ik = 1 / k;
-    let sp: number, S: number;
+    const s0 = u.x * ex + u.y * ey + u.z * ez, vt = Math.sqrt(A / k), g = Math.sqrt(A * k), ik = 1 / k, ig = 1 / g;
+    let sp: number, S: number, ph: number, Ph: number;
     if (s0 >= 0) {
       const r = s0 / vt;
-      if (r === 1) { sp = vt; S = vt * t; }
-      else if (r < 1) { const c = atanhP(r), y = c + g * t; sp = vt * tanhP(y); S = (lncosh(y) - lncosh(c)) * ik; }
-      else { const c = atanhP(1 / r), y = c + g * t; sp = vt / tanhP(y); S = (lnsinh(y) - lnsinh(c)) * ik; }
+      if (r === 1) { sp = vt; S = vt * t; ph = mexp(-g * t); Ph = -mexpm1(-g * t) * ig; }
+      else if (r < 1) {
+        const c = atanhP(r), y = c + g * t, lc = lncosh(c);
+        sp = vt * tanhP(y); S = (lncosh(y) - lc) * ik;
+        ph = mexp(lc - lncosh(y)); Ph = mexp(lc) * (gd(y) - gd(c)) * ig;
+      } else {
+        const c = atanhP(1 / r), y = c + g * t, ls = lnsinh(c);
+        sp = vt / tanhP(y); S = (lnsinh(y) - ls) * ik;
+        ph = mexp(ls - lnsinh(y)); Ph = mexp(ls) * (mlog(tanhP(0.5 * y)) - mlog(tanhP(0.5 * c))) * ig;
+      }
     } else {
-      const th0 = matan(s0 / vt), t1 = -th0 / g;
-      if (t <= t1) { const th = th0 + g * t; sp = vt * mtan(th); S = -(mlog(mcos(th)) - mlog(mcos(th0))) * ik; }
-      else { const y = g * (t - t1); sp = vt * tanhP(y); S = mlog(mcos(th0)) * ik + lncosh(y) * ik; }
+      const th0 = matan(s0 / vt), t1 = -th0 / g, c0 = mcos(th0), g0 = masinh(s0 / vt);
+      if (t <= t1) {
+        const th = th0 + g * t, tt = mtan(th);
+        sp = vt * tt; S = -(mlog(mcos(th)) - mlog(c0)) * ik;
+        ph = c0 / mcos(th); Ph = c0 * (masinh(tt) - g0) * ig;
+      } else {
+        const y = g * (t - t1), lh = lncosh(y);
+        sp = vt * tanhP(y); S = mlog(c0) * ik + lh * ik;
+        ph = c0 * mexp(-lh); Ph = c0 * (gd(y) - g0) * ig;
+      }
     }
-    const dS = S - s0 * t, dv = sp - s0;
-    x.x = x0.x + v0.x * t + dS * ex; x.y = x0.y + v0.y * t + dS * ey; x.z = x0.z + v0.z * t + dS * ez;
-    vOut.x = v0.x + dv * ex; vOut.y = v0.y + dv * ey; vOut.z = v0.z + dv * ez;
+    const dS = S - s0 * t, dv = sp - s0, cx = u.x - s0 * ex, cy = u.y - s0 * ey, cz = u.z - s0 * ez, dP = Ph - t, dq = ph - 1;
+    x.x = x0.x + v0.x * t + dS * ex + dP * cx; x.y = x0.y + v0.y * t + dS * ey + dP * cy; x.z = x0.z + v0.z * t + dS * ez + dP * cz;
+    vOut.x = v0.x + dv * ex + dq * cx; vOut.y = v0.y + dv * ey + dq * cy; vOut.z = v0.z + dv * ez + dq * cz;
     return;
   }
   let px = x0.x + v0.x * t - 0.5 * a.x * t * t, py = x0.y + v0.y * t - 0.5 * a.y * t * t, pz = x0.z + v0.z * t - 0.5 * a.z * t * t;
@@ -419,7 +519,8 @@ export function driftEval(s: QsState, tick: number, k: number, x: V3, vOut: V3):
  * The drag model's excess approach acceleration beyond max(0, n·a_s): for every unit n, −n·(model's x'' + a_s)
  * ≤ max(0, n·a_s)·0 + mag·max(0, n·dir). Fixed-direction model: k|u₀|² along û₀. 1-D model (s = u·ê, ê = −â):
  * 0 ≤ s₀ ≤ v_t adds nothing (the net acceleration is λ(−a_s), λ ∈ [0, 1]); s₀ > v_t: (k s₀² − A) along ê;
- * s₀ < 0: k s₀² along −ê. Returns mag; the direction goes to DD.
+ * s₀ < 0: k s₀² along −ê; plus the cross drag k·max(|s₀|, v_t)·|u⊥₀| along +û⊥₀ (both: isotropic, DD = 0).
+ * Returns mag; the direction goes to DD (DD = 0 with mag > 0 means every direction).
  */
 const DD: V3 = v3();
 function dragExcess(s: QsState, k: number): number {
@@ -430,9 +531,16 @@ function dragExcess(s: QsState, k: number): number {
   if (mode === 1) { const l = Math.sqrt(uu); DD.x = u.x / l; DD.y = u.y / l; DD.z = u.z / l; return k * uu; }
   const a = s.aS, A = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z), ex = -a.x / A, ey = -a.y / A, ez = -a.z / A;
   const s0 = u.x * ex + u.y * ey + u.z * ez, ks = k * s0 * s0;
-  if (s0 < 0) { DD.x = -ex; DD.y = -ey; DD.z = -ez; return ks; }
-  if (ks > A) { DD.x = ex; DD.y = ey; DD.z = ez; return ks - A; }
-  return 0;
+  let e1 = 0;
+  if (s0 < 0) { DD.x = -ex; DD.y = -ey; DD.z = -ez; e1 = ks; }
+  else if (ks > A) { DD.x = ex; DD.y = ey; DD.z = ez; e1 = ks - A; }
+  // the cross drag −k|s|u⊥ (|s| ≤ max(|s₀|, v_t), |u⊥| ≤ |u⊥₀|) along −û⊥₀: approach excess along +û⊥₀
+  const cx = u.x - s0 * ex, cy = u.y - s0 * ey, cz = u.z - s0 * ez, cl = Math.sqrt(cx * cx + cy * cy + cz * cz);
+  if (!(cl > 0)) return e1;
+  const as = s0 < 0 ? -s0 : s0, vt = Math.sqrt(A / k), e2 = k * (as > vt ? as : vt) * cl;
+  if (e1 > 0) { DD.x = 0; DD.y = 0; DD.z = 0; return e1 + e2; } // two directions: isotropic (DD = 0)
+  DD.x = cx / cl; DD.y = cy / cl; DD.z = cz / cl;
+  return e2;
 }
 
 /** Inertial state at the ship frame: p = q⁻¹x, v = q⁻¹v_in − ω × p. */
@@ -487,8 +595,8 @@ const NI: V3 = v3();
  * dragB along d̂ the drag model's excess (dragExcess), and r_eff bounds |x(τ)|
  * over DRIFT_MAX (the walls sweep as the ship turns). Other bodies take half their gap each, isotropic. Every gap
  * gets DRIFT_SLOP. With a static grid only boxes within the isotropic reach are visited (two passes). Then the
- * caps: DRIFT_MAX, DRIFT_N/n, 0.2/|ω| with drag (the air co-rotates), and the neglected-drag caps of the
- * fixed-direction model under a felt acceleration. The schedule fields (aR, dB, wB, alB) must be set.
+ * caps: DRIFT_MAX, DRIFT_N/n, and the neglected-drag caps (the felt part of the fixed-direction model, the
+ * co-rotating cabin air, the 1-D model's cross terms). The schedule fields (aR, dB, wB, alB) must be set.
  */
 export function driftBound(b: QsBody, i: number, bodies: readonly QsBody[], w: QsWorld, m: BodyMotion, q: Quat): number {
   const s = b.qs, p = b.p, r = w.r[i], k = w.k[i], hy = w.hy ? w.hy[i] : 0;
@@ -499,29 +607,36 @@ export function driftBound(b: QsBody, i: number, bodies: readonly QsBody[], w: Q
   const cRot = wB * rEff, aRot = alB * rEff;
   let best = DRIFT_MAX;
   if (m.n2 > 0) { const c = DRIFT_N / Math.sqrt(m.n2); if (c < best) best = c; }
-  const W = m.w, wl = Math.sqrt(W.x * W.x + W.y * W.y + W.z * W.z);
   const dm = dragMode(s, k);
-  if (dm !== 0 && wl > 0) { const c = 0.2 / wl; if (c < best) best = c; }
-  if (dm === 1 && al2 > 0) {
-    // the felt part of the velocity is not dragged: k(U A t³/3 + A² t⁴/12) < ε_x, k(U A t² + A² t³/3) < ε_v
-    const u = s.u0, U = Math.sqrt(u.x * u.x + u.y * u.y + u.z * u.z), A = al2;
-    let c = mpow((6 * DRAG_EPS_X) / (k * A * A), 0.25);
-    if (c < best) best = c;
-    c = mpow((1.5 * DRAG_EPS_V) / (k * A * A), 1 / 3);
-    if (c < best) best = c;
-    if (U > 0) {
-      c = mpow((1.5 * DRAG_EPS_X) / (k * U * A), 1 / 3);
+  if (k > 0) {
+    // the models drag a fixed direction (û₀, or ê with u⊥₀ decaying in place); what they leave out acts on the
+    // air-relative velocity like an extra acceleration A_n: the felt part (fixed-direction model only) and the
+    // turning cabin air, u = v − ω×x ⇒ |du/dt − model| ≤ |ω|·|v| + |α|·|x|. Its drag error is at most
+    // k(2U·A_n·t + A_n²t²) (U = the model's air speed bound): ∫ < ε_v, ∫∫ < ε_x.
+    const u = s.u0, vmax = vl + (al2 + dB + dragB) * best;
+    let U = Math.sqrt(u.x * u.x + u.y * u.y + u.z * u.z);
+    if (dm === 2) { const vt = Math.sqrt(al2 / k); if (vt > U) U = vt; }
+    const An = wB * vmax + alB * rEff + (dm === 1 ? al2 : 0);
+    if (An > 0) {
+      let c = mpow((6 * DRAG_EPS_X) / (k * An * An), 0.25);
       if (c < best) best = c;
-      c = Math.sqrt(DRAG_EPS_V / (2 * k * U * A));
+      c = mpow((1.5 * DRAG_EPS_V) / (k * An * An), 1 / 3);
       if (c < best) best = c;
+      if (U > 0) {
+        c = mpow((1.5 * DRAG_EPS_X) / (k * U * An), 1 / 3);
+        if (c < best) best = c;
+        c = Math.sqrt(DRAG_EPS_V / (2 * k * U * An));
+        if (c < best) best = c;
+      }
     }
   }
   if (dm === 2) {
-    // the 1-D form does not drag the cross velocity u⊥: k·u_max·|u⊥|·t < ε_v, ½k·u_max·|u⊥|·t² < ε_x
+    // the 1-D form drags u⊥ with |s| instead of |u| and ê with k s|s| instead of k s|u|: both errors ≤ k|u⊥₀|²
+    // (|u| − |s| ≤ |u⊥|²/|u|): 2k|u⊥₀|²·t < ε_v, k|u⊥₀|²·t² < ε_x
     const u = s.u0, A = al2, ex = -aR.x / A, ey = -aR.y / A, ez = -aR.z / A, s0 = u.x * ex + u.y * ey + u.z * ez;
-    const px = u.x - s0 * ex, py = u.y - s0 * ey, pz = u.z - s0 * ez, up = Math.sqrt(px * px + py * py + pz * pz);
-    if (up > 0) {
-      const uu = Math.sqrt(u.x * u.x + u.y * u.y + u.z * u.z), vt = Math.sqrt(A / k), r1 = k * (uu > vt ? uu : vt) * up;
+    const px = u.x - s0 * ex, py = u.y - s0 * ey, pz = u.z - s0 * ez, up2 = px * px + py * py + pz * pz;
+    if (up2 > 0) {
+      const r1 = 2 * k * up2;
       let c = DRAG_EPS_V / r1;
       if (c < best) best = c;
       c = Math.sqrt((2 * DRAG_EPS_X) / r1);
@@ -586,7 +701,7 @@ function boxTime(
     nx /= d; ny /= d; nz /= d;
     rot(NI, q, nx, ny, nz);
     const vn = NI.x * v0.x + NI.y * v0.y + NI.z * v0.z, an = NI.x * aR.x + NI.y * aR.y + NI.z * aR.z;
-    const dn = NI.x * dd.x + NI.y * dd.y + NI.z * dd.z;
+    const dn = dd.x === 0 && dd.y === 0 && dd.z === 0 ? 1 : NI.x * dd.x + NI.y * dd.y + NI.z * dd.z;
     c = (vn < 0 ? -vn : 0) + cRot;
     A = (an > 0 ? an : 0) + dB + (dn > 0 ? dragB * dn : 0) + aRot;
     g = d - r;
@@ -690,8 +805,37 @@ function anchorRot(b: QsBody, w: QsWorld | undefined, i: number, tick: number, m
   const L = s.rL, Ll = Math.sqrt(L.x * L.x + L.y * L.y + L.z * L.z), e2 = WO.x * L.x + WO.y * L.y + WO.z * L.z;
   const Imin = Math.min(I[3 * i], I[3 * i + 1], I[3 * i + 2]), wE = Math.sqrt((e2 > 0 ? e2 : 0) / Imin), wL = Ll / Imin;
   const wmax = wE < wL ? wE : wL;
-  const n = wmax > 0 ? Math.floor(ROT_STEP / (wmax * Q)) : NEVER;
-  s.rn = n < 1 ? 1 : n > 1e6 ? 1e6 : n;
+  s.rc.x = s.rq.x; s.rc.y = s.rq.y; s.rc.z = s.rq.z; s.rc.w = s.rq.w; s.rj = 0; s.rp = 0; s.rMok = 0;
+  if (!(wmax > 0)) { s.rn = 0; s.rT = 0; s.rH = 0; return; } // at rest: closed form (nothing turns)
+  const h = ROT_STEP / wmax, T = polhodePeriod(I[3 * i], I[3 * i + 1], I[3 * i + 2], Ll * Ll, e2);
+  const n = T > 0 ? Math.ceil(T / h) : 0;
+  if (n > 0 && n <= ROT_N_MAX) { s.rT = T; s.rn = n; s.rH = T / n; }
+  else { s.rT = 0; s.rn = 1; s.rH = h; }
+}
+
+/**
+ * Period (s) of the body-frame angular velocity of a torque-free triaxial body (Landau & Lifshitz §37): with
+ * I₁ < I₂ < I₃, L² > 2E·I₂: ω_p² = (I₃ − I₂)(L² − 2EI₁)/(I₁I₂I₃), k² = (I₂ − I₁)(2EI₃ − L²)/((I₃ − I₂)(L² − 2EI₁));
+ * L² < 2E·I₂: 1 ↔ 3. T = 4K(k)/ω_p, K by the AGM. 0 near the separatrix (k² > 1 − 1e-12) or when degenerate.
+ */
+export function polhodePeriod(a: number, b: number, c: number, L2: number, E2: number): number {
+  // sort
+  let I1 = a, I2 = b, I3 = c, t: number;
+  if (I1 > I2) { t = I1; I1 = I2; I2 = t; }
+  if (I2 > I3) { t = I2; I2 = I3; I3 = t; }
+  if (I1 > I2) { t = I1; I1 = I2; I2 = t; }
+  if (!(E2 > 0) || !(I1 > 0)) return 0;
+  const P = I1 * I2 * I3;
+  let wp2: number, k2: number;
+  if (L2 > E2 * I2) { wp2 = ((I3 - I2) * (L2 - E2 * I1)) / P; k2 = ((I2 - I1) * (E2 * I3 - L2)) / ((I3 - I2) * (L2 - E2 * I1)); }
+  else if (L2 < E2 * I2) { wp2 = ((I1 - I2) * (L2 - E2 * I3)) / P; k2 = ((I2 - I3) * (E2 * I1 - L2)) / ((I1 - I2) * (L2 - E2 * I3)); }
+  else return 0;
+  if (!(wp2 > 0) || !(k2 < 1 - 1e-12)) return 0;
+  if (k2 < 0) k2 = 0;
+  // K(k) = π / (2·AGM(1, √(1 − k²)))
+  let x = 1, y = Math.sqrt(1 - k2);
+  for (let it = 0; it < 12 && Math.abs(x - y) > 1e-15 * x; it++) { const m = 0.5 * (x + y); y = Math.sqrt(x * y); x = m; }
+  return (4 * (Math.PI / (x + y))) / Math.sqrt(wp2);
 }
 
 const RK = new Float64Array(16);
@@ -725,10 +869,37 @@ function rotEval(s: QsState, I: Float64Array, i: number, tick: number): void {
   const kind = inertiaKind(I, i), L = s.rL;
   const Ll = Math.sqrt(L.x * L.x + L.y * L.y + L.z * L.z);
   if (kind === 3) {
-    const n = s.rn;
-    while (s.rTick + n <= tick) { rotMid(s.rq, I, i, L, n * Q); s.rTick += n; }
-    QI.x = s.rq.x; QI.y = s.rq.y; QI.z = s.rq.z; QI.w = s.rq.w;
-    if (tick > s.rTick) rotMid(QI, I, i, L, (tick - s.rTick) * Q);
+    if (!(s.rn > 0)) { QI.x = s.rq.x; QI.y = s.rq.y; QI.z = s.rq.z; QI.w = s.rq.w; WO.x = WO.y = WO.z = 0; return; }
+    // R(nT + τ) = Mⁿ·R(τ): R(τ) on the fixed grid of the first period (cached: rc after rj steps), M = R(T)·R(0)⁻¹
+    // fixes L, so Mⁿ is a rotation about M's axis by n times its angle. At most rn + 1 steps per evaluation.
+    const T = s.rT, h = s.rH, tt = (tick - s.rTick) * Q;
+    let np = 0, tau = tt;
+    if (T > 0) {
+      if (s.rMok === 0) {
+        QB.x = s.rq.x; QB.y = s.rq.y; QB.z = s.rq.z; QB.w = s.rq.w;
+        for (let j = 0; j < s.rn; j++) rotMid(QB, I, i, L, h);
+        QA.x = -s.rq.x; QA.y = -s.rq.y; QA.z = -s.rq.z; QA.w = s.rq.w;
+        qmul(s.rM, QB, QA); qnorm(s.rM);
+        s.rMok = 1;
+      }
+      np = Math.floor(tt / T); tau = tt - np * T;
+      if (tau < 0) { np--; tau += T; } else if (tau >= T) { np++; tau -= T; }
+    }
+    let j = Math.floor(tau / h);
+    if (T > 0 && j > s.rn) j = s.rn;
+    if (s.rp !== np || s.rj > j) { s.rc.x = s.rq.x; s.rc.y = s.rq.y; s.rc.z = s.rq.z; s.rc.w = s.rq.w; s.rj = 0; s.rp = np; }
+    while (s.rj < j) { rotMid(s.rc, I, i, L, h); s.rj++; }
+    QI.x = s.rc.x; QI.y = s.rc.y; QI.z = s.rc.z; QI.w = s.rc.w;
+    const rem = tau - j * h;
+    if (rem > 0) rotMid(QI, I, i, L, rem);
+    if (np !== 0) {
+      const M = s.rM, vl = Math.sqrt(M.x * M.x + M.y * M.y + M.z * M.z);
+      if (vl > 0) {
+        const ang = 2 * Math.atan2(vl, M.w) * np;
+        qaxis(QA, M.x / vl, M.y / vl, M.z / vl, ang);
+        qmul(QI, QA, QI); qnorm(QI);
+      }
+    }
     omegaOf(WO, QI, I, i, L);
     return;
   }
@@ -763,10 +934,19 @@ function rotToShip(b: QsBody, w: QsWorld, i: number, tick: number, m: BodyMotion
   b.w.x -= m.w.x; b.w.y -= m.w.y; b.w.z -= m.w.z;
 }
 
-/** RK4 steps the triaxial drifting bodies will take over the next `ticks` (for the warp-quantum budget). */
+/**
+ * Worst-case RK4 attitude steps of the triaxial drifting bodies for one evaluation `ticks` ahead (the warp-quantum
+ * budget: ~0.25–0.3 µs each in node, warmed): a periodic body costs at most one period's grid (rn + 1, plus rn once for its
+ * monodromy), a near-separatrix one the whole span.
+ */
 export function rotSteps(bodies: readonly QsBody[], ticks: number): number {
   let n = 0;
-  for (let i = 0; i < bodies.length; i++) { const s = bodies[i].qs; if (s.mode === MODE_DRIFT && s.rn > 0) n += Math.ceil(ticks / s.rn); }
+  for (let i = 0; i < bodies.length; i++) {
+    const s = bodies[i].qs;
+    if (s.mode !== MODE_DRIFT || !(s.rn > 0) || !(s.rH > 0)) continue;
+    const span = Math.ceil((ticks * Q) / s.rH) + 1;
+    n += s.rT > 0 ? (span < s.rn + 1 ? span : s.rn + 1) + (s.rMok ? 0 : s.rn) : span;
+  }
   return n;
 }
 
@@ -847,15 +1027,16 @@ export function serviceBodies(
       if (jumped) {
         const p = b.p;
         JMP.x = -Dv.x - (Dw.y * p.z - Dw.z * p.y); JMP.y = -Dv.y - (Dw.z * p.x - Dw.x * p.z); JMP.z = -Dv.z - (Dw.x * p.y - Dw.y * p.x);
-        const fn = f.x * s.n.x + f.y * s.n.y + f.z * s.n.z;
-        if (!restHoldsJump(JMP, s.n, w.mu[i], fn, Q)) {
+        // the supports must supply Δv = −j and hold the felt load over the tick: P = −j − f·Q
+        NF.x = -JMP.x - f.x * Q; NF.y = -JMP.y - f.y * Q; NF.z = -JMP.z - f.z * Q;
+        if (!(supportMargin(NF, s, w.mu[i]) <= 0)) {
           s.mode = MODE_CONTACT; s.tickEnd = tick;
           b.v.x += JMP.x; b.v.y += JMP.y; b.v.z += JMP.z;
           if (b.w) { b.w.x -= Dw.x; b.w.y -= Dw.y; b.w.z -= Dw.z; }
         }
       }
       if (s.mode === MODE_REST) {
-        const g = restMargin(f, s.n, w.mu[i]);
+        const g = feltMargin(s, f, w.mu[i]);
         if (g > REST_WAKE_A) { s.mode = MODE_CONTACT; s.tickEnd = tick; }
         else if (tick >= s.tickEnd) { const kk = restWakeTicks(g, m.fDot); s.tickEnd = kk >= NEVER ? NEVER : tick + kk; }
       }
@@ -871,14 +1052,15 @@ export function serviceBodies(
 }
 
 /**
- * After the CONTACT solver's step for body i: touching (with the support normal nx, ny, nz) and slow and inside
- * the cone → REST; otherwise → DRIFT (when the segment would be ≥ DRIFT_MIN_TICKS; bodies touching a box they are
+ * After the CONTACT solver's step for body i: touching (with the support normal nx, ny, nz; on an edge or in a
+ * corner also n2, n3) and slow and held by the supports' cones (supportMargin) → REST; otherwise → DRIFT (when the segment would be ≥ DRIFT_MIN_TICKS; bodies touching a box they are
  * not approaching may drift along it). Returns the new mode.
  */
 export function afterContact(
   b: QsBody, i: number, bodies: readonly QsBody[], w: QsWorld, tick: number, m: BodyMotion, q: Quat, touching: boolean, nx: number, ny: number, nz: number,
+  n2: V3 | null = null, n3: V3 | null = null,
 ): number {
-  if (touching && tryRest(b, w.mu[i], tick, m, nx, ny, nz)) return MODE_REST;
+  if (touching && tryRest(b, w.mu[i], tick, m, nx, ny, nz, n2, n3)) return MODE_REST;
   anchorDrift(b, tick, m, q, w, i);
   scheduleDrift(b, i, bodies, w, tick, m, q);
   return b.qs.mode;
@@ -900,23 +1082,29 @@ const UP: V3 = { x: 0, y: 1, z: 0 };
 
 export function saveQsState(s: QsState): QsState {
   return {
-    mode: s.mode, n: { ...s.n }, x0: { ...s.x0 }, v0: { ...s.v0 }, aS: { ...s.aS }, u0: { ...s.u0 }, tick0: s.tick0, tickEnd: s.tickEnd, tickS: s.tickS,
+    mode: s.mode, n: { ...s.n }, n2: { ...s.n2 }, n3: { ...s.n3 }, nn: s.nn, x0: { ...s.x0 }, v0: { ...s.v0 }, aS: { ...s.aS }, u0: { ...s.u0 }, tick0: s.tick0, tickEnd: s.tickEnd, tickS: s.tickS,
     aR: { ...s.aR }, dB: s.dB, dragB: s.dragB, dragD: { ...s.dragD }, wB: s.wB, alB: s.alB, tickB: s.tickB, rq: { ...s.rq }, rL: { ...s.rL }, rTick: s.rTick, rn: s.rn,
+    rT: s.rT, rH: s.rH, rc: { ...s.rc }, rj: s.rj, rp: s.rp, rM: { ...s.rM }, rMok: s.rMok,
   };
 }
 
 /**
  * Loader with defaults: a save without the field gives CONTACT, which re-derives REST / DRIFT within a tick. A
- * DRIFT save without the schedule bounds gets dB = wB = alB = 0, which re-schedules at the next service.
+ * DRIFT save without the schedule bounds gets dB = wB = alB = 0, which re-schedules at the next service; one without
+ * the triaxial grid step gets CONTACT.
  */
 export function loadQsState(data: unknown): QsState {
   const o = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
-  const mode = o.mode === MODE_REST || o.mode === MODE_DRIFT ? (o.mode as number) : MODE_CONTACT;
+  const rn = num(o.rn, -1), rH = num(o.rH, 0);
+  let mode = o.mode === MODE_REST || o.mode === MODE_DRIFT ? (o.mode as number) : MODE_CONTACT;
+  // a triaxial drift without its grid step (older layout) re-derives through CONTACT
+  if (mode === MODE_DRIFT && rn > 0 && !(rH > 0)) mode = MODE_CONTACT;
   const tick0 = num(o.tick0, 0);
   return {
-    mode, n: lv(o.n, UP), x0: lv(o.x0, Z3), v0: lv(o.v0, Z3), aS: lv(o.aS, Z3), u0: lv(o.u0, Z3),
+    mode, n: lv(o.n, UP), n2: lv(o.n2, Z3), n3: lv(o.n3, Z3), nn: o.nn === 2 || o.nn === 3 ? (o.nn as number) : 1, x0: lv(o.x0, Z3), v0: lv(o.v0, Z3), aS: lv(o.aS, Z3), u0: lv(o.u0, Z3),
     tick0, tickEnd: num(o.tickEnd, 0), tickS: num(o.tickS, tick0),
     aR: lv(o.aR, Z3), dB: num(o.dB, 0), dragB: num(o.dragB, 0), dragD: lv(o.dragD, Z3), wB: num(o.wB, 0), alB: num(o.alB, 0), tickB: num(o.tickB, tick0),
-    rq: lq(o.rq), rL: lv(o.rL, Z3), rTick: num(o.rTick, tick0), rn: num(o.rn, -1),
+    rq: lq(o.rq), rL: lv(o.rL, Z3), rTick: num(o.rTick, tick0), rn,
+    rT: num(o.rT, 0), rH, rc: o.rc ? lq(o.rc) : lq(o.rq), rj: num(o.rj, 0), rp: num(o.rp, 0), rM: lq(o.rM), rMok: o.rMok === 1 ? 1 : 0,
   };
 }

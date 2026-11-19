@@ -174,6 +174,12 @@ export interface SceneManager {
    */
   setRayTracing(tier: RtQuality): void;
   rayTracing(): RayTracingInfo;
+  /**
+   * Make the lit materials under `root` take the traced sun (forward.ts patch). For objects mounted in the cabin
+   * after load (the loose-objects visual): call BEFORE their programs compile. While ray tracing runs the cabin's
+   * shadow-mapped sun is off, so an unpatched cabin object would get no sunlight at all. Returns the count patched.
+   */
+  patchCabinMaterials(root: THREE.Object3D): number;
   /** Rebuild the current system's visuals (after a restored WebGL context). */
   rebuild(): Promise<void>;
   /** True while worlds are still baking sharper textures. */
@@ -804,6 +810,10 @@ class Manager implements SceneManager {
     this.rt.setQuality(tier);
     if (tier !== 'off' && !this.loading) void this.buildRayTracing();
     this.planMemory();
+  }
+
+  patchCabinMaterials(root: THREE.Object3D): number {
+    return this.rt.patchMaterials(root);
   }
 
   rayTracing(): RayTracingInfo {

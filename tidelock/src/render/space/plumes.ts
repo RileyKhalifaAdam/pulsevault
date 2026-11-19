@@ -3,14 +3,23 @@
 //
 // WIRING (wave 1, W1-E; nothing here is called yet):
 //   * scene.ts: `this.puffs = new PuffRenderer(pool)`; `this.nearScene.add(this.puffs.mesh)` next to fx.object3d.
-//     Per frame after pool.frame/emit (see plumeCore.ts): `this.puffs.update(anchorRelCam, sunDir, sunRGB, occ, nOcc,
-//     frame.realDt)` with anchorRelCam = pool.anchorPos(t) − camAbs (doubles, then float), sunDir the unit direction
-//     to the star (inertial axes), sunRGB = the key light's colour × intensity × starVisibility at the player (so
-//     the planet's shadow gives exactly nothing), occ from packOccluders(WREN_OCCLUDERS, q, r − anchor). One draw
-//     call, none while nothing lives. REPLACES EffectsManager.rcsPuff and the scene's `fire < 0.25` loop.
-//   * scene.ts addShip: `createPhysicalPlumes(layout.engines, stats, {quality})` REPLACES createEnginePlumes; per
-//     frame `e.plume.setLevels(view.engineLevel)` REPLACES setThrottle(ctx.throttle) + update(dt) (no spool, kick,
-//     flicker or noise texture: one instanced draw call per ship, 16 samples, no texture taps).
+//     Per frame after pool.frame / pool.consume (plumeCore.ts WIRING):
+//       solvePuffFloor(pool, cam, sunDir, vis, budgetPx, occ, nOcc)   // cam: PuffCam (anchor-relative, same basis)
+//       this.puffs.update(anchorRelCam.x, .y, .z, sunDir, sunRGB, vis, occ, nOcc, shutter, cam.px)
+//     anchorRelCam = pool.anchorPos(tFrame) − camAbs (doubles, then float); sunDir the unit direction to the star
+//     (inertial axes); sunRGB = this.key.color × π·starIntensityAt(ds, lum) (the key's irradiance E before its visibility factor); vis =
+//     starVisibility at the player (0 in the planet's shadow: nothing is drawn); occ from
+//     packOccluders(WREN_OCCLUDERS, q, r − anchor); shutter = frame.realDt; for the solver cam.px = 0.5 ·
+//     renderer drawing-buffer height · camera.projectionMatrix.elements[5]; budgetPx = PUFF_FILL_SCREENS × width ×
+//     height of the target it draws into; cam.right/up/fwd from camera.matrixWorld (fwd = −z column). One draw call, none while nothing lives. REPLACES EffectsManager.rcsPuff
+//     and the scene's `fire < 0.25` loop.
+//   * scene.ts addShip: REPLACES createEnginePlumes(...) with
+//       createPhysicalPlumes(layout.engines.map((e, i) => ({ pos: e.pos, radius: e.radius,
+//         maxThrust: craft.engines[i].maxThrust, ve: craft.engines[i].ve })), { quality })   // once, at add time
+//     and per frame `e.plume.setLevels(view.engineLevel)` REPLACES setThrottle(ctx.throttle) + update(dt) (no
+//     spool, kick, flicker or noise texture: one instanced draw call per ship, 16 samples, no texture taps); in air
+//     `e.plume.setAmbient(p_a)` (Pa, 0 in vacuum) sets the shock-cell spacing. `e.plume.level` readers (hull bell
+//     glow) keep reading `.level` (the mean of the levels, no lag).
 import * as THREE from 'three';
 import {
   MAX_OCCLUDERS,
@@ -18,6 +27,8 @@ import {
   OMEGA0,
   PUFF_STRIDE,
   PLUME_THETA,
+  F_MIN,
+  plumeCellRadii,
   plumeExitFactor,
   plumeLength,
   plumeGlowLevel,
@@ -38,9 +49,14 @@ uniform vec3 uSun;          // irradiance scale x colour x planet-shadow visibil
 uniform vec4 uOcc[${MAX_OCCLUDERS * 2}];
 uniform int uNOcc;
 uniform float uShutter;     // s: the frame's exposure, for the motion smear
+uniform float uVis;         // sun visibility (planet shadow), 0..1
+uniform float uFloor;       // the frame's floor raise phi >= 1 (solvePuffFloor)
+uniform float uPx;          // pixels per unit of x/depth: 0.5 * buffer height * projection[1][1]
+uniform float uQuadCap;     // px per quad at most (pool.quadCapPx)
 out vec2 vUv;               // in sigmas along the two quad axes
 out vec3 vCol;
 out float vTau;             // centre optical depth after the smear
+out float vEdge;            // exp(-tau at the clip edge): subtracted so the quad fades to exactly 0 there
 float segDist2(vec3 p, vec3 s, vec3 a, vec3 b) {
   vec3 d1 = s * 1.0e4; vec3 d2 = b - a; vec3 r = p - a;
   float A = dot(d1, d1), E = dot(d2, d2), F = dot(d2, r), C = dot(d1, r), B = dot(d1, d2);
@@ -77,8 +93,19 @@ void main() {
   vec2 ax = vl > 1e-6 ? vxy / vl : vec2(1.0, 0.0);
   float l = vl * uShutter;
   float sa = sqrt(s * s + l * l / 12.0);
-  vTau = aC.z / (s * sa);
-  vec2 c = position.xy * 3.0;                  // quad corners at 3 sigma
+  float tc = aC.z / (s * sa);
+  // clip where the radiance at this phase drops below the floor (one LSB), and cap the quad's pixels
+  float q = uFloor * ${F_MIN.toExponential(6)} / (${OMEGA0.toFixed(4)} * phase * max(uVis, 1e-6));
+  float tm = q < 1.0 ? -log(1.0 - q) : 1e30;
+  float depth = -mv.z;
+  if (tc <= tm || depth < 1e-3) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  float sPx = s * uPx / depth, saPx = sa * uPx / depth;
+  float x2 = min(min(2.0 * log(tc / tm), uQuadCap / (4.0 * sPx * saPx)), 9.0);
+  if (x2 < 0.01) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  float xr = sqrt(x2);
+  vTau = tc;
+  vEdge = exp(-tc * exp(-0.5 * x2));
+  vec2 c = position.xy * xr;                   // quad corners at the clip radius (<= 3 sigma)
   mv.xy += ax * (c.x * sa) + vec2(-ax.y, ax.x) * (c.y * s);
   vUv = c;
   gl_Position = projectionMatrix * mv;
@@ -90,9 +117,10 @@ precision highp float;
 in vec2 vUv;
 in vec3 vCol;
 in float vTau;
+in float vEdge;
 void main() {
   float t = vTau * exp(-0.5 * dot(vUv, vUv));
-  gl_FragColor = vec4(vCol * (1.0 - exp(-t)), 1.0);
+  gl_FragColor = vec4(vCol * max(vEdge - exp(-t), 0.0), 1.0);
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
 }
@@ -131,6 +159,10 @@ export class PuffRenderer {
         uOcc: { value: this.occV },
         uNOcc: { value: 0 },
         uShutter: { value: 1 / 60 },
+        uVis: { value: 1 },
+        uFloor: { value: 1 },
+        uPx: { value: 500 },
+        uQuadCap: { value: 1e12 },
       },
       vertexShader: PUFF_VERT,
       fragmentShader: PUFF_FRAG,
@@ -148,11 +180,13 @@ export class PuffRenderer {
 
   /**
    * Per frame (no allocation): `anchorRelCam` = anchor − camera (m, the mesh's position in the camera-origin near
-   * scene); the sun; the occluders packed by packOccluders (anchor-relative); the frame's real dt (smear).
+   * scene); the sun (direction, unshadowed irradiance colour, visibility); the occluders packed by packOccluders
+   * (anchor-relative); the frame's real dt (smear); pixels per unit of x/depth (as cam.px). Call solvePuffFloor first (with
+   * the same camera, sun and occluders): its pool.floorPhi is the shader's floor raise.
    */
-  update(ax: number, ay: number, az: number, sunDir: THREE.Vector3, sunRGB: THREE.Vector3, occ: Float32Array | null, nOcc: number, shutter: number): void {
+  update(ax: number, ay: number, az: number, sunDir: THREE.Vector3, sunRGB: THREE.Vector3, sunVis: number, occ: Float32Array | null, nOcc: number, shutter: number, pxPerUnit: number): void {
     const pool = this.pool;
-    const vis = pool.alive && sunRGB.x + sunRGB.y + sunRGB.z > 0;
+    const vis = pool.alive && sunVis > 0 && sunRGB.x + sunRGB.y + sunRGB.z > 0;
     this.mesh.visible = vis;
     const d = pool.takeDirty(this.dirty);
     if (d[1] > 0) {
@@ -166,8 +200,12 @@ export class PuffRenderer {
     u.uNow.value = pool.now;
     (u.uCam.value as THREE.Vector3).set(-ax, -ay, -az);
     (u.uSunDir.value as THREE.Vector3).copy(sunDir);
-    (u.uSun.value as THREE.Vector3).copy(sunRGB);
+    (u.uSun.value as THREE.Vector3).copy(sunRGB).multiplyScalar(sunVis);
     u.uShutter.value = shutter;
+    u.uVis.value = sunVis;
+    u.uFloor.value = pool.floorPhi;
+    u.uPx.value = pxPerUnit;
+    u.uQuadCap.value = Math.min(pool.quadCapPx, 1e30);
     const n = occ ? Math.min(nOcc, MAX_OCCLUDERS) : 0;
     for (let i = 0; i < n * 2; i++) this.occV[i].set(occ![i * 4], occ![i * 4 + 1], occ![i * 4 + 2], occ![i * 4 + 3]);
     u.uNOcc.value = n;
@@ -276,23 +314,33 @@ export interface PhysicalPlume {
   object3d: THREE.Object3D;
   /** Per engine, the applied level F_s/F_max (CraftView.engineLevel); no lag of its own. */
   setLevels(levels: ArrayLike<number>): void;
+  /** Ambient static pressure, Pa (0 in vacuum: no cells); sets the shock-cell spacing 1.3·D_e·√(p_e/p_a). */
+  setAmbient(pa: number): void;
   /** Mean level, for hull glow and audio readers of the old `level`. */
   readonly level: number;
   dispose(): void;
 }
 
+/** One nozzle: exit centre (parent axes) and radius (layout), full thrust (N) and vₑ (m/s) (its EngineDef). */
+export interface PlumeNozzle {
+  pos: { x: number; y: number; z: number };
+  radius: number;
+  maxThrust: number;
+  ve: number;
+}
+
 export interface PhysicalPlumeOptions {
-  /** Per-engine full thrust (N) and exhaust velocity (m/s); defaults: the Wren's 400 kN at 34 km/s. */
-  maxThrust?: number;
-  ve?: number;
-  /** Shock-cell spacing in nozzle radii (shockCellSpacing / r_e); 0 in vacuum (default). */
-  cell?: number;
+  /** Ambient static pressure at creation, Pa (0 in vacuum, the default); later setAmbient(p_a). */
+  ambient?: number;
   quality?: 'low' | 'medium' | 'high' | 'ultra';
   tint?: readonly [number, number, number];
 }
 
 /** All of one ship's nozzles in a single instanced, texture-free ray-marched draw call. */
-export function createPhysicalPlumes(nozzles: readonly { pos: { x: number; y: number; z: number }; radius: number }[], opts: PhysicalPlumeOptions = {}): PhysicalPlume {
+export function createPhysicalPlumes(nozzles: readonly PlumeNozzle[], opts: PhysicalPlumeOptions = {}): PhysicalPlume {
+  for (const nz of nozzles) {
+    if (!(nz.maxThrust > 0 && nz.ve > 0 && nz.radius > 0)) throw new RangeError('createPhysicalPlumes: every nozzle needs radius, maxThrust and ve > 0');
+  }
   const tanT = Math.tan(PLUME_THETA);
   const z1 = plumeLength(tanT);
   const r1 = 2.5 * (1 + z1 * tanT);
@@ -324,7 +372,7 @@ export function createPhysicalPlumes(nozzles: readonly { pos: { x: number; y: nu
   const uniforms = {
     uTint: { value: new THREE.Vector3(tint[0] * PLUME_RADIANCE, tint[1] * PLUME_RADIANCE, tint[2] * PLUME_RADIANCE) },
     uBound: { value: new THREE.Vector4(PLUME_Z0, r0, (r1 - r0) / h, z1) },
-    uShape: { value: new THREE.Vector2(tanT, opts.cell ?? 0) },
+    uShape: { value: new THREE.Vector2(tanT, plumeCellRadii(opts.ambient ?? 0)) },
     uInvModel: { value: new THREE.Matrix4() },
   };
   const mat = new THREE.ShaderMaterial({
@@ -346,7 +394,6 @@ export function createPhysicalPlumes(nozzles: readonly { pos: { x: number; y: nu
     uniforms.uInvModel.value.copy(mesh.matrixWorld).invert();
     mat.uniformsNeedUpdate = true;
   };
-  const F = opts.maxThrust ?? 400e3, ve = opts.ve ?? 34e3;
   let mean = 0;
   return {
     object3d: mesh,
@@ -355,12 +402,16 @@ export function createPhysicalPlumes(nozzles: readonly { pos: { x: number; y: nu
       for (let i = 0; i < n; i++) {
         const l = src[i] ?? 0;
         levels[i] = l;
-        const f = plumeExitFactor(l, F, ve, nozzles[i].radius);
+        const f = plumeExitFactor(l, nozzles[i].maxThrust, nozzles[i].ve, nozzles[i].radius);
         if (lv[i] !== f) { lv[i] = f; lvAttr.needsUpdate = true; }
         if (f > 0) any = true;
       }
       mean = plumeGlowLevel(levels, n);
       mesh.visible = any;
+    },
+    setAmbient(pa: number): void {
+      const c = plumeCellRadii(pa);
+      if (uniforms.uShape.value.y !== c) { uniforms.uShape.value.y = c; mat.uniformsNeedUpdate = true; }
     },
     get level(): number {
       return mean;
