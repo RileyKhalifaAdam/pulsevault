@@ -1947,6 +1947,15 @@ export function createShipVisual(id: ShipVisualId, opts: ShipVisualOptions): Shi
       if (!geo) continue;
       const mesh = new THREE.Mesh(geo, mats.byChannel[ch]);
       mesh.renderOrder = ch === CH_GLASS ? 2 : ch === CH_FLARE ? 3 : ch;
+      // the ray tracer's material record (surfaces.ts header); the hull's colour is per vertex: aTint.rgb^2 x the
+      // livery colour of slot round(aFx.w * 3) (0 = none), roughness aSurf.z, metalness aSurf.y
+      const liv = opts.livery ?? def.livery;
+      mesh.userData.rt =
+        ch === CH_HULL
+          ? { albedo: [...liv.primary], roughness: 0.36, metalness: 0.05, tiles: null, perVertex: 'aTint^2 x livery[aFx.w]; aSurf.z rough; aSurf.y metal', livery: liv, demodulate: null }
+          : ch === CH_GLASS
+            ? { albedo: [0.016, 0.022, 0.03], roughness: 0.035, metalness: 0, glass: true }
+            : { albedo: [0, 0, 0], roughness: 1, metalness: 0, emissive: true };
       g.add(mesh);
       calls++;
     }
