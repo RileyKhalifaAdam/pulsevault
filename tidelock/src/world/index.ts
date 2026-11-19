@@ -24,4 +24,5 @@ export * from './contact';
 export * from './elements';
 export * from './predict';
 export * from './world';
+export * from './crew';
 export { qRot, qRotInv, qMulTo, qAxisTo, rotAxis } from './math';

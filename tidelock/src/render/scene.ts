@@ -36,6 +36,8 @@ import { createStationVisual, type StationVisual } from './space/stations';
 import { EffectsManager, createEnginePlumes, createStrobes, type EnginePlume, type Strobes } from './space/effects';
 import { createCameraRig, type CameraEnv, type CameraFocus, type CameraPose } from './camera';
 import { addShip, playerShip, type FrameShip, type SceneFrame } from './frame';
+import { INTERIORS, type InteriorLayout } from '../data/interiors';
+import { createInteriorVisual, type InteriorUpdate, type InteriorVisual } from './space/interior';
 
 // ------------------------------------------------------------------------------------------------ API
 
@@ -68,6 +70,8 @@ export interface Projection {
 export interface SceneStats {
   drawCalls: number;
   triangles: number;
+  /** The player ship's interior, once built: its own draw calls and triangles (drawn only in the 'interior' view). */
+  interior: { drawCalls: number; triangles: number } | null;
 }
 
 export interface SceneManagerOptions {
@@ -397,6 +401,20 @@ class Manager implements SceneManager {
   private readonly nearScene = new THREE.Scene();
   private readonly farCam = new THREE.PerspectiveCamera(50, 1, 0.05, 600);
   private readonly nearCam = new THREE.PerspectiveCamera(50, 1, 0.3, FAR_PLANE);
+  // first person inside the player's ship: its own scene, drawn last with the depth cleared
+  private readonly insideScene = new THREE.Scene();
+  private readonly insideCam = new THREE.PerspectiveCamera(60, 1, 0.05, 80);
+  private layersInside: RenderLayer[] = [];
+  private interior: { shipId: string; visualId: string; visual: InteriorVisual } | null = null;
+  private readonly interiorCtx: Required<InteriorUpdate> = {
+    time: 0,
+    lights: true,
+    eye: { x: 0, y: 0, z: 0 },
+    gain: 1,
+    sunDir: { x: 0, y: 1, z: 0 },
+    sunColor: { r: 0, g: 0, b: 0 },
+    windowColor: { r: 0, g: 0, b: 0 },
+  };
   private readonly layers: RenderLayer[];
   private readonly key = new THREE.DirectionalLight(0xffffff, 0);
   private readonly shine = new THREE.DirectionalLight(0xffffff, 0);
@@ -467,7 +485,7 @@ class Manager implements SceneManager {
   private readonly tv2 = new THREE.Vector3();
   private readonly projOut: Projection = { x: 0, y: 0, visible: false, behind: false, distance: 0, radiusPx: 0, occluded: false };
   private readonly pickOut: Projection = { x: 0, y: 0, visible: false, behind: false, distance: 0, radiusPx: 0, occluded: false };
-  private readonly statsOut: SceneStats = { drawCalls: 0, triangles: 0 };
+  private readonly statsOut: SceneStats = { drawCalls: 0, triangles: 0, interior: null };
   private readonly focus: CameraFocus = { id: '', kind: 'ship', radius: 10, q: { x: 0, y: 0, z: 0, w: 1 }, chaseDistance: 34, chaseHeight: 8, cockpit: v3(), throttle: 0 };
   private readonly dockEnv = { pos: v3(), dir: v3(), up: v3() };
   private readonly lookEnv = v3();
@@ -488,6 +506,7 @@ class Manager implements SceneManager {
       { scene: this.farScene, camera: this.farCam },
       { scene: this.nearScene, camera: this.nearCam, clearDepth: true },
     ];
+    this.layersInside = [...this.layers, { scene: this.insideScene, camera: this.insideCam, clearDepth: true }];
     this.camEnv.collide = this.collideCamera;
   }
 
@@ -637,14 +656,34 @@ class Manager implements SceneManager {
     const s = this.pipeline.stats();
     this.statsOut.drawCalls = s.drawCalls;
     this.statsOut.triangles = s.triangles;
+    const iv = this.interior?.visual;
+    this.statsOut.interior = iv ? { drawCalls: iv.drawCalls, triangles: iv.triangles } : null;
     return this.statsOut;
   }
 
   private disposeShip(e: ShipEntry): void {
+    if (this.interior && this.interior.shipId === e.id) {
+      this.interior.visual.dispose();
+      this.interior = null;
+    }
     e.plume?.dispose();
     e.strobes?.dispose();
     e.visual.dispose();
     e.group.removeFromParent();
+  }
+
+  /** The interior of a ship that has one (built once, when the player's ship first appears), or null. */
+  private ensureInterior(e: ShipEntry): InteriorVisual | null {
+    const cur = this.interior;
+    if (cur && cur.shipId === e.id && cur.visualId === e.visualId) return cur.visual;
+    const layout = (INTERIORS as Record<string, InteriorLayout | undefined>)[e.visualId];
+    if (!layout) return null;
+    if (cur) cur.visual.dispose();
+    const visual = createInteriorVisual(layout, { quality: this.quality });
+    visual.object3d.visible = false;
+    this.insideScene.add(visual.object3d);
+    this.interior = { shipId: e.id, visualId: e.visualId, visual };
+    return visual;
   }
 
   private disposeSystem(): void {
@@ -1535,7 +1574,44 @@ class Manager implements SceneManager {
       m.aDir.needsUpdate = true;
       m.aCol.needsUpdate = true;
     }
-    pipeline.render(this.layers, dt);
+    // ---- inside the player's ship: the interior in its own pass over the outside world, lit by itself, so
+    // the star does not shine through the bulkheads and the window openings show what is really out there
+    let layers = this.layers;
+    const inside = pose.mode === 'interior' && pose.hideFocus && focusShip !== null;
+    const host = inside ? focusShip : playerEntry;
+    const interior = host ? this.ensureInterior(host) : null;
+    if (interior) {
+      const obj = interior.object3d;
+      obj.visible = inside;
+      if (inside && focusShip) {
+        obj.position.set(focusShip.rel.x, focusShip.rel.y, focusShip.rel.z);
+        obj.quaternion.set(focusShip.q.x, focusShip.q.y, focusShip.q.z, focusShip.q.w);
+        const ic = this.insideCam;
+        ic.quaternion.copy(this.nearCam.quaternion);
+        ic.fov = this.nearCam.fov;
+        ic.aspect = aspect;
+        ic.updateProjectionMatrix();
+        const c = this.interiorCtx;
+        c.time = this.clock;
+        c.lights = frame.cabinLights !== false;
+        const eye = frame.camera.eye;
+        c.eye.x = eye ? eye.x : 0;
+        c.eye.y = eye ? eye.y : 0;
+        c.eye.z = eye ? eye.z : 0;
+        c.gain = Math.pow(2, -this.ev);
+        unrotTo(c.sunDir, focusShip.q, this.sunDirFocus.x, this.sunDirFocus.y, this.sunDirFocus.z);
+        c.sunColor.r = this.keyColor.r * this.keyLevel;
+        c.sunColor.g = this.keyColor.g * this.keyLevel;
+        c.sunColor.b = this.keyColor.b * this.keyLevel;
+        const sh = (this.shine.intensity / Math.PI) * 1.5;
+        c.windowColor.r = this.shine.color.r * sh + c.sunColor.r * 0.1;
+        c.windowColor.g = this.shine.color.g * sh + c.sunColor.g * 0.1;
+        c.windowColor.b = this.shine.color.b * sh + c.sunColor.b * 0.1;
+        interior.update(c);
+        layers = this.layersInside;
+      }
+    }
+    pipeline.render(layers, dt);
   }
 
   private readonly dockPort: { pos: V3; dir: V3; up: V3 } = { pos: v3(), dir: v3(), up: v3() };

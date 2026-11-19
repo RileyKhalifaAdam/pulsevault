@@ -25,6 +25,11 @@ const HELP = `
 <p>The line is your predicted path, with apoapsis, periapsis, closest approach to the target, atmosphere entry and impact marked. Tap the path to plan a burn there, then set its prograde, normal and radial parts and slide it in time: the path shows what would happen. A plan flies nothing. Point the ship (hold: Burn) and work the throttle yourself.</p>
 <h3>Docking by latch</h3>
 <p>Match speed with the station first (target chip: relative speed near zero). Close in slowly. Near a port the docking chip shows how far you are off its axis, how far your nose is off, and your closing speed. Switch on <b>RCS</b>: the stick then pushes the ship sideways and up or down, and the two roll buttons push back and forward. Arrive slow and aligned and the latch closes by itself when the chip reads <b>Latch ready</b>. Arrive fast and you bounce, or break.</p>
+<h3>Living aboard</h3>
+<p>You are a body inside the ship. At the helm, <b>View</b> switches between the chase camera and the pilot’s eyes, and <b>Leave seat</b> unstraps you. On foot the left thumb walks, dragging on the right looks around, and the big button names whatever is in reach: the light switch, the galley, the window seat, a bunk, and the pilot seat to take the helm again.</p>
+<p>The ship is in free fall, so nothing holds you down. <b>Boots on</b>: magnets grip the deck and you walk. <b>Boots off</b>: you float, and <b>Push off</b> sends you the way you are looking until you meet a wall. Switch the boots back on near the deck to stand again.</p>
+<p>When the drive fires, the ship accelerates and everything loose falls toward the stern at up to 1.2 g. That is why you can only unstrap with the drive off, and why you strap in before a burn. The plate at the top left shows what your body feels.</p>
+<p>Time runs at ×1 while you are on your feet. To pass the time, lie down in the bunk and tap <b>Sleep</b>: the hours run fast until you touch the screen or something disturbs the ship.</p>
 <h3>If it goes wrong</h3>
 <p><b>Reset to starting orbit</b> puts you back beside the Wheel with full tanks.</p>
 `;

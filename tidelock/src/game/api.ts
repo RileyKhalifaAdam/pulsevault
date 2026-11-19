@@ -22,7 +22,7 @@ export type HoldMode =
   | 'dock'; // docking collar onto the axis of the nearest free port (holds the heading when there is none)
 
 /** Why time acceleration is lower than requested ('' = it is not). */
-export type WarpLimit = '' | 'thrust' | 'rotation' | 'contact' | 'atmosphere' | 'proximity' | 'cpu' | 'docked';
+export type WarpLimit = '' | 'thrust' | 'rotation' | 'contact' | 'atmosphere' | 'proximity' | 'cpu' | 'docked' | 'crew';
 
 export interface StepInfo {
   /** Sim seconds actually covered by this call. */
@@ -215,6 +215,13 @@ export interface SessionEvents {
   primaryChanged: { from: string; to: string };
   landed: { bodyId: string };
   reset: Record<string, never>;
+  /** The pilot strapped in ('helm') or left the seat ('onFoot'). */
+  crewMode: { mode: PlayerMode };
+  /** An in-fiction line from something the pilot used (hatch, galley, washroom, reactor, lights…). */
+  crewMessage: { source: string; text: string };
+  cabinLights: { on: boolean };
+  /** Sleep in the bunk began (asleep true) or ended; `seconds` = sim time slept when it ended. */
+  sleep: { asleep: boolean; seconds: number };
 }
 
 export interface SessionOptions {

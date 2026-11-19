@@ -243,6 +243,11 @@ const Y_UP: V3 = { x: 0, y: 1, z: 0 };
 
 // ------------------------------------------------------------------------------------------------ rig
 
+/** Vertical field of view of the first-person interior view: 56 degrees in landscape, 88 in tall portrait. */
+export function interiorFov(aspect: number): number {
+  return clamp(2 * Math.atan(1.11 / Math.max(aspect, 0.1)), 56 * DEG, 88 * DEG);
+}
+
 export function createCameraRig(): CameraRig {
   const pose: CameraPose = { offset: { x: 0, y: 0, z: 40 }, q: { x: 0, y: 0, z: 0, w: 1 }, fovY: 50 * DEG, hideFocus: false, mode: 'chase' };
   const tOff: V3 = { x: 0, y: 0, z: 0 };
@@ -323,7 +328,27 @@ export function createCameraRig(): CameraRig {
     let fovScale = 1;
     let fovAdd = 0;
 
-    if (mode === 'cockpit') {
+    if (mode === 'interior') {
+      // first person inside the hull: rigid to the ship (no lag, no blend), eye and look angles from the frame
+      const hy = (Number.isFinite(req.lookYaw) ? req.lookYaw : 0) * 0.5;
+      const hp = clamp(Number.isFinite(req.lookPitch) ? req.lookPitch : 0, -1.55, 1.55) * 0.5;
+      localQ.x = 0;
+      localQ.y = Math.sin(hy);
+      localQ.z = 0;
+      localQ.w = Math.cos(hy);
+      wantQ.x = Math.sin(hp);
+      wantQ.y = 0;
+      wantQ.z = 0;
+      wantQ.w = Math.cos(hp);
+      qMulTo(localQ, localQ, wantQ);
+      qMulTo(tQ, focus.q, localQ);
+      tmp.x = req.eye ? req.eye.x : 0;
+      tmp.y = req.eye ? req.eye.y : 0;
+      tmp.z = req.eye ? req.eye.z : 0;
+      qRotTo(tOff, focus.q, tmp);
+      hide = true;
+      qCopy(frameQ, focus.q);
+    } else if (mode === 'cockpit') {
       // look-around: yaw about ship up, then pitch about the turned right axis
       const hy = clamp(yaw, -2.2, 2.2) * 0.5;
       const hp = clamp(-pitch, -1.1, 1.1) * 0.5;
@@ -444,6 +469,7 @@ export function createCameraRig(): CameraRig {
       // very long moves (a station kilometres away) cut rather than swoop
       blend = jump > Math.max(4000, r0 * 60) ? 1 : 0;
     }
+    if (changed && (mode === 'interior' || lastMode === 'interior')) blend = 1; // in and out of the hull is a cut
     lastMode = mode;
     lastFocus = focus.id;
     lastLook = look;
@@ -473,8 +499,8 @@ export function createCameraRig(): CameraRig {
     }
     if (env.collide && !hide) env.collide(pose.offset);
 
-    const fovWant = clamp(fovForAspect(aspect) * fovScale + fovAdd, 20 * DEG, 85 * DEG);
-    if (first || fov === 0) fov = fovWant;
+    const fovWant = mode === 'interior' ? interiorFov(aspect) : clamp(fovForAspect(aspect) * fovScale + fovAdd, 20 * DEG, 85 * DEG);
+    if (first || fov === 0 || mode === 'interior') fov = fovWant;
     else fov += (fovWant - fov) * (1 - Math.exp(-dt / 0.3));
     pose.fovY = fov;
     pose.hideFocus = hide && blend >= 0.6;

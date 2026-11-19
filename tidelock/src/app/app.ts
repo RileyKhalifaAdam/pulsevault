@@ -255,6 +255,18 @@ export async function boot(): Promise<void> {
   session.events.on('undocked', (e) => host.toast(`Released from ${craftName(e.stationId)}`, 'info'));
   session.events.on('impact', (e) => host.toast(`Impact at ${fmtSpeed(e.speed)}`, 'warn'));
   session.events.on('destroyed', (e) => host.toast(`Ship destroyed (${e.cause})`, 'bad'));
+  session.events.on('crewMessage', (e) => host.toast(e.text, 'info'));
+  session.events.on('cabinLights', (e) => host.toast(e.on ? 'Cabin lights on' : 'Cabin lights off', 'info'));
+  session.events.on('crewMode', (e) => {
+    host.saveNow();
+    host.toast(e.mode === 'onFoot' ? 'Unstrapped — boots on the deck' : 'Strapped in at the helm', 'good');
+  });
+  session.events.on('sleep', (e) => {
+    if (e.asleep) return;
+    const hrs = e.seconds / 3600;
+    host.saveNow();
+    host.toast(hrs >= 1 ? `Awake — slept ${hrs.toFixed(1)} h` : `Awake — slept ${Math.max(1, Math.round(e.seconds / 60))} min`, 'info');
+  });
   session.events.on('atmosphere', (e) => host.toast(e.entered ? 'Entering atmosphere' : 'Clear of the atmosphere', e.entered ? 'warn' : 'info'));
 
   // device lines for the performance report
@@ -343,10 +355,31 @@ export async function boot(): Promise<void> {
       return;
     }
     const c = flight.controls.camera;
-    cam.mode = 'chase';
     cam.yaw = c.yaw;
     cam.pitch = c.pitch;
     cam.distance = c.distance;
+    frame.cabinLights = session.cabinLights();
+    const inside = session.interior();
+    if (session.mode() === 'onFoot') {
+      // first person: the pilot's own eyes, inside the ship
+      const cv = session.crew();
+      cam.mode = 'interior';
+      cam.eye.x = cv.eye.x;
+      cam.eye.y = cv.eye.y;
+      cam.eye.z = cv.eye.z;
+      cam.lookYaw = cv.yaw;
+      cam.lookPitch = cv.pitch;
+    } else if (flight.cockpit && inside) {
+      // strapped in, looking out over the console; the drag that orbits the chase camera turns the head
+      cam.mode = 'interior';
+      cam.eye.x = inside.helmEye.x;
+      cam.eye.y = inside.helmEye.y;
+      cam.eye.z = inside.helmEye.z;
+      c.yaw = Math.max(-2.2, Math.min(2.2, c.yaw));
+      c.pitch = Math.max(-1.1, Math.min(1.1, c.pitch));
+      cam.lookYaw = c.yaw;
+      cam.lookPitch = -c.pitch;
+    } else cam.mode = 'chase';
     if (!p.dockedTo && d.stationId && d.portId) {
       addStationExtra(frame, d.stationId, d.portId);
       setDockingGuide(frame, d.stationId, d.portId);

@@ -21,7 +21,7 @@
 import type { Quat, RGB, ShipVisualId, V3 } from '../core/types';
 import type { BodyView, CraftView } from '../game/api';
 
-export type CameraMode = 'chase' | 'orbit' | 'cockpit' | 'dock' | 'flyby';
+export type CameraMode = 'chase' | 'orbit' | 'cockpit' | 'dock' | 'flyby' | 'interior';
 
 export interface FrameShip {
   /** Stable id (the scene keeps one visual per id). */
@@ -67,6 +67,8 @@ export interface FrameCamera {
    * dock    behind the focus ship looking down the approach axis of `environment.dockingGuide`
    *         (falls back to chase without a guide)
    * flyby   a drifting external camera the ship passes by
+   * interior first person inside the player's ship: the camera sits at `eye` (ship-local) and looks along
+   *         `lookYaw` / `lookPitch`; the ship's interior (src/data/interiors.ts) is drawn around it
    */
   mode: CameraMode;
   /** Ship id for every mode; 'orbit' also accepts a station or body id. Empty = the player ship. */
@@ -83,6 +85,11 @@ export interface FrameCamera {
   distance: number;
   /** Optional id (body, station, site or ship) the camera should keep in view beyond the focus; null = none. */
   lookAtId: string | null;
+  /** 'interior' only: eye position in the focus ship's local axes (forward -Z, up +Y, starboard +X), m. */
+  eye: V3;
+  /** 'interior' only: look direction, rad. Yaw about +Y (0 = facing -Z, positive = left); pitch positive = up. */
+  lookYaw: number;
+  lookPitch: number;
 }
 
 export interface FrameEnvironment {
@@ -118,6 +125,8 @@ export interface SceneFrame {
   ships: FrameShip[];
   stationExtras: FrameStationExtra[];
   camera: FrameCamera;
+  /** Cabin lighting of the player's ship interior (the pilot's switch). */
+  cabinLights: boolean;
   environment: FrameEnvironment;
   fx: FrameFx[];
   /** @internal pools behind the lists (see beginFrame / add*) */
@@ -150,7 +159,8 @@ export function createSceneFrame(): SceneFrame {
     craft: [],
     ships: [],
     stationExtras: [],
-    camera: { mode: 'chase', focusId: '', yaw: 0, pitch: 0, distance: 1, lookAtId: null },
+    camera: { mode: 'chase', focusId: '', yaw: 0, pitch: 0, distance: 1, lookAtId: null, eye: { x: 0, y: 0, z: 0 }, lookYaw: 0, lookPitch: 0 },
+    cabinLights: true,
     environment: { reentry: 0, dockingGuide: null },
     fx: [],
     _pool: { ships: [], extras: [], fx: [], guide: { stationId: '', portId: '' } },

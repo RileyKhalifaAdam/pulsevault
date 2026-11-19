@@ -7,6 +7,7 @@
 import { EventBus } from '../core/events';
 import type { Quat, ShipVisualId, StationVisualId, SystemDef, V3 } from '../core/types';
 import { qLook } from '../core/vec';
+import { INTERIORS, type InteriorLayout } from '../data/interiors';
 import { SHIP_LAYOUTS } from '../data/shipLayouts';
 import { START_STATION_ID, START_SYSTEM_ID } from '../data/systems/layout';
 import { computeStats, defaultLoadout } from '../sim/ships';
@@ -16,8 +17,12 @@ import {
   flightReadout, holdTorque, loadWorld, pointingError, predictionEvent, Predictor, qRot, qRotInv, saveWorld, shipDef, undock,
   type AdvanceOptions, type Craft, type PredictOptions, type World,
 } from '../world';
+import {
+  craftMotion, createCrew, createShipMotion, crewEye, crewFelt, CREW_COM, feltAt, findPrompt, lookCrew, pushOffCrew, roomAt, sitCrew, standCrew, stepCrew,
+  type CrewState,
+} from '../world';
 import type {
-  BodyView, CraftView, DockingView, FlightView, HoldMode, PlannedBurn, PlayerView, PredictionEvent, PredictionView, Session, SessionEvents,
+  BodyView, CraftView, CrewView, DockingView, FlightView, HoldMode, PlannedBurn, PlayerMode, PlayerView, PredictionEvent, PredictionView, Session, SessionEvents,
   SessionOptions, StepInfo, TargetView, WarpLimit, WarpView,
 } from './api';
 
@@ -59,6 +64,13 @@ const WARP_WINDOW = 20;
 const LIMIT_STICKY = 20;
 /** A planned burn stays "the next burn" for this long after its time, s. */
 const BURN_GRACE = 300;
+/** Time acceleration while the pilot sleeps in the bunk (within the world's limits). */
+export const SLEEP_WARP = 1e4;
+const GALLEY_LINES = [
+  'A bulb of hot tea from the galley. It keeps its shape until you drink it.',
+  'Rice and beans from a warmed pouch. Better than it sounds.',
+  'Cold water from the recycler, and a ration bar for later.',
+];
 
 const v3 = (): V3 => ({ x: 0, y: 0, z: 0 });
 const now = (): number => (typeof performance !== 'undefined' ? performance.now() : 0);
@@ -75,6 +87,9 @@ interface SessionState {
   throttle: number;
   rearmBlock: boolean;
   settled: boolean;
+  mode?: PlayerMode;
+  crew?: CrewState | null;
+  lights?: boolean;
 }
 
 const galaxies = new Map<number, SystemDef>();
@@ -185,6 +200,22 @@ class WorldSession implements Session {
   private readonly OM = v3();
   private readonly A = v3();
 
+  // the pilot's body
+  private playerMode: PlayerMode = 'helm';
+  private layout: InteriorLayout | null = null;
+  private body: CrewState | null = null;
+  private lights = true;
+  private asleep = false;
+  private sleptFrom = 0;
+  private galleyN = 0;
+  private readonly walk = { moveX: 0, moveZ: 0 };
+  private readonly motion = createShipMotion();
+  private readonly promptView = { id: '', kind: '', label: '' };
+  private readonly crewView: CrewView = {
+    mode: 'helm', posture: 'seated', pos: v3(), eye: v3(), yaw: 0, pitch: 0, vel: v3(), boots: true, gripped: false, roomId: '', roomName: '',
+    felt: v3(), prompt: null, asleep: false,
+  };
+
   constructor(system: SystemDef, world: World, opts: SessionOptions, seed: number, state?: SessionState) {
     this.system = system;
     this.seed = seed;
@@ -200,6 +231,13 @@ class WorldSession implements Session {
       this.throttle = state.throttle;
       this.rearmBlock = state.rearmBlock;
       this.settled = state.settled;
+      this.lights = state.lights !== false;
+      const b = state.crew;
+      if (state.mode === 'onFoot' && this.layout && b && b.pos && b.vel && b.back && typeof b.yaw === 'number') {
+        this.playerMode = 'onFoot';
+        this.body = JSON.parse(JSON.stringify(b)) as CrewState;
+        this.throttle = 0;
+      }
     } else this.targetId = findCraft(world, START_STATION_ID) ? START_STATION_ID : null;
   }
 
@@ -208,6 +246,7 @@ class WorldSession implements Session {
     if (!ship) throw new Error('session: the world has no player craft');
     this.world = world;
     this.ship = ship;
+    this.layout = (ship.shipVisual && INTERIORS[ship.shipVisual as ShipVisualId]) || null;
     const defs = this.system.bodies;
     this.bodyViews = world.bodies.map((b, i) => ({ id: b.id, def: defs[i] && defs[i].id === b.id ? defs[i] : defs.find((d) => d.id === b.id)!, r: v3(), v: v3(), spinAxis: { ...b.spinAxis }, spinAngle: 0 }));
     this.craftViews = world.craft.map((c) => ({
@@ -230,7 +269,7 @@ class WorldSession implements Session {
     if (realDt > 0.1) realDt = 0.1;
     const world = this.world;
     const start = now();
-    const want = realDt * WARP_LADDER[this.warpIndex];
+    const want = realDt * this.mult();
     const budget = this.budgetMs;
     this.clock += realDt;
     this.arm();
@@ -243,6 +282,7 @@ class WorldSession implements Session {
       const res = advance(world, active && left > CONTROL_DT ? CONTROL_DT : left, this.advOpts);
       info.simDt += res.simDt;
       info.steps += res.steps;
+      if (this.playerMode === 'onFoot' && res.simDt > 0) this.stepBody(res.simDt);
       const limited = res.limitedBy;
       if (world.events.length > 0) this.pump();
       if (limited !== '') { why = limited; break; }
@@ -269,6 +309,18 @@ class WorldSession implements Session {
     return this.world.t;
   }
 
+  /** Time acceleration in force: the ladder at the helm, 1x on foot, SLEEP_WARP while asleep. */
+  private mult(): number {
+    return this.asleep ? SLEEP_WARP : this.playerMode === 'onFoot' ? 1 : WARP_LADDER[this.warpIndex];
+  }
+
+  /** The pilot's body moves with what the ship just did. */
+  private stepBody(dt: number): void {
+    const b = this.body, layout = this.layout;
+    if (!b || !layout || b.seat !== '') return;
+    stepCrew(b, layout, craftMotion(this.world, this.ship, this.motion), this.walk, dt);
+  }
+
   /** Keep the docking latch armed near a station (and open for a moment after an undock). */
   private arm(): void {
     const c = this.ship;
@@ -287,6 +339,12 @@ class WorldSession implements Session {
   private command(): boolean {
     const c = this.ship;
     if (c.destroyed) return false;
+    if (this.playerMode === 'onFoot') {
+      // Nobody is at the controls: the drive and the thrusters are locked off; the attitude hold keeps working.
+      this.throttle = 0;
+      this.pitch = this.yaw = this.roll = 0;
+      this.translate.x = this.translate.y = this.translate.z = 0;
+    }
     const tq = c.torque, tr = this.translate;
     if (c.dockedTo !== null) {
       // The latch interlocks drive and RCS; the joint carries the attitude.
@@ -328,7 +386,7 @@ class WorldSession implements Session {
     const th = Math.sqrt(ERR.x * ERR.x + ERR.y * ERR.y + ERR.z * ERR.z);
     const we = Math.sqrt(WE.x * WE.x + WE.y * WE.y + WE.z * WE.z);
     if (this.settled) {
-      const warp = WARP_LADDER[this.warpIndex];
+      const warp = this.mult();
       if (warp < SUSPEND_WARP && (th > (warp >= LOOSE_WARP ? WAKE_ANGLE_LOOSE : WAKE_ANGLE) || we > WAKE_RATE)) this.settled = false;
     } else if (th < SETTLE_ANGLE && we < SETTLE_RATE) this.settled = true;
     if (this.settled) {
@@ -472,9 +530,9 @@ class WorldSession implements Session {
           out.emit('docked', { stationId: e.stationId, portId: e.portId });
           break;
         case 'undocked': this.predDirty = true; out.emit('undocked', { stationId: e.stationId }); break;
-        case 'impact': this.predDirty = true; out.emit('impact', { speed: e.speed, with: e.with }); break;
-        case 'destroyed': this.throttle = 0; out.emit('destroyed', { cause: e.cause }); break;
-        case 'atmosphere': out.emit('atmosphere', { bodyId: e.bodyId, entered: e.entered }); break;
+        case 'impact': this.wake(); this.predDirty = true; out.emit('impact', { speed: e.speed, with: e.with }); break;
+        case 'destroyed': this.wake(); this.throttle = 0; out.emit('destroyed', { cause: e.cause }); break;
+        case 'atmosphere': if (e.entered) this.wake(); out.emit('atmosphere', { bodyId: e.bodyId, entered: e.entered }); break;
         case 'primaryChanged': this.predDirty = true; out.emit('primaryChanged', { from: e.from, to: e.to }); break;
         case 'landed': this.predDirty = true; out.emit('landed', { bodyId: e.bodyId }); break;
         default: break;
@@ -486,7 +544,7 @@ class WorldSession implements Session {
 
   warp(): WarpView {
     const w = this.warpView;
-    w.requested = WARP_LADDER[this.warpIndex];
+    w.requested = this.mult();
     let sim = 0, real = 0;
     for (let i = 0; i < this.winN; i++) { sim += this.winSim[i]; real += this.winReal[i]; }
     w.achieved = real > 0 ? sim / real : w.requested;
@@ -506,6 +564,12 @@ class WorldSession implements Session {
   }
   private setWarpIndex(i: number): void {
     i = clamp(i, 0, WARP_LADDER.length - 1);
+    if (this.asleep) { this.wake(); return; }
+    if (this.playerMode === 'onFoot') {
+      // on foot and awake, time runs at 1x
+      if (i > 0) { this.warpView.limitedBy = 'crew'; this.limitFrames = 4 * LIMIT_STICKY; }
+      i = 0;
+    }
     if (i === this.warpIndex) return;
     this.warpIndex = i;
     this.settled = false; // the hold looks again (and tightens up when time slows down)
@@ -518,6 +582,7 @@ class WorldSession implements Session {
   // ------------------------------------------------------------------------------------------ input
 
   setControls(c: { pitch?: number; yaw?: number; roll?: number; throttle?: number; translate?: V3 }): void {
+    if (this.playerMode === 'onFoot') return; // the seat is empty
     if (c.pitch !== undefined) this.pitch = clamp(c.pitch, -1, 1) || 0;
     if (c.yaw !== undefined) this.yaw = clamp(c.yaw, -1, 1) || 0;
     if (c.roll !== undefined) this.roll = clamp(c.roll, -1, 1) || 0;
@@ -758,10 +823,163 @@ class WorldSession implements Session {
     return true;
   }
 
+  // ------------------------------------------------------------------------------------------ the pilot's body
+
+  mode(): PlayerMode {
+    return this.playerMode;
+  }
+  interior(): InteriorLayout | null {
+    return this.layout;
+  }
+  cabinLights(): boolean {
+    return this.lights;
+  }
+  crew(): CrewView {
+    const o = this.crewView, layout = this.layout, b = this.playerMode === 'onFoot' ? this.body : null;
+    const m = craftMotion(this.world, this.ship, this.motion);
+    o.mode = this.playerMode;
+    o.asleep = this.asleep;
+    o.prompt = null;
+    if (b && layout) {
+      o.posture = b.posture;
+      o.pos.x = b.pos.x; o.pos.y = b.pos.y; o.pos.z = b.pos.z;
+      o.vel.x = b.vel.x; o.vel.y = b.vel.y; o.vel.z = b.vel.z;
+      crewEye(b, layout, o.eye);
+      o.yaw = b.yaw; o.pitch = b.pitch;
+      o.boots = b.boots; o.gripped = b.gripped;
+      crewFelt(b, m, o.felt);
+      const p = this.promptView;
+      if (this.asleep) { p.id = 'bunk'; p.kind = 'bunk'; p.label = 'Wake up'; o.prompt = p; }
+      else if (b.seat === 'bunk') { p.id = 'bunk'; p.kind = 'bunk'; p.label = 'Sleep'; o.prompt = p; }
+      else {
+        const it = findPrompt(b, layout);
+        if (it) { p.id = it.id; p.kind = it.kind; p.label = it.label; o.prompt = p; }
+      }
+    } else {
+      // strapped into the pilot seat
+      const e = layout ? layout.helmEye : o.eye, deck = layout ? layout.spawn.pos.y : 0;
+      o.posture = 'seated';
+      o.eye.x = e.x; o.eye.y = e.y; o.eye.z = e.z;
+      o.pos.x = e.x; o.pos.y = deck; o.pos.z = e.z;
+      o.vel.x = o.vel.y = o.vel.z = 0;
+      o.yaw = 0; o.pitch = 0;
+      o.boots = true; o.gripped = false;
+      feltAt0(m, e.x, deck + CREW_COM, e.z, o.felt);
+    }
+    const room = layout ? roomAt(layout, o.pos.x, o.pos.y + CREW_COM, o.pos.z) : null;
+    o.roomId = room ? room.id : '';
+    o.roomName = room ? room.name : '';
+    return o;
+  }
+  setWalk(c: { moveX?: number; moveZ?: number }): void {
+    const w = this.walk;
+    if (c.moveX !== undefined) w.moveX = clamp(c.moveX, -1, 1) || 0;
+    if (c.moveZ !== undefined) w.moveZ = clamp(c.moveZ, -1, 1) || 0;
+    if (this.asleep && (w.moveX !== 0 || w.moveZ !== 0)) this.wake();
+  }
+  addLook(dYaw: number, dPitch: number): void {
+    if (!(dYaw !== 0 || dPitch !== 0)) return;
+    if (this.asleep) this.wake();
+    if (this.playerMode === 'onFoot' && this.body) lookCrew(this.body, dYaw, dPitch);
+  }
+  setBoots(on: boolean): void {
+    if (this.asleep) this.wake();
+    if (this.body) this.body.boots = !!on;
+  }
+  pushOff(): void {
+    if (this.asleep) { this.wake(); return; }
+    if (this.playerMode === 'onFoot' && this.body && this.layout) pushOffCrew(this.body, this.layout);
+  }
+  leaveHelm(): boolean {
+    const c = this.ship, layout = this.layout;
+    if (this.playerMode !== 'helm' || !layout || c.destroyed) return false;
+    if (this.throttle > 0 || c.throttle > 0) return false; // strapped in while the drive is on
+    this.pitch = this.yaw = this.roll = 0;
+    this.translate.x = this.translate.y = this.translate.z = 0;
+    const boots = this.body ? this.body.boots : true;
+    this.body = createCrew(layout, PLAYER_ID);
+    this.body.boots = boots;
+    this.walk.moveX = this.walk.moveZ = 0;
+    this.setWarpIndex(0);
+    this.playerMode = 'onFoot';
+    this.settled = false;
+    this.events.emit('crewMode', { mode: 'onFoot' });
+    return true;
+  }
+  standUp(): void {
+    if (this.asleep) this.wake();
+    if (this.playerMode === 'onFoot' && this.body) standCrew(this.body);
+  }
+  interact(): boolean {
+    if (this.asleep) { this.wake(); return true; }
+    const b = this.body, layout = this.layout, out = this.events;
+    if (this.playerMode !== 'onFoot' || !b || !layout) return false;
+    if (b.seat === 'bunk') {
+      // lying down already: sleep until something wakes the pilot
+      this.asleep = true;
+      this.sleptFrom = this.world.t;
+      this.walk.moveX = this.walk.moveZ = 0;
+      this.settled = false;
+      this.winN = this.winAt = 0;
+      out.emit('sleep', { asleep: true, seconds: 0 });
+      return true;
+    }
+    const it = findPrompt(b, layout);
+    if (!it) return false;
+    const c = this.ship;
+    switch (it.kind) {
+      case 'helm':
+        this.playerMode = 'helm';
+        this.walk.moveX = this.walk.moveZ = 0;
+        out.emit('crewMode', { mode: 'helm' });
+        break;
+      case 'bunk': sitCrew(b, layout, 'bunk'); break;
+      case 'tableSeat': sitCrew(b, layout, 'table'); break;
+      case 'lights':
+        this.lights = !this.lights;
+        out.emit('cabinLights', { on: this.lights });
+        break;
+      case 'hatch': {
+        const st = c.dockedTo !== null ? findCraft(this.world, c.dockedTo) : null;
+        out.emit('crewMessage', { source: it.id, text: c.dockedTo !== null ? `Docked to ${st ? st.name : 'the station'} — the station side is not built yet` : 'Hatch sealed — not docked' });
+        break;
+      }
+      case 'galley':
+        out.emit('crewMessage', { source: it.id, text: GALLEY_LINES[this.galleyN++ % GALLEY_LINES.length] });
+        break;
+      case 'washroom':
+        out.emit('crewMessage', { source: it.id, text: 'You wash up with a damp cloth; the recycler takes the water back.' });
+        break;
+      case 'reactor': {
+        const pct = (x: number): string => `${Math.round(clamp(x, 0, 9.99) * 100)}%`;
+        out.emit('crewMessage', {
+          source: it.id,
+          text: `Reactor steady · propellant ${pct(c.propellantCapacity > 0 ? c.propellant / c.propellantCapacity : 0)} · heat ${pct(c.heatCapacity > 0 ? c.heat / c.heatCapacity : 0)} · hull ${pct(c.hull)}`,
+        });
+        break;
+      }
+      default: return false;
+    }
+    return true;
+  }
+  /** End the sleep (any input, or the ship being knocked about). */
+  private wake(): void {
+    if (!this.asleep) return;
+    this.asleep = false;
+    this.settled = false;
+    this.winN = this.winAt = 0;
+    this.events.emit('sleep', { asleep: false, seconds: this.world.t - this.sleptFrom });
+  }
+
   // ------------------------------------------------------------------------------------------ life cycle
 
   reset(): void {
     this.bind(buildWorld(this.system));
+    this.asleep = false;
+    this.playerMode = 'helm';
+    this.body = null;
+    this.lights = true;
+    this.walk.moveX = this.walk.moveZ = 0;
     this.pitch = this.yaw = this.roll = this.throttle = 0;
     this.translate.x = this.translate.y = this.translate.z = 0;
     this.hold = 'stability';
@@ -779,10 +997,14 @@ class WorldSession implements Session {
     const state: SessionState = {
       seed: this.seed, hold: this.hold, holdQ: this.holdQValid ? { ...this.holdQ } : null, targetId: this.targetId, predFrame: this.predFrame,
       burns: this.burnList, burnSeq: this.burnSeq, throttle: this.throttle, rearmBlock: this.rearmBlock, settled: this.settled,
+      mode: this.playerMode, crew: this.playerMode === 'onFoot' ? this.body : null, lights: this.lights,
     };
     return JSON.stringify({ tidelock: SAVE_VERSION, session: state, world: saveWorld(this.world) });
   }
 }
+
+/** Felt acceleration of something at rest in the ship at a point. */
+const feltAt0 = (m: ReturnType<typeof createShipMotion>, x: number, y: number, z: number, out: V3): V3 => feltAt(m, x, y, z, 0, 0, 0, out);
 
 const TS: { r: V3; v: V3; name: string; craft: boolean } = { r: v3(), v: v3(), name: '', craft: false };
 
@@ -804,6 +1026,7 @@ export function loadSession(json: string, opts: SessionOptions = {}): Session | 
     return new WorldSession(system, world, opts, s.seed, {
       seed: s.seed, hold: s.hold ?? 'stability', holdQ: s.holdQ ?? null, targetId: s.targetId ?? null, predFrame: s.predFrame ?? null,
       burns: Array.isArray(s.burns) ? s.burns : [], burnSeq: s.burnSeq ?? 0, throttle: s.throttle ?? 0, rearmBlock: !!s.rearmBlock, settled: !!s.settled,
+      mode: s.mode === 'onFoot' ? 'onFoot' : 'helm', crew: s.crew ?? null, lights: s.lights !== false,
     });
   } catch {
     return null;

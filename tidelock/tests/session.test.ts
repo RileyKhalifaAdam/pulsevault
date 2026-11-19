@@ -270,3 +270,152 @@ describe('session on the physical world', () => {
     expect(snapshot(createSession(FREE))).toEqual(start);
   });
 });
+
+describe('the pilot as a body in the ship', () => {
+  /** Walk toward ship-local waypoints, steering by the body's own yaw. */
+  const walkTo = (s: Session, points: [number, number][]): void => {
+    for (const [x, z] of points) {
+      let n = 0;
+      for (; n < 1500; n++) {
+        const c = s.crew();
+        const dx = x - c.pos.x, dz = z - c.pos.z, d = Math.hypot(dx, dz);
+        if (d < 0.06) break;
+        const k = Math.min(0.8, d * 3) / d, cy = Math.cos(c.yaw), sy = Math.sin(c.yaw);
+        s.setWalk({ moveX: (cy * dx - sy * dz) * k, moveZ: (-sy * dx - cy * dz) * k });
+        s.step(1 / 60);
+      }
+      expect(n, `waypoint ${x},${z}`).toBeLessThan(1500);
+    }
+    s.setWalk({ moveX: 0, moveZ: 0 });
+  };
+  const face = (s: Session, yaw: number): void => s.addLook(yaw - s.crew().yaw || 1e-9, 0);
+
+  it('leave the helm, walk to the cabin, switch the lights, sleep an hour in the bunk, wake, fly again', () => {
+    const s = createSession(FREE);
+    const said: string[] = [];
+    const modes: string[] = [];
+    const sleeps: { asleep: boolean; seconds: number }[] = [];
+    s.events.on('crewMessage', (e) => said.push(e.text));
+    s.events.on('crewMode', (e) => modes.push(e.mode));
+    s.events.on('sleep', (e) => sleeps.push({ ...e }));
+    expect(s.mode()).toBe('helm');
+    expect(s.interior()?.shipId).toBe('wren');
+    expect(s.crew().posture).toBe('seated');
+    expect(s.crew().eye).toEqual(s.interior()!.helmEye);
+    expect(s.leaveHelm()).toBe(true);
+    expect(s.mode()).toBe('onFoot');
+    expect(modes).toEqual(['onFoot']);
+    let c = s.crew();
+    expect(c.pos).toEqual(s.interior()!.spawn.pos);
+    expect(c.roomId).toBe('cockpit');
+    expect(c.prompt?.kind).toBe('helm');
+    run(s, 0.2);
+    expect(s.crew().gripped).toBe(true);
+    expect(s.crew().posture).toBe('walking');
+    // the drive is locked off and time stays at 1x
+    s.setControls({ throttle: 1, translate: { x: 1, y: 0, z: 0 } });
+    const t0 = s.time();
+    s.warpUp();
+    s.warpUp();
+    run(s, 1);
+    expect(s.player().throttle).toBe(0);
+    expect(s.flight().accel).toBeLessThan(1e-6);
+    expect(s.time() - t0).toBeCloseTo(1, 6);
+    expect(s.warp().requested).toBe(1);
+    expect(s.warp().limitedBy).toBe('crew');
+    expect(s.player().hold).toBe('stability');
+    // into the cabin, to the light switch
+    face(s, Math.PI);
+    walkTo(s, [[0, -3.2], [0, -2.0]]);
+    expect(s.crew().roomName).toBe('Cabin');
+    face(s, Math.atan2(0.6, 0.5));
+    expect(s.crew().prompt?.kind).toBe('lights');
+    expect(s.cabinLights()).toBe(true);
+    expect(s.interact()).toBe(true);
+    expect(s.cabinLights()).toBe(false);
+    // hatch, galley
+    walkTo(s, [[0, 1.0]]);
+    expect(s.crew().prompt?.kind).toBe('hatch');
+    s.interact();
+    expect(said.pop()).toBe('Hatch sealed — not docked');
+    // boots off: the pilot floats; push off toward the corridor door, boots back on to land
+    s.setBoots(false);
+    run(s, 0.1);
+    expect(s.crew().posture).toBe('floating');
+    s.setBoots(true);
+    run(s, 0.5);
+    expect(s.crew().gripped).toBe(true);
+    // to the bunk
+    walkTo(s, [[0, 1.6], [0, 3.05], [0.73, 3.05]]);
+    c = s.crew();
+    expect(c.roomId).toBe('bunks');
+    expect(c.prompt?.kind).toBe('bunk');
+    s.interact();
+    c = s.crew();
+    expect(c.posture).toBe('lying');
+    expect(c.eye).toEqual(s.interior()!.bunkEye);
+    expect(c.prompt?.label).toBe('Sleep');
+    expect(c.asleep).toBe(false);
+    s.interact();
+    expect(s.crew().asleep).toBe(true);
+    expect(s.warp().requested).toBe(1e4);
+    const t1 = s.time();
+    let frames = 0;
+    while (s.time() - t1 < 3600 && frames < 4000) { s.step(1 / 60); frames++; }
+    expect(s.time() - t1).toBeGreaterThanOrEqual(3600);
+    expect(frames).toBeLessThan(200); // well above 100x: the world granted the sleep
+    s.addLook(0.01, 0);
+    expect(s.crew().asleep).toBe(false);
+    expect(sleeps.length).toBe(2);
+    expect(sleeps[1].seconds).toBeCloseTo(s.time() - t1, 6);
+    const t2 = s.time();
+    run(s, 1);
+    expect(s.time() - t2).toBeCloseTo(1, 6);
+    // save while on foot: the body comes back where it was
+    const again = loadSession(s.save(), FREE)!;
+    expect(again.mode()).toBe('onFoot');
+    expect(again.crew().posture).toBe('lying');
+    expect(again.cabinLights()).toBe(false);
+    // up, back to the cockpit, strap in, light the drive
+    s.standUp();
+    run(s, 0.3);
+    expect(s.crew().posture).toBe('walking');
+    walkTo(s, [[0, 3.05], [0, 1.6], [0, -2.0], [0, -3.2], [-0.5, -3.25]]);
+    face(s, 0);
+    expect(s.crew().prompt?.kind).toBe('helm');
+    expect(s.interact()).toBe(true);
+    expect(s.mode()).toBe('helm');
+    expect(modes).toEqual(['onFoot', 'helm']);
+    s.setControls({ throttle: 1 });
+    run(s, 2);
+    expect(s.player().throttle).toBe(1);
+    expect(s.flight().accel).toBeGreaterThan(5);
+    s.reset();
+    expect(s.mode()).toBe('helm');
+    expect(s.cabinLights()).toBe(true);
+  });
+
+  it('thrust while the pilot is loose is not possible; a turning ship is felt on foot', () => {
+    const s = createSession(FREE);
+    // strapped in while the drive is on; the crew is pressed toward the stern at the ship's acceleration
+    s.setControls({ throttle: 1 });
+    run(s, 0.5);
+    expect(s.leaveHelm()).toBe(false);
+    expect(s.crew().felt.z).toBeCloseTo(s.player().maxAccel, 6);
+    s.setControls({ throttle: 0 });
+    run(s, 0.5);
+    expect(Math.hypot(s.crew().felt.x, s.crew().felt.y, s.crew().felt.z)).toBeLessThan(0.05);
+    expect(s.leaveHelm()).toBe(true);
+    s.setHold('prograde'); // the hold keeps working with the seat empty: the ship turns under the pilot
+    let felt = 0;
+    for (let i = 0; i < 600; i++) {
+      s.step(1 / 60);
+      const f = s.crew().felt;
+      felt = Math.max(felt, Math.hypot(f.x, f.y, f.z));
+    }
+    expect(felt).toBeGreaterThan(0.01);
+    expect(felt).toBeLessThan(4);
+    expect(s.crew().roomId).toBe('cockpit');
+    expect(s.player().throttle).toBe(0);
+  });
+});

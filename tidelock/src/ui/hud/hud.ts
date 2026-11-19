@@ -10,6 +10,7 @@ import { fmtDistance, fmtDuration, fmtSpeed } from '../../core/units';
 import type { WarpLimit } from '../../game';
 import { h, icon, installStyles, onTap, type IconName } from '../kit';
 import { createFlightControls, type FlightControls } from '../controls/controls';
+import { createFootHud } from './foot';
 
 const CSS = `
 .hud{position:absolute;inset:0;pointer-events:none;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent;font-variant-numeric:tabular-nums;
@@ -106,6 +107,11 @@ const CSS = `
 .hud-brk span{position:absolute;top:calc(100% + 4px);left:50%;transform:translateX(-50%);white-space:nowrap;font-size:11px;font-weight:600;letter-spacing:.08em;padding:2px 6px;background:rgba(8,12,18,.72);border-radius:2px;color:var(--tl-ion)}
 .hud-warn{margin-top:5px;padding-right:6px;font-size:11px;font-weight:600;letter-spacing:.04em;color:var(--tl-ember-hi)}
 .hud-warn.is-bad{color:var(--tl-red)}
+.hud-btn--seat{flex:1 1 0;min-width:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;font-size:12px;font-weight:600;letter-spacing:.08em;color:var(--tl-text)}
+.hud-btn--seat small{font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--tl-dim);white-space:nowrap}
+.hud-btn--leave{flex:1.4 1 0;border-color:rgba(111,227,255,.45);color:var(--tl-ion)}
+.hud-btn--leave.is-off{border-color:var(--tl-line-2,rgba(255,255,255,.18));color:var(--tl-dim)}
+.hud-btn--leave.is-off small{color:var(--tl-ember-hi)}
 .hud-btn--rcs{width:52px;flex:none;padding:0;color:var(--tl-dim)}
 .hud-btn--rcs.is-on{background:rgba(255,180,84,.22);border-color:var(--tl-ember);color:var(--tl-ember)}
 .hud-stick.is-rcs{border-color:rgba(255,180,84,.8)}
@@ -140,9 +146,11 @@ const cap = (s: string): string => (s ? s.charAt(0).toUpperCase() + s.slice(1) :
 
 export interface FlightScreen extends UiScreen {
   controls: FlightControls;
+  /** True while the pilot has chosen the view from the seat (SceneFrame.camera.mode 'interior' at the helm eye). */
+  readonly cockpit: boolean;
 }
 
-const WHY: Record<WarpLimit, string> = { '': '', thrust: 'thrusting', rotation: 'turning', contact: 'in contact', atmosphere: 'in atmosphere', proximity: 'close to something', cpu: 'CPU budget', docked: 'docked' };
+const WHY: Record<WarpLimit, string> = { '': '', thrust: 'thrusting', rotation: 'turning', contact: 'in contact', atmosphere: 'in atmosphere', proximity: 'close to something', cpu: 'CPU budget', docked: 'docked', crew: 'on foot' };
 const fmtX = (v: number): string => (v >= 1e6 ? `${+(v / 1e6).toFixed(1)}M` : v >= 1000 ? `${+(v / 1000).toFixed(1)}k` : v >= 10 ? String(Math.round(v)) : String(+v.toFixed(1)));
 
 export function createFlightScreen(host: UiHost, scene: SceneManager, hooks: { pause(): void }): FlightScreen {
@@ -160,6 +168,10 @@ export function createFlightScreen(host: UiHost, scene: SceneManager, hooks: { p
     stamp = 1;
   };
   const controls = createFlightControls(host, { warp, map: () => host.go('map'), pause: hooks.pause });
+  // the pilot on foot has a HUD of their own; this screen swaps between the two with Session.mode()
+  const foot = createFootHud(host, { pause: hooks.pause });
+  let onFoot = false;
+  let cockpit = false;
 
   // ---------------------------------------------------------------- top
   const sit = h('div.hud-sit');
@@ -234,9 +246,36 @@ export function createFlightScreen(host: UiHost, scene: SceneManager, hooks: { p
   const warpEl = h('div.hud-warp.hud-plate', null, warpDown, h('div', null, warpX, warpWhy), warpUp);
   onTap(warpDown, () => warp(-1));
   onTap(warpUp, () => warp(1));
+  // the seat: view from the cockpit, and unstrap to walk the ship
+  const camLabel = h('span', { text: 'CHASE' });
+  const camBtn = h('button.hud-btn.hud-btn--seat', { attrs: { type: 'button', 'aria-label': 'Camera view' } }, h('small', { text: 'VIEW' }), camLabel);
+  const setCam = text(camLabel);
+  onTap(camBtn, () => {
+    cockpit = !cockpit;
+    controls.camera.yaw = 0;
+    controls.camera.pitch = cockpit ? 0 : 0.12;
+    setCam(cockpit ? 'COCKPIT' : 'CHASE');
+  });
+  const leaveLabel = h('span', { text: 'LEAVE SEAT' });
+  const leaveWhy = h('small');
+  const leaveBtn = h('button.hud-btn.hud-btn--seat.hud-btn--leave', { attrs: { type: 'button' } }, leaveWhy, leaveLabel);
+  const setLeaveWhy = text(leaveWhy);
+  /** Why the pilot cannot unstrap right now ('' = they can). */
+  const seatLock = (): string => {
+    const p = ses.player();
+    return p.destroyed ? 'ship lost' : p.throttle > 0 ? 'drive is on' : '';
+  };
+  onTap(leaveBtn, () => {
+    const why = seatLock();
+    if (why || !ses.leaveHelm()) host.toast(why === 'drive is on' ? 'Cut the drive before you unstrap' : 'You cannot leave the seat right now', 'warn');
+    stamp = 1;
+  });
+  const seatRow = h('div.hud-row', null, camBtn, leaveBtn);
+  if (!ses.interior()) seatRow.hidden = true;
   const col = h('div.hud-col', null,
     controls.sasDrawer,
     primary,
+    seatRow,
     h('div.hud-row', null, warpEl),
     h('div.hud-row', null, controls.roll, controls.rcs, controls.sas));
   const bottom = h('div.hud-bottom', null, col, controls.throttle);
@@ -466,15 +505,33 @@ export function createFlightScreen(host: UiHost, scene: SceneManager, hooks: { p
       if (primary.dataset.tone !== tone) primary.dataset.tone = tone;
     }
     primaryAct = act;
+    const lock = seatLock();
+    leaveBtn.classList.toggle('is-off', lock !== '');
+    setLeaveWhy(lock || 'walk the ship');
+  };
+  const setMode = (foot_: boolean): void => {
+    onFoot = foot_;
+    const shown = el.style.display !== 'none' || foot.el.style.display !== 'none';
+    if (!shown) return;
+    el.style.display = foot_ ? 'none' : '';
+    controls.setActive(!foot_);
+    foot.setActive(foot_);
+    stamp = 1;
   };
 
   return {
     el,
     controls,
+    get cockpit() {
+      return cockpit && !onFoot;
+    },
     show() {
       if (!el.isConnected) host.root.appendChild(el);
-      el.style.display = '';
-      controls.setActive(true);
+      if (!foot.el.isConnected) host.root.appendChild(foot.el);
+      onFoot = ses.mode() === 'onFoot';
+      el.style.display = onFoot ? 'none' : '';
+      controls.setActive(!onFoot);
+      foot.setActive(onFoot);
       // a sensible default target: the nearest station
       if (!ses.target()) {
         const ids = targetIds();
@@ -485,8 +542,14 @@ export function createFlightScreen(host: UiHost, scene: SceneManager, hooks: { p
     hide() {
       el.style.display = 'none';
       controls.setActive(false);
+      foot.setActive(false);
     },
     update(dt) {
+      if ((ses.mode() === 'onFoot') !== onFoot) setMode(!onFoot);
+      if (onFoot) {
+        foot.update(dt);
+        return;
+      }
       vw = el.clientWidth;
       vh = el.clientHeight;
       controls.update(dt);
@@ -499,6 +562,7 @@ export function createFlightScreen(host: UiHost, scene: SceneManager, hooks: { p
     },
     dispose() {
       controls.dispose();
+      foot.dispose();
       el.remove();
     },
   };
