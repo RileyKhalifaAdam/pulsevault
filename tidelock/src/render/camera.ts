@@ -243,9 +243,9 @@ const Y_UP: V3 = { x: 0, y: 1, z: 0 };
 
 // ------------------------------------------------------------------------------------------------ rig
 
-/** Vertical field of view of the first-person interior view: 56 degrees in landscape, 88 in tall portrait. */
+/** Vertical field of view of the first-person interior view: 60 degrees in landscape, 88 in tall portrait. */
 export function interiorFov(aspect: number): number {
-  return clamp(2 * Math.atan(1.11 / Math.max(aspect, 0.1)), 56 * DEG, 88 * DEG);
+  return clamp(2 * Math.atan(1.11 / Math.max(aspect, 0.1)), 60 * DEG, 88 * DEG);
 }
 
 export function createCameraRig(): CameraRig {
@@ -499,7 +499,9 @@ export function createCameraRig(): CameraRig {
     }
     if (env.collide && !hide) env.collide(pose.offset);
 
-    const fovWant = mode === 'interior' ? interiorFov(aspect) : clamp(fovForAspect(aspect) * fovScale + fovAdd, 20 * DEG, 85 * DEG);
+    // leaning in (pinch) narrows the interior view: frame.camera.zoom scales the picture, 1..3
+    const lean = clamp(typeof req.zoom === 'number' && Number.isFinite(req.zoom) ? req.zoom : 1, 1, 3);
+    const fovWant = mode === 'interior' ? 2 * Math.atan(Math.tan(interiorFov(aspect) / 2) / lean) : clamp(fovForAspect(aspect) * fovScale + fovAdd, 20 * DEG, 85 * DEG);
     if (first || fov === 0 || mode === 'interior') fov = fovWant;
     else fov += (fovWant - fov) * (1 - Math.exp(-dt / 0.3));
     pose.fovY = fov;

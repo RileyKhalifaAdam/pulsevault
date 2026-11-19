@@ -1,7 +1,10 @@
-// TIDELOCK app shell: boot, the UiHost, screen flow, the main loop and its performance record.
+// TIDELOCK app shell: boot, the main loop and its performance record.
 //
-//   title -> flight <-> map, with the pause menu and the perf overlay above. The client talks to the Session
-//   contract (src/game) and nothing else; the scene draws the world's state as the session reports it.
+// The game is first person only and has no flight UI: the frame is always the pilot's own eyes inside the ship
+// (camera.mode 'interior' from Session.crew()), and the only inputs are the walk stick, the head and the hand on
+// a physical control (src/app/input.ts). The title is one tap; a three-finger tap opens the system menu (reset,
+// quality, sensitivity, performance overlay); a destroyed ship fades to black and starts again. The client
+// talks to the Session contract (src/game) and nothing else.
 //
 // URL parameters: q=low|medium|high|ultra (pin the quality tier for this run), fresh=1 (ignore the saved flight),
 // perf=1 (open the perf overlay).
@@ -9,19 +12,22 @@ import { createPipeline, type Quality, type RenderPipeline } from '../render/pip
 import { createSceneManager, type SceneManager } from '../render/scene';
 import { addStationExtra, beginFrame, createSceneFrame, setDockingGuide } from '../render/frame';
 import { createSession, loadSession, type Session } from '../game';
-import { createRoot, Splash, ToastStack, type ToastStackApi } from '../ui/kit';
+import { createRoot, Splash } from '../ui/kit';
 import type { UiHost, UiScreen } from '../ui/host';
-import { createFlightScreen, type FlightScreen } from '../ui/hud/hud';
-import { createMapScreen, createPauseMenu, createTitleScreen } from '../ui/screens';
+import { createPauseMenu, createTitleScreen, type PauseMenu } from '../ui/screens';
 import { createPerfOverlay } from '../ui/perfOverlay';
-import { fmtSpeed } from '../core/units';
 import { PerfMonitor } from './perf';
 import { noteForReport, showFatal, showPlainMessage } from './errors';
+import { createInstrumentData, readInstruments } from '../render/space/instruments';
+import { createPlayInput, type DevicePick, type PlayInput } from './input';
 
 const SAVE_KEY = 'tidelock.save.v1';
 const SETTINGS_KEY = 'tidelock.settings.v1';
 const QUALITIES: Quality[] = ['low', 'medium', 'high', 'ultra'];
-type ScreenName = 'title' | 'flight' | 'map';
+type ScreenName = 'title' | 'flight';
+/** A wrecked ship: seconds of black before the restart. Asleep: how dark closed eyes are. */
+const WRECK_SECONDS = 3.5;
+const SLEEP_SHADE = 0.94;
 
 // ------------------------------------------------------------------------------------------------ storage (guarded)
 
@@ -158,13 +164,12 @@ export async function boot(): Promise<void> {
       return null;
     }
   };
-  let toasts: ToastStackApi | null = null;
   let current: ScreenName | null = null;
-  let pauseOpen = false;
+  let menuOpen = false;
   let sinceSave = 0;
-  const screens = {} as Record<ScreenName, UiScreen>;
-  let pause: UiScreen | null = null;
-  const TONE = { info: 'ion', good: 'green', warn: 'ember', bad: 'red' } as const;
+  let title: UiScreen | null = null;
+  let menu: PauseMenu | null = null;
+  let input: PlayInput | null = null;
   const session: Session = (fresh ? null : readSave()) ?? createSession({ seed: 1 });
 
   const applyTier = (q: Quality): void => {
@@ -174,6 +179,21 @@ export async function boot(): Promise<void> {
     root.dataset.fx = q === 'low' ? 'lite' : 'full';
     perf.clear(8);
     scene.setQuality(q).catch((err) => showFatal(err, 'quality'));
+  };
+
+  const closeMenu = (): void => {
+    if (!menuOpen) return;
+    menuOpen = false;
+    menu?.hide();
+    input?.setActive(current === 'flight');
+  };
+  const openMenu = (): void => {
+    if (!menu || menuOpen || current !== 'flight') return;
+    menuOpen = true;
+    input?.setActive(false);
+    host.saveNow();
+    menu.show();
+    if (!menu.el.isConnected) root.appendChild(menu.el);
   };
 
   const host: UiHost = {
@@ -186,23 +206,20 @@ export async function boot(): Promise<void> {
       host.settings.set('perfOverlay', on);
     },
     go(name) {
-      if (pauseOpen) {
-        pauseOpen = false;
-        pause?.hide();
-      }
+      closeMenu();
       if (current === name) return;
-      if (current) screens[current].hide();
       current = name;
       perf.clear(1); // each screen's frames are their own record
       noteForReport(`screen ${name}`);
-      const s = screens[name];
-      s.show();
-      if (!s.el.isConnected) root.appendChild(s.el);
+      if (name === 'title') {
+        title?.show();
+        if (title && !title.el.isConnected) root.appendChild(title.el);
+      } else title?.hide();
+      input?.setActive(name === 'flight');
     },
     reset() {
       session.reset();
       host.saveNow();
-      host.toast('Back in the starting orbit beside Chandler’s Wheel', 'good');
       if (current !== 'flight') host.go('flight');
     },
     saveNow() {
@@ -236,38 +253,17 @@ export async function boot(): Promise<void> {
         }
       },
     },
-    toast(message, kind = 'info') {
-      if (!message) return;
-      try {
-        toasts ??= ToastStack(root);
-        toasts.push({ title: message, tone: TONE[kind] ?? 'ion', duration: kind === 'bad' ? 7000 : 3800 });
-      } catch {
-        /* a toast must never break the game */
-      }
+    toast() {
+      /* nothing is written over the view: what happened is on the console screens and out of the windows */
     },
   };
 
-  const craftName = (id: string): string => session.craft().find((c) => c.id === id)?.name ?? id;
-  session.events.on('docked', (e) => {
-    host.saveNow();
-    host.toast(`Latched to ${craftName(e.stationId)}`, 'good');
-  });
-  session.events.on('undocked', (e) => host.toast(`Released from ${craftName(e.stationId)}`, 'info'));
-  session.events.on('impact', (e) => host.toast(`Impact at ${fmtSpeed(e.speed)}`, 'warn'));
-  session.events.on('destroyed', (e) => host.toast(`Ship destroyed (${e.cause})`, 'bad'));
-  session.events.on('crewMessage', (e) => host.toast(e.text, 'info'));
-  session.events.on('cabinLights', (e) => host.toast(e.on ? 'Cabin lights on' : 'Cabin lights off', 'info'));
-  session.events.on('crewMode', (e) => {
-    host.saveNow();
-    host.toast(e.mode === 'onFoot' ? 'Unstrapped — boots on the deck' : 'Strapped in at the helm', 'good');
-  });
+  session.events.on('docked', () => host.saveNow());
+  session.events.on('crewMode', () => host.saveNow());
   session.events.on('sleep', (e) => {
-    if (e.asleep) return;
-    const hrs = e.seconds / 3600;
-    host.saveNow();
-    host.toast(hrs >= 1 ? `Awake — slept ${hrs.toFixed(1)} h` : `Awake — slept ${Math.max(1, Math.round(e.seconds / 60))} min`, 'info');
+    if (!e.asleep) host.saveNow();
   });
-  session.events.on('atmosphere', (e) => host.toast(e.entered ? 'Entering atmosphere' : 'Clear of the atmosphere', e.entered ? 'warn' : 'info'));
+  session.events.on('destroyed', (e) => noteForReport(`ship destroyed (${e.cause})`));
 
   // device lines for the performance report
   try {
@@ -284,17 +280,6 @@ export async function boot(): Promise<void> {
     return [`view ${lastW}×${lastH} css px · internal ${st.width}×${st.height}`, `time acceleration asked ×${w.requested} achieved ×${w.achieved.toFixed(1)}${w.limitedBy ? ` (${w.limitedBy})` : ''}`, `screen ${current ?? '-'} · sim time ${session.time().toFixed(0)} s`];
   });
   if (params.get('perf') === '1' || settingsData.perfOverlay === true) overlay.setVisible(true);
-  // three-finger tap toggles the overlay
-  let tap3 = 0;
-  document.addEventListener('touchstart', (e) => {
-    tap3 = e.touches.length === 3 ? performance.now() : e.touches.length > 3 ? 0 : tap3;
-  }, { passive: true });
-  document.addEventListener('touchend', (e) => {
-    if (tap3 && e.touches.length === 0) {
-      if (performance.now() - tap3 < 600) host.setPerfVisible(!overlay.visible());
-      tap3 = 0;
-    }
-  }, { passive: true });
 
   // ---------------------------------------------------------------------------------------------- loading
   const splash = Splash({ status: 'Charting the Tallow system', progress: 0, footer: 'Loading — this takes a few seconds' });
@@ -304,22 +289,38 @@ export async function boot(): Promise<void> {
   await scene.setSystem(session.system, (f, label) => splash.update({ progress: f, status: label || 'Loading' }), { nearBodyId: session.flight().primaryId });
   splash.update({ progress: 1, status: 'Ready' });
 
-  // ---------------------------------------------------------------------------------------------- screens
-  const openPause = (): void => {
-    if (!pause || pauseOpen) return;
-    pauseOpen = true;
-    pause.show();
-    if (!pause.el.isConnected) root.appendChild(pause.el);
+  // ---------------------------------------------------------------------------------------------- title, menu, the pilot's touch
+  title = createTitleScreen(host);
+  menu = createPauseMenu(host);
+  menu.onResume = closeMenu;
+  // scene.pickDevice(x, y): the physical control under a finger, by a ray from the eye through the 3D cockpit.
+  input = createPlayInput({
+    surface: canvas,
+    layer: root,
+    session,
+    pick: (x, y): DevicePick | null => scene.pickDevice(x, y),
+    sensitivity: () => Number(host.settings.get<number>('stickSensitivity', 1)) || 1,
+    invertPitch: () => !!host.settings.get<boolean>('invertPitch', false),
+    onMenu: openMenu,
+  });
+  // closed eyes and the end of a wreck: a black shade between the canvas and the (empty) UI layer
+  const shade = document.createElement('div');
+  shade.style.cssText = 'position:fixed;left:0;top:0;width:100%;height:100%;background:#000;opacity:0;pointer-events:none;';
+  document.body.insertBefore(shade, root);
+  let shadeNow = 0;
+  let wreckT = 0;
+  const shadeToward = (target: number, dt: number): void => {
+    const rate = target > shadeNow ? 0.6 : 2.5; // eyes close slowly and open fast
+    const next = shadeNow + Math.max(-rate * dt, Math.min(rate * dt, target - shadeNow));
+    if (next === shadeNow) return;
+    shadeNow = next;
+    shade.style.opacity = next.toFixed(3);
   };
-  const flight: FlightScreen = createFlightScreen(host, scene, { pause: openPause });
-  screens.flight = flight;
-  screens.title = createTitleScreen(host);
-  screens.map = createMapScreen(host);
-  pause = createPauseMenu(host);
 
   // ---------------------------------------------------------------------------------------------- frame
   const frame = createSceneFrame();
-  let titleYaw = 0.6;
+  const instruments = createInstrumentData();
+  let instrumentsAge = 1;
   let lost = false;
   pipeline.onContextLost = () => {
     lost = true;
@@ -333,59 +334,42 @@ export async function boot(): Promise<void> {
     }, (err) => showFatal(err, 'context restore'));
   };
 
-  /** Refill the frame from the session: the world's bodies and craft as they are, plus the camera. */
+  /** Refill the frame from the session: the world as it is, seen from the pilot's eyes. Always first person. */
   const fill = (dt: number): void => {
     beginFrame(frame, session.time(), dt, session.warp().achieved);
     frame.bodies = session.bodies();
     frame.craft = session.craft();
     const p = session.player();
+    const cv = session.crew();
     const cam = frame.camera;
+    cam.mode = 'interior';
     cam.focusId = p.craftId;
     cam.lookAtId = null;
-    frame.environment.reentry = session.flight().situation === 'atmosphere' ? Math.min(1, Math.max(0, p.heat * 1.2)) : 0;
-    const d = session.docking();
-    if (current === 'title' || current === null) {
-      // a slow turn around the ship behind the title
-      titleYaw += dt * 0.03;
-      cam.mode = 'orbit';
-      cam.yaw = titleYaw;
-      cam.pitch = 0.22;
-      cam.distance = 2.2;
-      setDockingGuide(frame, null);
-      return;
+    cam.yaw = 0;
+    cam.pitch = 0;
+    cam.distance = 1;
+    cam.eye.x = cv.eye.x;
+    cam.eye.y = cv.eye.y;
+    cam.eye.z = cv.eye.z;
+    cam.lookYaw = cv.yaw;
+    cam.lookPitch = cv.pitch;
+    cam.zoom = input ? input.zoom : 1;
+    // the physical controls as they are, and what the console screens show (re-read five times a second)
+    frame.devices = session.devices();
+    instrumentsAge += dt;
+    if (instrumentsAge >= 0.2 || !frame.instruments) {
+      instrumentsAge = 0;
+      frame.instruments = readInstruments(session, instruments, frame.devices, session.cockpit());
     }
-    const c = flight.controls.camera;
-    cam.yaw = c.yaw;
-    cam.pitch = c.pitch;
-    cam.distance = c.distance;
     frame.cabinLights = session.cabinLights();
-    const inside = session.interior();
-    if (session.mode() === 'onFoot') {
-      // first person: the pilot's own eyes, inside the ship
-      const cv = session.crew();
-      cam.mode = 'interior';
-      cam.eye.x = cv.eye.x;
-      cam.eye.y = cv.eye.y;
-      cam.eye.z = cv.eye.z;
-      cam.lookYaw = cv.yaw;
-      cam.lookPitch = cv.pitch;
-    } else if (flight.cockpit && inside) {
-      // strapped in, looking out over the console; the drag that orbits the chase camera turns the head
-      cam.mode = 'interior';
-      cam.eye.x = inside.helmEye.x;
-      cam.eye.y = inside.helmEye.y;
-      cam.eye.z = inside.helmEye.z;
-      c.yaw = Math.max(-2.2, Math.min(2.2, c.yaw));
-      c.pitch = Math.max(-1.1, Math.min(1.1, c.pitch));
-      cam.lookYaw = c.yaw;
-      cam.lookPitch = -c.pitch;
-    } else cam.mode = 'chase';
-    if (!p.dockedTo && d.stationId && d.portId) {
-      addStationExtra(frame, d.stationId, d.portId);
-      setDockingGuide(frame, d.stationId, d.portId);
-    } else setDockingGuide(frame, null);
+    frame.environment.reentry = session.flight().situation === 'atmosphere' ? Math.min(1, Math.max(0, p.heat * 1.2)) : 0;
+    // the port the latch would take keeps its own lights; no drawn guides
+    const d = session.docking();
+    if (!p.dockedTo && d.stationId && d.portId) addStationExtra(frame, d.stationId, d.portId);
+    setDockingGuide(frame, null);
   };
 
+  let lastMode: string | null = null;
   let last = performance.now();
   let raf = 0;
   let failed = false;
@@ -399,29 +383,51 @@ export async function boot(): Promise<void> {
     const dt = Math.min(0.1, Math.max(0, frameMs / 1000));
     last = now;
     try {
-      if (pauseOpen && pause && pause.el.getClientRects().length === 0) pauseOpen = false;
-      const running = current !== 'title' && current !== null && !pauseOpen;
+      if (menuOpen && menu && menu.el.getClientRects().length === 0) closeMenu();
+      const running = current === 'flight' && !menuOpen;
       let simMs = 0;
       let steps = 0;
       if (running) {
         const info = session.step(dt);
         simMs = info.simMs;
         steps = info.steps;
+        input?.update(dt);
+        // sitting down, the pilot's eyes fall on the console: screens in the middle of the view, the windscreen
+        // above them, the hand controllers below (a wide phone needs the head a little lower to see the desk)
+        const modeNow = session.mode();
+        if (modeNow !== lastMode) {
+          lastMode = modeNow;
+          if (modeNow === 'helm') {
+            const cv = session.crew();
+            const want = (lastW > lastH ? -30 : -22) * (Math.PI / 180);
+            session.addLook(-cv.yaw, want - cv.pitch);
+          }
+        }
         sinceSave += dt;
         if (sinceSave >= 60) host.saveNow();
+        if (session.player().destroyed) {
+          // the wreck fades out; then the pilot is back in the starting orbit
+          wreckT += dt;
+          shadeToward(1, dt);
+          if (wreckT >= WRECK_SECONDS && shadeNow >= 1) {
+            wreckT = 0;
+            host.reset();
+          }
+        } else {
+          wreckT = 0;
+          shadeToward(session.crew().asleep ? SLEEP_SHADE : 0, dt);
+        }
       }
       layout();
       let renderMs = 0;
-      if (!lost && current !== 'map') {
+      if (!lost) {
         const r0 = performance.now();
         fill(dt);
         scene.render(frame);
         renderMs = performance.now() - r0;
       }
-      if (current) screens[current].update(dt);
-      if (pauseOpen) pause?.update(dt);
-      // the record, and the automatic quality it drives (not while baking, paused, or on the 2D map)
-      if (running && current === 'flight' && !lost && !scene.busy()) {
+      // the record, and the automatic quality it drives (not while baking, in the menu or on the title)
+      if (running && !lost && !scene.busy()) {
         perf.record(frameMs, simMs, renderMs, steps);
         const ch = perf.auto(dt);
         if (ch) {
@@ -429,7 +435,7 @@ export async function boot(): Promise<void> {
           if (ch.tier) applyTier(ch.tier);
           noteForReport(`auto quality: ${perf.snapshot().note}`);
         }
-      } else if (running && current === 'map') perf.record(frameMs, simMs, 0, steps);
+      }
       if (overlay.visible()) {
         const ss = scene.stats();
         perf.setRender(ss.drawCalls, ss.triangles);
@@ -443,7 +449,7 @@ export async function boot(): Promise<void> {
   };
 
   const onHide = (): void => {
-    if (current && current !== 'title') host.saveNow();
+    if (current === 'flight') host.saveNow();
   };
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) onHide();
@@ -451,7 +457,7 @@ export async function boot(): Promise<void> {
   });
   window.addEventListener('pagehide', onHide);
 
-  // First frames behind the splash, then the title over the live scene.
+  // First frames behind the splash, then the title over the pilot's view.
   fill(0);
   scene.render(frame);
   host.go('title');
@@ -464,6 +470,7 @@ export async function boot(): Promise<void> {
     host,
     scene,
     pipeline,
+    input,
     get screen() { return current; },
     frame,
   };

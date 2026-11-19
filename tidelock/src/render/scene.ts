@@ -38,6 +38,9 @@ import { createCameraRig, type CameraEnv, type CameraFocus, type CameraPose } fr
 import { addShip, playerShip, type FrameShip, type SceneFrame } from './frame';
 import { INTERIORS, type InteriorLayout } from '../data/interiors';
 import { createInteriorVisual, type InteriorUpdate, type InteriorVisual } from './space/interior';
+import { COCKPITS, type CockpitLayout } from '../data/cockpit';
+import type { DeviceView } from '../game/api';
+import { createCockpitVisual, type CockpitPick, type CockpitUpdate, type CockpitVisual } from './space/cockpit';
 
 // ------------------------------------------------------------------------------------------------ API
 
@@ -72,6 +75,8 @@ export interface SceneStats {
   triangles: number;
   /** The player ship's interior, once built: its own draw calls and triangles (drawn only in the 'interior' view). */
   interior: { drawCalls: number; triangles: number } | null;
+  /** The physical controls and screens drawn with the interior (also counted in the frame totals). */
+  cockpit: { drawCalls: number; triangles: number } | null;
 }
 
 export interface SceneManagerOptions {
@@ -97,6 +102,14 @@ export interface SceneManager {
   project(ref: SceneRef, out?: Projection): Projection;
   /** Id of the object under a touch (CSS px), with a generous radius; the player's own ship is never picked. */
   pick(x: number, y: number): string | null;
+  /**
+   * The physical control of the player's ship under a touch (CSS px) as of the last rendered frame, seen
+   * through the first-person camera, with the hand position in the device's own axes (see CockpitPick), or
+   * null. Only reachable devices are found, the nearest to the finger within a finger's width. With `heldId`
+   * the result is always that device: the hand position for a drag that started on it.
+   * The returned object is reused between calls.
+   */
+  pickDevice(x: number, y: number, heldId?: string): CockpitPick | null;
   /** What an id refers to in the current system / frame, or null. */
   refKind(id: string): SceneRefKind | null;
   /** Change the quality tier (also the pipeline's). Rebuilds the current system's visuals; resolves when done. */
@@ -405,7 +418,15 @@ class Manager implements SceneManager {
   private readonly insideScene = new THREE.Scene();
   private readonly insideCam = new THREE.PerspectiveCamera(60, 1, 0.05, 80);
   private layersInside: RenderLayer[] = [];
-  private interior: { shipId: string; visualId: string; visual: InteriorVisual } | null = null;
+  private interior: { shipId: string; visualId: string; visual: InteriorVisual; cockpit: CockpitVisual | null } | null = null;
+  private readonly cockpitCtx: CockpitUpdate = { devices: [], time: 0, lights: true, gain: 1, instruments: null };
+  /** Ship pose relative to the camera of the last interior frame, for pickDevice. */
+  private pickValid = false;
+  private readonly pickRel: V3 = { x: 0, y: 0, z: 0 };
+  private readonly pickQ: Quat = { x: 0, y: 0, z: 0, w: 1 };
+  private readonly pickO: V3 = { x: 0, y: 0, z: 0 };
+  private readonly pickD: V3 = { x: 0, y: 0, z: -1 };
+  private readonly pickV = new THREE.Vector3();
   private readonly interiorCtx: Required<InteriorUpdate> = {
     time: 0,
     lights: true,
@@ -485,7 +506,7 @@ class Manager implements SceneManager {
   private readonly tv2 = new THREE.Vector3();
   private readonly projOut: Projection = { x: 0, y: 0, visible: false, behind: false, distance: 0, radiusPx: 0, occluded: false };
   private readonly pickOut: Projection = { x: 0, y: 0, visible: false, behind: false, distance: 0, radiusPx: 0, occluded: false };
-  private readonly statsOut: SceneStats = { drawCalls: 0, triangles: 0, interior: null };
+  private readonly statsOut: SceneStats = { drawCalls: 0, triangles: 0, interior: null, cockpit: null };
   private readonly focus: CameraFocus = { id: '', kind: 'ship', radius: 10, q: { x: 0, y: 0, z: 0, w: 1 }, chaseDistance: 34, chaseHeight: 8, cockpit: v3(), throttle: 0 };
   private readonly dockEnv = { pos: v3(), dir: v3(), up: v3() };
   private readonly lookEnv = v3();
@@ -658,13 +679,17 @@ class Manager implements SceneManager {
     this.statsOut.triangles = s.triangles;
     const iv = this.interior?.visual;
     this.statsOut.interior = iv ? { drawCalls: iv.drawCalls, triangles: iv.triangles } : null;
+    const ck = this.interior?.cockpit;
+    this.statsOut.cockpit = ck ? { drawCalls: ck.drawCalls, triangles: ck.triangles } : null;
     return this.statsOut;
   }
 
   private disposeShip(e: ShipEntry): void {
     if (this.interior && this.interior.shipId === e.id) {
+      this.interior.cockpit?.dispose();
       this.interior.visual.dispose();
       this.interior = null;
+      this.pickValid = false;
     }
     e.plume?.dispose();
     e.strobes?.dispose();
@@ -678,11 +703,18 @@ class Manager implements SceneManager {
     if (cur && cur.shipId === e.id && cur.visualId === e.visualId) return cur.visual;
     const layout = (INTERIORS as Record<string, InteriorLayout | undefined>)[e.visualId];
     if (!layout) return null;
-    if (cur) cur.visual.dispose();
+    if (cur) {
+      cur.cockpit?.dispose();
+      cur.visual.dispose();
+    }
     const visual = createInteriorVisual(layout, { quality: this.quality });
     visual.object3d.visible = false;
     this.insideScene.add(visual.object3d);
-    this.interior = { shipId: e.id, visualId: e.visualId, visual };
+    // the physical controls and console screens ride with the interior (same ship-local axes, same pass)
+    const cl = (COCKPITS as Record<string, CockpitLayout | undefined>)[e.visualId];
+    const cockpit = cl ? createCockpitVisual(cl, { quality: this.quality }) : null;
+    if (cockpit) visual.object3d.add(cockpit.object3d);
+    this.interior = { shipId: e.id, visualId: e.visualId, visual, cockpit };
     return visual;
   }
 
@@ -1580,6 +1612,7 @@ class Manager implements SceneManager {
     const inside = pose.mode === 'interior' && pose.hideFocus && focusShip !== null;
     const host = inside ? focusShip : playerEntry;
     const interior = host ? this.ensureInterior(host) : null;
+    this.pickValid = false;
     if (interior) {
       const obj = interior.object3d;
       obj.visible = inside;
@@ -1608,6 +1641,24 @@ class Manager implements SceneManager {
         c.windowColor.g = this.shine.color.g * sh + c.sunColor.g * 0.1;
         c.windowColor.b = this.shine.color.b * sh + c.sunColor.b * 0.1;
         interior.update(c);
+        const cockpit = this.interior?.cockpit;
+        if (cockpit) {
+          const k = this.cockpitCtx;
+          k.devices = frame.devices ?? NO_DEVICES;
+          k.time = c.time;
+          k.lights = c.lights;
+          k.gain = c.gain;
+          k.instruments = frame.instruments ?? null;
+          cockpit.update(k);
+          this.pickValid = true;
+          this.pickRel.x = focusShip.rel.x;
+          this.pickRel.y = focusShip.rel.y;
+          this.pickRel.z = focusShip.rel.z;
+          this.pickQ.x = focusShip.q.x;
+          this.pickQ.y = focusShip.q.y;
+          this.pickQ.z = focusShip.q.z;
+          this.pickQ.w = focusShip.q.w;
+        }
         layers = this.layersInside;
       }
     }
@@ -1711,6 +1762,19 @@ class Manager implements SceneManager {
     return out;
   }
 
+  pickDevice(x: number, y: number, heldId?: string): CockpitPick | null {
+    const cockpit = this.interior?.cockpit;
+    if (!cockpit || !this.pickValid) return null;
+    // the touch as a ray from the eye, in the ship's own axes
+    const v = this.pickV;
+    v.set(((x / this.cssW) * 2 - 1) * this.tanX, (1 - (y / this.cssH) * 2) * this.tanY, -1).normalize().applyQuaternion(this.insideCam.quaternion);
+    unrotTo(this.pickD, this.pickQ, v.x, v.y, v.z);
+    unrotTo(this.pickO, this.pickQ, -this.pickRel.x, -this.pickRel.y, -this.pickRel.z);
+    // a finger covers about 22 CSS px either side of its centre
+    const tol = Math.atan((22 * 2 * this.tanY) / Math.max(1, this.cssH));
+    return cockpit.pick(this.pickO, this.pickD, tol, heldId);
+  }
+
   pick(x: number, y: number): string | null {
     let best: string | null = null;
     let bestScore = Infinity;
@@ -1744,6 +1808,8 @@ class Manager implements SceneManager {
  * Create the scene manager for a pipeline. Call setSystem() (and await it) before the first render();
  * render() before that only clears the canvas.
  */
+const NO_DEVICES: readonly DeviceView[] = [];
+
 export function createSceneManager(pipeline: RenderPipeline, opts: SceneManagerOptions): SceneManager {
   return new Manager(pipeline, opts);
 }

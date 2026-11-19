@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // Proves dist/tidelock-artifact.html (the fragment the Claude page viewer publishes): wraps it in a skeleton
 // like the host's, serves it, and loads it twice in iPhone 15 emulation — directly, and inside
-// <iframe sandbox="allow-scripts"> where localStorage throws. Each must reach the title, enter the flight view
-// straight into orbit and keep flying, with no page errors and no requests besides the page itself.
+// <iframe sandbox="allow-scripts"> where localStorage throws. Each must reach the title, begin on a tap, strap
+// in by a touch on the harness, take a touch on a hold lamp and keep flying, with no page errors and no
+// requests besides the page itself.
 //   node e2e/artifact.cjs [--no-build]        screenshots: shots/artifact-direct.png, shots/artifact-iframe.png
 const { execSync } = require('node:child_process');
 const fs = require('node:fs');
@@ -100,20 +101,42 @@ async function run() {
         check(ls === 'throws', `[${mode}] localStorage ${ls} in the sandboxed frame`);
       }
       await frame.waitForFunction(() => window.__ready === true, null, { timeout: 180000 });
+      // the new way in: tap to begin -> on foot behind the left seat -> tap the harness -> tap a hold lamp,
+      // all by touches that go through the 3D picker (helpers of e2e/cockpit.cjs)
+      const { fingers, pickMap, painted, st } = require('./cockpit.cjs');
+      const h = await fingers(page, frame);
       let s = await snap(frame);
       check(s.screen === 'title', `[${mode}] title screen is up (default quality: ${mode === 'direct'})`);
-      check(await tap(page, frame, BTN, /^\s*enter/), `[${mode}] tapped Enter`);
+      const vw = page.viewportSize();
+      await h.tapAt(vw.width / 2, vw.height * 0.45);
       await sleep(1200);
-      s = await snap(frame);
-      check(s.screen === 'flight' && s.hud && !s.docked, `[${mode}] flight HUD is up, flying free around ${s.primary} (${s.situation})`);
-      const t0 = s.time;
+      await settle(frame);
+      let c = await st(frame);
+      check(c.screen === 'flight' && c.mode === 'onFoot' && c.stick && !c.docked, `[${mode}] tap to begin: on foot in the cockpit, walk stick up, flying free around ${s.primary} (${s.situation})`);
+      const buckle = await frame.evaluate(() => window.__tidelock.session.cockpit().devices.find((d) => d.id === 'harness').pos);
+      await h.aimAt(buckle, 0.15);
+      await settle(frame);
+      let map = await pickMap(frame, 6);
+      if (map.harness) await h.tapAt(map.harness.x, map.harness.y);
+      await pump(frame, 20);
+      await sleep(500);
+      await settle(frame);
+      c = await st(frame);
+      const ui = await painted(frame);
+      check(c.mode === 'helm' && c.posture === 'seated' && !c.stick && ui.length === 0, `[${mode}] tapped the harness: strapped in, nothing drawn over the view [${ui.join(', ')}]`);
+      map = await pickMap(frame, 6);
+      if (map['hold-pro']) await h.tapAt(map['hold-pro'].x, map['hold-pro'].y);
+      const t0 = c.time;
       await pump(frame, 600);
       await settle(frame);
+      c = await st(frame);
       s = await snap(frame);
+      check(c.hold === 'prograde' && c.dev['hold-pro'].lit && !!c.fl && c.fl.hold.length > 0, `[${mode}] tapped the PRO lamp: hold = ${c.hold}, lamp lit, FLIGHT screen has data`);
+      const cost = await frame.evaluate(() => { const k = window.__tidelock.scene.stats(); return `${k.drawCalls} draw calls, ${k.triangles} triangles`; });
       await sleep(mode === 'direct' ? 1500 : 300);
       await settle(frame);
       await page.screenshot({ path: path.join(shots, `artifact-${mode}.png`) });
-      check(s.screen === 'flight' && s.time > t0 + 5 && Number.isFinite(s.alt), `[${mode}] flying: sim +${(s.time - t0).toFixed(0)} s, altitude ${(s.alt / 1000).toFixed(0)} km`);
+      check(s.screen === 'flight' && s.time > t0 + 5 && Number.isFinite(s.alt), `[${mode}] flying: sim +${(s.time - t0).toFixed(0)} s, altitude ${(s.alt / 1000).toFixed(0)} km; frame from the seat: ${cost}`);
       check(!s.errPanel, `[${mode}] no error panel`);
     } catch (err) {
       fail.push(`[${mode}] ${String((err && err.stack) || err)}`);

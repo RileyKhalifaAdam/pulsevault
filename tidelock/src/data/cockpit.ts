@@ -69,52 +69,105 @@ export interface DeviceDef {
   reach: 'pilotSeat' | 'arm';
 }
 
+/**
+ * The pilot's flight station: a binnacle standing on the main console in front of the pilot seat, with a
+ * sloping instrument face (screens above, lamps and switches below) and a level desk over the knees
+ * (hand controllers, rockers, throttle). The renderer builds the housing from this so picture and device
+ * positions agree. Profile points are (y, z) in ship axes; the housing spans x0..x1.
+ */
+export interface StationShape {
+  x0: number;
+  x1: number;
+  /** A point on the instrument face (the screens' centre line) and the face's extent along `up` from it, m. */
+  faceOrigin: V3;
+  faceNormal: V3;
+  faceUp: V3;
+  faceTop: number;
+  faceBottom: number;
+  /** Desk top height and the z of its near (pilot-side) edge; it starts at the lower edge of the face. */
+  deskY: number;
+  deskNearZ: number;
+  /** Where the glare-shield top meets the main console's hood, and where the underside meets its shelf. */
+  hoodBack: { y: number; z: number };
+  underBack: { y: number; z: number };
+}
+
 export interface CockpitLayout {
   shipId: ShipVisualId;
   devices: DeviceDef[];
+  station?: StationShape;
 }
 
 const v = (x: number, y: number, z: number): V3 => ({ x, y, z });
-/** Console face: a panel sloping back from its lower edge near the pilot; this is its outward normal. */
+/** Instrument face: a panel leaning back 30 degrees, square to the seated pilot's line of sight. */
 const FACE = v(0, 0.5, 0.866);
 const FACE_UP = v(0, 0.866, -0.5);
 const TOP = v(0, 1, 0);
+const FWD = v(0, 0, -1);
 const AFT = v(0, 0, 1);
 
+/** Pilot centreline, and the face's origin: the centre line of the two screens. */
+const PX = -0.55;
+const FY = 0.217;
+const FZ = -4.701;
+/** A point on the instrument face: x across, s metres up the face from the screens' centre line. */
+const face = (x: number, s: number): V3 => v(x, FY + 0.866 * s, FZ - 0.5 * s);
+/** Desk top (level), y of its surface. */
+const DESK_Y = -0.011;
+const desk = (x: number, z: number): V3 => v(x, DESK_Y, z);
+
+const WREN_STATION: StationShape = {
+  x0: PX - 0.32,
+  x1: PX + 0.32,
+  faceOrigin: v(PX, FY, FZ),
+  faceNormal: FACE,
+  faceUp: FACE_UP,
+  faceTop: 0.108,
+  faceBottom: -0.263,
+  deskY: DESK_Y,
+  deskNearZ: -4.37,
+  hoodBack: { y: 0.25, z: -5.09 },
+  underBack: { y: -0.16, z: -4.8 },
+};
+
+const LAMP_PITCH_X = 0.076;
+const LAMP_ROW = [-0.147, -0.221]; // s of the upper and the lower row
 const holdButton = (id: string, role: DeviceRole, label: string, col: number, row: number): DeviceDef => ({
   id,
   kind: 'button',
   role,
   label,
   room: 'cockpit',
-  // a 5 x 2 block of lamps on the console face in front of the pilot, 6 cm pitch
-  pos: v(-0.79 + col * 0.06, 0.02 + row * 0.052, -4.72 - row * 0.03),
+  // a 5 x 2 block of square lamps on the instrument face under the screens
+  pos: face(PX + (col - 2) * LAMP_PITCH_X, LAMP_ROW[row]),
   normal: FACE,
   up: FACE_UP,
-  radius: 0.026,
+  radius: 0.027,
   reach: 'pilotSeat',
 });
 
 /**
- * Halcyon Wren, pilot station (left seat; eye at about (-0.55, 0.5, -4.05) looking forward).
- * Positions are a starting arrangement: the renderer may move a control a few centimetres so everything is
- * visible and touchable from the seat on a phone held upright, as long as it edits them HERE.
+ * Halcyon Wren, pilot station (left seat; eye at about (-0.55, 0.5, -4.05), looking forward and about 20
+ * degrees down). Laid out for a phone held upright, where the view is 88 degrees tall but only 48 wide:
+ * everything sits within about 0.3 m of the pilot's centreline, stacked from the screens (top, 0.7 m from
+ * the eye) down to the hand controllers at the near corners of the desk.
  */
 const WREN: CockpitLayout = {
   shipId: 'wren',
+  station: WREN_STATION,
   devices: [
-    // two screens on the console face, either side of the pilot's centreline
+    // two screens side by side at the top of the instrument face
     {
       id: 'screen-flight', kind: 'screen', role: 'display', label: 'FLIGHT', room: 'cockpit',
-      pos: v(-0.74, 0.16, -4.86), normal: FACE, up: FACE_UP, radius: 0.16, halfWidth: 0.15, halfHeight: 0.1,
+      pos: face(PX - 0.148, 0), normal: FACE, up: FACE_UP, radius: 0.14, halfWidth: 0.14, halfHeight: 0.093,
       pages: ['flight'], reach: 'pilotSeat',
     },
     {
       id: 'screen-nav', kind: 'screen', role: 'display', label: 'NAV', room: 'cockpit',
-      pos: v(-0.36, 0.16, -4.86), normal: FACE, up: FACE_UP, radius: 0.16, halfWidth: 0.15, halfHeight: 0.1,
+      pos: face(PX + 0.148, 0), normal: FACE, up: FACE_UP, radius: 0.14, halfWidth: 0.14, halfHeight: 0.093,
       pages: ['orbit', 'docking', 'systems'], reach: 'pilotSeat',
     },
-    // attitude-hold lamps
+    // attitude-hold lamps: upper row OFF HOLD PRO RETRO TGT, lower row NML+ NML- RAD+ RAD- DOCK
     holdButton('hold-off', 'holdOff', 'OFF', 0, 0),
     holdButton('hold-stab', 'holdStability', 'HOLD', 1, 0),
     holdButton('hold-pro', 'holdPrograde', 'PRO', 2, 0),
@@ -125,44 +178,46 @@ const WREN: CockpitLayout = {
     holdButton('hold-rout', 'holdRadialOut', 'RAD+', 2, 1),
     holdButton('hold-rin', 'holdRadialIn', 'RAD-', 3, 1),
     holdButton('hold-dock', 'holdDock', 'DOCK', 4, 1),
+    // right of the lamps: target select above, latch release below
     {
       id: 'target-next', kind: 'button', role: 'targetNext', label: 'TARGET', room: 'cockpit',
-      pos: v(-0.42, 0.02, -4.72), normal: FACE, up: FACE_UP, radius: 0.028, reach: 'pilotSeat',
+      pos: face(PX + 0.25, -0.143), normal: FACE, up: FACE_UP, radius: 0.026, reach: 'pilotSeat',
     },
-    // hand controllers on the console's near edge: translation left hand, rotation right hand
+    // hand controllers at the near corners of the desk: translation left hand, rotation right hand
     {
       id: 'thc', kind: 'stick2', role: 'translation', label: 'TRANSLATE', room: 'cockpit',
-      pos: v(-0.84, -0.04, -4.62), normal: TOP, up: v(0, 0, -1), radius: 0.06, travel: 0.05, reach: 'pilotSeat',
+      pos: desk(PX - 0.16, -4.42), normal: TOP, up: FWD, radius: 0.045, travel: 0.06, reach: 'pilotSeat',
     },
     {
       id: 'thc-z', kind: 'rocker', role: 'translationZ', label: 'FWD / AFT', room: 'cockpit',
-      pos: v(-0.72, -0.05, -4.66), normal: FACE, up: FACE_UP, radius: 0.03, reach: 'pilotSeat',
+      pos: desk(PX - 0.088, -4.522), normal: TOP, up: FWD, radius: 0.03, reach: 'pilotSeat',
     },
     {
       id: 'rhc', kind: 'stick2', role: 'rotation', label: 'ROTATE', room: 'cockpit',
-      pos: v(-0.3, -0.04, -4.62), normal: TOP, up: v(0, 0, -1), radius: 0.06, travel: 0.06, reach: 'pilotSeat',
+      pos: desk(PX + 0.16, -4.42), normal: TOP, up: FWD, radius: 0.045, travel: 0.06, reach: 'pilotSeat',
     },
     {
       id: 'roll', kind: 'rocker', role: 'roll', label: 'ROLL', room: 'cockpit',
-      pos: v(-0.42, -0.05, -4.66), normal: FACE, up: FACE_UP, radius: 0.03, reach: 'pilotSeat',
+      pos: desk(PX + 0.088, -4.522), normal: TOP, up: FWD, radius: 0.03, reach: 'pilotSeat',
     },
-    // main drive on the centre pedestal, at the pilot's right hand
+    // main drive: the throttle slides in a slot down the middle of the desk (forward = more), its arming
+    // switch sits under a flip guard on the face to the left of the lamps
     {
       id: 'throttle', kind: 'lever', role: 'throttle', label: 'DRIVE', room: 'cockpit',
-      pos: v(-0.1, 0.0, -4.5), normal: TOP, up: v(0, 0, -1), radius: 0.06, travel: 0.16, reach: 'pilotSeat',
+      pos: desk(PX, -4.445), normal: TOP, up: FWD, radius: 0.04, travel: 0.12, reach: 'pilotSeat',
     },
     {
       id: 'drive-arm', kind: 'toggle', role: 'driveArm', label: 'DRIVE ARM', room: 'cockpit',
-      pos: v(0.06, -0.03, -4.62), normal: TOP, up: v(0, 0, -1), radius: 0.03, reach: 'pilotSeat',
+      pos: face(PX - 0.25, -0.18), normal: FACE, up: FACE_UP, radius: 0.028, reach: 'pilotSeat',
     },
     {
       id: 'undock', kind: 'handle', role: 'undock', label: 'LATCH RELEASE', room: 'cockpit',
-      pos: v(0.06, -0.03, -4.3), normal: TOP, up: v(0, 0, -1), radius: 0.035, reach: 'pilotSeat',
+      pos: face(PX + 0.25, -0.222), normal: FACE, up: FACE_UP, radius: 0.03, reach: 'pilotSeat',
     },
-    // the seat harness: tap to strap in from beside the seat, tap again to unstrap
+    // the seat harness buckle, in the pilot's lap: tap to strap in from beside the seat, tap again to unstrap
     {
       id: 'harness', kind: 'buckle', role: 'harness', label: 'HARNESS', room: 'cockpit',
-      pos: v(-0.55, 0.0, -4.05), normal: AFT, up: TOP, radius: 0.3, reach: 'arm',
+      pos: v(PX, -0.01, -4.285), normal: v(0, 0.866, 0.5), up: v(0, 0.5, -0.866), radius: 0.07, reach: 'arm',
     },
     // around the house
     {
@@ -171,11 +226,11 @@ const WREN: CockpitLayout = {
     },
     {
       id: 'bunk', kind: 'rest', role: 'bunk', label: 'BUNK', room: 'bunks',
-      pos: v(1.27, -0.2, 3.25), normal: TOP, up: v(0, 0, -1), radius: 0.5, halfWidth: 0.32, halfHeight: 1.2, reach: 'arm',
+      pos: v(1.27, -0.2, 3.25), normal: TOP, up: FWD, radius: 0.5, halfWidth: 0.32, halfHeight: 1.2, reach: 'arm',
     },
     {
       id: 'table-seat', kind: 'rest', role: 'tableSeat', label: 'BENCH', room: 'cabin',
-      pos: v(1.17, -0.28, -2.02), normal: TOP, up: v(0, 0, -1), radius: 0.35, halfWidth: 0.4, halfHeight: 0.27, reach: 'arm',
+      pos: v(1.17, -0.28, -2.02), normal: TOP, up: FWD, radius: 0.35, halfWidth: 0.4, halfHeight: 0.27, reach: 'arm',
     },
   ],
 };

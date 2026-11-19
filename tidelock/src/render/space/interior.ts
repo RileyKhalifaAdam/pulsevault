@@ -1775,11 +1775,7 @@ function buildInterior(layout: InteriorLayout, R: Record<string, UVR>, white: [n
     g.box(-hw + 0.01, H - 0.16, -hd, hw - 0.01, H - 0.06, 0.05, top, { bevel: 0.012 });
     g.rbox(-hw + 0.03, H - 0.17, 0.09, hw - 0.03, H - 0.125, 0.27, 0.02, S(0x4a3a2c, 0.6, 0.3), 1);
     g.box(-0.14, H - 0.062, -0.34, -0.01, H - 0.054, -0.05, S(0x0e0f11, 0.4, 0.6), { occ: false });
-    g.along([-0.075, H - 0.07, -0.16], [-0.075, H + 0.03, -0.235], (L) => g.box(-0.008, -0.012, 0, 0.008, 0.012, L, STEEL, { occ: false }));
-    g.cyl([-0.125, H + 0.034, -0.238], [-0.025, H + 0.034, -0.238], 0.017, 0.017, S(0xd8d2c4, 0.5, 0.4), CS, 3);
-    g.cyl([-0.082, H + 0.034, -0.238], [-0.068, H + 0.034, -0.238], 0.0185, 0.0185, glow(0xffa030, 1.4), CS, 0);
-    g.along([-0.03, H - 0.07, -0.11], [-0.03, H - 0.012, -0.135], (L) => g.box(-0.005, -0.008, 0, 0.005, 0.008, L, STEEL, { occ: false }));
-    g.ball([-0.03, H - 0.002, -0.139], 0.015, 0.015, 0.015, S(0xb03020, 0.4, 0.5), 8);
+    // (no levers here: the working throttle is the one on the pilot's flight station, src/data/cockpit.ts)
     flat(0.09, H - 0.057, -0.2, HP, () => {
       panel(0.27, 0.135, R.keys, { ...SCR, emis: 0.8 }, 0, 0, 0);
     });

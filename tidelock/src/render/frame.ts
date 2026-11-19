@@ -18,6 +18,8 @@
 // states, subtracting in doubles before converting to floats. `frame.ships` is filled by the scene itself from
 // the craft of kind 'ship' (a FrameShip's `r`, `v` are barycentric; `soiBodyId` is unused).
 
+import type { DeviceView } from '../game/api';
+import type { InstrumentData } from './space/instruments';
 import type { Quat, RGB, ShipVisualId, V3 } from '../core/types';
 import type { BodyView, CraftView } from '../game/api';
 
@@ -90,6 +92,8 @@ export interface FrameCamera {
   /** 'interior' only: look direction, rad. Yaw about +Y (0 = facing -Z, positive = left); pitch positive = up. */
   lookYaw: number;
   lookPitch: number;
+  /** 'interior' only: the pilot leaning in / narrowing the view (pinch): 1 = normal, up to 3 = three times closer. */
+  zoom: number;
 }
 
 export interface FrameEnvironment {
@@ -127,6 +131,13 @@ export interface SceneFrame {
   camera: FrameCamera;
   /** Cabin lighting of the player's ship interior (the pilot's switch). */
   cabinLights: boolean;
+  /**
+   * The physical controls of the player's ship (Session.devices(), not copied) and what its console screens
+   * show (readInstruments() of render/space/instruments.ts). Null / omitted: controls at rest, screens keep
+   * their last picture.
+   */
+  devices?: readonly DeviceView[] | null;
+  instruments?: InstrumentData | null;
   environment: FrameEnvironment;
   fx: FrameFx[];
   /** @internal pools behind the lists (see beginFrame / add*) */
@@ -159,8 +170,10 @@ export function createSceneFrame(): SceneFrame {
     craft: [],
     ships: [],
     stationExtras: [],
-    camera: { mode: 'chase', focusId: '', yaw: 0, pitch: 0, distance: 1, lookAtId: null, eye: { x: 0, y: 0, z: 0 }, lookYaw: 0, lookPitch: 0 },
+    camera: { mode: 'chase', focusId: '', yaw: 0, pitch: 0, distance: 1, lookAtId: null, eye: { x: 0, y: 0, z: 0 }, lookYaw: 0, lookPitch: 0, zoom: 1 },
     cabinLights: true,
+    devices: null,
+    instruments: null,
     environment: { reentry: 0, dockingGuide: null },
     fx: [],
     _pool: { ships: [], extras: [], fx: [], guide: { stationId: '', portId: '' } },

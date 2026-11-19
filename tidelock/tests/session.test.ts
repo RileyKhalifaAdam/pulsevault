@@ -1,5 +1,6 @@
 // The session on the physical world (src/game/session.ts): what the client flies. Everything here goes through
-// the Session contract only — setControls, setHold, setWarp, the views and the events.
+// the Session contract only — setControls, setHold, setWarp, the views and the events — and, in the last block,
+// through the pilot's hand on the physical controls alone.
 
 import { describe, expect, it } from 'vitest';
 import type { Quat, V3 } from '../src/core/types';
@@ -271,7 +272,8 @@ describe('session on the physical world', () => {
   });
 });
 
-describe('the pilot as a body in the ship', () => {
+
+describe('the pilot, hands on the physical controls', () => {
   /** Walk toward ship-local waypoints, steering by the body's own yaw. */
   const walkTo = (s: Session, points: [number, number][]): void => {
     for (const [x, z] of points) {
@@ -288,134 +290,285 @@ describe('the pilot as a body in the ship', () => {
     }
     s.setWalk({ moveX: 0, moveZ: 0 });
   };
-  const face = (s: Session, yaw: number): void => s.addLook(yaw - s.crew().yaw || 1e-9, 0);
-
-  it('leave the helm, walk to the cabin, switch the lights, sleep an hour in the bunk, wake, fly again', () => {
-    const s = createSession(FREE);
-    const said: string[] = [];
-    const modes: string[] = [];
-    const sleeps: { asleep: boolean; seconds: number }[] = [];
-    s.events.on('crewMessage', (e) => said.push(e.text));
-    s.events.on('crewMode', (e) => modes.push(e.mode));
-    s.events.on('sleep', (e) => sleeps.push({ ...e }));
-    expect(s.mode()).toBe('helm');
-    expect(s.interior()?.shipId).toBe('wren');
-    expect(s.crew().posture).toBe('seated');
-    expect(s.crew().eye).toEqual(s.interior()!.helmEye);
-    expect(s.leaveHelm()).toBe(true);
-    expect(s.mode()).toBe('onFoot');
-    expect(modes).toEqual(['onFoot']);
-    let c = s.crew();
-    expect(c.pos).toEqual(s.interior()!.spawn.pos);
-    expect(c.roomId).toBe('cockpit');
-    expect(c.prompt?.kind).toBe('helm');
+  /** Device id by what it is wired to (positions and ids belong to the cockpit data). */
+  const idOf = (s: Session, role: string): string => s.cockpit()!.devices.find((d) => d.role === role)!.id;
+  const dev = (s: Session, role: string) => { const id = idOf(s, role); return s.devices().find((d) => d.id === id)!; };
+  const tap = (s: Session, role: string): void => {
+    expect(s.tapDevice(idOf(s, role)), `tap ${role}`).toBe(true);
+    run(s, 0.3);
+  };
+  const litHolds = (s: Session): string[] => s.cockpit()!.devices.filter((d) => d.role.startsWith('hold') && dev(s, d.role).lit).map((d) => d.role);
+  const strapIn = (s: Session): void => {
     run(s, 0.2);
-    expect(s.crew().gripped).toBe(true);
-    expect(s.crew().posture).toBe('walking');
-    // the drive is locked off and time stays at 1x
-    s.setControls({ throttle: 1, translate: { x: 1, y: 0, z: 0 } });
-    const t0 = s.time();
-    s.warpUp();
-    s.warpUp();
-    run(s, 1);
+    tap(s, 'harness');
+    expect(s.mode()).toBe('helm');
+  };
+
+  it('starts on foot beside the pilot seat, drive safe, hold on HOLD; the seat controls are out of reach until strapped in', () => {
+    const s = createSession(FREE);
+    const modes: string[] = [];
+    s.events.on('crewMode', (e) => modes.push(e.mode));
+    expect(s.mode()).toBe('onFoot');
+    expect(s.interior()?.shipId).toBe('wren');
+    expect(s.cockpit()?.shipId).toBe('wren');
+    expect(s.devices().length).toBe(s.cockpit()!.devices.length);
+    run(s, 0.3);
+    let c = s.crew();
+    expect(c.roomId).toBe('cockpit');
+    expect(c.posture).toBe('walking');
+    expect(c.gripped).toBe(true);
+    expect(s.player().hold).toBe('stability');
+    expect(litHolds(s)).toEqual(['holdStability']);
+    expect(dev(s, 'driveArm').lit).toBe(false);
+    expect(dev(s, 'harness').lit).toBe(false);
+    expect(dev(s, 'cabinLights').lit).toBe(true);
+    // out of reach from the deck: nothing happens
+    for (const role of ['throttle', 'rotation', 'driveArm', 'holdPrograde']) expect(dev(s, role).reachable, role).toBe(false);
+    expect(s.grabDevice(idOf(s, 'throttle'), 1)).toBe(false);
+    expect(s.tapDevice(idOf(s, 'driveArm'))).toBe(false);
+    expect(s.tapDevice(idOf(s, 'holdPrograde'))).toBe(false);
+    run(s, 0.5);
+    expect(s.player().hold).toBe('stability');
+    expect(s.tapDevice('no-such-device')).toBe(false);
+    // the harness is within reach of the hand
+    expect(dev(s, 'harness').reachable).toBe(true);
+    strapIn(s);
+    expect(modes).toEqual(['helm']);
+    c = s.crew();
+    expect(c.posture).toBe('seated');
+    expect(c.eye).toEqual(s.interior()!.helmEye);
+    expect(dev(s, 'harness').lit).toBe(true);
+    for (const d of s.cockpit()!.devices) if (d.reach === 'pilotSeat') expect(dev(s, d.role).reachable, d.id).toBe(true);
+    // the head turns in the seat, within limits
+    s.addLook(0.4, -0.2);
+    expect(s.crew().yaw).toBeCloseTo(0.4, 9);
+    expect(s.crew().pitch).toBeCloseTo(-0.2, 9);
+    s.addLook(10, 10);
+    expect(s.crew().yaw).toBeLessThan(2.5);
+    expect(s.crew().pitch).toBeLessThan(1.3);
+    // screens page; TARGET steps on from the Wheel
+    const nav = s.cockpit()!.devices.find((d) => d.kind === 'screen' && (d.pages?.length ?? 0) > 1)!;
+    const page = (): string => s.devices().find((d) => d.id === nav.id)!.page;
+    expect(page()).toBe(nav.pages![0]);
+    expect(s.tapDevice(nav.id)).toBe(true);
+    expect(page()).toBe(nav.pages![1]);
+    expect(s.target()?.id).toBe(START_STATION_ID);
+    tap(s, 'targetNext');
+    const t1 = s.target()?.id;
+    expect(t1).toBeDefined();
+    expect(t1).not.toBe(START_STATION_ID);
+    // LATCH RELEASE with nothing latched does nothing
+    tap(s, 'undock');
+    expect(s.player().dockedTo).toBe(null);
+  });
+
+  it('PRO lamp, DRIVE ARM and the throttle lever: a 20 s burn raises the apoapsis as vis-viva says; safe, the lever does nothing', () => {
+    const s = createSession(FREE);
+    strapIn(s);
+    tap(s, 'holdPrograde');
+    expect(s.player().hold).toBe('prograde');
+    expect(litHolds(s)).toEqual(['holdPrograde']);
+    expect(settleOn(s, () => progradeError(s))).toBeLessThan(60);
+    expect(progradeError(s)).toBeLessThan(0.004);
+
+    // drive safe: the lever moves, the valves stay shut
+    const lever = idOf(s, 'throttle');
+    const m0 = s.player().mass;
+    expect(s.grabDevice(lever, 7)).toBe(true);
+    expect(s.grabDevice(lever, 8)).toBe(false); // one hand to a control
+    s.moveDevice(7, 1, 0);
+    run(s, 2);
+    expect(dev(s, 'throttle').x).toBeCloseTo(1, 6);
+    expect(dev(s, 'throttle').held).toBe(true);
     expect(s.player().throttle).toBe(0);
     expect(s.flight().accel).toBeLessThan(1e-6);
-    expect(s.time() - t0).toBeCloseTo(1, 6);
-    expect(s.warp().requested).toBe(1);
-    expect(s.warp().limitedBy).toBe('crew');
-    expect(s.player().hold).toBe('stability');
-    // into the cabin, to the light switch
-    face(s, Math.PI);
-    walkTo(s, [[0, -3.2], [0, -2.0]]);
-    expect(s.crew().roomName).toBe('Cabin');
-    face(s, Math.atan2(0.6, 0.5));
-    expect(s.crew().prompt?.kind).toBe('lights');
-    expect(s.cabinLights()).toBe(true);
-    expect(s.interact()).toBe(true);
-    expect(s.cabinLights()).toBe(false);
-    // hatch, galley
-    walkTo(s, [[0, 1.0]]);
-    expect(s.crew().prompt?.kind).toBe('hatch');
-    s.interact();
-    expect(said.pop()).toBe('Hatch sealed — not docked');
-    // boots off: the pilot floats; push off toward the corridor door, boots back on to land
-    s.setBoots(false);
-    run(s, 0.1);
-    expect(s.crew().posture).toBe('floating');
-    s.setBoots(true);
+    expect(s.player().mass).toBe(m0);
+    s.moveDevice(7, 0, 0);
+    run(s, 1);
+    s.releaseDevice(7);
+    run(s, 0.2);
+    expect(dev(s, 'throttle').x).toBe(0);
+
+    // arm, push the lever forward for 20 s, pull it back
+    tap(s, 'driveArm');
+    expect(dev(s, 'driveArm').lit).toBe(true);
+    expect(s.player().throttle).toBe(0);
+    settleOn(s, () => progradeError(s), 30);
+    const f0 = s.flight();
+    const body = s.bodies().find((b) => b.id === f0.primaryId)!.def;
+    const r0 = f0.altitude + body.radius, v0 = f0.speed, apo0 = f0.apoapsisAlt;
+    expect(s.grabDevice(lever, 7)).toBe(true);
+    s.moveDevice(7, 1, 0);
+    run(s, 1 / 60);
+    expect(s.player().throttle).toBeLessThan(0.2); // the lever has to travel
+    run(s, 20 - 1 / 60);
+    expect(s.player().throttle).toBe(1);
+    expect(dev(s, 'throttle').lit).toBe(true);
+    expect(s.crew().felt.z).toBeCloseTo(s.player().maxAccel, 4); // pressed into the seat
+    s.moveDevice(7, 0, 0);
+    run(s, 1);
+    s.releaseDevice(7);
+    expect(s.player().throttle).toBe(0);
+    const m1 = m0 - (STATS.mainThrust / STATS.exhaustVelocity) * 20;
+    const dv = STATS.exhaustVelocity * Math.log(m0 / m1);
+    const a = 1 / (2 / r0 - ((v0 + dv) * (v0 + dv)) / body.mu);
+    const expected = 2 * a - r0 - body.radius - apo0;
+    const rise = s.flight().apoapsisAlt - apo0;
+    expect(expected).toBeGreaterThan(100e3);
+    expect(Math.abs(rise / expected - 1)).toBeLessThan(0.03);
+    expect(Math.abs(s.player().mass / m1 - 1)).toBeLessThan(1e-3);
+
+    // lever left open, drive disarmed: the valves close; re-armed, they open again
+    s.grabDevice(lever, 7);
+    s.moveDevice(7, 0.5, 0);
+    run(s, 1);
+    s.releaseDevice(7);
+    run(s, 1);
+    expect(s.player().throttle).toBeGreaterThan(0.4);
+    expect(dev(s, 'throttle').x).toBeCloseTo(0.5, 6); // friction holds it
+    // the harness is interlocked with the drive
+    expect(s.tapDevice(idOf(s, 'harness'))).toBe(false);
+    expect(s.mode()).toBe('helm');
+    tap(s, 'driveArm');
+    expect(dev(s, 'driveArm').lit).toBe(false);
+    expect(s.player().throttle).toBe(0);
+    expect(s.flight().accel).toBeLessThan(1e-6);
+    // save / load keeps the controls where they were
+    const again = loadSession(s.save(), FREE)!;
+    expect(again.mode()).toBe('helm');
+    expect(again.devices().map((d) => [d.id, d.x, d.lit])).toEqual(s.devices().map((d) => [d.id, d.x, d.lit]));
+    expect(again.player().hold).toBe('prograde');
+    // now the buckle opens
+    tap(s, 'harness');
+    expect(s.mode()).toBe('onFoot');
+    expect(dev(s, 'harness').lit).toBe(false);
+    expect(dev(s, 'throttle').reachable).toBe(false);
+  });
+
+  it('the rotation controller turns the ship with real torque and HOLD stops it when the hand lets go; RCS pushes; hold lamps are exclusive', () => {
+    const s = createSession(FREE);
+    strapIn(s);
+    const rhc = idOf(s, 'rotation');
+    const q0 = { ...me(s).q };
+    const n0 = nose(q0);
+    expect(s.grabDevice(rhc, 3)).toBe(true);
+    s.moveDevice(3, 1, 0); // yaw right
+    run(s, 4);
+    expect(dev(s, 'rotation').x).toBeCloseTo(1, 2);
+    expect(s.player().spin).toBeGreaterThan(0.05);
+    const turned = angle(nose(me(s).q), n0);
+    expect(turned).toBeGreaterThan(0.1);
+    // nose went to starboard: its component along the ship's original +X axis is positive
+    const local = qRotInv({ x: 0, y: 0, z: 0 }, q0, nose(me(s).q).x, nose(me(s).q).y, nose(me(s).q).z);
+    expect(local.x).toBeGreaterThan(0.05);
+    s.releaseDevice(3);
+    run(s, 0.3);
+    expect(dev(s, 'rotation').x).toBe(0); // the spring brought it back
+    run(s, 30);
+    expect(s.player().spin).toBeLessThan(1e-3);
+    // translation controller: starboard thrusters, real acceleration, then it stops when released
+    const v0 = { ...me(s).v };
+    expect(s.grabDevice(idOf(s, 'translation'), 4)).toBe(true);
+    s.moveDevice(4, 1, 0);
+    run(s, 2);
+    expect(me(s).rcs.x).toBeCloseTo(1, 2);
+    expect(s.flight().accel).toBeGreaterThan(0.01);
+    s.releaseDevice(4);
     run(s, 0.5);
-    expect(s.crew().gripped).toBe(true);
+    expect(me(s).rcs.x).toBe(0);
+    expect(s.flight().accel).toBeLessThan(1e-6);
+    expect(v0).toBeDefined();
+    // fore/aft rocker: forward is -Z
+    expect(s.grabDevice(idOf(s, 'translationZ'), 5)).toBe(true);
+    s.moveDevice(5, 0, 1);
+    run(s, 0.5);
+    expect(me(s).rcs.z).toBe(-1);
+    s.releaseDevice(5);
+    run(s, 0.5);
+    expect(me(s).rcs.z).toBe(0);
+    // every hold lamp selects its mode, one lit at a time
+    for (const d of s.cockpit()!.devices.filter((x) => x.role.startsWith('hold'))) {
+      tap(s, d.role);
+      expect(litHolds(s), d.id).toEqual([d.role]);
+    }
+    tap(s, 'holdOff');
+    expect(s.player().hold).toBe('off');
+  });
+
+  it('unstrap, walk aft, switch the lights, lie in the bunk: four still seconds is sleep, an hour passes, a touch wakes', () => {
+    const s = createSession(FREE);
+    const sleeps: { asleep: boolean; seconds: number }[] = [];
+    s.events.on('sleep', (e) => sleeps.push({ ...e }));
+    strapIn(s);
+    tap(s, 'harness');
+    expect(s.mode()).toBe('onFoot');
+    expect(s.crew().pos).toEqual(s.interior()!.spawn.pos);
+    // the bench and the bunk are far away; the light switch too
+    for (const role of ['bunk', 'tableSeat', 'cabinLights']) expect(dev(s, role).reachable, role).toBe(false);
+    expect(s.tapDevice(idOf(s, 'bunk'))).toBe(false);
+    walkTo(s, [[0, -3.2], [0, -2.0], [-0.35, -2.15]]);
+    expect(s.crew().roomName).toBe('Cabin');
+    expect(s.cabinLights()).toBe(true);
+    tap(s, 'cabinLights');
+    expect(s.cabinLights()).toBe(false);
+    expect(dev(s, 'cabinLights').lit).toBe(false);
+    // the bench by the window: tap to sit, any walk input stands up
+    walkTo(s, [[0.45, -2.0]]);
+    tap(s, 'tableSeat');
+    expect(s.crew().posture).toBe('seated');
+    expect(s.crew().eye).toEqual(s.interior()!.tableEye);
+    s.setWalk({ moveX: -1, moveZ: 0 });
+    run(s, 0.5);
+    s.setWalk({ moveX: 0, moveZ: 0 });
+    run(s, 0.5);
+    expect(s.crew().posture).toBe('walking');
     // to the bunk
-    walkTo(s, [[0, 1.6], [0, 3.05], [0.73, 3.05]]);
-    c = s.crew();
-    expect(c.roomId).toBe('bunks');
-    expect(c.prompt?.kind).toBe('bunk');
-    s.interact();
-    c = s.crew();
+    walkTo(s, [[0, -2.0], [0, 1.6], [0, 3.05], [0.73, 3.05]]);
+    expect(s.crew().roomId).toBe('bunks');
+    tap(s, 'bunk');
+    let c = s.crew();
     expect(c.posture).toBe('lying');
     expect(c.eye).toEqual(s.interior()!.bunkEye);
-    expect(c.prompt?.label).toBe('Sleep');
     expect(c.asleep).toBe(false);
-    s.interact();
+    run(s, 2);
+    s.addLook(0.05, 0); // not still yet
+    run(s, 3);
+    expect(s.crew().asleep).toBe(false);
+    let n = 0;
+    while (!s.crew().asleep && n++ < 120) s.step(1 / 60);
     expect(s.crew().asleep).toBe(true);
     expect(s.warp().requested).toBe(1e4);
     const t1 = s.time();
     let frames = 0;
     while (s.time() - t1 < 3600 && frames < 4000) { s.step(1 / 60); frames++; }
     expect(s.time() - t1).toBeGreaterThanOrEqual(3600);
-    expect(frames).toBeLessThan(200); // well above 100x: the world granted the sleep
-    s.addLook(0.01, 0);
+    expect(frames).toBeLessThan(200); // the world granted the sleep
+    // any touch wakes: the first one does nothing else
+    expect(s.tapDevice(idOf(s, 'bunk'))).toBe(true);
     expect(s.crew().asleep).toBe(false);
+    expect(s.crew().posture).toBe('lying');
     expect(sleeps.length).toBe(2);
-    expect(sleeps[1].seconds).toBeCloseTo(s.time() - t1, 6);
+    expect(sleeps[1].seconds).toBeGreaterThanOrEqual(3600);
     const t2 = s.time();
     run(s, 1);
     expect(s.time() - t2).toBeCloseTo(1, 6);
-    // save while on foot: the body comes back where it was
+    // saved lying down: it comes back lying down, lights off
     const again = loadSession(s.save(), FREE)!;
     expect(again.mode()).toBe('onFoot');
     expect(again.crew().posture).toBe('lying');
     expect(again.cabinLights()).toBe(false);
-    // up, back to the cockpit, strap in, light the drive
-    s.standUp();
-    run(s, 0.3);
+    // walk input gets the pilot up; back to the seat
+    s.setWalk({ moveX: 0, moveZ: 1 });
+    run(s, 0.1);
+    s.setWalk({ moveX: 0, moveZ: 0 });
+    run(s, 0.5);
     expect(s.crew().posture).toBe('walking');
     walkTo(s, [[0, 3.05], [0, 1.6], [0, -2.0], [0, -3.2], [-0.5, -3.25]]);
-    face(s, 0);
-    expect(s.crew().prompt?.kind).toBe('helm');
-    expect(s.interact()).toBe(true);
+    tap(s, 'harness');
     expect(s.mode()).toBe('helm');
-    expect(modes).toEqual(['onFoot', 'helm']);
-    s.setControls({ throttle: 1 });
-    run(s, 2);
-    expect(s.player().throttle).toBe(1);
-    expect(s.flight().accel).toBeGreaterThan(5);
     s.reset();
-    expect(s.mode()).toBe('helm');
+    expect(s.mode()).toBe('onFoot');
     expect(s.cabinLights()).toBe(true);
-  });
-
-  it('thrust while the pilot is loose is not possible; a turning ship is felt on foot', () => {
-    const s = createSession(FREE);
-    // strapped in while the drive is on; the crew is pressed toward the stern at the ship's acceleration
-    s.setControls({ throttle: 1 });
-    run(s, 0.5);
-    expect(s.leaveHelm()).toBe(false);
-    expect(s.crew().felt.z).toBeCloseTo(s.player().maxAccel, 6);
-    s.setControls({ throttle: 0 });
-    run(s, 0.5);
-    expect(Math.hypot(s.crew().felt.x, s.crew().felt.y, s.crew().felt.z)).toBeLessThan(0.05);
-    expect(s.leaveHelm()).toBe(true);
-    s.setHold('prograde'); // the hold keeps working with the seat empty: the ship turns under the pilot
-    let felt = 0;
-    for (let i = 0; i < 600; i++) {
-      s.step(1 / 60);
-      const f = s.crew().felt;
-      felt = Math.max(felt, Math.hypot(f.x, f.y, f.z));
-    }
-    expect(felt).toBeGreaterThan(0.01);
-    expect(felt).toBeLessThan(4);
-    expect(s.crew().roomId).toBe('cockpit');
-    expect(s.player().throttle).toBe(0);
+    expect(s.player().hold).toBe('stability');
   });
 });

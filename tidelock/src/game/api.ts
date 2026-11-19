@@ -217,8 +217,6 @@ export interface SessionEvents {
   reset: Record<string, never>;
   /** The pilot strapped in ('helm') or left the seat ('onFoot'). */
   crewMode: { mode: PlayerMode };
-  /** An in-fiction line from something the pilot used (hatch, galley, washroom, reactor, lights…). */
-  crewMessage: { source: string; text: string };
   cabinLights: { on: boolean };
   /** Sleep in the bunk began (asleep true) or ended; `seconds` = sim time slept when it ended. */
   sleep: { asleep: boolean; seconds: number };

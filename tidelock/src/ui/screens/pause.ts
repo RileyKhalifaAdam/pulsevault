@@ -1,4 +1,4 @@
-// Pause menu: resume, reset to the starting orbit, settings, how it works, performance overlay. An overlay above whichever screen is showing.
+// The system menu (three-finger tap; never visible during play): resume, reset to the starting orbit, settings, how it works, performance overlay.
 import { h, icon, onTap, Button, SegmentedControl, Slider, Toggle, confirmDialog } from '../kit';
 import type { UiHost, UiScreen } from '../host';
 import { screenRoot, SETTING_KEYS, VERSION_LINE } from './shared';
@@ -12,26 +12,27 @@ export interface PauseMenu extends UiScreen {
 
 const HELP = `
 <h3>What this is</h3>
-<p>A physics sandbox. Your ship is a rigid body in low orbit of Wick, beside Chandler’s Wheel. It moves only because forces act on it: gravity from every world, your main drive, your thrusters, air, and contact.</p>
-<h3>The read-outs</h3>
-<p><b>ALT</b> is height above the surface, with your climb or sink rate under it. <b>SPEED</b> is speed relative to the world you are closest bound to. <b>APO</b> and <b>PERI</b> are the highest and lowest points of the orbit you are on right now, each with the time until you reach it. <b>PROP</b> shows propellant and <b>Δv</b>: how much speed change is left in the tanks. A warning line appears only when something is off: heat, hull, tumbling.</p>
+<p>A physics sandbox seen through one pair of eyes. You are a body aboard the Wren, a small courier in low orbit of Wick, beside Chandler’s Wheel. The ship moves only because forces act on it, and you move only because you walk, push off, or are carried.</p>
+<h3>Your hands</h3>
+<p>Nothing is drawn over the view. <b>Touch a control</b> you can reach and your hand is on it: drag a hand controller or a lever and it follows; tap a button, a switch, a handle, a screen. <b>Touch anywhere else</b> and you move your head: drag to look, pinch to lean in, flick upward to jump (boots on the deck) or push off (floating). On your feet, the <b>left thumb</b> walks.</p>
+<h3>The pilot seat</h3>
+<p>The controls on the console can only be reached from the left seat. Stand beside it and tap the <b>harness buckle</b> to strap in; tap it again to get up. The buckle stays locked while DRIVE ARM is on: under thrust everything loose falls toward the stern.</p>
+<h3>Flying</h3>
+<p><b>ROTATE</b> (right hand) turns the ship with real torque: sideways is yaw, forward and back is pitch; the <b>ROLL</b> rocker rolls. <b>TRANSLATE</b> (left hand) fires the thrusters sideways and up or down; the <b>FWD / AFT</b> rocker pushes along the nose. Let go and the springs centre them.</p>
+<p><b>DRIVE ARM</b> opens the main-drive valves; only then does the <b>DRIVE</b> lever do anything. The lever stays where you leave it. Disarm to close the valves.</p>
+<p>The lamp block picks what the attitude system holds: <b>HOLD</b> stops the rotation and keeps the heading, <b>PRO / RETRO</b> along or against your motion, <b>NML±</b> out of the orbit plane, <b>RAD±</b> away from or toward the world, <b>TGT</b> at the target, <b>DOCK</b> lines the collar up with the nearest port, <b>OFF</b> leaves the ship as it is. One lamp is lit. Moving ROTATE overrides the hold while you hold it over. <b>TARGET</b> steps through the stations, then the worlds.</p>
+<h3>A burn, in order</h3>
+<p><b>1.</b> Stand behind the left seat, look down and tap the seat (its <b>harness buckle</b>). <b>2.</b> Tap a lamp, say <b>PRO</b>, and wait until the ship has stopped turning. <b>3.</b> Tap <b>DRIVE ARM</b> (left of the lamps); its light comes on. <b>4.</b> Drag the <b>DRIVE</b> lever in the middle of the desk away from you; watch thrust and apoapsis on FLIGHT. <b>5.</b> Drag the lever all the way back toward you, then tap DRIVE ARM again. Only now will the buckle let you out.</p>
+<h3>The screens</h3>
+<p>FLIGHT shows altitude, speed, apoapsis and periapsis, propellant and Δv. Tap NAV to page between the orbit, docking and systems. They are the only read-outs there are.</p>
 <h3>How thrust changes an orbit</h3>
-<p>You do not steer toward things. Burn <i>prograde</i> (along your motion, the green marker) and the opposite side of your orbit rises; burn <i>retrograde</i> (red marker) and it falls. Burn at periapsis to move the apoapsis, and at apoapsis to move the periapsis. Normal and anti-normal tilt the orbit; radial burns rotate it.</p>
-<h3>Holds</h3>
-<p>The <b>hold</b> button asks the attitude system to turn the ship with real torque and keep it pointed: prograde, retrograde, normal, radial, at the target, or along a planned burn. <b>Hold</b> alone stops the rotation. <b>Off</b> leaves the ship with whatever spin it has. Turning takes time; wait for the nose before you burn.</p>
-<h3>Time acceleration</h3>
-<p>The arrows speed time up. The world takes more or larger steps under the same laws, so the request is a wish: while you thrust, turn, touch something or fly through air it runs slower, and the HUD shows what you asked for, what you got, and why.</p>
-<h3>The map</h3>
-<p>The line is your predicted path, with apoapsis, periapsis, closest approach to the target, atmosphere entry and impact marked. Tap the path to plan a burn there, then set its prograde, normal and radial parts and slide it in time: the path shows what would happen. A plan flies nothing. Point the ship (hold: Burn) and work the throttle yourself.</p>
-<h3>Docking by latch</h3>
-<p>Match speed with the station first (target chip: relative speed near zero). Close in slowly. Near a port the docking chip shows how far you are off its axis, how far your nose is off, and your closing speed. Switch on <b>RCS</b>: the stick then pushes the ship sideways and up or down, and the two roll buttons push back and forward. Arrive slow and aligned and the latch closes by itself when the chip reads <b>Latch ready</b>. Arrive fast and you bounce, or break.</p>
-<h3>Living aboard</h3>
-<p>You are a body inside the ship. At the helm, <b>View</b> switches between the chase camera and the pilot’s eyes, and <b>Leave seat</b> unstraps you. On foot the left thumb walks, dragging on the right looks around, and the big button names whatever is in reach: the light switch, the galley, the window seat, a bunk, and the pilot seat to take the helm again.</p>
-<p>The ship is in free fall, so nothing holds you down. <b>Boots on</b>: magnets grip the deck and you walk. <b>Boots off</b>: you float, and <b>Push off</b> sends you the way you are looking until you meet a wall. Switch the boots back on near the deck to stand again.</p>
-<p>When the drive fires, the ship accelerates and everything loose falls toward the stern at up to 1.2 g. That is why you can only unstrap with the drive off, and why you strap in before a burn. The plate at the top left shows what your body feels.</p>
-<p>Time runs at ×1 while you are on your feet. To pass the time, lie down in the bunk and tap <b>Sleep</b>: the hours run fast until you touch the screen or something disturbs the ship.</p>
+<p>You do not steer toward things. Burn prograde and the far side of your orbit rises; burn retrograde and it falls. Burn at periapsis to move the apoapsis, and at apoapsis to move the periapsis. Turning takes time: wait for the nose before you open the drive.</p>
+<h3>Docking</h3>
+<p>Match speed with the station, close in slowly, select DOCK, and work the last metres with TRANSLATE. Arrive slow and aligned and the latch closes by itself. <b>LATCH RELEASE</b> lets go.</p>
+<h3>Passing time</h3>
+<p>Time runs at its own pace. To let hours go by, walk aft to the bunk room, tap the bunk and lie still: after a few seconds you sleep and the hours run as fast as the world allows, until you touch the screen or something disturbs the ship.</p>
 <h3>If it goes wrong</h3>
-<p><b>Reset to starting orbit</b> puts you back beside the Wheel with full tanks.</p>
+<p>A wrecked ship fades out and you start again beside the Wheel. <b>Reset to starting orbit</b> does the same on request. A three-finger tap opens this menu at any time.</p>
 `;
 
 export function createPauseMenu(host: UiHost): PauseMenu {
@@ -56,7 +57,7 @@ export function createPauseMenu(host: UiHost): PauseMenu {
       b('Resume', 'play', resume, 'primary'),
       h('div.tls-pause__grid', null,
         b('Reset to starting orbit', 'undock', () => {
-          void confirmDialog({ title: 'Reset to the starting orbit?', message: 'The ship goes back beside Chandler’s Wheel with full tanks. Planned burns are cleared.', confirmLabel: 'Reset', cancelLabel: 'Keep flying', icon: 'warning' }, el)
+          void confirmDialog({ title: 'Reset to the starting orbit?', message: 'The ship goes back beside Chandler’s Wheel with full tanks, and you stand in the cockpit again.', confirmLabel: 'Reset', cancelLabel: 'Keep flying', icon: 'warning' }, el)
             .then((yes) => {
               if (!yes) return;
               api.hide();
@@ -83,10 +84,10 @@ export function createPauseMenu(host: UiHost): PauseMenu {
       }).el,
       h('p.tl-small', { text: 'Auto measures the frame time and lowers the resolution first, then the detail, to stay smooth. The resolution adapts at every setting.' }),
       Slider({
-        label: 'Stick sensitivity', value: Math.min(2, Math.max(0.5, Number(s.get<number>(SETTING_KEYS.sensitivity, 1)) || 1)), min: 0.5, max: 2, step: 0.1, ticks: 15,
+        label: 'Hand and look sensitivity', value: Math.min(2, Math.max(0.5, Number(s.get<number>(SETTING_KEYS.sensitivity, 1)) || 1)), min: 0.5, max: 2, step: 0.1, ticks: 15,
         format: (v) => `${v.toFixed(1)}×`, onChange: (v) => s.set(SETTING_KEYS.sensitivity, Math.round(v * 10) / 10),
       }).el,
-      Toggle({ label: 'Invert pitch', hint: 'Pull the stick down to raise the nose', value: !!s.get<boolean>(SETTING_KEYS.invertPitch, false), onChange: (v) => s.set(SETTING_KEYS.invertPitch, v) }).el,
+      Toggle({ label: 'Invert pitch', hint: 'Finger up on ROTATE raises the nose', value: !!s.get<boolean>(SETTING_KEYS.invertPitch, false), onChange: (v) => s.set(SETTING_KEYS.invertPitch, v) }).el,
     );
   }
 
@@ -98,7 +99,7 @@ export function createPauseMenu(host: UiHost): PauseMenu {
       body.scrollTop = 0;
       back.style.visibility = view === 'menu' ? 'hidden' : '';
       back.style.width = view === 'menu' ? '0' : '';
-      title.textContent = view === 'menu' ? 'Paused' : view === 'settings' ? 'Settings' : 'How it works';
+      title.textContent = view === 'menu' ? 'System' : view === 'settings' ? 'Settings' : 'How it works';
       if (view === 'menu') menu();
       else if (view === 'settings') settings();
       else body.appendChild(h('div.tls-help', { ref: (n) => { n.innerHTML = HELP; } }));

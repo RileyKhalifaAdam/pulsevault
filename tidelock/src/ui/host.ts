@@ -8,7 +8,7 @@ export interface UiHost {
   /** Full-screen DOM layer above the WebGL canvas. Screens append their root element here. */
   root: HTMLElement;
   /** Switch the top-level screen. */
-  go(screen: 'title' | 'flight' | 'map'): void;
+  go(screen: 'title' | 'flight'): void;
   /** Back to the starting orbit beside Chandler's Wheel with full tanks. */
   reset(): void;
   saveNow(): void;
@@ -16,6 +16,7 @@ export interface UiHost {
   sfx(id: string): void;
   /** Persistent player settings. */
   settings: { get<T>(key: string, fallback: T): T; set(key: string, value: unknown): void };
+  /** Kept for callers; nothing is written on the screen during play, so the app ignores it. */
   toast(message: string, kind?: 'info' | 'good' | 'warn' | 'bad'): void;
   /** Frame-time record and automatic quality (docs/ARCHITECTURE.md §5). */
   perf: PerfMonitor;

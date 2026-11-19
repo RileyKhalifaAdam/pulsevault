@@ -7,6 +7,7 @@
 import { EventBus } from '../core/events';
 import type { Quat, ShipVisualId, StationVisualId, SystemDef, V3 } from '../core/types';
 import { qLook } from '../core/vec';
+import { COCKPITS, type CockpitLayout, type DeviceDef, type DeviceRole } from '../data/cockpit';
 import { INTERIORS, type InteriorLayout } from '../data/interiors';
 import { SHIP_LAYOUTS } from '../data/shipLayouts';
 import { START_STATION_ID, START_SYSTEM_ID } from '../data/systems/layout';
@@ -18,11 +19,12 @@ import {
   type AdvanceOptions, type Craft, type PredictOptions, type World,
 } from '../world';
 import {
-  craftMotion, createCrew, createShipMotion, crewEye, crewFelt, CREW_COM, feltAt, findPrompt, lookCrew, pushOffCrew, roomAt, sitCrew, standCrew, stepCrew,
-  type CrewState,
+  craftMotion, createCrew, createDevice, createShipMotion, crewEye, crewFelt, CREW_COM, devGrab, devMove, devRelease, devTap, feltAt, findPrompt, leverValue, lookCrew,
+  pushOffCrew, rockerValue, roomAt, sitCrew, standCrew, stepCrew, stepDevice, stickAxis,
+  type CrewState, type DeviceState,
 } from '../world';
 import type {
-  BodyView, CraftView, CrewView, DockingView, FlightView, HoldMode, PlannedBurn, PlayerMode, PlayerView, PredictionEvent, PredictionView, Session, SessionEvents,
+  BodyView, CraftView, CrewView, DeviceView, DockingView, FlightView, HoldMode, PlannedBurn, PlayerMode, PlayerView, PredictionEvent, PredictionView, Session, SessionEvents,
   SessionOptions, StepInfo, TargetView, WarpLimit, WarpView,
 } from './api';
 
@@ -32,7 +34,7 @@ export const WARP_LADDER: readonly number[] = [1, 2, 5, 10, 50, 100, 1000, 1e4, 
 /** The start: this far clear of the station's bounding sphere, ahead of it in the same orbit, m. */
 export const START_CLEARANCE = 200;
 
-const SAVE_VERSION = 2;
+const SAVE_VERSION = 3;
 /** Longest stretch of sim time the attitude controller's command is held while it is working, s. */
 const CONTROL_DT = 1 / 50;
 /** Stick below this is no input. */
@@ -66,11 +68,20 @@ const LIMIT_STICKY = 20;
 const BURN_GRACE = 300;
 /** Time acceleration while the pilot sleeps in the bunk (within the world's limits). */
 export const SLEEP_WARP = 1e4;
-const GALLEY_LINES = [
-  'A bulb of hot tea from the galley. It keeps its shape until you drink it.',
-  'Rice and beans from a warmed pouch. Better than it sounds.',
-  'Cold water from the recycler, and a ration bar for later.',
-];
+/** Lying still in the bunk this long (real seconds) is falling asleep. */
+export const SLEEP_AFTER = 4;
+/** The hand reaches a control this far from the eye or the body's middle, m (plus the control's own size). */
+export const ARM_REACH = 0.9;
+/** Standing this close to the pilot seat (plan distance), the pilot can sit down and fasten the harness, m. */
+const SEAT_REACH = 1.2;
+/** How far the head turns in the pilot seat, rad. */
+const HEAD_YAW = 2.2;
+const HEAD_PITCH = 1.1;
+/** Hold lamps: the mode each one selects. */
+const HOLD_OF: Partial<Record<DeviceRole, HoldMode>> = {
+  holdOff: 'off', holdStability: 'stability', holdPrograde: 'prograde', holdRetrograde: 'retrograde', holdNormal: 'normal', holdAntinormal: 'antinormal',
+  holdRadialOut: 'radialOut', holdRadialIn: 'radialIn', holdTarget: 'target', holdDock: 'dock',
+};
 
 const v3 = (): V3 => ({ x: 0, y: 0, z: 0 });
 const now = (): number => (typeof performance !== 'undefined' ? performance.now() : 0);
@@ -90,6 +101,9 @@ interface SessionState {
   mode?: PlayerMode;
   crew?: CrewState | null;
   lights?: boolean;
+  devices?: DeviceState[];
+  pages?: number[];
+  head?: number[];
 }
 
 const galaxies = new Map<number, SystemDef>();
@@ -207,7 +221,21 @@ class WorldSession implements Session {
   private lights = true;
   private asleep = false;
   private sleptFrom = 0;
-  private galleyN = 0;
+  private restT = 0;
+  private headYaw = 0;
+  private headPitch = 0;
+  private readonly EYE = v3();
+
+  // the physical controls (src/data/cockpit.ts, src/world/devices.ts) and what the flight computer last read
+  private cockpitLayout: CockpitLayout | null = null;
+  private devDefs: DeviceDef[] = [];
+  private devs: DeviceState[] = [];
+  private devViews: DeviceView[] = [];
+  private devSeen: number[] = [];
+  private devPage: number[] = [];
+  private readonly hands = new Map<number, number>();
+  private readonly ix = { rot: -1, roll: -1, trans: -1, transZ: -1, throttle: -1, arm: -1, lights: -1, harness: -1 };
+  private cmdThrottle = 0;
   private readonly walk = { moveX: 0, moveZ: 0 };
   private readonly motion = createShipMotion();
   private readonly promptView = { id: '', kind: '', label: '' };
@@ -232,13 +260,31 @@ class WorldSession implements Session {
       this.rearmBlock = state.rearmBlock;
       this.settled = state.settled;
       this.lights = state.lights !== false;
+      const num = (x: unknown): number => (typeof x === 'number' && x === x ? x : 0);
+      if (Array.isArray(state.devices)) {
+        for (const sd of state.devices) {
+          const i = sd ? this.devIndex(sd.id) : -1;
+          if (i < 0 || this.devs[i].kind !== sd.kind) continue;
+          const d = this.devs[i];
+          d.x = num(sd.x); d.y = num(sd.y); d.vx = num(sd.vx); d.vy = num(sd.vy); d.press = num(sd.press); d.latch = num(sd.latch);
+          d.on = !!sd.on; d.made = !!sd.made; d.count = num(sd.count);
+          this.devSeen[i] = d.count;
+          const pages = this.devDefs[i].pages, pg = Array.isArray(state.pages) ? num(state.pages[i]) | 0 : 0;
+          this.devPage[i] = pages && pg >= 0 && pg < pages.length ? pg : 0;
+        }
+      }
+      if (this.ix.lights >= 0) this.lights = this.devs[this.ix.lights].on;
+      if (Array.isArray(state.head)) { this.headYaw = clamp(num(state.head[0]), -HEAD_YAW, HEAD_YAW); this.headPitch = clamp(num(state.head[1]), -HEAD_PITCH, HEAD_PITCH); }
       const b = state.crew;
-      if (state.mode === 'onFoot' && this.layout && b && b.pos && b.vel && b.back && typeof b.yaw === 'number') {
+      if (state.mode === 'helm' || !this.layout) { this.playerMode = 'helm'; this.body = null; }
+      else if (b && b.pos && b.vel && b.back && typeof b.yaw === 'number') {
         this.playerMode = 'onFoot';
         this.body = JSON.parse(JSON.stringify(b)) as CrewState;
-        this.throttle = 0;
-      }
-    } else this.targetId = findCraft(world, START_STATION_ID) ? START_STATION_ID : null;
+      } else this.startPilot();
+    } else {
+      this.targetId = findCraft(world, START_STATION_ID) ? START_STATION_ID : null;
+      this.startPilot();
+    }
   }
 
   private bind(world: World): void {
@@ -258,6 +304,34 @@ class WorldSession implements Session {
     this.settled = false;
     this.winN = this.winAt = 0;
     this.limitFrames = 0;
+    this.initDevices();
+  }
+
+  /** The ship's controls in their resting state: sticks centred, throttle closed, drive safe, cabin lights on. */
+  private initDevices(): void {
+    const ck = (this.ship.shipVisual && COCKPITS[this.ship.shipVisual as ShipVisualId]) || null;
+    this.cockpitLayout = ck;
+    const defs = (this.devDefs = ck ? ck.devices : []);
+    this.devs = defs.map((d) => createDevice(d.id, d.kind, d.role === 'cabinLights'));
+    this.devViews = defs.map((d) => ({ id: d.id, x: 0, y: 0, lit: false, held: false, reachable: false, page: d.pages ? d.pages[0] : '' }));
+    this.devSeen = defs.map(() => 0);
+    this.devPage = defs.map(() => 0);
+    this.hands.clear();
+    this.cmdThrottle = 0;
+    const ix = this.ix, at = (role: DeviceRole): number => defs.findIndex((d) => d.role === role);
+    ix.rot = at('rotation'); ix.roll = at('roll'); ix.trans = at('translation'); ix.transZ = at('translationZ');
+    ix.throttle = at('throttle'); ix.arm = at('driveArm'); ix.lights = at('cabinLights'); ix.harness = at('harness');
+  }
+
+  /** The start: on foot in the cockpit beside the pilot seat (or strapped in, in a ship with no interior). */
+  private startPilot(): void {
+    const layout = this.layout;
+    this.playerMode = layout ? 'onFoot' : 'helm';
+    this.body = layout ? createCrew(layout, PLAYER_ID) : null;
+    this.asleep = false;
+    this.restT = 0;
+    this.headYaw = this.headPitch = 0;
+    this.walk.moveX = this.walk.moveZ = 0;
   }
 
   // ------------------------------------------------------------------------------------------ stepping
@@ -273,6 +347,7 @@ class WorldSession implements Session {
     const budget = this.budgetMs;
     this.clock += realDt;
     this.arm();
+    this.drowse(realDt);
     let why: WarpLimit = '';
     for (let guard = 0; guard < 1e6; guard++) {
       const left = want - info.simDt;
@@ -282,7 +357,10 @@ class WorldSession implements Session {
       const res = advance(world, active && left > CONTROL_DT ? CONTROL_DT : left, this.advOpts);
       info.simDt += res.simDt;
       info.steps += res.steps;
-      if (this.playerMode === 'onFoot' && res.simDt > 0) this.stepBody(res.simDt);
+      if (res.simDt > 0) {
+        if (this.playerMode === 'onFoot') this.stepBody(res.simDt);
+        this.stepDevices(res.simDt);
+      }
       const limited = res.limitedBy;
       if (world.events.length > 0) this.pump();
       if (limited !== '') { why = limited; break; }
@@ -309,15 +387,58 @@ class WorldSession implements Session {
     return this.world.t;
   }
 
-  /** Time acceleration in force: the ladder at the helm, 1x on foot, SLEEP_WARP while asleep. */
+  /** Time acceleration in force: SLEEP_WARP while the pilot sleeps, otherwise 1x (setWarp's ladder is for tests). */
   private mult(): number {
-    return this.asleep ? SLEEP_WARP : this.playerMode === 'onFoot' ? 1 : WARP_LADDER[this.warpIndex];
+    return this.asleep ? SLEEP_WARP : WARP_LADDER[this.warpIndex];
+  }
+
+  /** Lying still in the bunk for SLEEP_AFTER real seconds is falling asleep. */
+  private drowse(realDt: number): void {
+    const b = this.body;
+    if (this.asleep || this.playerMode !== 'onFoot' || !b || b.seat !== 'bunk' || this.ship.destroyed || this.hands.size > 0) { this.restT = 0; return; }
+    this.restT += realDt;
+    if (this.restT < SLEEP_AFTER) return;
+    this.asleep = true;
+    this.sleptFrom = this.world.t;
+    this.walk.moveX = this.walk.moveZ = 0;
+    this.settled = false;
+    this.winN = this.winAt = 0;
+    this.events.emit('sleep', { asleep: true, seconds: 0 });
+  }
+
+  /** Every mechanism moves with the world; the flight computer acts on the contacts that closed. */
+  private stepDevices(dt: number): void {
+    const ds = this.devs, seen = this.devSeen;
+    for (let i = 0; i < ds.length; i++) {
+      const d = ds[i];
+      stepDevice(d, dt);
+      if (d.count === seen[i]) continue;
+      seen[i] = d.count;
+      const role = this.devDefs[i].role, hm = HOLD_OF[role];
+      if (hm) this.setHold(hm);
+      else if (role === 'targetNext') this.nextTarget();
+      else if (role === 'undock') this.undock();
+    }
+    const li = this.ix.lights;
+    if (li >= 0 && ds[li].made !== this.lights) {
+      this.lights = ds[li].made;
+      this.events.emit('cabinLights', { on: this.lights });
+    }
+  }
+
+  /** TARGET: the next station, then the bodies, round again. */
+  private nextTarget(): void {
+    const w = this.world, ids: string[] = [];
+    for (const c of w.craft) if (c.kind === 'station') ids.push(c.id);
+    for (const b of w.bodies) ids.push(b.id);
+    if (ids.length === 0) return;
+    this.setTarget(ids[(ids.indexOf(this.targetId ?? '') + 1) % ids.length]);
   }
 
   /** The pilot's body moves with what the ship just did. */
   private stepBody(dt: number): void {
     const b = this.body, layout = this.layout;
-    if (!b || !layout || b.seat !== '') return;
+    if (!b || !layout || b.seat !== '' || this.warpIndex > 0) return;
     stepCrew(b, layout, craftMotion(this.world, this.ship, this.motion), this.walk, dt);
   }
 
@@ -339,13 +460,21 @@ class WorldSession implements Session {
   private command(): boolean {
     const c = this.ship;
     if (c.destroyed) return false;
-    if (this.playerMode === 'onFoot') {
-      // Nobody is at the controls: the drive and the thrusters are locked off; the attitude hold keeps working.
-      this.throttle = 0;
-      this.pitch = this.yaw = this.roll = 0;
-      this.translate.x = this.translate.y = this.translate.z = 0;
-    }
-    const tq = c.torque, tr = this.translate;
+    // The flight computer reads the physical controls (the direct inputs of setControls are added: tests only).
+    const ds = this.devs, ix = this.ix;
+    let p = this.pitch, y = this.yaw, r = this.roll, thr = this.throttle;
+    let tx = this.translate.x, ty = this.translate.y, tz = this.translate.z;
+    if (ix.rot >= 0) { y += stickAxis(ds[ix.rot].x); p -= stickAxis(ds[ix.rot].y); } // pull back = nose up
+    if (ix.roll >= 0) r += rockerValue(ds[ix.roll]);
+    if (ix.trans >= 0) { tx += stickAxis(ds[ix.trans].x); ty += stickAxis(ds[ix.trans].y); }
+    if (ix.transZ >= 0) tz -= rockerValue(ds[ix.transZ]); // +1 = forward = -Z
+    // The throttle lever opens the main-drive valves only while DRIVE ARM is on.
+    if (ix.arm >= 0 && ix.throttle >= 0 && ds[ix.arm].made) thr = Math.max(thr, leverValue(ds[ix.throttle]));
+    p = clamp(p, -1, 1); y = clamp(y, -1, 1); r = clamp(r, -1, 1);
+    tx = clamp(tx, -1, 1); ty = clamp(ty, -1, 1); tz = clamp(tz, -1, 1);
+    if (thr > 0 && this.cmdThrottle === 0) this.settled = false; // point properly before the drive lights
+    this.cmdThrottle = thr;
+    const tq = c.torque;
     if (c.dockedTo !== null) {
       // The latch interlocks drive and RCS; the joint carries the attitude.
       c.throttle = 0;
@@ -355,15 +484,14 @@ class WorldSession implements Session {
       this.settled = false;
       return false;
     }
-    c.throttle = this.throttle;
-    c.rcs.x = tr.x; c.rcs.y = tr.y; c.rcs.z = tr.z;
+    c.throttle = thr;
+    c.rcs.x = tx; c.rcs.y = ty; c.rcs.z = tz;
     if (c.landedOn !== null) {
       tq.x = tq.y = tq.z = 0;
       this.holdQValid = false;
       this.settled = false;
       return false;
     }
-    const p = this.pitch, y = this.yaw, r = this.roll;
     const stick = Math.abs(p) > STICK_DEADZONE || Math.abs(y) > STICK_DEADZONE || Math.abs(r) > STICK_DEADZONE;
     if (this.hold === 'off') {
       // Raw torque demand: pitch about +X (nose up), yaw about -Y (nose right), roll about -Z (clockwise).
@@ -565,11 +693,6 @@ class WorldSession implements Session {
   private setWarpIndex(i: number): void {
     i = clamp(i, 0, WARP_LADDER.length - 1);
     if (this.asleep) { this.wake(); return; }
-    if (this.playerMode === 'onFoot') {
-      // on foot and awake, time runs at 1x
-      if (i > 0) { this.warpView.limitedBy = 'crew'; this.limitFrames = 4 * LIMIT_STICKY; }
-      i = 0;
-    }
     if (i === this.warpIndex) return;
     this.warpIndex = i;
     this.settled = false; // the hold looks again (and tightens up when time slows down)
@@ -582,7 +705,6 @@ class WorldSession implements Session {
   // ------------------------------------------------------------------------------------------ input
 
   setControls(c: { pitch?: number; yaw?: number; roll?: number; throttle?: number; translate?: V3 }): void {
-    if (this.playerMode === 'onFoot') return; // the seat is empty
     if (c.pitch !== undefined) this.pitch = clamp(c.pitch, -1, 1) || 0;
     if (c.yaw !== undefined) this.yaw = clamp(c.yaw, -1, 1) || 0;
     if (c.roll !== undefined) this.roll = clamp(c.roll, -1, 1) || 0;
@@ -641,7 +763,7 @@ class WorldSession implements Session {
     o.propellantFraction = c.propellantCapacity > 0 ? c.propellant / c.propellantCapacity : 0;
     o.deltaV = c.propellant > 0 ? c.exhaustVelocity * Math.log(m / c.dryMass) : 0;
     o.maxAccel = c.propellant > 0 ? c.mainThrust / m : 0;
-    o.throttle = this.throttle;
+    o.throttle = this.cmdThrottle > this.throttle ? this.cmdThrottle : this.throttle;
     o.hold = this.hold;
     o.heat = c.heatCapacity > 0 ? c.heat / c.heatCapacity : 0;
     o.hull = c.hull;
@@ -848,21 +970,19 @@ class WorldSession implements Session {
       o.yaw = b.yaw; o.pitch = b.pitch;
       o.boots = b.boots; o.gripped = b.gripped;
       crewFelt(b, m, o.felt);
-      const p = this.promptView;
-      if (this.asleep) { p.id = 'bunk'; p.kind = 'bunk'; p.label = 'Wake up'; o.prompt = p; }
-      else if (b.seat === 'bunk') { p.id = 'bunk'; p.kind = 'bunk'; p.label = 'Sleep'; o.prompt = p; }
-      else {
-        const it = findPrompt(b, layout);
-        if (it) { p.id = it.id; p.kind = it.kind; p.label = it.label; o.prompt = p; }
+      const it = this.asleep ? null : findPrompt(b, layout);
+      if (it && (it.kind === 'helm' || it.kind === 'bunk' || it.kind === 'tableSeat' || it.kind === 'lights')) {
+        const p = this.promptView;
+        p.id = it.id; p.kind = it.kind; p.label = it.label; o.prompt = p;
       }
     } else {
-      // strapped into the pilot seat
+      // strapped into the pilot seat; the head is free to look around
       const e = layout ? layout.helmEye : o.eye, deck = layout ? layout.spawn.pos.y : 0;
       o.posture = 'seated';
       o.eye.x = e.x; o.eye.y = e.y; o.eye.z = e.z;
       o.pos.x = e.x; o.pos.y = deck; o.pos.z = e.z;
       o.vel.x = o.vel.y = o.vel.z = 0;
-      o.yaw = 0; o.pitch = 0;
+      o.yaw = this.headYaw; o.pitch = this.headPitch;
       o.boots = true; o.gripped = false;
       feltAt0(m, e.x, deck + CREW_COM, e.z, o.felt);
     }
@@ -871,115 +991,230 @@ class WorldSession implements Session {
     o.roomName = room ? room.name : '';
     return o;
   }
+  /** Any input from the pilot: the wait for sleep starts again, and a sleeper wakes (true when it did). */
+  private touch(): boolean {
+    this.restT = 0;
+    if (!this.asleep) return false;
+    this.wake();
+    return true;
+  }
   setWalk(c: { moveX?: number; moveZ?: number }): void {
     const w = this.walk;
     if (c.moveX !== undefined) w.moveX = clamp(c.moveX, -1, 1) || 0;
     if (c.moveZ !== undefined) w.moveZ = clamp(c.moveZ, -1, 1) || 0;
-    if (this.asleep && (w.moveX !== 0 || w.moveZ !== 0)) this.wake();
+    if (w.moveX === 0 && w.moveZ === 0) return;
+    this.touch();
+    const b = this.body;
+    if (this.playerMode === 'onFoot' && b && b.seat !== '') standCrew(b); // any walk input stands up
   }
   addLook(dYaw: number, dPitch: number): void {
     if (!(dYaw !== 0 || dPitch !== 0)) return;
-    if (this.asleep) this.wake();
-    if (this.playerMode === 'onFoot' && this.body) lookCrew(this.body, dYaw, dPitch);
+    this.touch();
+    if (this.playerMode === 'onFoot') {
+      if (this.body) lookCrew(this.body, dYaw, dPitch);
+      return;
+    }
+    this.headYaw = clamp(this.headYaw + dYaw, -HEAD_YAW, HEAD_YAW) || 0;
+    this.headPitch = clamp(this.headPitch + dPitch, -HEAD_PITCH, HEAD_PITCH) || 0;
   }
   setBoots(on: boolean): void {
-    if (this.asleep) this.wake();
+    this.touch();
     if (this.body) this.body.boots = !!on;
   }
   pushOff(): void {
-    if (this.asleep) { this.wake(); return; }
-    if (this.playerMode === 'onFoot' && this.body && this.layout) pushOffCrew(this.body, this.layout);
+    if (this.touch()) return;
+    const b = this.body;
+    if (this.playerMode !== 'onFoot' || !b || !this.layout) return;
+    if (b.seat !== '') standCrew(b);
+    else pushOffCrew(b, this.layout);
   }
+  /** Fasten the harness: only from on one's feet (the buckle's reach is checked by the caller). */
+  private strapIn(): boolean {
+    const b = this.body;
+    if (this.playerMode !== 'onFoot' || !b || !this.layout || this.ship.destroyed || b.seat !== '') return false;
+    this.playerMode = 'helm';
+    this.walk.moveX = this.walk.moveZ = 0;
+    this.headYaw = this.headPitch = 0;
+    this.events.emit('crewMode', { mode: 'helm' });
+    return true;
+  }
+  /** Release the harness. The buckle is interlocked with the drive: it stays shut while DRIVE ARM is on. */
   leaveHelm(): boolean {
-    const c = this.ship, layout = this.layout;
+    const c = this.ship, layout = this.layout, ix = this.ix;
     if (this.playerMode !== 'helm' || !layout || c.destroyed) return false;
-    if (this.throttle > 0 || c.throttle > 0) return false; // strapped in while the drive is on
+    const armed = ix.arm >= 0 && (this.devs[ix.arm].on || this.devs[ix.arm].made);
+    if (armed || this.cmdThrottle > 0 || this.throttle > 0 || c.throttle > 0) return false;
     this.pitch = this.yaw = this.roll = 0;
     this.translate.x = this.translate.y = this.translate.z = 0;
+    for (const i of this.hands.values()) devRelease(this.devs[i]); // hands off the controls
+    this.hands.clear();
     const boots = this.body ? this.body.boots : true;
     this.body = createCrew(layout, PLAYER_ID);
     this.body.boots = boots;
     this.walk.moveX = this.walk.moveZ = 0;
     this.setWarpIndex(0);
     this.playerMode = 'onFoot';
+    this.restT = 0;
     this.settled = false;
     this.events.emit('crewMode', { mode: 'onFoot' });
     return true;
   }
   standUp(): void {
-    if (this.asleep) this.wake();
+    this.touch();
     if (this.playerMode === 'onFoot' && this.body) standCrew(this.body);
   }
-  interact(): boolean {
-    if (this.asleep) { this.wake(); return true; }
-    const b = this.body, layout = this.layout, out = this.events;
+  /** Lie in the bunk / sit on the bench. */
+  private useRest(role: DeviceRole): boolean {
+    const b = this.body, layout = this.layout;
     if (this.playerMode !== 'onFoot' || !b || !layout) return false;
-    if (b.seat === 'bunk') {
-      // lying down already: sleep until something wakes the pilot
-      this.asleep = true;
-      this.sleptFrom = this.world.t;
-      this.walk.moveX = this.walk.moveZ = 0;
-      this.settled = false;
-      this.winN = this.winAt = 0;
-      out.emit('sleep', { asleep: true, seconds: 0 });
-      return true;
-    }
+    const seat = role === 'bunk' ? 'bunk' : 'table';
+    if (b.seat !== seat) sitCrew(b, layout, seat);
+    this.restT = 0;
+    return true;
+  }
+  /** Kept for callers of the old contract: the thing in reach, through the same paths as the devices. */
+  interact(): boolean {
+    if (this.touch()) return true;
+    const b = this.body, layout = this.layout;
+    if (this.playerMode !== 'onFoot' || !b || !layout) return false;
     const it = findPrompt(b, layout);
     if (!it) return false;
-    const c = this.ship;
     switch (it.kind) {
-      case 'helm':
-        this.playerMode = 'helm';
-        this.walk.moveX = this.walk.moveZ = 0;
-        out.emit('crewMode', { mode: 'helm' });
-        break;
-      case 'bunk': sitCrew(b, layout, 'bunk'); break;
-      case 'tableSeat': sitCrew(b, layout, 'table'); break;
-      case 'lights':
-        this.lights = !this.lights;
-        out.emit('cabinLights', { on: this.lights });
-        break;
-      case 'hatch': {
-        const st = c.dockedTo !== null ? findCraft(this.world, c.dockedTo) : null;
-        out.emit('crewMessage', { source: it.id, text: c.dockedTo !== null ? `Docked to ${st ? st.name : 'the station'} — the station side is not built yet` : 'Hatch sealed — not docked' });
-        break;
-      }
-      case 'galley':
-        out.emit('crewMessage', { source: it.id, text: GALLEY_LINES[this.galleyN++ % GALLEY_LINES.length] });
-        break;
-      case 'washroom':
-        out.emit('crewMessage', { source: it.id, text: 'You wash up with a damp cloth; the recycler takes the water back.' });
-        break;
-      case 'reactor': {
-        const pct = (x: number): string => `${Math.round(clamp(x, 0, 9.99) * 100)}%`;
-        out.emit('crewMessage', {
-          source: it.id,
-          text: `Reactor steady · propellant ${pct(c.propellantCapacity > 0 ? c.propellant / c.propellantCapacity : 0)} · heat ${pct(c.heatCapacity > 0 ? c.heat / c.heatCapacity : 0)} · hull ${pct(c.hull)}`,
-        });
-        break;
-      }
-      default: return false;
+      case 'helm': return this.strapIn();
+      case 'bunk': return this.useRest('bunk');
+      case 'tableSeat': return this.useRest('tableSeat');
+      case 'lights': return this.ix.lights >= 0 && devTap(this.devs[this.ix.lights]);
+      default: return false; // furniture
     }
-    return true;
   }
   /** End the sleep (any input, or the ship being knocked about). */
   private wake(): void {
     if (!this.asleep) return;
     this.asleep = false;
+    this.restT = 0;
     this.settled = false;
     this.winN = this.winAt = 0;
     this.events.emit('sleep', { asleep: false, seconds: this.world.t - this.sleptFrom });
+  }
+
+  // ------------------------------------------------------------------------------------------ the pilot's hand
+
+  cockpit(): CockpitLayout | null {
+    return this.cockpitLayout;
+  }
+  private devIndex(id: string): number {
+    const defs = this.devDefs;
+    for (let i = 0; i < defs.length; i++) if (defs[i].id === id) return i;
+    return -1;
+  }
+  /** Can the hand get to this control from where the body is now? */
+  private reach(i: number): boolean {
+    const def = this.devDefs[i], layout = this.layout, b = this.body;
+    if (this.ship.destroyed || this.asleep) return false;
+    if (def.reach === 'pilotSeat') return this.playerMode === 'helm';
+    if (def.kind === 'buckle') {
+      // the harness goes with the seat: fastened from standing beside it, released from in it
+      if (this.playerMode === 'helm') return true;
+      if (!b || !layout || b.seat !== '') return false;
+      const sx = b.pos.x - layout.helmEye.x, sz = b.pos.z - layout.helmEye.z;
+      return sx * sx + sz * sz <= SEAT_REACH * SEAT_REACH;
+    }
+    let ex: number, ey: number, ez: number, my: number;
+    if (this.playerMode === 'helm' || !b || !layout) {
+      const e = layout ? layout.helmEye : this.EYE;
+      ex = e.x; ey = e.y; ez = e.z; my = e.y - 0.45;
+    } else {
+      if (b.seat === 'bunk') return def.role === 'bunk'; // lying down: get up first
+      if (b.seat === 'table' && def.role === 'tableSeat') return true;
+      const e = crewEye(b, layout, this.EYE);
+      ex = e.x; ey = e.y; ez = e.z; my = b.seat === '' ? b.pos.y + CREW_COM : e.y - 0.45;
+    }
+    // from the side the control faces (not through a bulkhead), within arm's length of the eye or the body's middle
+    const p = def.pos, n = def.normal, dx = ex - p.x, dz = ez - p.z, dy = ey - p.y, dm = my - p.y;
+    if (dx * n.x + dy * n.y + dz * n.z < -0.25) return false;
+    const lim = ARM_REACH + def.radius;
+    return dx * dx + dz * dz + Math.min(dy * dy, dm * dm) <= lim * lim;
+  }
+  private litOf(i: number): boolean {
+    const def = this.devDefs[i], d = this.devs[i], ix = this.ix, role = def.role;
+    const hm = HOLD_OF[role];
+    if (hm) return this.hold === hm;
+    switch (role) {
+      case 'driveArm': return d.made;
+      case 'throttle': return ix.arm >= 0 && this.devs[ix.arm].made && leverValue(d) > 0;
+      case 'cabinLights': return this.lights;
+      case 'harness': return this.playerMode === 'helm';
+      case 'undock': return this.ship.dockedTo !== null;
+      case 'display': return !this.ship.destroyed;
+      case 'bunk': return this.playerMode === 'onFoot' && !!this.body && this.body.seat === 'bunk';
+      case 'tableSeat': return this.playerMode === 'onFoot' && !!this.body && this.body.seat === 'table';
+      default: return d.made || d.held;
+    }
+  }
+  devices(): readonly DeviceView[] {
+    const out = this.devViews, ds = this.devs, defs = this.devDefs;
+    for (let i = 0; i < out.length; i++) {
+      const o = out[i], d = ds[i], pages = defs[i].pages;
+      o.x = d.x; o.y = d.y;
+      o.held = d.held;
+      o.lit = this.litOf(i);
+      o.reachable = this.reach(i);
+      o.page = pages ? pages[this.devPage[i]] ?? pages[0] : '';
+    }
+    return out;
+  }
+  grabDevice(id: string, pointerId: number): boolean {
+    const i = this.devIndex(id);
+    if (i < 0 || this.touch() || !this.reach(i) || this.hands.has(pointerId)) return false; // a touch that wakes does nothing else
+    for (const j of this.hands.values()) if (j === i) return false; // one hand to a control
+    this.hands.set(pointerId, i);
+    devGrab(this.devs[i]);
+    return true;
+  }
+  moveDevice(pointerId: number, x: number, y: number): void {
+    const i = this.hands.get(pointerId);
+    if (i === undefined) return;
+    this.restT = 0;
+    devMove(this.devs[i], x, y);
+  }
+  releaseDevice(pointerId: number): void {
+    const i = this.hands.get(pointerId);
+    if (i === undefined) return;
+    this.hands.delete(pointerId);
+    devRelease(this.devs[i]);
+  }
+  tapDevice(id: string): boolean {
+    const i = this.devIndex(id);
+    if (i < 0) return false;
+    if (this.touch()) return true; // the touch woke the pilot
+    if (!this.reach(i)) return false;
+    const def = this.devDefs[i], d = this.devs[i];
+    switch (def.kind) {
+      case 'screen': {
+        const n = def.pages ? def.pages.length : 0;
+        if (n > 1) this.devPage[i] = (this.devPage[i] + 1) % n;
+        devTap(d);
+        return true;
+      }
+      case 'buckle':
+        if (!(this.playerMode === 'helm' ? this.leaveHelm() : this.strapIn())) return false;
+        devTap(d);
+        return true;
+      case 'rest':
+        if (!this.useRest(def.role)) return false;
+        devTap(d);
+        return true;
+      default:
+        return devTap(d); // button, handle, toggle: the mechanism moves and the flight computer sees the contact
+    }
   }
 
   // ------------------------------------------------------------------------------------------ life cycle
 
   reset(): void {
     this.bind(buildWorld(this.system));
-    this.asleep = false;
-    this.playerMode = 'helm';
-    this.body = null;
+    this.startPilot();
     this.lights = true;
-    this.walk.moveX = this.walk.moveZ = 0;
     this.pitch = this.yaw = this.roll = this.throttle = 0;
     this.translate.x = this.translate.y = this.translate.z = 0;
     this.hold = 'stability';
@@ -998,6 +1233,7 @@ class WorldSession implements Session {
       seed: this.seed, hold: this.hold, holdQ: this.holdQValid ? { ...this.holdQ } : null, targetId: this.targetId, predFrame: this.predFrame,
       burns: this.burnList, burnSeq: this.burnSeq, throttle: this.throttle, rearmBlock: this.rearmBlock, settled: this.settled,
       mode: this.playerMode, crew: this.playerMode === 'onFoot' ? this.body : null, lights: this.lights,
+      devices: this.devs, pages: this.devPage, head: [this.headYaw, this.headPitch],
     };
     return JSON.stringify({ tidelock: SAVE_VERSION, session: state, world: saveWorld(this.world) });
   }
@@ -1026,7 +1262,7 @@ export function loadSession(json: string, opts: SessionOptions = {}): Session | 
     return new WorldSession(system, world, opts, s.seed, {
       seed: s.seed, hold: s.hold ?? 'stability', holdQ: s.holdQ ?? null, targetId: s.targetId ?? null, predFrame: s.predFrame ?? null,
       burns: Array.isArray(s.burns) ? s.burns : [], burnSeq: s.burnSeq ?? 0, throttle: s.throttle ?? 0, rearmBlock: !!s.rearmBlock, settled: !!s.settled,
-      mode: s.mode === 'onFoot' ? 'onFoot' : 'helm', crew: s.crew ?? null, lights: s.lights !== false,
+      mode: s.mode === 'helm' ? 'helm' : 'onFoot', crew: s.crew ?? null, lights: s.lights !== false, devices: s.devices, pages: s.pages, head: s.head,
     });
   } catch {
     return null;
