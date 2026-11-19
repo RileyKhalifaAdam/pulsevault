@@ -326,3 +326,42 @@ export interface CrewView {
   /** True while asleep in the bunk (time is being accelerated until woken). */
   asleep: boolean;
 }
+
+// ---- physical controls (no on-screen flight UI) -------------------------------------------------------------
+// The client's only inputs are: walk (setWalk), look (addLook), a flick to jump / push off (pushOff), and the
+// pilot's hand on a physical device (below). Devices are defined in src/data/cockpit.ts. The flight computer
+// reads the devices; the client must not call setControls / setHold / setWarp / interact / leaveHelm itself.
+
+/** The live state of one physical control. Objects are reused between calls. */
+export interface DeviceView {
+  id: string;
+  /** Deflection: stick2 x,y in -1..1; lever x in 0..1; rocker x in -1|0|1; toggle x 0|1; button/handle x 1 while pressed. */
+  x: number;
+  y: number;
+  /** Lamp or indicator lit (a hold button whose mode is active, drive armed, harness fastened…). */
+  lit: boolean;
+  /** True while the pilot's hand is on it. */
+  held: boolean;
+  /** True when the pilot can reach it from where the body is now. */
+  reachable: boolean;
+  /** For screens: the page being shown. */
+  page: string;
+}
+
+export interface Session {
+  /** Every device of the player's ship, in the order of the cockpit layout. */
+  devices(): readonly DeviceView[];
+  cockpit(): import('../data/cockpit').CockpitLayout | null;
+  /** Hand down on a device (a touch that started on it). False when it is out of reach. */
+  grabDevice(id: string, pointerId: number): boolean;
+  /**
+   * Hand motion while holding: where the hand wants the control, in the device's own axes
+   * (stick2: x right, y along its `up`, each -1..1; lever: x = 0..1). The control follows with its own
+   * dynamics (inertia, friction, spring) — it is not set.
+   */
+  moveDevice(pointerId: number, x: number, y: number): void;
+  /** Hand off. Spring-centred controls return; levers and toggles stay. */
+  releaseDevice(pointerId: number): void;
+  /** A short tap: press a button, flip a toggle, pull a handle, page a screen, fasten or release a buckle, use a rest. */
+  tapDevice(id: string): boolean;
+}
