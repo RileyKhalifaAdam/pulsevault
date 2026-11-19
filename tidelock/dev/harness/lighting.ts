@@ -73,7 +73,7 @@ const PRESETS: Record<string, Preset> = {
   lounge,
   cockpit: { eye: layout.helmEye, yaw: -6, pitch: -14, nadir: { x: 0, y: -0.857, z: -0.515 }, sun: { x: 0.25, y: 0.55, z: -0.8 }, lights: true },
   eclipse: { ...lounge, nadir: { x: 0.3, y: -0.9, z: 0.3 }, sun: { x: 0.25, y: -0.92, z: 0.3 } },
-  window: { eye: { x: 2.0, y: 0.45, z: -7.5 }, yaw: -90, pitch: -12, nadir: { x: 0.5, y: -0.85, z: 0.1 }, sun: { x: -0.4, y: 0.6, z: -0.7 }, lights: true },
+  window: { eye: { x: 1.3, y: 0.55, z: -6.6 }, yaw: -112, pitch: -24, nadir: { x: 0.5, y: -0.85, z: 0.1 }, sun: { x: -0.4, y: 0.6, z: -0.7 }, lights: true },
   corridor: { eye: { x: 0, y: 0.62, z: 2.2 }, yaw: 0, pitch: -4, nadir: { x: 0.3, y: -0.9, z: 0.3 }, sun: { x: 0.8, y: 0.5, z: -0.15 }, lights: true },
   cargo: { eye: { x: 0.4, y: 0.7, z: 9.3 }, yaw: 8, pitch: -10, nadir: { x: 0.3, y: -0.9, z: 0.3 }, sun: { x: 0.8, y: 0.5, z: -0.15 }, lights: true },
   dark: { ...lounge, lights: false },

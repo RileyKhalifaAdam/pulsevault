@@ -77,6 +77,12 @@ interface RoomInfo {
   links: [number, number][];
   probe: number;
   visible: boolean;
+  /** Outward normals of its windows (ship-local); empty = no window. */
+  windows: V3[];
+  /** Casters other than the shell: they cast only while light can come in through a window. */
+  casters: THREE.Mesh[];
+  /** Seen only through a small opening this frame (portal rectangle under ~2 % of the screen). */
+  far: boolean;
 }
 
 interface Probe {
@@ -290,7 +296,10 @@ export class InteriorLighting {
     // rooms and their door links
     for (const r of layout.rooms) {
       this.roomIndex.set(r.id, this.rooms.length);
-      this.rooms.push({ id: r.id, box: r.box, nodes: [], links: [], probe: -1, visible: true });
+      const windows: V3[] = layout.windows
+        .filter((w) => w.room === r.id)
+        .map((w) => ({ x: w.wall === '+x' ? 1 : w.wall === '-x' ? -1 : 0, y: w.wall === '+y' ? 1 : 0, z: w.wall === '+z' ? 1 : w.wall === '-z' ? -1 : 0 }));
+      this.rooms.push({ id: r.id, box: r.box, nodes: [], links: [], probe: -1, visible: true, windows, casters: [], far: false });
     }
     layout.doors.forEach((d, i) => {
       const a = this.roomIndex.get(d.a);
@@ -404,17 +413,17 @@ export class InteriorLighting {
   }
 
   /**
-   * In a room without windows the sun can only ever fall on the inside of its shell, which its shell already
-   * shadows: there only the shell (meshes spanning most of the room) keeps casting, the furniture does not.
-   * That keeps the shadow pass to about one draw per windowless room.
+   * In a room the light cannot enter (no window, or none facing the light) everything inside is in the shadow of
+   * its shell: there only the shell (meshes spanning most of the room) casts, the furniture does not. Windowless
+   * rooms are pruned once here; rooms with windows switch their furniture per frame (see castersFor).
    */
   private pruneCasters(): void {
-    const lit = new Set(this.layout.windows.map((w) => w.room));
     const box = new THREE.Box3();
     const size = new THREE.Vector3();
     const inv = new THREE.Matrix4().copy(this.root.matrixWorld).invert();
     for (const room of this.rooms) {
-      if (lit.has(room.id)) continue;
+      room.casters.length = 0;
+      const lit = room.windows.length > 0;
       const b = room.box;
       const diag = Math.hypot(b.max.x - b.min.x, b.max.y - b.min.y, b.max.z - b.min.z);
       for (const n of room.nodes)
@@ -429,7 +438,9 @@ export class InteriorLighting {
             box.copy(im.boundingBox as THREE.Box3);
           }
           box.applyMatrix4(m.matrixWorld).applyMatrix4(inv).getSize(size);
-          if (size.length() < 0.6 * diag) m.castShadow = false;
+          if (size.length() >= 0.6 * diag) return;
+          if (lit) room.casters.push(m);
+          else m.castShadow = false;
         });
     }
   }
@@ -669,6 +680,7 @@ export class InteriorLighting {
       }
     }
     if (this.shadowEvery > 1 && this.frameNo % this.shadowEvery === 0) this.sun.shadow.needsUpdate = true;
+    this.castersFor(sunOn ? f.sunDir : null, this.shine && f.shineIntensity > 1e-4 ? f.shineDir : null);
     // the shadow maps now, before the pipeline binds its multisampled target
     if (sunOn || (this.shine && this.shine.shadow.needsUpdate)) this.renderShadows();
     this.stats.drawCalls = info.calls - c0;
@@ -691,6 +703,24 @@ export class InteriorLighting {
     r.render(this.scene, this.nullCam);
     r.shadowMap.needsUpdate = false;
     r.setRenderTarget(prev);
+  }
+
+  /** Furniture casts only in the visible rooms with a window facing the sun or the planetshine. */
+  private castersFor(sun: THREE.Vector3 | null, shine: THREE.Vector3 | null): void {
+    const q = this.rq;
+    this.root.getWorldQuaternion(q).invert();
+    const s = sun ? this.tv.copy(sun).applyQuaternion(q) : null;
+    const p = shine ? this.tv2.copy(shine).applyQuaternion(q) : null;
+    for (const room of this.rooms) {
+      if (room.casters.length === 0) continue;
+      let open = false;
+      if (room.visible && !room.far)
+        for (const n of room.windows) {
+          if (s && n.x * s.x + n.y * s.y + n.z * s.z > 0.02) open = true;
+          if (p && n.x * p.x + n.y * p.y + n.z * p.z > 0.02) open = true;
+        }
+      for (const m of room.casters) m.castShadow = open;
+    }
   }
 
   /** Portal culling from the camera's room through the door boxes; sets node visibility. */
@@ -737,6 +767,9 @@ export class InteriorLighting {
 
   private visit(ri: number, from: number, x0: number, x1: number, y0: number, y1: number, depth: number, camera: THREE.PerspectiveCamera): void {
     const room = this.rooms[ri];
+    // the largest opening it is seen through decides whether its furniture is worth a shadow
+    const small = (x1 - x0) * (y1 - y0) < 0.08;
+    room.far = room.visible ? room.far && small : small;
     room.visible = true;
     if (depth > 8) return;
     for (const [di, other] of room.links) {
