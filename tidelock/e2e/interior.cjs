@@ -74,7 +74,10 @@ async function run() {
       check(!!r && r.room === 'lounge' && r.n < r.of, `room culling from the lounge looking aft: ${r ? `${r.n}/${r.of} rooms drawn` : 'no lighting stats'}`);
       await shot('1-lounge');
       // ---- the LIGHTS switch on the lounge's forward bulkhead (within arm's reach of it)
-      await h.walkTo(stick, -0.9, -9.4);
+      // (step up to it: 0.7 m from the bulkhead, so the eye is inside the 0.95 m reach whatever the walk's 0.14 m slop)
+      const dl = await h.walkTo(stick, -0.95, -9.7);
+      s = await st(f);
+      console.log(`     at the LIGHTS switch: ${s.x.toFixed(2)}, ${s.z.toFixed(2)} (${dl.toFixed(2)} m off)`);
       await h.aimAt({ x: -1.1, y: 0.2, z: -10.4 });
       await settle(f);
       let map = await pickMap(f);
