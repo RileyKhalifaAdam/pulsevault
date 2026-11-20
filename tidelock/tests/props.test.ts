@@ -34,7 +34,7 @@ definePropsLayout('t-box', BOX, [
   def('b', 'mug', v3(0.5, 0.02, 0)),
   def('tab', 'tablet', v3(0, 0.8, 1)),
   def('crate', 'crateSmall', v3(-1, -0.798, -1)),
-]);
+], { rho: 0 }); // a vacuum room: the conservation checks are exact (cabin-air drag has its own tests)
 const body = (s: PropsState, id: string) => s.bodies.find((b) => b.id === id)!;
 const set = (s: PropsState, id: string, p: V3, v: V3 = v3(), w: V3 = v3()): void => {
   const b = body(s, id);

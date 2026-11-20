@@ -306,6 +306,8 @@ const D_NTR = 'Solid-core nuclear-thermal drive. Strong thrust on a self-powered
 const D_PULSE = 'Pulsed fusion drive tuned for thrust. Twice a torch\'s push at three-quarters of its exhaust velocity, and it wants a great deal of power.';
 const D_TORCH = 'Steady-burn fusion torch, the Reach\'s everyday drive: balanced thrust and exhaust velocity for a reasonable power bill.';
 const D_CRUISE = 'Magnetic-nozzle cruise drive. Less than half a torch\'s thrust, half again its exhaust velocity: the choice when Δv matters more than hurry.';
+// The Tern packs are hydrazine monopropellant: 2250 m/s (Isp 229 s) at full tank pressure, the figure world/jets.ts
+// (RCS_VE0) uses for the blowdown pool; the jets themselves make all the attitude torque (SIMULATION.md W1-B).
 const D_RCS = 'Monopropellant thruster quads with a reaction-wheel pack. Dependable, cheap, unremarkable.';
 const D_RCS_AGILE = 'Hot-gas combat thrusters and oversized control-moment gyros. Far more authority than the standard pack for more mass, power and money.';
 const D_RCS_ARC = 'Arcjet thrusters: nearly three times the exhaust velocity of monopropellant for half the push and a real power draw.';
@@ -354,10 +356,10 @@ const MODULE_LIST: ModuleDef[] = [
   mod('eng_cruise_3', ILMARIN, 'Longwake', 'engine', 3, 4, 18900, 300000, 30, { thrust: 1.14e6, exhaustVelocity: 58000 }, D_CRUISE),
 
   // ---------------------------------------------------------------- RCS + reaction wheels
-  mod('rcs_std_1', CALDER, 'Tern', 'rcs', 1, 1, 600, 2400, 0.3, { rcsThrust: 34000, rcsExhaustVelocity: 2400, torque: 4.6e5 }, D_RCS),
-  mod('rcs_std_2', CALDER, 'Tern', 'rcs', 2, 1, 1700, 7500, 0.7, { rcsThrust: 100000, rcsExhaustVelocity: 2400, torque: 2.4e6 }, D_RCS),
-  mod('rcs_std_3', CALDER, 'Tern', 'rcs', 3, 1, 4500, 24000, 1.6, { rcsThrust: 300000, rcsExhaustVelocity: 2400, torque: 1.0e7 }, D_RCS),
-  mod('rcs_std_4', CALDER, 'Tern', 'rcs', 4, 2, 11000, 75000, 3.5, { rcsThrust: 920000, rcsExhaustVelocity: 2400, torque: 3.6e7 }, D_RCS),
+  mod('rcs_std_1', CALDER, 'Tern', 'rcs', 1, 1, 600, 2400, 0.3, { rcsThrust: 34000, rcsExhaustVelocity: 2250, torque: 4.6e5 }, D_RCS),
+  mod('rcs_std_2', CALDER, 'Tern', 'rcs', 2, 1, 1700, 7500, 0.7, { rcsThrust: 100000, rcsExhaustVelocity: 2250, torque: 2.4e6 }, D_RCS),
+  mod('rcs_std_3', CALDER, 'Tern', 'rcs', 3, 1, 4500, 24000, 1.6, { rcsThrust: 300000, rcsExhaustVelocity: 2250, torque: 1.0e7 }, D_RCS),
+  mod('rcs_std_4', CALDER, 'Tern', 'rcs', 4, 2, 11000, 75000, 3.5, { rcsThrust: 920000, rcsExhaustVelocity: 2250, torque: 3.6e7 }, D_RCS),
   mod('rcs_agile_1', CALDER, 'Dervish', 'rcs', 1, 3, 800, 9500, 0.8, { rcsThrust: 60000, rcsExhaustVelocity: 2900, torque: 7.6e5 }, D_RCS_AGILE),
   mod('rcs_agile_2', CALDER, 'Dervish', 'rcs', 2, 3, 2300, 28000, 1.8, { rcsThrust: 170000, rcsExhaustVelocity: 2900, torque: 4.0e6 }, D_RCS_AGILE),
   mod('rcs_agile_3', CALDER, 'Dervish', 'rcs', 3, 3, 6000, 88000, 4, { rcsThrust: 510000, rcsExhaustVelocity: 2900, torque: 1.7e7 }, D_RCS_AGILE),

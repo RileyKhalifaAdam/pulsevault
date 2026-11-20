@@ -12,22 +12,36 @@
 // the crew collides with), against each other (broad phase on a hashed grid; sphere / capsule / box narrow
 // phase) and against the crew capsule (80 kg, so the pilot pushes things and things push the pilot).
 // Sequential-impulse solver with restitution and Coulomb friction, then a linear position projection.
-// Bodies sleep when at rest on a surface (or perfectly still in free fall) and wake on contact or when the
-// ship's motion changes. Stowed bodies (clip / magnet / strap) are fixed to the ship until the inertial force
-// on them (mass × felt acceleration, plus the pull of a hand) exceeds their holding force.
+// Stowed bodies (clip / magnet / strap) are fixed to the ship until the inertial force on them (mass × felt
+// acceleration, plus the pull of a hand) exceeds their holding force.
 //
-// Integration (the session/world code owns the calls, once per frame, ship time):
+// Three modes per loose body (SIMULATION.md W1-C 6, src/world/quasistatic.ts), so loose objects never block sleep
+// warp: CONTACT — stepped at the tick Q = 1/120 s by the solver above, only the awake island (contact bodies and
+// whatever they touch); REST — at rest in the friction cones of its supports, costs nothing until the felt load
+// leaves them or an impulse needs more than they give; DRIFT — touching nothing, in closed form in the ship's
+// CoM-centred inertial frame (exact cabin-air drag), re-scheduled only when it could reach a surface. The ship's
+// impulses (the ledger's Δv, Δω) reach every body exactly once, in every mode. Cabin-air drag acts in CONTACT too.
+// `asleep` is kept as the view of REST (the renderer and older callers read it; setting it false wakes a body).
+//
+// Integration (the session owns the calls, once per tick — once per quantum under warp):
 //   const props = createPropsState('wren');            // or loadPropsState(saved)
-//   moveGrab(props, handPointShip, dt);                  // only while something is held
-//   stepProps(props, shipMotion, crew, dt);              // shipMotion from craftMotion(), crew from stepCrew()
+//   moveGrab(props, handPointShip, Q);                   // only while something is held
+//   stepProps(props, shipMotion, crew, k·Q, tick);      // shipMotion from craftMotion(ledger mean), crew after stepCrew
+//   nextBodyEvent(props, …, maxTicks)                    // how far the world may go before a body needs it
 //   visual.update(propViews(props));
-// Call stepProps after stepCrew in the same frame: it applies contact impulses to crew.vel (and nudges
-// crew.pos out of objects), which stepCrew integrates next frame.
+// Call stepProps after stepCrew in the same tick: it applies contact impulses to crew.vel (and nudges crew.pos out
+// of objects), which stepCrew integrates next tick. It writes contact and slide records to the event ring.
 
 import type { Quat, V3 } from '../core/types';
 import { INTERIORS, type InteriorLayout } from '../data/interiors';
-import { PROP_TYPES, PROPS, type PropDef, type PropType } from '../data/props';
+import { DECK_MATERIAL, LINING_MATERIAL, PROP_TYPES, PROPS, solidMaterial, type PropDef, type PropType } from '../data/props';
 import { CREW_EYE, CREW_FRICTION, CREW_HEIGHT, CREW_RADIUS, CREW_RESTITUTION, feltAt, type BodyTick, type CrewState, type ShipMotion } from './crew';
+import { createBodyMotion, type BodyMotion } from './body';
+import { BODY_CREW, BODY_SHIP, emitEvent, MAT, type EventRing } from './events';
+import {
+  afterContact, createQsState, dragK, dragStep, loadQsState, makeQsWorld, MODE_CONTACT, MODE_DRIFT, MODE_FIXED, MODE_REST, RHO_CABIN,
+  nextBodyEvent as qsNextEvent, bodyEvent as qsEvent, serviceBodies, tryRest, WHY_CONTACT, type QsState, type QsWorld,
+} from './quasistatic';
 
 /** Mass of the crew body (with clothes and kit), kg. */
 export const CREW_MASS = 80;
@@ -56,14 +70,8 @@ const GRAB_SLIP = 0.6;
 /** How far outside an object a hand may be and still grab it, m. */
 const GRAB_SLOP = 0.12;
 
+/** The fixed tick, s (SIMULATION.md §1.3): contact bodies step at it (or finer, MAX_MOVE). */
 const SUB_DT = 1 / 120;
-/**
- * Coasting (felt acceleration below LIGHT_A, nothing in hand, the crew still): contacts are slow, light touches, so
- * the step is set by how far things move (MAX_MOVE) and turn (ROT_STEP rad), at least every COAST_DT, not by 120 Hz.
- */
-const LIGHT_A = 0.05;
-const COAST_DT = 0.25;
-const ROT_STEP = 0.2;
 /**
  * Most any point of a body may move in one sub-step, m: less than a 4 cm wall panel, so a contact is always seen;
  * the side it is pushed out of is the side it came from (its position before the sub-step).
@@ -75,14 +83,21 @@ const SLOP = 0.0005;
 const PROJ = 0.5;
 /** Approach speed below which a contact does not bounce, m/s (a steady 12 m/s² adds 0.1 m/s per sub-step). */
 const BOUNCE_V = 0.25;
-const SLEEP_V = 0.06;
-const SLEEP_W = 1.0;
-const SLEEP_T = 0.25;
-const FLOAT_V = 1e-3;
-const FLOAT_W = 5e-3;
+/** A walking crew this fast wakes a resting object it brushes, m/s. */
 const WAKE_V = 0.05;
-const WAKE_DA = 0.02;
-const WAKE_DW = 1e-4;
+/**
+ * An impact is a contact record (event ring) when it closes faster than IMPACT_V (m/s) and faster than three
+ * sub-steps of the felt load would push a resting contact (so a body pressed into a deck by thrust is not a hit).
+ * A sliding or rolling body writes a slide record per tick above SLIDE_V (m/s).
+ */
+const IMPACT_V = 0.05;
+const SLIDE_V = 0.005;
+/**
+ * Rolling (and pivoting) resistance length δ, m: a loaded contact resists the bodies' relative turning with a torque
+ * N·δ (hysteresis of the deformed contact patch; hard polymer and metal on composite panels ~0.1–1 mm). It is what
+ * stops a pen rolling on a deck; without it a round thing under thrust would roll for ever.
+ */
+const ROLL_D = 5e-4;
 const WALL = 0.02;
 const MAX_CONTACTS = 2048;
 const GRID_B = 256;
@@ -101,9 +116,12 @@ export interface PropBody {
   w: V3;
   /** Still held by its clip / magnet / strap. */
   stowed: boolean;
+  /** At rest (qs.mode REST): a view of the mode. Set it false to wake the body (it re-derives its mode in a tick). */
   asleep: boolean;
-  /** Seconds it has spent nearly still. */
+  /** Unused since wave 1 (the rest mode replaced the sleep timer); kept for older saves. */
   still: number;
+  /** Contact / rest / drift (quasistatic.ts): the mode, the support normals, the drift anchor and schedule. Saved. */
+  qs: QsState;
 }
 
 export interface PropGrab {
@@ -124,9 +142,18 @@ export interface PropsState {
   t: number;
   bodies: PropBody[];
   grab: PropGrab;
-  /** The ship's motion at the last sub-step (to wake sleepers when it changes). */
+  /** Unused since wave 1 (waking is per body, quasistatic.ts); kept for older saves. */
   lastA: V3;
   lastW: V3;
+  /** The world tick of the last step (sim time = tick / 120 s). */
+  tick: number;
+  /**
+   * The ship's attitude (ship → inertial) the drift anchors are written in: the craft's own at each session tick;
+   * carried forward by the ship's rate when stepProps is called without a tick context (tests).
+   */
+  q: Quat;
+  /** Ticks owed to a caller without a tick context (fraction of a tick), so any dt sums to the right time. */
+  due: number;
 }
 
 /** What the renderer needs per object. Reused objects: read, do not keep. */
@@ -192,27 +219,48 @@ interface Rt {
   head: Int32Array;
   next: Int32Array;
   stamp: Int32Array;
+  /** Drag constants, rest friction and the static grid for the rest / drift modes (quasistatic.ts). */
+  qw: QsWorld;
+  /** Material codes (events.ts MAT): per body, per static box. */
+  mat: Int8Array;
+  smat: Int8Array;
+  /** Per body, this tick: mode before the service; 1 = handed from drift to contact at the tick end (step next tick). */
+  pre: Int8Array;
+  skip: Uint8Array;
+  /** Per body, the last sub-step: up to 3 support normals (out of the support), how many, Σ normal impulse, crew touch. */
+  nrm: Float64Array;
+  nn: Int32Array;
+  jn: Float64Array;
+  other: Int32Array;
+  onCrew: Uint8Array;
+  /** The ship's motion in the form the rest / drift modes take (scratch). */
+  bm: BodyMotion;
 }
 
-const registry = new Map<string, { layout: InteriorLayout; defs: PropDef[] }>();
+/** Options of a registered layout: cabin air density (kg/m³; 0 = a vacuum room), until W2-D's cabin model supplies it. */
+export interface PropsLayoutOptions { rho?: number }
+const registry = new Map<string, { layout: InteriorLayout; defs: PropDef[]; rho?: number }>();
 const runtimes = new Map<string, Rt>();
 
 /** Register (or replace) a layout and its objects under an id, e.g. for a test room. Built-ins: 'wren'. */
-export function definePropsLayout(id: string, layout: InteriorLayout, defs: PropDef[]): void {
-  registry.set(id, { layout, defs });
+export function definePropsLayout(id: string, layout: InteriorLayout, defs: PropDef[], opts: PropsLayoutOptions = {}): void {
+  registry.set(id, { layout, defs, rho: opts.rho });
   runtimes.delete(id);
 }
 
-function staticBoxes(layout: InteriorLayout): number[] {
+function staticBoxes(layout: InteriorLayout, mats: number[]): number[] {
   // Same boxes the crew collides with (src/world/crew.ts): solids, decks, overheads, wall panels minus doors.
   const list: number[] = [];
+  let mat: number = LINING_MATERIAL;
   const add = (x0: number, y0: number, z0: number, x1: number, y1: number, z1: number): void => {
-    if (x1 - x0 > 1e-9 && y1 - y0 > 1e-9 && z1 - z0 > 1e-9) list.push(x0, y0, z0, x1, y1, z1);
+    if (x1 - x0 > 1e-9 && y1 - y0 > 1e-9 && z1 - z0 > 1e-9) { list.push(x0, y0, z0, x1, y1, z1); mats.push(mat); }
   };
-  for (const s of layout.solids) add(s.box.min.x, s.box.min.y, s.box.min.z, s.box.max.x, s.box.max.y, s.box.max.z);
+  for (const s of layout.solids) { mat = solidMaterial(s.kind); add(s.box.min.x, s.box.min.y, s.box.min.z, s.box.max.x, s.box.max.y, s.box.max.z); }
   for (const r of layout.rooms) {
     const lo = r.box.min, hi = r.box.max;
+    mat = DECK_MATERIAL;
     add(lo.x, lo.y - 0.5, lo.z, hi.x, lo.y, hi.z);
+    mat = LINING_MATERIAL;
     add(lo.x, hi.y, lo.z, hi.x, hi.y + 0.5, hi.z);
     for (let f = 0; f < 4; f++) {
       const alongX = f >= 2;
@@ -254,8 +302,10 @@ function runtime(id: string): Rt | null {
     src = { layout, defs };
   }
   const { layout, defs } = src;
+  const rho = 'rho' in src && typeof src.rho === 'number' && src.rho >= 0 ? src.rho : RHO_CABIN;
   const n = defs.length;
-  const sbl = staticBoxes(layout);
+  const sml: number[] = [];
+  const sbl = staticBoxes(layout, sml);
   const vl: number[] = [];
   let rmax = 1;
   for (const b of [...layout.rooms.map((r) => r.box), ...layout.doors.map((d) => d.box)]) {
@@ -272,6 +322,8 @@ function runtime(id: string): Rt | null {
     pp: new Float64Array(3 * (n + 1)), im: new Float64Array(n + 1), Iw: new Float64Array(9 * (n + 1)), R: new Float64Array(9 * n),
     vw: new Float64Array(6 * (n + 1)), prev: new Float64Array(7 * n), prevOk: new Uint8Array(n), fm: new Float64Array(n), spd: new Float64Array(n), cnt: new Int32Array(n + 1),
     dyn: new Uint8Array(n), prim: new Uint8Array(n), head: new Int32Array(GRID_B), next: new Int32Array(n), stamp: new Int32Array(n),
+    qw: makeQsWorld(new Float64Array(0), 0, 0), mat: new Int8Array(n), smat: Int8Array.from(sml), pre: new Int8Array(n), skip: new Uint8Array(n),
+    nrm: new Float64Array(9 * n), nn: new Int32Array(n), jn: new Float64Array(n), other: new Int32Array(n), onCrew: new Uint8Array(n), bm: createBodyMotion(),
   };
   let maxB = 0;
   for (let i = 0; i < n; i++) {
@@ -296,8 +348,12 @@ function runtime(id: string): Rt | null {
     rt.Ib[3 * i] = I0; rt.Ib[3 * i + 1] = I1; rt.Ib[3 * i + 2] = I2;
     rt.invIb[3 * i] = 1 / I0; rt.invIb[3 * i + 1] = 1 / I1; rt.invIb[3 * i + 2] = 1 / I2;
     rt.e[i] = t.restitution; rt.mu[i] = t.friction; rt.hold[i] = d.stow === 'loose' ? 0 : Math.max(0, d.holdN);
+    rt.mat[i] = t.mat;
     maxB = Math.max(maxB, rt.bound[i]);
   }
+  const kq = new Float64Array(n);
+  for (let i = 0; i < n; i++) kq[i] = dragK(PROP_TYPES[defs[i].type].cdA, rt.mass[i], rho);
+  rt.qw = makeQsWorld(rt.sb, rt.ns, n, { r: rt.bound, k: kq, mu: rt.mu, I: rt.Ib });
   rt.cell = Math.max(0.5, 2 * maxB + 0.05);
   // static grid
   const sb = rt.sb, ns = rt.ns, lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
@@ -337,13 +393,17 @@ export function createPropsState(layoutId: string): PropsState | null {
       layoutId, t: 0,
       bodies: rt.defs.map((d) => {
         const q = d.rot, l = Math.hypot(q.x, q.y, q.z, q.w) || 1;
+        // a loose object starts at rest on what it sits on (the layouts place them 2 mm above an upward face)
+        const qs = createQsState();
+        qs.mode = d.stow !== 'loose' ? MODE_FIXED : MODE_REST;
+        qs.tickEnd = 2 ** 52;
         return {
           id: d.id, p: v3(d.pos.x, d.pos.y, d.pos.z), v: v3(), q: { x: q.x / l, y: q.y / l, z: q.z / l, w: q.w / l }, w: v3(),
-          stowed: d.stow !== 'loose', asleep: true, still: 0,
+          stowed: d.stow !== 'loose', asleep: true, still: 0, qs,
         };
       }),
       grab: { id: '', local: v3(), hand: v3(), handVel: v3(), eye: v3() },
-      lastA: v3(), lastW: v3(),
+      lastA: v3(), lastW: v3(), tick: 0, q: { x: 0, y: 0, z: 0, w: 1 }, due: 0,
     };
   } catch {
     return null;
@@ -373,6 +433,13 @@ export function loadPropsState(data: unknown): PropsState | null {
       const b = s.bodies[i];
       if (!b || b.id !== rt.defs[i].id || !isV3(b.p) || !isV3(b.v) || !isV3(b.w) || !b.q || !isNum(b.q.w) || !isV3(b.q)) return null;
       b.stowed = !!b.stowed; b.asleep = !!b.asleep; b.still = isNum(b.still) ? b.still : 0;
+      // older saves: a sleeper rests on an upward face, anything else re-derives its mode through contact
+      if (b.qs === undefined) {
+        const qs = createQsState();
+        qs.mode = b.stowed ? MODE_FIXED : b.asleep ? MODE_REST : MODE_CONTACT;
+        if (qs.mode !== MODE_CONTACT) qs.tickEnd = 2 ** 52;
+        b.qs = qs;
+      } else b.qs = loadQsState(b.qs);
     }
     const g = s.grab;
     if (!g || typeof g.id !== 'string' || !isV3(g.local) || !isV3(g.hand) || !isV3(g.handVel) || !isV3(g.eye)) {
@@ -380,6 +447,10 @@ export function loadPropsState(data: unknown): PropsState | null {
     } else if (g.id !== '' && !rt.index.has(g.id)) g.id = '';
     if (!isV3(s.lastA)) s.lastA = v3();
     if (!isV3(s.lastW)) s.lastW = v3();
+    if (!isNum(s.tick)) s.tick = Math.round(s.t * 120);
+    if (!isNum(s.due)) s.due = 0;
+    const q = s.q;
+    if (!q || !isNum(q.w) || !isV3(q)) s.q = { x: 0, y: 0, z: 0, w: 1 };
     return s;
   } catch {
     return null;
@@ -417,19 +488,19 @@ function rdrt(R: Float64Array, o: number, d0: number, d1: number, d2: number, x:
 
 // ------------------------------------------------------------------------------------------------ contacts
 
-// per contact: n(3) ra(3) rb(3) pen e mu kN t1(3) t2(3) kT1 kT2 target λn λt1 λt2   (point kept in ra until prep)
-const CS = 25;
+// per contact: n(3) ra(3) rb(3) pen e mu kN t1(3) t2(3) kT1 kT2 target λn λt1 λt2 vn₀ matB   (point kept in ra until prep)
+const CS = 27;
 const cf = new Float64Array(MAX_CONTACTS * CS);
 const ci = new Int32Array(MAX_CONTACTS * 2);
 let nc = 0;
-let curE = 0, curMu = 0;
+let curE = 0, curMu = 0, curMatB: number = MAT.composite;
 
 function addC(a: number, b: number, nx: number, ny: number, nz: number, px: number, py: number, pz: number, pen: number): void {
   if (nc >= MAX_CONTACTS || !(pen > 0)) return;
   const k = nc * CS;
   ci[2 * nc] = a; ci[2 * nc + 1] = b;
   cf[k] = nx; cf[k + 1] = ny; cf[k + 2] = nz; cf[k + 3] = px; cf[k + 4] = py; cf[k + 5] = pz;
-  cf[k + 9] = pen; cf[k + 10] = curE; cf[k + 11] = curMu;
+  cf[k + 9] = pen; cf[k + 10] = curE; cf[k + 11] = curMu; cf[k + 25] = 0; cf[k + 26] = curMatB;
   nc++;
 }
 
@@ -861,6 +932,7 @@ function solve(rt: Rt): void {
     cf[k + 19] = k1 > 1e-12 ? 1 / k1 : 0;
     cf[k + 20] = k2 > 1e-12 ? 1 / k2 : 0;
     cf[k + 21] = vn < -BOUNCE_V ? -cf[k + 10] * vn : 0;
+    cf[k + 25] = vn;
     cf[k + 22] = cf[k + 23] = cf[k + 24] = 0;
     rt.cnt[a]++;
     if (b >= 0) rt.cnt[b]++;
@@ -890,6 +962,29 @@ function solve(rt: Rt): void {
       const d1 = l1 - o1, d2 = l2 - o2;
       applyPair(rt, a, b, k, t1x * d1 + t2x * d2, t1y * d1 + t2y * d2, t1z * d1 + t2z * d2);
     }
+  }
+  // rolling resistance: an angular impulse ≤ λn·δ against the relative rotation, never reversing it
+  const vw = rt.vw, Iw = rt.Iw, im = rt.im;
+  for (let c = 0; c < nc; c++) {
+    const k = c * CS, a = ci[2 * c], b = ci[2 * c + 1], ln = cf[k + 22];
+    if (!(ln > 0)) continue;
+    const ia = im[a] > 0, ib = b >= 0 && im[b] > 0;
+    if (!ia && !ib) continue;
+    const oa = 6 * a + 3, ob = 6 * b + 3;
+    let wx = vw[oa], wy = vw[oa + 1], wz = vw[oa + 2];
+    if (b >= 0) { wx -= vw[ob]; wy -= vw[ob + 1]; wz -= vw[ob + 2]; }
+    const wl = Math.sqrt(wx * wx + wy * wy + wz * wz);
+    if (!(wl > 1e-9)) continue;
+    const ux = wx / wl, uy = wy / wl, uz = wz / wl;
+    let kk = 0;
+    if (ia) { const o = 9 * a; kk += ux * (Iw[o] * ux + Iw[o + 1] * uy + Iw[o + 2] * uz) + uy * (Iw[o + 3] * ux + Iw[o + 4] * uy + Iw[o + 5] * uz) + uz * (Iw[o + 6] * ux + Iw[o + 7] * uy + Iw[o + 8] * uz); }
+    if (ib) { const o = 9 * b; kk += ux * (Iw[o] * ux + Iw[o + 1] * uy + Iw[o + 2] * uz) + uy * (Iw[o + 3] * ux + Iw[o + 4] * uy + Iw[o + 5] * uz) + uz * (Iw[o + 6] * ux + Iw[o + 7] * uy + Iw[o + 8] * uz); }
+    if (!(kk > 0)) continue;
+    let L = ROLL_D * ln;
+    if (L * kk > wl) L = wl / kk;
+    const Lx = -L * ux, Ly = -L * uy, Lz = -L * uz;
+    if (ia) { const o = 9 * a; vw[oa] += Iw[o] * Lx + Iw[o + 1] * Ly + Iw[o + 2] * Lz; vw[oa + 1] += Iw[o + 3] * Lx + Iw[o + 4] * Ly + Iw[o + 5] * Lz; vw[oa + 2] += Iw[o + 6] * Lx + Iw[o + 7] * Ly + Iw[o + 8] * Lz; }
+    if (ib) { const o = 9 * b; vw[ob] -= Iw[o] * Lx + Iw[o + 1] * Ly + Iw[o + 2] * Lz; vw[ob + 1] -= Iw[o + 3] * Lx + Iw[o + 4] * Ly + Iw[o + 5] * Lz; vw[ob + 2] -= Iw[o + 6] * Lx + Iw[o + 7] * Ly + Iw[o + 8] * Lz; }
   }
 }
 
@@ -952,10 +1047,12 @@ function makeDyn(rt: Rt, i: number, b: PropBody): void {
   vw[o] = b.v.x; vw[o + 1] = b.v.y; vw[o + 2] = b.v.z; vw[o + 3] = b.w.x; vw[o + 4] = b.w.y; vw[o + 5] = b.w.z;
 }
 
+/** Hand a loose body to the contact solver (it re-derives rest or drift after its next tick). */
 function wake(b: PropBody): void {
   if (b.stowed) return;
   b.asleep = false;
   b.still = 0;
+  b.qs.mode = MODE_CONTACT;
 }
 
 function crewNear(rt: Rt, crew: CrewState, i: number, pad: number): boolean {
@@ -965,15 +1062,13 @@ function crewNear(rt: Rt, crew: CrewState, i: number, pad: number): boolean {
   return dx * dx + dy * dy + dz * dz < r * r;
 }
 
-function sub(s: PropsState, rt: Rt, m: ShipMotion, crew: CrewState | null, gi: number, h: number): void {
-  const B = s.bodies, n = rt.n, pp = rt.pp, R = rt.R, vw = rt.vw, im = rt.im, Iw = rt.Iw, dyn = rt.dyn;
-  const a = m.a, W = m.w, al = m.alpha, la = s.lastA, lw = s.lastW;
-  // a change in the ship's motion wakes everything loose
-  const dax = a.x - la.x, day = a.y - la.y, daz = a.z - la.z, dwx = W.x - lw.x, dwy = W.y - lw.y, dwz = W.z - lw.z;
-  if (dax * dax + day * day + daz * daz > WAKE_DA * WAKE_DA || dwx * dwx + dwy * dwy + dwz * dwz > WAKE_DW * WAKE_DW || (al.x * al.x + al.y * al.y + al.z * al.z) * rt.rmax * rt.rmax > WAKE_DA * WAKE_DA) {
-    for (let i = 0; i < n; i++) wake(B[i]);
-  }
-  la.x = a.x; la.y = a.y; la.z = a.z; lw.x = W.x; lw.y = W.y; lw.z = W.z;
+/**
+ * One contact sub-step of h over the awake island: the bodies in CONTACT (not the ones handed over at this tick's
+ * end), whatever they touch (woken into CONTACT), the hand, the crew. Impacts go to the event ring `ev` at time t.
+ */
+function sub(s: PropsState, rt: Rt, m: ShipMotion, crew: CrewState | null, gi: number, h: number, ev: EventRing | null, t: number): void {
+  const B = s.bodies, n = rt.n, pp = rt.pp, R = rt.R, vw = rt.vw, im = rt.im, Iw = rt.Iw, dyn = rt.dyn, skip = rt.skip;
+  const W = m.w, al = m.alpha;
   const crewIm = crew && crew.seat === '' ? 1 / CREW_MASS : 0;
   const g = s.grab;
 
@@ -1007,14 +1102,16 @@ function sub(s: PropsState, rt: Rt, m: ShipMotion, crew: CrewState | null, gi: n
         }
       }
       if (fx * fx + fy * fy + fz * fz <= rt.hold[i] * rt.hold[i]) continue;
-      b.stowed = false; b.asleep = false; b.still = 0;
+      b.stowed = false; b.still = 0;
+      wake(b);
+      skip[i] = 0;
     }
-    if (b.asleep && i !== gi) {
-      if (crew && crewIm > 0) {
+    if (i !== gi && (b.qs.mode !== MODE_CONTACT || skip[i])) {
+      if (!skip[i] && crew && crewIm > 0) {
         const cv = crew.vel;
         if (cv.x * cv.x + cv.y * cv.y + cv.z * cv.z > WAKE_V * WAKE_V && crewNear(rt, crew, i, 0.02)) wake(b);
       }
-      if (b.asleep) continue;
+      if (b.qs.mode !== MODE_CONTACT || skip[i]) continue;
     }
     b.asleep = false;
     const v = b.v, w = b.w;
@@ -1023,6 +1120,8 @@ function sub(s: PropsState, rt: Rt, m: ShipMotion, crew: CrewState | null, gi: n
     feltAt(m, b.p.x, b.p.y, b.p.z, v.x, v.y, v.z, FELT);
     rt.fm[i] = Math.sqrt(FELT.x * FELT.x + FELT.y * FELT.y + FELT.z * FELT.z);
     v.x += FELT.x * h; v.y += FELT.y * h; v.z += FELT.z * h;
+    // cabin air (still: u = v until W3-B's draughts), exact for the step's fixed direction
+    dragStep(v, rt.qw.k[i], h);
     makeDyn(rt, i, b);
     if (i === gi) {
       // critically damped spring from the grip point to the hand, limited to HAND_FORCE; the arm pushes back on the body
@@ -1095,6 +1194,7 @@ function sub(s: PropsState, rt: Rt, m: ShipMotion, crew: CrewState | null, gi: n
         st[k] = tick;
         const o = 6 * k;
         if (cx + ex < sb[o] || cx - ex > sb[o + 3] || cy + ey < sb[o + 1] || cy - ey > sb[o + 4] || cz + ez < sb[o + 2] || cz - ez > sb[o + 5]) continue;
+        curMatB = rt.smat[k];
         vsStatic(rt, i, o);
       }
     }
@@ -1113,7 +1213,8 @@ function sub(s: PropsState, rt: Rt, m: ShipMotion, crew: CrewState | null, gi: n
         const dx = pp[3 * j] - cx, dy = pp[3 * j + 1] - cy, dz = pp[3 * j + 2] - cz, rr = bd + bound[j];
         if (dx * dx + dy * dy + dz * dz >= rr * rr) continue;
         const bj = B[j];
-        if (!dyn[j] && bj.asleep && !bj.stowed && (sp > WAKE_V || i === gi)) { wake(bj); makeDyn(rt, j, bj); }
+        // the island: whatever an awake body reaches joins it (a resting or drifting body is not a wall)
+        if (!dyn[j] && !bj.stowed && !skip[j]) { wake(bj); makeDyn(rt, j, bj); }
         pairNarrow(rt, i, j);
       }
     }
@@ -1123,6 +1224,7 @@ function sub(s: PropsState, rt: Rt, m: ShipMotion, crew: CrewState | null, gi: n
   propsStats.contacts += nc;
   propsStats.subSteps++;
   solve(rt);
+  if (ev) emitImpacts(rt, ev, t, h);
   for (let i = 0; i < n; i++) {
     if (!dyn[i]) continue;
     const b = B[i], o = 6 * i;
@@ -1170,182 +1272,282 @@ function sub(s: PropsState, rt: Rt, m: ShipMotion, crew: CrewState | null, gi: n
       p.x = pr[o7]; p.y = pr[o7 + 1]; p.z = pr[o7 + 2]; q.x = pr[o7 + 3]; q.y = pr[o7 + 4]; q.z = pr[o7 + 5]; q.w = pr[o7 + 6];
       v.x = v.y = v.z = 0; w.x = w.y = w.z = 0;
     }
-    // sleep: at rest on something, or perfectly still with nothing pushing it
-    const v2 = v.x * v.x + v.y * v.y + v.z * v.z, w2 = w.x * w.x + w.y * w.y + w.z * w.z;
-    const ps = Math.sqrt(v2) + Math.sqrt(w2) * rt.bound[i];
-    const quiet = rt.cnt[i] > 0 ? ps < SLEEP_V && w2 < SLEEP_W * SLEEP_W : rt.fm[i] < 1e-6 && v2 < FLOAT_V * FLOAT_V && w2 < FLOAT_W * FLOAT_W;
-    b.still = quiet ? b.still + h : 0;
-    if (b.still > SLEEP_T && i !== gi) {
-      b.asleep = true;
-      v.x = v.y = v.z = 0; w.x = w.y = w.z = 0;
+  }
+}
+
+const EP: V3 = { x: 0, y: 0, z: 0 };
+const EN: V3 = { x: 0, y: 0, z: 0 };
+
+/**
+ * Contact records for this sub-step's impacts: one per touching pair (its points merged: J summed, the fastest
+ * approach), when it closed faster than IMPACT_V and than three sub-steps of the felt load. Body ids: prop index,
+ * BODY_SHIP for the interior, BODY_CREW for the pilot; normal from b toward a; matA, matB the two surfaces.
+ */
+function emitImpacts(rt: Rt, ev: EventRing, t: number, h: number): void {
+  const n = rt.n, pp = rt.pp;
+  for (let c = 0; c < nc;) {
+    const a = ci[2 * c], b = ci[2 * c + 1];
+    let J = 0, vmax = 0, best = c;
+    let e = c;
+    for (; e < nc && ci[2 * e] === a && ci[2 * e + 1] === b; e++) {
+      const k = e * CS, vn = -cf[k + 25];
+      J += cf[k + 22];
+      if (vn > vmax) { vmax = vn; best = e; }
+    }
+    c = e;
+    const fa = a < n ? rt.fm[a] : 0, fb = b >= 0 && b < n ? rt.fm[b] : 0;
+    if (!(vmax > IMPACT_V) || !(vmax > 3 * (fa > fb ? fa : fb) * h) || !(J > 0)) continue;
+    const k = best * CS;
+    EP.x = pp[3 * a] + cf[k + 3]; EP.y = pp[3 * a + 1] + cf[k + 4]; EP.z = pp[3 * a + 2] + cf[k + 5];
+    EN.x = cf[k]; EN.y = cf[k + 1]; EN.z = cf[k + 2];
+    const ida = a === n ? BODY_CREW : a, idb = b < 0 ? BODY_SHIP : b === n ? BODY_CREW : b;
+    const ma = a === n ? MAT.tissue : rt.mat[a], mb = b < 0 ? cf[k + 26] : b === n ? MAT.tissue : rt.mat[b];
+    emitEvent(ev, 'contact', t, ida, idb, J, EP, EN, vmax, ma, mb);
+  }
+}
+
+/** The ship's motion as the rest / drift modes take it (r̂, n², the slow-force bound; defaults outside wave 2). */
+function bodyMotionOf(rt: Rt, m: ShipMotion): BodyMotion {
+  const o = rt.bm;
+  o.a.x = m.a.x; o.a.y = m.a.y; o.a.z = m.a.z;
+  o.w.x = m.w.x; o.w.y = m.w.y; o.w.z = m.w.z;
+  o.alpha.x = m.alpha.x; o.alpha.y = m.alpha.y; o.alpha.z = m.alpha.z;
+  const r = m.rhat;
+  if (r) { o.rhat.x = r.x; o.rhat.y = r.y; o.rhat.z = r.z; } else { o.rhat.x = 0; o.rhat.y = 1; o.rhat.z = 0; }
+  o.n2 = m.n2 !== undefined && m.n2 > 0 ? m.n2 : 0;
+  o.fDot = m.fDot !== undefined && m.fDot > 0 ? m.fDot : 0;
+  return o;
+}
+
+/** q ← q ⊗ exp(½ ω h): the ship's attitude carried forward by its own rate ω (ship axes), exact for constant ω. */
+function turnShip(q: Quat, w: V3, h: number): void {
+  const wl = Math.sqrt(w.x * w.x + w.y * w.y + w.z * w.z), th = 0.5 * wl * h;
+  if (!(th > 0)) return;
+  const sn = Math.sin(th) / wl, dw = Math.cos(th), dx = w.x * sn, dy = w.y * sn, dz = w.z * sn;
+  const qx = q.x, qy = q.y, qz = q.z, qw = q.w;
+  let x = qw * dx + qx * dw + qy * dz - qz * dy;
+  let y = qw * dy - qx * dz + qy * dw + qz * dx;
+  let z = qw * dz + qx * dy - qy * dx + qz * dw;
+  let ww = qw * dw - qx * dx - qy * dy - qz * dz;
+  const l = Math.sqrt(x * x + y * y + z * z + ww * ww);
+  x /= l; y /= l; z /= l; ww /= l;
+  q.x = x; q.y = y; q.z = z; q.w = ww;
+}
+
+/** Keep the mode in step with what outside code changed: stowage, `asleep = false` (a wake), a held body. */
+function syncModes(s: PropsState, gi: number): void {
+  const B = s.bodies;
+  for (let i = 0; i < B.length; i++) {
+    const b = B[i], m = b.qs.mode;
+    if (b.stowed) { if (m !== MODE_FIXED) { b.qs.mode = MODE_FIXED; b.qs.tickEnd = 2 ** 52; } b.asleep = true; continue; }
+    if (m === MODE_FIXED || (m === MODE_REST && !b.asleep) || (i === gi && m !== MODE_CONTACT)) wake(b);
+  }
+}
+
+/** Is any loose body in the contact solver (or held)? */
+function anyContact(s: PropsState, gi: number): boolean {
+  if (gi >= 0) return true;
+  const B = s.bodies;
+  for (let i = 0; i < B.length; i++) if (B[i].qs.mode === MODE_CONTACT) return true;
+  return false;
+}
+
+const SN: V3 = { x: 0, y: 0, z: 0 };
+const SN2: V3 = { x: 0, y: 0, z: 0 };
+const SN3: V3 = { x: 0, y: 0, z: 0 };
+const SP: V3 = { x: 0, y: 0, z: 0 };
+
+/**
+ * The last sub-step's contacts, per body: up to three distinct support normals (out of the support, toward the
+ * body; the largest normal impulse first), the summed normal impulse and the partner, and whether the crew touches it.
+ */
+function gatherSupports(rt: Rt): void {
+  const n = rt.n, nrm = rt.nrm, nn = rt.nn, jn = rt.jn;
+  nn.fill(0); jn.fill(0); rt.onCrew.fill(0); rt.other.fill(BODY_SHIP);
+  for (let c = 0; c < nc; c++) {
+    const k = c * CS, a = ci[2 * c], b = ci[2 * c + 1], l = cf[k + 22];
+    for (let side = 0; side < 2; side++) {
+      const i = side === 0 ? a : b, o = side === 0 ? b : a, sg = side === 0 ? 1 : -1;
+      if (i < 0 || i >= n) continue;
+      if (o === n) { rt.onCrew[i] = 1; continue; }
+      const nx = sg * cf[k], ny = sg * cf[k + 1], nz = sg * cf[k + 2];
+      if (jn[i] === 0 || l > 0) rt.other[i] = o < 0 ? BODY_SHIP : o;
+      jn[i] += l;
+      let dup = false;
+      for (let m = 0; m < nn[i]; m++) {
+        const q = 9 * i + 3 * m;
+        if (nrm[q] * nx + nrm[q + 1] * ny + nrm[q + 2] * nz > 0.95) { dup = true; break; }
+      }
+      if (dup) continue;
+      if (nn[i] < 3) { const q = 9 * i + 3 * nn[i]; nrm[q] = nx; nrm[q + 1] = ny; nrm[q + 2] = nz; nn[i]++; }
     }
   }
 }
 
 /**
- * Advance every object by dt of ship time (s) under the ship's motion (craftMotion() output) and with the crew
- * body (null when nobody is aboard). Sub-stepped at 120 Hz or finer, so that no point of any body moves more
- * than MAX_MOVE per sub-step; while the ship coasts (felt acceleration under LIGHT_A, nothing in hand, the crew
- * still) only that motion bound, ROT_STEP of turn and COAST_DT set the step, and a pure free flight clear of every
- * surface goes from gap to gap (freeStep). Returns the number of sub-steps taken (0 when everything slept).
+ * One tick (or `ticks` of them when nothing is in contact) of every body, ending at `tick`, with the ship at
+ * attitude q and its impulses dv, dw (craft axes, or null): the rest / drift service, wakes by the crew and by the
+ * load on stowed things, then the contact sub-steps of the awake island, then each contact body chooses its next
+ * mode (rest, drift or contact). Returns the sub-steps taken.
+ */
+function tickBodies(
+  s: PropsState, rt: Rt, M: BodyMotion, ship: ShipMotion, crew: CrewState | null, gi: number, tick: number, q: Quat,
+  dv: V3 | null, dw: V3 | null, ev: EventRing | null, ticks: number,
+): number {
+  const B = s.bodies, n = rt.n, pre = rt.pre, skip = rt.skip, g = s.grab;
+  for (let i = 0; i < n; i++) pre[i] = B[i].qs.mode;
+  serviceBodies(B, rt.qw, tick, M, q, dv, dw);
+  for (let i = 0; i < n; i++) {
+    const b = B[i];
+    skip[i] = pre[i] === MODE_DRIFT && b.qs.mode === MODE_CONTACT ? 1 : 0;
+    rt.pp[3 * i] = b.p.x; rt.pp[3 * i + 1] = b.p.y; rt.pp[3 * i + 2] = b.p.z;
+    if (b.stowed && i !== gi) {
+      // what the holder must resist: mass × felt at its place
+      feltAt(M, b.p.x, b.p.y, b.p.z, 0, 0, 0, FELT);
+      const mass = rt.mass[i], hd = rt.hold[i];
+      if (mass * mass * (FELT.x * FELT.x + FELT.y * FELT.y + FELT.z * FELT.z) > hd * hd) { b.stowed = false; wake(b); }
+    }
+  }
+  // the pilot's body brushing a resting or drifting thing wakes it
+  if (crew && crew.seat === '') {
+    const cv = crew.vel, cs = Math.sqrt(cv.x * cv.x + cv.y * cv.y + cv.z * cv.z), pad = 0.05 + cs * ticks * SUB_DT;
+    for (let i = 0; i < n; i++) {
+      const b = B[i], m = b.qs.mode;
+      if (b.stowed || skip[i] || (m !== MODE_REST && m !== MODE_DRIFT) || (m === MODE_REST && cs <= WAKE_V)) continue;
+      if (crewNear(rt, crew, i, pad)) { const d = m === MODE_DRIFT; wake(b); if (d) skip[i] = 1; }
+    }
+  }
+  let any = gi >= 0, vmax = 0, wmax = 0;
+  for (let i = 0; i < n; i++) {
+    const b = B[i];
+    if (b.qs.mode !== MODE_CONTACT || b.stowed) continue;
+    if (ticks > 1) { skip[i] = 1; continue; } // woken at the end of a long step: it starts from here next tick
+    if (skip[i]) continue;
+    any = true;
+    const v = b.v, w = b.w, wl = Math.sqrt(w.x * w.x + w.y * w.y + w.z * w.z), sp = Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z) + wl * rt.bound[i];
+    if (sp > vmax) vmax = sp;
+    if (wl > wmax) wmax = wl;
+  }
+  if (!any) {
+    for (let i = 0; i < n; i++) B[i].asleep = B[i].stowed || B[i].qs.mode === MODE_REST;
+    return 0;
+  }
+  // the contact sub-steps: the tick, or finer so no point moves more than MAX_MOVE
+  if (gi >= 0) vmax = Math.max(vmax, Math.sqrt(g.handVel.x ** 2 + g.handVel.y ** 2 + g.handVel.z ** 2) + 1);
+  if (crew) vmax = Math.max(vmax, Math.sqrt(crew.vel.x ** 2 + crew.vel.y ** 2 + crew.vel.z ** 2));
+  const a = ship.a, W = ship.w, al = ship.alpha, w2 = W.x * W.x + W.y * W.y + W.z * W.z;
+  const amax = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z) + (w2 + Math.sqrt(al.x * al.x + al.y * al.y + al.z * al.z)) * rt.rmax + 2 * Math.sqrt(w2) * vmax;
+  const dt = SUB_DT;
+  let nsub = Math.max(1, Math.ceil(((vmax + amax * dt) * dt) / MAX_MOVE));
+  if (nsub > MAX_SUB) nsub = MAX_SUB;
+  const h = dt / nsub, t = tick * SUB_DT;
+  for (let k = 0; k < nsub; k++) {
+    sub(s, rt, ship, crew, gi, h, ev, t);
+    if (gi >= 0) {
+      // a hand that ends up too far from what it held lets go
+      const b = B[gi], o = 9 * gi, R = rt.R, l = g.local;
+      const ex = g.hand.x - b.p.x - (R[o] * l.x + R[o + 1] * l.y + R[o + 2] * l.z);
+      const ey = g.hand.y - b.p.y - (R[o + 3] * l.x + R[o + 4] * l.y + R[o + 5] * l.z);
+      const ez = g.hand.z - b.p.z - (R[o + 6] * l.x + R[o + 7] * l.y + R[o + 8] * l.z);
+      if (ex * ex + ey * ey + ez * ez > GRAB_SLIP * GRAB_SLIP) { g.id = ''; gi = -1; }
+    }
+  }
+  // each body the solver moved chooses its next mode: at rest in its supports' cones, free (drift), or still in contact
+  gatherSupports(rt);
+  const nrm = rt.nrm;
+  for (let i = 0; i < n; i++) {
+    const b = B[i];
+    if (!rt.dyn[i] || b.stowed || b.qs.mode !== MODE_CONTACT) continue;
+    const c = rt.nn[i];
+    if (ev && c > 0) {
+      // sliding or rolling on its support: one record per tick (normal force, slip speed)
+      const o = 9 * i, v = b.v, vn = v.x * nrm[o] + v.y * nrm[o + 1] + v.z * nrm[o + 2];
+      const tx = v.x - vn * nrm[o], ty = v.y - vn * nrm[o + 1], tz = v.z - vn * nrm[o + 2], vt = Math.sqrt(tx * tx + ty * ty + tz * tz);
+      if (vt > SLIDE_V && rt.jn[i] > 0) {
+        SN.x = nrm[o]; SN.y = nrm[o + 1]; SN.z = nrm[o + 2];
+        SP.x = b.p.x; SP.y = b.p.y; SP.z = b.p.z;
+        const ot = rt.other[i];
+        emitEvent(ev, 'slide', t, i, ot, rt.jn[i] / h, SP, SN, vt, rt.mat[i], ot >= 0 ? rt.mat[ot] : MAT.composite);
+      }
+    }
+    if (i === gi || rt.onCrew[i]) continue;
+    const o = 9 * i;
+    if (c > 0 && rt.jn[i] > 0) {
+      // a loaded contact: it rests in its supports' cones, or it slides or rolls (friction needs the solver)
+      SN.x = nrm[o]; SN.y = nrm[o + 1]; SN.z = nrm[o + 2];
+      SN2.x = nrm[o + 3]; SN2.y = nrm[o + 4]; SN2.z = nrm[o + 5];
+      SN3.x = nrm[o + 6]; SN3.y = nrm[o + 7]; SN3.z = nrm[o + 8];
+      tryRest(b, rt.qw.mu[i], tick, M, SN.x, SN.y, SN.z, c > 1 ? SN2 : null, c > 2 ? SN3 : null);
+      continue;
+    }
+    SN2.x = nrm[o + 3]; SN2.y = nrm[o + 4]; SN2.z = nrm[o + 5];
+    SN3.x = nrm[o + 6]; SN3.y = nrm[o + 7]; SN3.z = nrm[o + 8];
+    afterContact(b, i, B, rt.qw, tick, M, q, c > 0, c > 0 ? nrm[o] : 0, c > 0 ? nrm[o + 1] : 1, c > 0 ? nrm[o + 2] : 0, c > 1 ? SN2 : null, c > 2 ? SN3 : null);
+  }
+  for (let i = 0; i < n; i++) B[i].asleep = B[i].stowed || B[i].qs.mode === MODE_REST;
+  return nsub;
+}
+
+/**
+ * Advance every object by dt of ship time (s; whole ticks of 1/120 s, at least one) under the ship's motion
+ * (craftMotion() output: the ledger mean of the step) and with the crew body (null when nobody is aboard). With the
+ * session's tick context `tk` the step ends at tk.tick, the ship's impulses (tk.ledger.dv, dw) reach every body once,
+ * the drift anchors use the craft's attitude tk.q, and contact records go to tk.events. Ticks in which no body is in
+ * contact are taken in one closed-form service (rest and drift cost nothing per tick); otherwise each tick steps
+ * the awake island at 120 Hz or finer. Returns the number of contact sub-steps taken (0 when nothing touched).
  */
 export function stepProps(s: PropsState, ship: ShipMotion, crew: CrewState | null, dt: number, tk?: BodyTick): number {
-  void tk; // W1-C fills: the tick context (impulses via quasistatic serviceBodies, events)
   try {
     if (!(dt > 0) || !Number.isFinite(dt)) return 0;
     const rt = runtime(s.layoutId);
     if (!rt || s.bodies.length !== rt.n) return 0;
-    const B = s.bodies, n = rt.n, g = s.grab, a = ship.a, W = ship.w, al = ship.alpha;
+    const g = s.grab;
     if (crew) setEye(rt, crew, g.eye);
     let gi = g.id === '' ? -1 : rt.index.get(g.id) ?? -1;
     if (gi < 0) g.id = '';
-    // anything to do?
-    let awake = gi >= 0;
-    let vmax = 0, wmax = 0;
-    for (let i = 0; i < n; i++) {
-      const b = B[i];
-      if (!b.asleep && !b.stowed) {
-        awake = true;
-        const v = b.v, w = b.w, wl = Math.sqrt(w.x * w.x + w.y * w.y + w.z * w.z);
-        const sp = Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z) + wl * rt.bound[i];
-        if (sp > vmax) vmax = sp;
-        if (wl > wmax) wmax = wl;
-      }
+    syncModes(s, gi);
+    // the session steps whole ticks (dt = k·Q); other callers' time is carried over in whole ticks (s.due)
+    let K: number;
+    if (tk) K = Math.max(1, Math.round(dt / SUB_DT));
+    else {
+      const due = (s.due > 0 ? s.due : 0) + dt / SUB_DT;
+      K = Math.floor(due + 1e-9);
+      s.due = K > due ? 0 : due - K;
+      if (K < 1) return 0;
     }
-    const la = s.lastA, lw = s.lastW;
-    const dax = a.x - la.x, day = a.y - la.y, daz = a.z - la.z, dwx = W.x - lw.x, dwy = W.y - lw.y, dwz = W.z - lw.z;
-    if (dax * dax + day * day + daz * daz > WAKE_DA * WAKE_DA || dwx * dwx + dwy * dwy + dwz * dwz > WAKE_DW * WAKE_DW || (al.x * al.x + al.y * al.y + al.z * al.z) * rt.rmax * rt.rmax > WAKE_DA * WAKE_DA) awake = true;
-    if (!awake && crew && crew.seat === '') {
-      const cv = crew.vel;
-      if (cv.x * cv.x + cv.y * cv.y + cv.z * cv.z > WAKE_V * WAKE_V) {
-        for (let i = 0; i < n; i++) {
-          rt.pp[3 * i] = B[i].p.x; rt.pp[3 * i + 1] = B[i].p.y; rt.pp[3 * i + 2] = B[i].p.z;
-          if (!B[i].stowed && crewNear(rt, crew, i, 0.05 + Math.sqrt(cv.x * cv.x + cv.y * cv.y + cv.z * cv.z) * dt)) { awake = true; break; }
-        }
-      }
+    const end = tk ? tk.tick : s.tick + K, M = bodyMotionOf(rt, ship), ev = tk ? tk.events : null;
+    let cur = end - K, subs = 0, first = true;
+    while (cur < end) {
+      let k = 1;
+      if (!anyContact(s, gi)) k = qsNextEvent(s.bodies, cur, end - cur);
+      if (k < 1) k = 1;
+      cur += k;
+      if (tk && cur === end) { const q = tk.q; s.q.x = q.x; s.q.y = q.y; s.q.z = q.z; s.q.w = q.w; }
+      else turnShip(s.q, M.w, k * SUB_DT);
+      subs += tickBodies(s, rt, M, ship, crew, gi, cur, s.q, first && tk ? tk.ledger.dv : null, first && tk ? tk.ledger.dw : null, ev, k);
+      first = false;
+      if (g.id === '') gi = -1;
     }
-    if (!awake) { s.t += dt; return 0; }
-    if (gi >= 0) vmax = Math.max(vmax, Math.sqrt(g.handVel.x ** 2 + g.handVel.y ** 2 + g.handVel.z ** 2) + 1);
-    if (crew) vmax = Math.max(vmax, Math.sqrt(crew.vel.x ** 2 + crew.vel.y ** 2 + crew.vel.z ** 2));
-    const w2 = W.x * W.x + W.y * W.y + W.z * W.z;
-    const amax = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z) + (w2 + Math.sqrt(al.x * al.x + al.y * al.y + al.z * al.z)) * rt.rmax + 2 * Math.sqrt(w2) * vmax;
-    const cv2 = crew ? crew.vel.x * crew.vel.x + crew.vel.y * crew.vel.y + crew.vel.z * crew.vel.z : 0;
-    const light = gi < 0 && amax < LIGHT_A && cv2 < WAKE_V * WAKE_V;
-    let nsub = light
-      ? Math.max(Math.ceil(dt / COAST_DT - 1e-9), Math.ceil(((vmax + amax * dt) * dt) / MAX_MOVE), Math.ceil((wmax * dt) / ROT_STEP))
-      : Math.max(Math.ceil(dt / SUB_DT - 1e-9), Math.ceil(((vmax + amax * dt) * dt) / MAX_MOVE));
-    if (nsub < 1) nsub = 1; else if (nsub > MAX_SUB) nsub = MAX_SUB;
-    const h = dt / nsub;
-    if (gi < 0 && freeStep(rt, s, crew, amax, w2) > h) {
-      // Everything awake is in free flight, clear of every surface: take steps as long as the nearest possible
-      // contact allows (re-judged every step; back to the fixed step as soon as anything comes near).
-      let left = dt, k = 0;
-      while (left > 0 && k < nsub) {
-        let hk = freeStep(rt, s, crew, amax, w2);
-        if (hk < h) hk = h;
-        if (hk > left || k === nsub - 1) hk = left;
-        sub(s, rt, ship, crew, -1, hk);
-        left -= hk;
-        k++;
-      }
-      s.t += dt;
-      return k;
-    }
-    for (let k = 0; k < nsub; k++) {
-      sub(s, rt, ship, crew, gi, h);
-      if (gi >= 0) {
-        // a hand that ends up too far from what it held lets go
-        const b = B[gi], o = 9 * gi, R = rt.R, l = g.local;
-        const ex = g.hand.x - b.p.x - (R[o] * l.x + R[o + 1] * l.y + R[o + 2] * l.z);
-        const ey = g.hand.y - b.p.y - (R[o + 3] * l.x + R[o + 4] * l.y + R[o + 5] * l.z);
-        const ez = g.hand.z - b.p.z - (R[o + 6] * l.x + R[o + 7] * l.y + R[o + 8] * l.z);
-        if (ex * ex + ey * ey + ez * ez > GRAB_SLIP * GRAB_SLIP) { g.id = ''; gi = -1; }
-      }
-    }
-    s.t += dt;
-    return nsub;
+    s.tick = end;
+    s.t = end * SUB_DT;
+    return subs;
   } catch {
     return 0;
   }
 }
 
-/**
- * Longest sub-step (s) that free flight allows right now, 0 when some awake body touches something or is near it.
- * The nearest possible contact of each awake body (static boxes, every other body, the crew) is at least its gap;
- * a step may close half of it at the worst relative speed and felt acceleration (so nothing can tunnel), and turns
- * no body (or the cabin) by more than a small angle. Pure in-flight drift in a coasting ship thus costs a few steps
- * per gap crossed instead of 120 per second.
- */
-function freeStep(rt: Rt, s: PropsState, crew: CrewState | null, amax: number, w2: number): number {
-  const B = s.bodies, n = rt.n, sb = rt.sb, ns = rt.ns;
-  let gap = Infinity, vmax = 0, wmax = 0, any = false;
-  for (let i = 0; i < n; i++) {
-    const b = B[i];
-    if (b.asleep || b.stowed) continue;
-    if (rt.cnt[i] > 0) return 0;
-    any = true;
-    const p = b.p, bd = rt.bound[i];
-    const v = Math.sqrt(b.v.x * b.v.x + b.v.y * b.v.y + b.v.z * b.v.z), w = Math.sqrt(b.w.x * b.w.x + b.w.y * b.w.y + b.w.z * b.w.z);
-    if (v > vmax) vmax = v;
-    if (w > wmax) wmax = w;
-    for (let k = 0; k < ns; k++) {
-      const o = 6 * k;
-      const dx = p.x < sb[o] ? sb[o] - p.x : p.x > sb[o + 3] ? p.x - sb[o + 3] : 0;
-      const dy = p.y < sb[o + 1] ? sb[o + 1] - p.y : p.y > sb[o + 4] ? p.y - sb[o + 4] : 0;
-      const dz = p.z < sb[o + 2] ? sb[o + 2] - p.z : p.z > sb[o + 5] ? p.z - sb[o + 5] : 0;
-      const g = Math.sqrt(dx * dx + dy * dy + dz * dz) - bd;
-      if (g < gap) gap = g;
-    }
-    for (let j = 0; j < n; j++) {
-      if (j === i) continue;
-      const q = B[j].p, g = Math.sqrt((p.x - q.x) ** 2 + (p.y - q.y) ** 2 + (p.z - q.z) ** 2) - bd - rt.bound[j];
-      if (g < gap) gap = g;
-    }
-    if (crew) {
-      const c = crew.pos, y0 = c.y, y1 = c.y + CREW_HEIGHT, cy = p.y < y0 ? y0 : p.y > y1 ? y1 : p.y;
-      const g = Math.sqrt((p.x - c.x) ** 2 + (p.y - cy) ** 2 + (p.z - c.z) ** 2) - bd - CREW_RADIUS;
-      if (g < gap) gap = g;
-    }
-  }
-  if (!any || !(gap > 0)) return 0;
-  // worst closing speed: two bodies head on, or a body and the crew
-  const cv = crew ? Math.sqrt(crew.vel.x * crew.vel.x + crew.vel.y * crew.vel.y + crew.vel.z * crew.vel.z) : 0;
-  const v = 2 * vmax + cv, a = 2 * amax, half = 0.5 * gap;
-  let h = a > 1e-12 ? (Math.sqrt(v * v + 2 * a * half) - v) / a : v > 1e-12 ? half / v : Infinity;
-  if (wmax > 0 && 0.2 / wmax < h) h = 0.2 / wmax;
-  if (w2 > 0 && 0.05 / Math.sqrt(w2) < h) h = 0.05 / Math.sqrt(w2);
-  return h;
-}
-
-/**
- * How much ship time one stepProps call may cover cheaply, s (for a caller that advances the world in pieces under
- * time acceleration): Infinity when everything sleeps or is stowed; LONG_CHUNK while the ship coasts (stepped by
- * motion) or everything awake is in free flight clear of every surface (stepped from gap to gap); otherwise
- * SHORT_CHUNK (contact under thrust or spin, a hand, a walking crew: 120 Hz).
- */
+/** Kept for older callers: SHORT_CHUNK while anything is in contact (or held), else how far the drift/rest schedule allows. */
 export const SHORT_CHUNK = 0.1;
 export const LONG_CHUNK = 10;
 export function propsChunk(s: PropsState, ship: ShipMotion, crew: CrewState | null): number {
+  void ship; void crew;
   try {
-    const rt = runtime(s.layoutId);
-    if (!rt) return Infinity;
-    if (s.grab.id !== '') return SHORT_CHUNK;
-    let awake = false, vmax = 0;
-    for (let i = 0; i < rt.n; i++) {
-      const b = s.bodies[i];
-      if (b.asleep || b.stowed) continue;
-      awake = true;
-      const v = Math.sqrt(b.v.x * b.v.x + b.v.y * b.v.y + b.v.z * b.v.z);
-      if (v > vmax) vmax = v;
-    }
-    if (!awake) return Infinity;
-    const a = ship.a, W = ship.w, al = ship.alpha, w2 = W.x * W.x + W.y * W.y + W.z * W.z;
-    const amax = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z) + (w2 + Math.sqrt(al.x * al.x + al.y * al.y + al.z * al.z)) * rt.rmax + 2 * Math.sqrt(w2) * vmax;
-    const cv2 = crew ? crew.vel.x * crew.vel.x + crew.vel.y * crew.vel.y + crew.vel.z * crew.vel.z : 0;
-    if (amax < LIGHT_A && cv2 < WAKE_V * WAKE_V) return LONG_CHUNK; // coasting: stepped by motion, not by 120 Hz
-    return freeStep(rt, s, crew, amax, w2) > SUB_DT ? LONG_CHUNK : SHORT_CHUNK;
+    if (s.grab.id !== '') return SUB_DT;
+    if (anyContact(s, -1)) return SUB_DT;
+    const n = qsNextEvent(s.bodies, s.tick, 2 ** 40);
+    return n >= 2 ** 40 ? Infinity : n * SUB_DT;
   } catch {
-    return SHORT_CHUNK;
+    return SUB_DT;
   }
 }
 
@@ -1541,23 +1743,29 @@ export function propInfo(s: PropsState, propId: string): { type: PropType; mass:
 
 // ================================================================================================ day-1 contract (W1-A)
 
-/** Why the last nextBodyEvent result was short: '' (nothing due), a loose object ('props') or the crew body ('crew'). */
+/**
+ * Why the last nextBodyEvent result was short: '' (nothing limits the warp: no answer, or a drift segment / rest
+ * re-check that is only a schedule), a loose object in contact ('props') or the crew body ('crew').
+ */
 export const bodyEvent: { why: '' | 'props' | 'crew' } = { why: '' };
 
 /**
  * The drift/rest scheduler (SIMULATION.md W1-C 6, §1.4): how many ticks (1 ≤ n ≤ maxTicks) the world may advance
- * before a loose body or the crew body (on foot, not seated) next needs servicing; bodyEvent.why says who asked when
- * the answer is short. The session's tick loop (W1-A) takes min(warp quantum, this). W1-C fills it with quasistatic.ts
- * nextBodyEvent; until then it is today's propsChunk (contact chunks while anything is awake, maxTicks when all sleep).
+ * before a loose body next needs servicing (quasistatic.ts nextBodyEvent over the bodies' modes): 1 while anything is
+ * in contact or held (bodyEvent.why 'props': that limits the warp), else the earliest drift segment end or rest
+ * re-check (why '': a schedule, not a limit). The session's tick loop takes min(warp quantum, this).
  */
 export function nextBodyEvent(s: PropsState, ship: ShipMotion, crew: CrewState | null, tk: BodyTick, maxTicks: number): number {
-  void tk; // W1-C fills
+  void ship; void crew; void tk;
   bodyEvent.why = '';
-  let awake = s.grab.id !== '';
-  for (let i = 0; i < s.bodies.length && !awake; i++) if (!s.bodies[i].asleep && !s.bodies[i].stowed) awake = true;
-  if (!awake) return maxTicks;
-  const n = Math.floor(propsChunk(s, ship, crew) * 120 + 1e-9);
-  if (n >= maxTicks) return maxTicks;
-  bodyEvent.why = 'props';
-  return n > 1 ? n : 1;
+  const mx = maxTicks > 1 ? maxTicks : 1;
+  if (s.grab.id !== '') { bodyEvent.why = 'props'; return 1; }
+  // a body woken from outside (asleep = false) needs the solver
+  for (let i = 0; i < s.bodies.length; i++) {
+    const b = s.bodies[i];
+    if (!b.stowed && ((b.qs.mode === MODE_REST && !b.asleep) || b.qs.mode === MODE_FIXED)) { bodyEvent.why = 'props'; return 1; }
+  }
+  const n = qsNextEvent(s.bodies, s.tick, mx);
+  if (qsEvent.why === WHY_CONTACT) { bodyEvent.why = 'props'; return 1; }
+  return n < 1 ? 1 : n > mx ? mx : n;
 }

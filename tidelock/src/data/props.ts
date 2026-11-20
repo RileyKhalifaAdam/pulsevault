@@ -13,6 +13,8 @@
 // exceeds that, it breaks free and is an ordinary rigid body from then on.
 
 import type { Quat, ShipVisualId, V3 } from '../core/types';
+import type { SolidKind } from './interiors';
+import { MAT, type MaterialCode } from '../world/events';
 
 export type PropType =
   | 'mug'
@@ -45,6 +47,46 @@ export interface PropTypeDef {
   /** Coefficient of restitution against the ship's composite panels, and Coulomb friction coefficient. */
   restitution: number;
   friction: number;
+  /**
+   * Drag area C_d·A, m² (SIMULATION.md W1-C 6: cabin-air drag F = −½ρ·C_dA·|u|·u). The plan's reference objects
+   * (pillow 0.19, pen 0.002, mug 0.006 m²) are given; the others take C_d ≈ 1 on their mean projected area
+   * (a tumbling convex body: S/4).
+   */
+  cdA: number;
+  /** Surface material that touches things (event ring matA / matB, src/world/events.ts MAT). */
+  mat: MaterialCode;
+}
+
+/**
+ * Material constants, indexed by MAT code (src/world/events.ts): Young's modulus E (Pa), density ρ (kg/m³), Poisson's
+ * ratio ν and loss factor η. Handbook values at room temperature. The single source for the audio's modal models
+ * (src/audio/materials.ts keeps an identical table until W1-D points it here).
+ */
+export interface MaterialConstants { E: number; rho: number; nu: number; eta: number }
+export const MATERIAL_CONSTANTS: readonly MaterialConstants[] = [
+  /* aluminium */ { E: 69e9, rho: 2700, nu: 0.33, eta: 1e-3 },
+  /* composite */ { E: 20e9, rho: 1900, nu: 0.3, eta: 0.01 },
+  /* glass     */ { E: 70e9, rho: 2500, nu: 0.22, eta: 1e-3 },
+  /* foam      */ { E: 2e5, rho: 40, nu: 0.3, eta: 0.3 },
+  /* steel     */ { E: 200e9, rho: 7850, nu: 0.29, eta: 3e-4 },
+  /* ceramic   */ { E: 60e9, rho: 2400, nu: 0.22, eta: 1e-3 },
+  /* polymer   */ { E: 2.3e9, rho: 1050, nu: 0.35, eta: 0.02 },
+  /* card      */ { E: 4e9, rho: 800, nu: 0.3, eta: 0.07 },
+  /* tissue    */ { E: 1e6, rho: 1000, nu: 0.45, eta: 0.3 },
+];
+
+/** The surface a solid fitting presents: cushions foam, everything else the composite lining over the frame. */
+export const solidMaterial = (kind: SolidKind): MaterialCode => (kind === 'seat' || kind === 'sofa' || kind === 'bunk' ? MAT.foam : MAT.composite);
+/** Room faces: decks are aluminium panels, walls and overheads the composite lining. */
+export const DECK_MATERIAL: MaterialCode = MAT.aluminium;
+export const LINING_MATERIAL: MaterialCode = MAT.composite;
+
+/** C_d ≈ 1 on the mean projected area of a convex shape (S/4), m². */
+function cdaOfShape(sh: PropShape): number {
+  if (sh.kind === 'sphere') return Math.PI * sh.r * sh.r;
+  if (sh.kind === 'capsule') return 0.25 * (4 * Math.PI * sh.r * sh.r + 2 * Math.PI * sh.r * 2 * sh.halfLen);
+  const h = sh.half;
+  return 0.25 * 8 * (h.x * h.y + h.y * h.z + h.x * h.z);
 }
 
 export interface PropDef {
@@ -64,32 +106,32 @@ const box = (x: number, y: number, z: number): PropShape => ({ kind: 'box', half
 
 export const PROP_TYPES: Record<PropType, PropTypeDef> = {
   // insulated travel mug with a lid, 0.3 L of coffee: 8.4 cm across, 11 cm tall
-  mug: { shape: box(0.042, 0.055, 0.042), mass: 0.4, restitution: 0.35, friction: 0.5 },
+  mug: { shape: box(0.042, 0.055, 0.042), mass: 0.4, restitution: 0.35, friction: 0.5, cdA: 0.006, mat: MAT.steel },
   // 0.75 L water bottle, 25.6 cm long
-  bottle: { shape: { kind: 'capsule', r: 0.038, halfLen: 0.09 }, mass: 1.0, restitution: 0.45, friction: 0.35 },
+  bottle: { shape: { kind: 'capsule', r: 0.038, halfLen: 0.09 }, mass: 1.0, restitution: 0.45, friction: 0.35, cdA: cdaOfShape({ kind: 'capsule', r: 0.038, halfLen: 0.09 }), mat: MAT.polymer },
   // 25 × 17 cm tablet, 9 mm thick
-  tablet: { shape: box(0.125, 0.0045, 0.085), mass: 0.5, restitution: 0.3, friction: 0.35 },
+  tablet: { shape: box(0.125, 0.0045, 0.085), mass: 0.5, restitution: 0.3, friction: 0.35, cdA: cdaOfShape(box(0.125, 0.0045, 0.085)), mat: MAT.aluminium },
   // hardback, 15 × 22 cm, 3 cm thick
-  book: { shape: box(0.075, 0.015, 0.11), mass: 0.6, restitution: 0.15, friction: 0.55 },
+  book: { shape: box(0.075, 0.015, 0.11), mass: 0.6, restitution: 0.15, friction: 0.55, cdA: cdaOfShape(box(0.075, 0.015, 0.11)), mat: MAT.card },
   // stylus pen, 14 cm
-  pen: { shape: { kind: 'capsule', r: 0.0055, halfLen: 0.065 }, mass: 0.012, restitution: 0.5, friction: 0.3 },
+  pen: { shape: { kind: 'capsule', r: 0.0055, halfLen: 0.065 }, mass: 0.012, restitution: 0.5, friction: 0.3, cdA: 0.002, mat: MAT.polymer },
   // ration pouch, 14 × 10 cm
-  foodpack: { shape: box(0.07, 0.022, 0.05), mass: 0.4, restitution: 0.1, friction: 0.6 },
+  foodpack: { shape: box(0.07, 0.022, 0.05), mass: 0.4, restitution: 0.1, friction: 0.6, cdA: cdaOfShape(box(0.07, 0.022, 0.05)), mat: MAT.card },
   // steel toolbox, 44 × 22 × 22 cm, full
-  toolbox: { shape: box(0.22, 0.11, 0.11), mass: 6.5, restitution: 0.25, friction: 0.4 },
+  toolbox: { shape: box(0.22, 0.11, 0.11), mass: 6.5, restitution: 0.25, friction: 0.4, cdA: cdaOfShape(box(0.22, 0.11, 0.11)), mat: MAT.steel },
   // 22 cm combination spanner
-  spanner: { shape: box(0.11, 0.006, 0.017), mass: 0.3, restitution: 0.4, friction: 0.25 },
+  spanner: { shape: box(0.11, 0.006, 0.017), mass: 0.3, restitution: 0.4, friction: 0.25, cdA: cdaOfShape(box(0.11, 0.006, 0.017)), mat: MAT.steel },
   // hand torch, 19 cm
-  torch: { shape: { kind: 'capsule', r: 0.019, halfLen: 0.075 }, mass: 0.3, restitution: 0.4, friction: 0.3 },
+  torch: { shape: { kind: 'capsule', r: 0.019, halfLen: 0.075 }, mass: 0.3, restitution: 0.4, friction: 0.3, cdA: cdaOfShape({ kind: 'capsule', r: 0.019, halfLen: 0.075 }), mat: MAT.aluminium },
   // cushion, 40 × 30 × 12 cm
-  pillow: { shape: box(0.2, 0.06, 0.15), mass: 0.45, restitution: 0.05, friction: 0.8 },
+  pillow: { shape: box(0.2, 0.06, 0.15), mass: 0.45, restitution: 0.05, friction: 0.8, cdA: 0.19, mat: MAT.foam },
   // composite cargo crates, 60 × 40 × 40 cm and 1.0 × 0.6 × 0.6 m, loaded
-  crateSmall: { shape: box(0.3, 0.2, 0.2), mass: 25, restitution: 0.15, friction: 0.5 },
-  crateLarge: { shape: box(0.5, 0.3, 0.3), mass: 80, restitution: 0.15, friction: 0.5 },
+  crateSmall: { shape: box(0.3, 0.2, 0.2), mass: 25, restitution: 0.15, friction: 0.5, cdA: cdaOfShape(box(0.3, 0.2, 0.2)), mat: MAT.composite },
+  crateLarge: { shape: box(0.5, 0.3, 0.3), mass: 80, restitution: 0.15, friction: 0.5, cdA: cdaOfShape(box(0.5, 0.3, 0.3)), mat: MAT.composite },
   // pressure-suit helmet, 31 cm across
-  helmet: { shape: { kind: 'sphere', r: 0.155 }, mass: 1.6, restitution: 0.4, friction: 0.35 },
+  helmet: { shape: { kind: 'sphere', r: 0.155 }, mass: 1.6, restitution: 0.4, friction: 0.35, cdA: cdaOfShape({ kind: 'sphere', r: 0.155 }), mat: MAT.polymer },
   // potted herb, 18 cm square pot with soil, 24 cm tall
-  plantpot: { shape: box(0.09, 0.12, 0.09), mass: 2.5, restitution: 0.2, friction: 0.5 },
+  plantpot: { shape: box(0.09, 0.12, 0.09), mass: 2.5, restitution: 0.2, friction: 0.5, cdA: cdaOfShape(box(0.09, 0.12, 0.09)), mat: MAT.ceramic },
 };
 
 const Q0: Quat = { x: 0, y: 0, z: 0, w: 1 };

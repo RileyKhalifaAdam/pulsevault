@@ -14,6 +14,7 @@
 // planned burn, the target's state).
 
 import type { Quat, V3 } from '../core/types';
+import { HOLD_MAX_RATE, HOLD_RATE_GAIN } from '../world/control';
 import {
   attitudeError, craftInertia, dockingStatus, findCraft, holdTorque, pointingError, qRot, qRotInv, leverValue, rockerValue, stickAxis,
   type Craft, type DeviceState, type World,
@@ -58,8 +59,22 @@ export const SETTLE_ANGLE = 0.003;
 export const SETTLE_RATE = 2e-5;
 export const WAKE_ANGLE = 0.03;
 export const WAKE_RATE = 0.01;
-/** Bound on the disturbing angular acceleration the wake time allows for, rad/s² (no gravity gradient in wave 1). */
-const HOLD_ALPHA_B = 0;
+/**
+ * The wake time allows for the target frame's own angular acceleration (holdTarget's alphaB: on an eccentric orbit the
+ * prograde and radial directions turn faster near periapsis), times this margin. No disturbing torque in wave 1 (the
+ * gravity gradient comes with W2-B's CMGs).
+ */
+const HOLD_ALPHA_MARGIN = 1.5;
+/**
+ * Walking a drift back (rad/s): when the error is small (< 2·WAKE_ANGLE) and the ship nearly at rest relative to the
+ * target (< 2·HOLD_DRIFT_RATE), as after a deadband wake, the hold slews at this rate instead of HOLD_MAX_RATE, and once
+ * it is moving at it the jets fall silent and the ship COASTS back (a pulse, a coast, a brake: the deadband limit
+ * cycle). At HOLD_MAX_RATE the stiff law would spin up to 0.045 rad/s for a 0.03 rad error and spend ~27 kg of
+ * hydrazine per wake; this costs well under a kilogram, and the coast is free under time acceleration.
+ */
+export const HOLD_DRIFT_RATE = WAKE_ANGLE / 60;
+/** The coast ends where the linear zone of the hold law takes over at HOLD_DRIFT_RATE: θ = rate / (K/4). */
+const DRIFT_ARRIVE = HOLD_DRIFT_RATE / (HOLD_RATE_GAIN / 4);
 /** The latch is armed within this distance of a station's bounding sphere, m. */
 const ARM_RANGE = 1000;
 /** After undocking the latch stays open until the collar is this far from the port, m. */
@@ -106,7 +121,18 @@ export class FlightComputer {
   hold: HoldMode = 'stability';
   readonly holdQ: Quat = { x: 0, y: 0, z: 0, w: 1 };
   holdQValid = false;
-  settled = false;
+  /**
+   * The hold is settled inside its deadband (silent until c.holdWakeT). Unsettling a settled hold from outside (the
+   * session: a new target, a burn edit, waking) also ends any coast, so the law looks again at once.
+   */
+  get settled(): boolean {
+    return this.settledF;
+  }
+  set settled(v: boolean) {
+    if (this.settledF && !v && this.ship) this.ship.holdWakeT = Infinity;
+    this.settledF = v;
+  }
+  private settledF = false;
   rearmBlock = false;
   /** The throttle the computer last commanded (the lever through DRIVE ARM, or Flight Assist). */
   cmdThrottle = 0;
@@ -123,6 +149,8 @@ export class FlightComputer {
   private readonly WE = v3();
   private readonly D = v3();
   private readonly OM = v3();
+  /** |dΩ/dt| of the hold's target frame, rad/s² (holdTarget; Kepler motion: a pure function of the state). */
+  private alphaB = 0;
   private readonly A = v3();
 
   constructor(private readonly host: FlightHost) {}
@@ -142,6 +170,7 @@ export class FlightComputer {
     this.hold = mode;
     this.holdQValid = false;
     this.settled = false;
+    if (this.ship) this.ship.holdWakeT = Infinity;
   }
 
   /**
@@ -249,7 +278,7 @@ export class FlightComputer {
         this.faFiring = thr > 0 || tx !== 0 || ty !== 0 || tz !== 0;
       }
     }
-    if (thr > 0 && this.cmdThrottle === 0) this.settled = false; // point properly before the drive lights
+    if (thr > 0 && this.cmdThrottle === 0) { this.settled = false; c.holdWakeT = Infinity; } // point properly before the drive lights
     this.cmdThrottle = thr;
     const tq = c.torque;
     if (c.dockedTo !== null) {
@@ -271,7 +300,6 @@ export class FlightComputer {
       c.holdWakeT = Infinity;
       return false;
     }
-    if (!this.settled) c.holdWakeT = Infinity; // (the session may unsettle the hold directly)
     const stick = Math.abs(p) > STICK_DEADZONE || Math.abs(y) > STICK_DEADZONE || Math.abs(r) > STICK_DEADZONE;
     if (this.hold === 'off') {
       // Raw torque demand straight onto the jets' torque columns: pitch about +X (nose up), yaw about -Y (nose right),
@@ -299,22 +327,39 @@ export class FlightComputer {
     WE.x = w.x - WFF.x; WE.y = w.y - WFF.y; WE.z = w.z - WFF.z;
     const th = Math.sqrt(ERR.x * ERR.x + ERR.y * ERR.y + ERR.z * ERR.z);
     const we = Math.sqrt(WE.x * WE.x + WE.y * WE.y + WE.z * WE.z);
+    // The states, all pure functions of saved state (settled, c.holdWakeT): settled (silent until the deadband or
+    // c.holdWakeT), coasting back from a drift (not settled, c.holdWakeT finite: silent until the arrival time), working.
     const now = this.world.t;
     if (this.settled) {
-      // one law at every warp: wake at the deadband, or at the time solved for it at settle
-      if (th > WAKE_ANGLE || we > WAKE_RATE || now >= c.holdWakeT) { this.settled = false; c.holdWakeT = Infinity; }
-    } else if (th < SETTLE_ANGLE && we < SETTLE_RATE) {
+      // one law at every warp: wake at the deadband, or at the time solved for it at settle (a rate kick: a disturbance)
+      if (we > WAKE_RATE || th > WAKE_ANGLE || now >= c.holdWakeT) { this.settled = false; c.holdWakeT = Infinity; }
+    } else if (c.holdWakeT !== Infinity) {
+      if (we > WAKE_RATE || th > 2 * WAKE_ANGLE || th < DRIFT_ARRIVE || now >= c.holdWakeT) c.holdWakeT = Infinity;
+    }
+    if (!this.settled && c.holdWakeT === Infinity && th < SETTLE_ANGLE && we < SETTLE_RATE) {
       this.settled = true;
       // the error coasts as e(t) = e₀ − (ω − ω_target)·t: the first time it reaches the deadband
-      c.holdWakeT = now + holdWakeTimeVec(ERR.x, ERR.y, ERR.z, -WE.x, -WE.y, -WE.z, HOLD_ALPHA_B, WAKE_ANGLE);
+      c.holdWakeT = now + holdWakeTimeVec(ERR.x, ERR.y, ERR.z, -WE.x, -WE.y, -WE.z, HOLD_ALPHA_MARGIN * this.orbitAlpha(), WAKE_ANGLE);
     }
-    if (this.settled) {
-      // Deadband: a settled ship commands nothing, so it coasts and time acceleration is free.
+    if (this.settled || c.holdWakeT !== Infinity) {
+      // Deadband (or the coast back): the ship commands nothing, so it coasts and time acceleration is free.
       tq.x = tq.y = tq.z = 0;
       return false;
     }
-    holdTorque(ERR, WE, I, c.maxTorque, tq);
+    // walking a drift back: slowly, unless something has pushed it well outside the deadband or set it turning
+    const slow = th < 2 * WAKE_ANGLE && we < 2 * HOLD_DRIFT_RATE;
+    holdTorque(ERR, WE, I, c.maxTorque, tq, slow ? HOLD_DRIFT_RATE : HOLD_MAX_RATE);
     this.toJets(tq);
+    if (slow && th > 2 * DRIFT_ARRIVE) {
+      // moving back at the drift rate along the error (dθ/dt = −ê·(ω − ω_target)): coast until the linear zone
+      const closing = (ERR.x * WE.x + ERR.y * WE.y + ERR.z * WE.z) / th;
+      const lx = WE.x - (ERR.x / th) * closing, ly = WE.y - (ERR.y / th) * closing, lz = WE.z - (ERR.z / th) * closing;
+      if (closing > 0.9 * HOLD_DRIFT_RATE && lx * lx + ly * ly + lz * lz < 0.01 * HOLD_DRIFT_RATE * HOLD_DRIFT_RATE) {
+        c.holdWakeT = now + (th - DRIFT_ARRIVE) / closing;
+        tq.x = tq.y = tq.z = 0;
+        return false;
+      }
+    }
     return true;
   }
 
@@ -337,6 +382,7 @@ export class FlightComputer {
   /** Attitude error (ERR, local rotation vector) and the rate the target itself turns at (WFF, local) for the hold. */
   holdTarget(): void {
     const c = this.ship, ERR = this.ERR, WFF = this.WFF, D = this.D, OM = this.OM;
+    this.alphaB = 0;
     ERR.x = ERR.y = ERR.z = 0;
     WFF.x = WFF.y = WFF.z = 0;
     OM.x = OM.y = OM.z = 0;
@@ -390,7 +436,11 @@ export class FlightComputer {
       case 'radialIn':
       case 'radialOut':
         D.x = r.x; D.y = r.y; D.z = r.z;
-        if (r2 > 0) { OM.x = hx / r2; OM.y = hy / r2; OM.z = hz / r2; }
+        if (r2 > 0) {
+          OM.x = hx / r2; OM.y = hy / r2; OM.z = hz / r2;
+          // Ω = h/r², h constant: |dΩ/dt| = 2|h|·|r·v|/r⁴
+          this.alphaB = (2 * Math.sqrt(hx * hx + hy * hy + hz * hz) * Math.abs(r.x * v.x + r.y * v.y + r.z * v.z)) / (r2 * r2);
+        }
         break;
       case 'antiTarget':
       case 'target': {
@@ -428,11 +478,42 @@ export class FlightComputer {
     qRotInv(WFF, c.q, OM.x, OM.y, OM.z);
   }
 
+  /**
+   * A bound on the target frame's angular acceleration until the next wake (at settle only): the largest |dΩ/dt| over
+   * the whole osculating orbit for the prograde-like and radial holds (at an apsis the present value is 0, so it alone
+   * would let the hold sleep through the next periapsis), the present value otherwise.
+   */
+  private orbitAlpha(): number {
+    const m = this.hold, pro = m === 'prograde' || m === 'retrograde' || m === 'burn', rad = m === 'radialIn' || m === 'radialOut';
+    let best = this.alphaB;
+    if (!pro && !rad) return best;
+    const c = this.ship, r = c.rel, v = c.relV, mu = this.world.bodies[c.primary].mu;
+    const hx = r.y * v.z - r.z * v.y, hy = r.z * v.x - r.x * v.z, hz = r.x * v.y - r.y * v.x, h = Math.sqrt(hx * hx + hy * hy + hz * hz);
+    const rl = Math.sqrt(r.x * r.x + r.y * r.y + r.z * r.z), v2 = v.x * v.x + v.y * v.y + v.z * v.z;
+    const inva = 2 / rl - v2 / mu, p = (h * h) / mu, e2 = 1 - p * inva;
+    if (!(inva > 0) || !(h > 0)) return best; // escaping: the present value
+    const e = e2 > 0 ? Math.sqrt(e2) : 0, sq = Math.sqrt(mu / p);
+    for (let k = 0; k < 32; k++) {
+      const nu = (k + 0.5) * (Math.PI / 32); // 0..π covers the orbit (|dΩ/dt| is symmetric in ν)
+      const rk = p / (1 + e * Math.cos(nu)), vk2 = mu * (2 / rk - inva), rv = rk * sq * e * Math.sin(nu);
+      const a = pro
+        ? ((mu * h) / (rk * rk * rk * vk2)) * Math.abs(rv * (3 * rk * vk2 - 2 * mu)) / (rk * rk * rk * vk2)
+        : (2 * h * Math.abs(rv)) / (rk * rk * rk * rk);
+      if (a > best) best = a;
+    }
+    return best;
+  }
+
   /** Rate at which the velocity direction turns under the primary's pull: (v × g) / v². */
   progradeRate(hx: number, hy: number, hz: number, r2: number, v2: number): void {
     // v × (−μ r / r³) = μ (r × v) / r³
     if (!(r2 > 0 && v2 > 0)) return;
-    const k = this.world.bodies[this.ship.primary].mu / (r2 * Math.sqrt(r2) * v2);
+    const mu = this.world.bodies[this.ship.primary].mu, rl = Math.sqrt(r2);
+    const k = mu / (r2 * rl * v2);
     this.OM.x = hx * k; this.OM.y = hy * k; this.OM.z = hz * k;
+    // Ω = μh/(r³v²) about the constant h (Kepler): |dΩ/dt| = |Ω|·|d(r³v²)/dt|/(r³v²), d(r³v²)/dt = (r·v)(3·r·v² − 2μ)
+    const r = this.ship.rel, v = this.ship.relV, rv = r.x * v.x + r.y * v.y + r.z * v.z;
+    const dk = rv * (3 * rl * v2 - 2 * mu);
+    this.alphaB = k * Math.sqrt(hx * hx + hy * hy + hz * hz) * Math.abs(dk) / (r2 * rl * v2);
   }
 }

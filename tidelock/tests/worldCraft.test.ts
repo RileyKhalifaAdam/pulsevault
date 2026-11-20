@@ -13,7 +13,13 @@ import {
   holdTorque, loadWorld, pointingError, RESTITUTION, saveWorld, shipDef, undock, type Craft, type World, type WorldEvent,
 } from '../src/world';
 import { HOLD_MAX_RATE } from '../src/world/control';
-import { holdCmdToJets, IN_RCS, makeStepIn, torqueAuthority } from '../src/world/jets';
+import { assistVisible, holdCmdToJets, IN_RCS, makeLedgerMean, makeStepIn, torqueAuthority } from '../src/world/jets';
+import { consumeLedger } from '../src/world/dynamics';
+import { eventRing } from '../src/world/state';
+import { drain } from '../src/world/events';
+import { refreshWorld } from '../src/world/world';
+import { qRotInv } from '../src/world/math';
+import { FlightComputer, WAKE_ANGLE, type FlightHost } from '../src/game/flight';
 
 const system = getSystem(generateGalaxy(1), 'tallow')!;
 const stats = computeStats(defaultLoadout('wren'));
@@ -551,5 +557,255 @@ describe('advance, save and load', () => {
     const a = run(false), b = run(true);
     expect(a.length).toBeLessThan(100_000);
     expect(b).toBe(a);
+  });
+});
+
+describe('real thrusters (W1-B): jets, two pools, two engines, the ledger, the settled hold', () => {
+  const Q = 1 / 120;
+  const mean = makeLedgerMean();
+  const sub3 = (a: V3, b: V3): V3 => v3(a.x - b.x, a.y - b.y, a.z - b.z);
+  const toCraft = (s: Craft, a: V3): V3 => qRotInv(v3(), s.q, a.x, a.y, a.z);
+  const rel = (a: number, b: number): number => Math.abs(a - b) / Math.max(Math.abs(a), Math.abs(b), 1e-300);
+
+  it('the ledger is the truth: per step ∫fAcc = m·Δv − ∫m·g (the RK4 mass weights), jets and engines, within 1e-9', () => {
+    // A thrusts, its twin B coasts from the same state: Δv_A − Δv_B is the proper part (B shares A's gravity to 1e-17).
+    const worldA = createWorld(system, { stations: false }), worldB = createWorld(system, { stations: false });
+    const a = wren(worldA, STAR, FAR, v3()), b = wren(worldB, STAR, FAR, v3());
+    let worstMag = 0, worstDir = 0, worstTau = 0, steps = 0;
+    const phase = (n: number, set: (s: Craft) => void, still: boolean): void => {
+      set(a);
+      for (let i = 0; i < n; i++) {
+        const va = { ...a.relV }, vb = { ...b.relV }, wa = { ...a.w }, m0 = craftMass(a);
+        const Ia = craftInertia(a, v3());
+        advance(worldA, Q); advance(worldB, Q);
+        const m1 = craftMass(a);
+        consumeLedger(a, mean);
+        expect(mean.T).toBeCloseTo(Q, 15);
+        const dvp = sub3(sub3(a.relV, va), sub3(b.relV, vb));
+        // RK4 with ṁ constant: Δv = (h/6)·F·(1/m₀ + 4/m½ + 1/m₁)
+        const k = (1 / m0 + 4 / (0.5 * (m0 + m1)) + 1 / m1) / 6;
+        const f = mean.f, J = v3(f.x * mean.T * k, f.y * mean.T * k, f.z * mean.T * k);
+        if (len(J) > 0) {
+          worstMag = Math.max(worstMag, rel(len(dvp), len(J)));
+          const dc = toCraft(a, dvp);
+          const e = len(sub3(dc, J)) / len(J);
+          if (still) expect(e).toBeLessThan(1e-9); // no rotation: the craft-axes vectors agree exactly
+          else worstDir = Math.max(worstDir, e); // turning: the applied direction is the step's mean attitude
+        }
+        // ∫τ dt = I·Δω + ∫ω × Iω dt (trapezoid over the step)
+        const w1 = a.w, gyro = (w: V3): V3 => v3(w.y * Ia.z * w.z - w.z * Ia.y * w.y, w.z * Ia.x * w.x - w.x * Ia.z * w.z, w.x * Ia.y * w.y - w.y * Ia.x * w.x);
+        const g0 = gyro(wa), g1 = gyro(w1);
+        const lhs = v3(mean.tau.x * mean.T, mean.tau.y * mean.T, mean.tau.z * mean.T);
+        const rhs = v3(Ia.x * (w1.x - wa.x) + 0.5 * Q * (g0.x + g1.x), Ia.y * (w1.y - wa.y) + 0.5 * Q * (g0.y + g1.y), Ia.z * (w1.z - wa.z) + 0.5 * Q * (g0.z + g1.z));
+        const scale = len(lhs) + Q * len(g0) + len(v3(Ia.x * (w1.x - wa.x), Ia.y * (w1.y - wa.y), Ia.z * (w1.z - wa.z)));
+        if (scale > 0) worstTau = Math.max(worstTau, len(sub3(lhs, rhs)) / scale);
+        steps++;
+      }
+    };
+    phase(30, (s) => { s.rcs.x = 1; }, true); // pure +X: 34 kN × 2 of the port jets, no rotation
+    phase(30, (s) => { s.rcs.x = 0; s.rcs.z = -1; }, true); // the Z jets: forward (+Z exhaust at the stern pods)
+    phase(120, (s) => { s.rcs.x = 0.3; s.rcs.y = -0.5; s.rcs.z = 1; s.torque.x = 0.2; s.torque.y = 0.4; s.torque.z = -0.3; }, false);
+    phase(300, (s) => { s.rcs.x = s.rcs.y = s.rcs.z = 0; s.torque.x = s.torque.y = s.torque.z = 0; s.throttle = 1; }, false); // ignition, spool
+    console.log(`ledger vs dynamics over ${steps} ticks: |∫F|·k vs |Δv_A − Δv_B| ≤ ${worstMag.toExponential(2)}; direction while turning ≤ ${worstDir.toExponential(2)}; torque ≤ ${worstTau.toExponential(2)}`);
+    expect(worstMag).toBeLessThan(1e-9);
+    expect(worstDir).toBeLessThan(2e-3);
+    expect(worstTau).toBeLessThan(1e-6);
+    expect(a.engineThrust[0]).toBeGreaterThan(0.9 * 400e3);
+  });
+
+  it('the ledger is the truth in air: the RK4-weighted drag mean equals m·Δv − ∫m·g within 1e-9', () => {
+    const A = lowOrbit(80e3, false), B = lowOrbit(80e3, false);
+    B.ship.dragArea = 0;
+    let worst = 0, dragMax = 0;
+    const sync = (): void => { // B rides on A's state each tick: only the drag inside the step differs
+      const a = A.ship, b = B.ship;
+      b.rel = { ...a.rel }; b.relV = { ...a.relV }; b.q = { ...a.q }; b.w = { ...a.w };
+    };
+    for (let i = 0; i < 120; i++) {
+      sync();
+      const va = { ...A.ship.relV }, vb = { ...B.ship.relV }, m = craftMass(A.ship);
+      advance(A.w, Q); advance(B.w, Q);
+      consumeLedger(A.ship, mean);
+      const dvp = toCraft(A.ship, sub3(sub3(A.ship.relV, va), sub3(B.ship.relV, vb)));
+      const J = v3(mean.f.x * mean.T / m, mean.f.y * mean.T / m, mean.f.z * mean.T / m);
+      worst = Math.max(worst, len(sub3(dvp, J)) / len(J));
+      dragMax = Math.max(dragMax, len(mean.f) / m);
+    }
+    expect(A.ship.inAtmosphere).toBe(true);
+    expect(len(A.ship.airVel)).toBeGreaterThan(7000);
+    expect(A.ship.heatFlux).toBeGreaterThan(0);
+    expect(B.ship.heatFlux).toBeCloseTo(A.ship.heatFlux, -3); // the flux is the air's, not the drag area's
+    console.log(`drag ${dragMax.toExponential(3)} m/s² at 80 km; ledger vs dynamics ≤ ${worst.toExponential(2)}; heat flux ${(A.ship.heatFlux / 1e3).toFixed(1)} kW/m²`);
+    expect(worst).toBeLessThan(1e-9);
+  });
+
+  it('applied ≠ commanded: a dry RCS pool turns nothing; landed the jets are off, the engines spool against the ground, and the ledger reads the ground (≈ g)', () => {
+    const w = deepSpace();
+    const s = wren(w, STAR, FAR, v3());
+    s.rcsPropellant = 0;
+    s.torque.y = 1; s.rcs.x = 1;
+    advance(w, 1);
+    expect(len(s.w)).toBe(0);
+    expect(s.jetDuty.every((d) => d === 0)).toBe(true);
+    // landed on Taper (the moon), commanding jets and a throttle below the drive's floor
+    const lw = createWorld(system, { stations: false });
+    const b = lw.bodies.find((x) => x.id === TAPER)!;
+    const up = v3(Math.cos(0.4), 0, -Math.sin(0.4)), tail = reach(v3(0, 0, 1));
+    const rr = b.radius + tail + 0.5, r = v3(up.x * rr, up.y * rr, up.z * rr), n = b.spinAxis, wv = b.spinRate;
+    const L = wren(lw, TAPER, r, v3(wv * (n.y * r.z - n.z * r.y), wv * (n.z * r.x - n.x * r.z), wv * (n.x * r.y - n.y * r.x)), qFromTo(v3(0, 0, -1), up));
+    for (let i = 0; i < 40 && L.landedOn === null; i++) advance(lw, 0.25);
+    expect(L.landedOn).toBe(TAPER);
+    advance(lw, 1);
+    consumeLedger(L, mean);
+    const rcs0 = L.rcsPropellant;
+    L.rcs.x = 1; L.torque.z = -1; L.throttle = 0.12;
+    for (let i = 0; i < 120; i++) advance(lw, 1 / 60);
+    expect(L.jetDuty.every((d) => d === 0)).toBe(true);
+    expect(L.rcsPropellant).toBe(rcs0);
+    expect(L.engineThrust).toEqual([0, 0]); // 12 % does not light a cold drive
+    consumeLedger(L, mean);
+    const g = b.mu / len(L.rel) ** 2;
+    console.log(`landed on Taper: the ledger's proper acceleration ${(len(mean.f) / craftMass(L)).toFixed(5)} m/s² (g ${g.toFixed(5)}), load ${L.load.toFixed(5)}`);
+    expect(Math.abs(len(mean.f) / craftMass(L) / g - 1)).toBeLessThan(0.01);
+    expect(Math.abs(L.load / g - 1)).toBeLessThan(0.01);
+    expect(mean.T).toBeCloseTo(2, 9);
+    // throttle 0.3 lights it after the 0.5 s ignition delay; the spool lifts the ship off when thrust beats weight
+    L.throttle = 0.3;
+    const ev: WorldEvent[] = [];
+    let tLift = -1;
+    for (let i = 0; i < 600 && tLift < 0; i++) { advance(lw, 1 / 60); ev.push(...drainEvents(lw)); if (L.landedOn === null) tLift = (i + 1) / 60; }
+    expect(L.engineThrust[0]).toBeGreaterThan(0);
+    console.log(`lift-off ${tLift.toFixed(3)} s after the throttle opened (0.5 s ignition delay, then the 0.8 s spool)`);
+    expect(tLift).toBeGreaterThan(0.5);
+    expect(tLift).toBeLessThan(1.5);
+  });
+
+  it('minimum throttle with hysteresis through the dynamics: never between 10 and 15 %', () => {
+    const w = deepSpace();
+    const s = wren(w, STAR, FAR, v3());
+    const F = 400e3;
+    s.throttle = 0.12; advance(w, 3);
+    expect(s.engineThrust).toEqual([0, 0]);
+    s.throttle = 0.5; advance(w, 6);
+    expect(s.engineThrust[0] / F).toBeCloseTo(0.5, 2);
+    s.throttle = 0.12; advance(w, 6); // lit: it stays lit, at the 15 % floor
+    expect(s.engineThrust[0] / F).toBeCloseTo(0.15, 3);
+    expect(s.engineThrust[1] / F).toBeCloseTo(0.15, 3);
+    s.throttle = 0.09; advance(w, 6); // below 10 %: out, and the tail ends at exactly zero
+    expect(s.engineThrust).toEqual([0, 0]);
+    expect(s.engineTimer).toEqual([-1, -1]);
+  });
+
+  it('the rocket equation per pool: the RCS runs its own hydrazine dry with blowdown; the main pool is untouched', () => {
+    const w = deepSpace();
+    const s = wren(w, STAR, FAR, v3());
+    const T = s.jetAlloc, m0 = craftMass(s), main0 = s.propellant, cap = s.rcsPropellantCapacity;
+    s.rcs.x = 1;
+    let t = 0;
+    while (s.rcsPropellant > 0 && t < 200) { advance(w, 1); t++; }
+    expect(s.rcsPropellant).toBe(0);
+    expect(s.propellant).toBe(main0);
+    advance(w, 5);
+    expect(s.jetDuty.every((d) => d === 0)).toBe(true);
+    // Δv = (F/ṁ at p₀)·∫(0.97 + 0.03·p/p₀) dm/m (Simpson); the pure +Fx column's F/ṁ at p₀ = authority/cost
+    const m1 = craftMass(s), N = 20000, hh = (m0 - m1) / N;
+    const f = (mm: number) => (0.97 + 0.03 / (3 - 2 * ((mm - m1) / cap))) / mm;
+    let sm = f(m1) + f(m0);
+    for (let i = 1; i < N; i++) sm += (i & 1 ? 4 : 2) * f(m1 + i * hh);
+    const dvExp = (T.authority[0] / T.cost[0]) * (sm * hh) / 3;
+    const gravity = 6.3e-5 * (t + 5); // the star's pull at FAR over the run, an upper bound
+    console.log(`RCS dry after ${t} s: Δv ${s.relV.x.toFixed(4)} m/s, rocket equation with blowdown ${dvExp.toFixed(4)} m/s`);
+    expect(Math.abs(s.relV.x - dvExp)).toBeLessThan(1e-3 * dvExp + gravity);
+  });
+
+  it.each([[1, 'circular'], [1.03, 'eccentric (e ≈ 0.06)']])('a settled hold sleeps one real minute at 1e4 in low orbit (%s, %s): prograde within the deadband throughout, waking on time', (boost) => {
+    const { w, ship } = lowOrbit(420e3, false);
+    ship.relV.x *= boost; ship.relV.y *= boost; ship.relV.z *= boost;
+    const host: FlightHost = { mult: () => 1e4, targetId: null, nextBurn: () => null, targetState: () => null };
+    const fc = new FlightComputer(host);
+    fc.world = w; fc.ship = ship;
+    fc.setHold('prograde');
+    const prograde = (): number => { const f = qRotate(ship.q, v3(0, 0, -1)), v = ship.relV; return Math.acos(Math.min(1, (f.x * v.x + f.y * v.y + f.z * v.z) / len(v))); };
+    // first the slew (1× control at 60 Hz), then sleep: a frame is 1/60 s real = 166.7 s of sim
+    for (let i = 0; i < 60 * 120 && !fc.settled; i++) { fc.command(); advance(w, 1 / 60); }
+    expect(fc.settled).toBe(true);
+    const rcs0 = ship.rcsPropellant, t0 = w.t, FRAME = 1e4 / 60;
+    let worst = 0, wakes = 0, ticks = 0, frames = 0;
+    while (w.t - t0 < 60 * 1e4) {
+      // one real frame: the controller at 60 Hz while it works; quiet, the world runs to the frame end or the wake time
+      const end = Math.min(w.t + FRAME, t0 + 60 * 1e4);
+      while (w.t < end - 1e-9) {
+        const was = fc.settled || ship.holdWakeT !== Infinity;
+        const active = fc.command();
+        if (was && active) wakes++;
+        if (active) { advance(w, 1 / 60); ticks++; } else advance(w, Math.min(end, ship.holdWakeT) - w.t > 1e-9 ? Math.min(end, ship.holdWakeT) - w.t : 1 / 60);
+        worst = Math.max(worst, prograde());
+      }
+      frames++;
+    }
+    const used = rcs0 - ship.rcsPropellant;
+    console.log(`[v×${boost}] asleep 60 real s at 1e4 (${(60 * 1e4 / 3600).toFixed(0)} h of sim, ${frames} frames): worst prograde error ${worst.toFixed(4)} rad, ${wakes} wakes (one per ${(60 * 1e4 / wakes).toFixed(0)} s), ${ticks} powered control ticks (${(ticks / wakes).toFixed(0)} per wake), ${used.toFixed(2)} kg of hydrazine (${(used / (60 * 1e4 / 3600)).toFixed(2)} kg per hour asleep)`);
+    expect(worst).toBeLessThan(WAKE_ANGLE + 0.005);
+    expect(prograde()).toBeLessThan(WAKE_ANGLE + 0.005);
+    expect(wakes).toBeGreaterThan(0);
+    expect(ticks / wakes).toBeLessThan(400); // the plan's ~120 powered steps per wake, give or take the limit cycle
+    expect(used / (60 * 1e4 / 3600)).toBeLessThan(1.5); // kg per hour of sleep (the stiff law would spend ~27 kg per wake)
+  });
+
+  it('Flight Assist: no reference behind Wick or beyond 100 km, whatever is targeted', () => {
+    const w = createWorld(system, { stations: true });
+    const b = w.bodies.find((x) => x.id === WICK)!;
+    const wheel = w.craft.find((c) => c.id === START_STATION_ID)!;
+    // the Wheel's antipode, 420 km up: behind Wick
+    const d = len(wheel.rel), k = -(b.radius + 420e3) / d;
+    const ship = wren(w, WICK, v3(wheel.rel.x * k, wheel.rel.y * k, wheel.rel.z * k), v3());
+    refreshWorld(w);
+    let target: string | null = START_STATION_ID;
+    const host: FlightHost = { mult: () => 1, get targetId() { return target; }, nextBurn: () => null, targetState: () => null };
+    const fc = new FlightComputer(host);
+    fc.world = w; fc.ship = ship;
+    expect(fc.assistRef()).toBe(null);
+    expect(assistVisible(ship.r, wheel.r, 1e12, w.bodies)).toBe(false); // the body is in the way, not only the range
+    // 500 km from the Wheel on its own side, in clear sight: out of range
+    const u = v3(wheel.rel.x / d, wheel.rel.y / d, wheel.rel.z / d);
+    ship.rel = v3(wheel.rel.x + u.x * 500e3, wheel.rel.y + u.y * 500e3, wheel.rel.z + u.z * 500e3);
+    refreshWorld(w);
+    expect(assistVisible(ship.r, wheel.r, 1e12, w.bodies)).toBe(true);
+    expect(fc.assistRef()).toBe(null);
+    // 2 km off: the Wheel is the reference, targeted or not
+    ship.rel = v3(wheel.rel.x + u.x * 2e3, wheel.rel.y + u.y * 2e3, wheel.rel.z + u.z * 2e3);
+    refreshWorld(w);
+    expect(fc.assistRef()).toBe(wheel);
+    target = null;
+    expect(fc.assistRef()).toBe(wheel);
+  });
+
+  it('jet edges reach the event ring; save → load mid-ignition, mid-spool, mid-tail with a pending ledger is bit-identical', () => {
+    const w0 = deepSpace();
+    const s0 = wren(w0, STAR, FAR, v3());
+    s0.torque.z = 1;
+    advance(w0, Q);
+    const seen: string[] = [];
+    drain(eventRing(w0), (e) => { seen.push(`${e.kind}:${e.a}`); });
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((x) => x.startsWith('jetOn'))).toBe(true);
+    const run = (saves: boolean): string => {
+      let w = deepSpace();
+      wren(w, STAR, FAR, v3());
+      const fly = (n: number, f: (s: Craft) => void): void => {
+        const s = w.craft.find((c) => c.id === 'player')!;
+        f(s);
+        for (let i = 0; i < n; i++) advance(w, Q);
+      };
+      fly(30, (s) => { s.throttle = 0.6; s.rcs.y = 0.4; s.torque.x = -0.3; }); // mid-ignition delay (0.25 s of 0.5)
+      if (saves) w = loadWorld(saveWorld(w));
+      fly(90, () => {}); // mid-spool
+      if (saves) w = loadWorld(saveWorld(w));
+      fly(60, (s) => { s.throttle = 0; s.rcs.y = 0; s.torque.x = 0.2; }); // mid-tail
+      if (saves) w = loadWorld(saveWorld(w));
+      fly(600, (s) => { s.torque.x = 0; });
+      return saveWorld(w);
+    };
+    expect(run(true)).toBe(run(false));
   });
 });

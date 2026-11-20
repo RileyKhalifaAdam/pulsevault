@@ -616,3 +616,24 @@ describe('stat comparisons for outfitting', () => {
     expect(dock.find((r) => r.key === 'hasDockingComputer')).toMatchObject({ from: 1, to: 0, verdict: -1 });
   });
 });
+
+describe('real thrusters (W1-B): the fitted Wren as the world builds it', () => {
+  it('pins: 2 × Tern = 68 kN per axis of hydrazine at 2250 m/s; 24 t of tankage = 22.5 t LH2 + 1.5 t N2H4; 2 × 400 kN at 34 km/s', async () => {
+    const { shipDef, rcsShare } = await import('../src/world/setup');
+    const st = computeStats(defaultLoadout('wren'));
+    expect(st.rcsThrust).toBe(68000);
+    expect(st.rcsExhaustVelocity).toBe(2250);
+    expect(st.mainThrust).toBe(800e3);
+    expect(st.exhaustVelocity).toBe(34000);
+    expect(st.fuelCapacity).toBe(24000);
+    expect(rcsShare(st)).toBe(1500);
+    const d = shipDef('p', 'Wren', st, SHIP_LAYOUTS.wren, { primaryId: 'x', r: { x: 0, y: 0, z: 0 }, v: { x: 0, y: 0, z: 0 } });
+    expect(d.propellant).toBe(22500);
+    expect(d.rcsPropellant).toBe(1500);
+    // every hull has jets for all three translation and all three rotation axes, both senses (SIMULATION.md W1-B 1)
+    for (const id of Object.keys(SHIP_LAYOUTS) as ShipVisualId[]) {
+      const dirs = new Set(SHIP_LAYOUTS[id].rcs.map((j) => `${j.dir.x},${j.dir.y},${j.dir.z}`));
+      for (const k of ['1,0,0', '-1,0,0', '0,1,0', '0,-1,0', '0,0,1', '0,0,-1']) expect(dirs.has(k), `${id} ${k}`).toBe(true);
+    }
+  });
+});

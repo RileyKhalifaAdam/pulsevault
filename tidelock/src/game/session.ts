@@ -546,12 +546,15 @@ class WorldSession implements Session {
     if (this.ctlActive) { const c = 2 - (tick & 1); if (c < k) { k = c; why = 'rotation'; } }
     const wt = this.ship.holdWakeT;
     if (wt < Infinity && wt === wt) {
-      const wk = Math.ceil(wt * TICK_HZ - 1e-9) - tick;
+      // a settled hold wakes on the first controller tick (an even one) at or after its wake time (W1-B)
+      let at = Math.ceil(wt * TICK_HZ - 1e-9);
+      if (at & 1) at++;
+      const wk = at - tick;
       if (wk >= 1 && wk < k) k = wk;
     }
     if (k > 1 && this.loose && this.propsAwake()) {
       const nb = nextBodyEvent(this.loose, craftMotion(this.world, this.ship, this.motion, this.ledger), this.playerMode === 'onFoot' ? this.body : null, this.tk, k);
-      if (nb < k) { k = nb > 1 ? nb : 1; why = bodyEvent.why === 'crew' ? 'crew' : 'props'; }
+      if (nb < k) { k = nb > 1 ? nb : 1; if (bodyEvent.why !== '') why = bodyEvent.why === 'crew' ? 'crew' : 'props'; } // W1-C hook: a drift/rest schedule is not a limit
     } else if (k === 1 && this.loose && this.propsAwake()) why = 'props';
     this.stepWhy = why;
     return k;
@@ -743,11 +746,10 @@ class WorldSession implements Session {
   private chunkMotion(dt: number): ShipMotionT {
     const mo = craftMotion(this.world, this.ship, this.motion, this.ledger);
     const j = this.jolt;
-    if (dt > 0 && takeJolt(this.ship, j)) {
-      const c = this.ship, a = qRotInv(this.FV, c.q, j.dv.x / dt, j.dv.y / dt, j.dv.z / dt);
-      mo.a.x += a.x; mo.a.y += a.y; mo.a.z += a.z;
-      mo.alpha.x += j.dw.x / dt; mo.alpha.y += j.dw.y / dt; mo.alpha.z += j.dw.z / dt;
-    }
+    // W1-C hook: contact impulses reach the bodies once, exactly, through the ledger's Δv, Δω (tk.ledger: props
+    // serviceBodies, crew boots / harness), not spread as an acceleration; the jolt is only cleared here
+    void dt;
+    takeJolt(this.ship, j);
     return mo;
   }
   /** Where the eye is now, ship-local (on foot, or the helm eye when strapped in). */

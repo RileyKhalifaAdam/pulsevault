@@ -70,6 +70,11 @@ export const Q = 1 / 120;
 export const MODE_CONTACT = 0;
 export const MODE_REST = 1;
 export const MODE_DRIFT = 2;
+/**
+ * Held by the ship (a stowed object in its clip, magnet or strap; W1-C wiring): the scheduler and the service skip
+ * it, and a drifting body treats it like a resting one (it does not move toward anything).
+ */
+export const MODE_FIXED = 3;
 /** Rest: speed limit (m/s), wake margin outside the friction cone (m/s²), entry margin (half of it: hysteresis). */
 export const REST_V = 1e-3;
 export const REST_WAKE_A = 1e-4;
@@ -78,10 +83,11 @@ export const REST_ENTER_A = 0.5e-4;
 export const DRIFT_MAX = 5;
 export const DRIFT_N = 0.1;
 /**
- * Penetration a drifting body may reach before CONTACT takes it, m: the contact solver's own slop (props.ts SLOP).
- * It lets a body slide along a surface it touches without being pinned to Q by rounding.
+ * Penetration a drifting body may reach before CONTACT takes it, m: twice the contact solver's slop (props.ts SLOP,
+ * 0.5 mm, the depth its projection leaves a touching body at). It lets a body that touches a surface without load
+ * (free fall, a spinning ship) slide along it in closed form instead of being pinned to Q by that resting depth.
  */
-export const DRIFT_SLOP = 5e-4;
+export const DRIFT_SLOP = 1e-3;
 /** A segment shorter than this many ticks hands the body to CONTACT. */
 export const DRIFT_MIN_TICKS = 2;
 /** Cabin air density until W2-D's cabin model supplies it, kg/m³. */
@@ -199,6 +205,9 @@ export interface QsWorld {
   selfJump?: Uint8Array;
   /** Static grid (makeQsGrid); absent = every box is scanned. */
   grid?: QsGrid;
+  /** Farthest box corner from the CoM, m (a drifting body inside the boxes is never farther): bounds the
+   * centrifugal and Euler terms over a segment (driftBound). 0 = no boxes. */
+  R?: number;
 }
 
 const v3 = (): V3 => ({ x: 0, y: 0, z: 0 });
@@ -262,6 +271,14 @@ export function makeQsWorld(
     return out;
   };
   const w: QsWorld = { boxes, nBoxes, r: f(o.r, 0.05), k: f(o.k, 0), mu: f(o.mu, 0.5), grid: makeQsGrid(boxes, nBoxes, o.cell ?? 1) };
+  let R2 = 0;
+  for (let k = 0; k < nBoxes; k++) {
+    const ax = Math.max(Math.abs(boxes[6 * k]), Math.abs(boxes[6 * k + 3])), ay = Math.max(Math.abs(boxes[6 * k + 1]), Math.abs(boxes[6 * k + 4]));
+    const az = Math.max(Math.abs(boxes[6 * k + 2]), Math.abs(boxes[6 * k + 5]));
+    const d2 = ax * ax + ay * ay + az * az;
+    if (d2 > R2) R2 = d2;
+  }
+  w.R = Math.sqrt(R2);
   if (o.hy) w.hy = f(o.hy, 0);
   if (o.I) w.I = f(o.I, 0, 3);
   if (o.selfJump) { w.selfJump = new Uint8Array(n); for (let i = 0; i < n && i < o.selfJump.length; i++) w.selfJump[i] = o.selfJump[i] ? 1 : 0; }
@@ -643,10 +660,29 @@ export function driftBound(b: QsBody, i: number, bodies: readonly QsBody[], w: Q
       if (c < best) best = c;
     }
   }
-  const cI = vl + cRot, aI = al2 + dB + dragB + aRot;
+  // Contact is judged in the ship frame, where the boxes stand still (review: the walls move in the inertial
+  // frame, so bound by the ship-frame closing speed, not the inertial one). The ship-frame path obeys
+  // ÿ = f(y, ẏ, t) (the felt acceleration feltAt: −a_s and the centrifugal, Coriolis and Euler terms). Over the
+  // segment f stays within dA of its anchor value f₀: |a_s − a_R| ≤ dB, the drag excess ≤ dragB, and with
+  // |ω| ≤ ω_m = ω_B + α_B·T, |α| ≤ α_B, |y| ≤ R (inside the boxes) and |ẏ| ≤ V: |Δcentrifugal + ΔEuler| ≤ (2ω_m² + 2α_B)R,
+  // |ΔCoriolis| ≤ 4ω_m·V. T ≤ 0.25/ω_m keeps the Coriolis feedback bounded: V ≤ 2(|ẏ₀| + (|f₀| + rest)·T).
+  const vS = b.v, vsl = Math.sqrt(vS.x * vS.x + vS.y * vS.y + vS.z * vS.z);
+  feltAt(m, p.x, p.y, p.z, vS.x, vS.y, vS.z, FB);
+  const fl = Math.sqrt(FB.x * FB.x + FB.y * FB.y + FB.z * FB.z);
+  const wm = wB + alB * DRIFT_MAX;
+  if (wm > 0 && 0.25 / wm < best) best = 0.25 / wm;
+  const Tc = best;
+  const pl = Math.sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
+  let R = w.R !== undefined && w.R > 0 ? w.R : 0;
+  if (R < pl + hy + r) R = pl + hy + r;
+  if (!(w.R !== undefined && w.R > 0)) R += vsl * Tc + 0.5 * (fl + dB + dragB) * Tc * Tc;
+  const S = 2 * (wm * wm + alB) * R;
+  const V = 2 * (vsl + (fl + dB + dragB + S) * Tc);
+  const dA = dB + dragB + S + 4 * wm * V;
+  const cI = vsl, aI = fl + dA;
   const g = w.grid;
   if (!g) {
-    for (let j = 0, o = 0; j < w.nBoxes; j++, o += 6) { const t = boxTime(w.boxes, o, p, r, hy, v0, aR, dB, s.dragD, dragB, cRot, aRot, cI, aI, q); if (t < best) best = t; }
+    for (let j = 0, o = 0; j < w.nBoxes; j++, o += 6) { const t = boxTime(w.boxes, o, p, r, hy, vS, FB, dA, cI, aI); if (t < best) best = t; }
   } else {
     const stamp = ++g.tick, st = g.stamp, items = g.items, start = g.start, gy = g.n[1], gz = g.n[2], bx = w.boxes;
     let Tp = best < GRID_PASS_T ? best : GRID_PASS_T;
@@ -660,7 +696,7 @@ export function driftBound(b: QsBody, i: number, bodies: readonly QsBody[], w: Q
           const j = items[it];
           if (st[j] === stamp) continue;
           st[j] = stamp;
-          const t = boxTime(bx, 6 * j, p, r, hy, v0, aR, dB, s.dragD, dragB, cRot, aRot, cI, aI, q);
+          const t = boxTime(bx, 6 * j, p, r, hy, vS, FB, dA, cI, aI);
           if (t < best) best = t;
         }
       }
@@ -669,23 +705,26 @@ export function driftBound(b: QsBody, i: number, bodies: readonly QsBody[], w: Q
       Tp = best;
     }
   }
-  // other bodies: each may close half the gap (isotropic, ship frame: |v_rel| plus the turning terms)
+  // other bodies: each may close half the gap (isotropic, ship frame)
   for (let j = 0; j < bodies.length; j++) {
     if (j === i) continue;
     const o = bodies[j], dx = o.p.x - p.x, dy = o.p.y - p.y, dz = o.p.z - p.z;
     let gp = Math.sqrt(dx * dx + dy * dy + dz * dz) - r - w.r[j] - hy - (w.hy ? w.hy[j] : 0);
     gp += DRIFT_SLOP;
     if (gp < 0) gp = 0;
-    if (o.qs.mode !== MODE_REST) gp *= 0.5;
+    if (o.qs.mode !== MODE_REST && o.qs.mode !== MODE_FIXED) gp *= 0.5;
     const t = cI > 0 || aI > 0 ? (2 * gp) / (cI + Math.sqrt(cI * cI + 2 * aI * gp)) : Infinity;
     if (t < best) best = t;
   }
+  void cRot; void aRot; void q;
   return best;
 }
 
-function boxTime(
-  bx: Float64Array, o: number, p: V3, r: number, hy: number, v0: V3, aR: V3, dB: number, dd: V3, dragB: number, cRot: number, aRot: number, cI: number, aI: number, q: Quat,
-): number {
+const FB: V3 = v3();
+
+/** Earliest time the body (sphere r about p, or the capsule ±hy) could reach box o, ship frame: closing speed
+ * max(0, −v·n), acceleration toward it max(0, −f·n) + dA. */
+function boxTime(bx: Float64Array, o: number, p: V3, r: number, hy: number, v: V3, f: V3, dA: number, cI: number, aI: number): number {
   const qx = p.x < bx[o] ? bx[o] : p.x > bx[o + 3] ? bx[o + 3] : p.x;
   const qz = p.z < bx[o + 2] ? bx[o + 2] : p.z > bx[o + 5] ? bx[o + 5] : p.z;
   // the segment [p.y − hy, p.y + hy] against [minY, maxY]
@@ -699,11 +738,9 @@ function boxTime(
   let c: number, A: number, g: number;
   if (d > 0) {
     nx /= d; ny /= d; nz /= d;
-    rot(NI, q, nx, ny, nz);
-    const vn = NI.x * v0.x + NI.y * v0.y + NI.z * v0.z, an = NI.x * aR.x + NI.y * aR.y + NI.z * aR.z;
-    const dn = dd.x === 0 && dd.y === 0 && dd.z === 0 ? 1 : NI.x * dd.x + NI.y * dd.y + NI.z * dd.z;
-    c = (vn < 0 ? -vn : 0) + cRot;
-    A = (an > 0 ? an : 0) + dB + (dn > 0 ? dragB * dn : 0) + aRot;
+    const vn = nx * v.x + ny * v.y + nz * v.z, fn = nx * f.x + ny * f.y + nz * f.z;
+    c = vn < 0 ? -vn : 0;
+    A = (fn < 0 ? -fn : 0) + dA;
     g = d - r;
   } else {
     c = cI; A = aI; g = 0;
@@ -968,6 +1005,7 @@ export function nextBodyEvent(bodies: readonly QsBody[], tick: number, tMaxTicks
   for (let i = 0; i < bodies.length; i++) {
     const s = bodies[i].qs;
     if (s.mode === MODE_CONTACT) { bodyEvent.why = WHY_CONTACT; bodyEvent.body = i; return 1; }
+    if (s.mode === MODE_FIXED) continue;
     const d = s.tickEnd - tick;
     if (d < best) { best = d < 1 ? 1 : d; why = s.mode === MODE_DRIFT ? WHY_DRIFT : WHY_REST; who = i; }
   }
@@ -1003,6 +1041,7 @@ export function serviceBodies(
   let nc = 0;
   for (let i = 0; i < bodies.length; i++) {
     const b = bodies[i], s = b.qs, k = w.k[i];
+    if (s.mode === MODE_FIXED) continue;
     if (s.mode === MODE_DRIFT) {
       const changed = accelChanged(s, m, q);
       if (changed) {
@@ -1096,7 +1135,7 @@ export function saveQsState(s: QsState): QsState {
 export function loadQsState(data: unknown): QsState {
   const o = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
   const rn = num(o.rn, -1), rH = num(o.rH, 0);
-  let mode = o.mode === MODE_REST || o.mode === MODE_DRIFT ? (o.mode as number) : MODE_CONTACT;
+  let mode = o.mode === MODE_REST || o.mode === MODE_DRIFT || o.mode === MODE_FIXED ? (o.mode as number) : MODE_CONTACT;
   // a triaxial drift without its grid step (older layout) re-derives through CONTACT
   if (mode === MODE_DRIFT && rn > 0 && !(rH > 0)) mode = MODE_CONTACT;
   const tick0 = num(o.tick0, 0);

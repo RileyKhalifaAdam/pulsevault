@@ -9,7 +9,7 @@
 // / typed arrays. The allocating functions are the load-time builders (buildJetTable, jetsFromLayout, engineDef,
 // saveJetState/loadJetState).
 //
-// WIRING (wave 1; nothing here is called yet):
+// WIRING (wave 1; WIRED by W1-B: setup.ts, dynamics.ts, contact.ts, control.ts, game/flight.ts — kept as the map):
 //   * setup.ts addCraft / shipDef (once per craft, at construction AND at load; nothing here is saved):
 //       c.jets    = jetsFromLayout(layout.rcs, stats.rcsThrust, stats.rcsExhaustVelocity)   // fitted RCS pack
 //       c.engines = layout.engines.map(e => engineDef(e.pos, com, stats.mainThrust / layout.engines.length,

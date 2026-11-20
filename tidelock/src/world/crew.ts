@@ -12,11 +12,10 @@
 
 import type { Quat, V3 } from '../core/types';
 import type { Interactable, InteriorLayout } from '../data/interiors';
-import { clamp1, qRotInv } from './math';
 import { craftMass, type Craft, type World } from './state';
 import type { EventRing } from './events';
 import type { LedgerMean } from './jets';
-import { createHarnessBody, loadHarnessBody, saveHarnessBody, type HarnessBody } from './body';
+import { createHarnessBody, landedProperAccel, loadHarnessBody, localVertical, motionFromLedger, saveHarnessBody, type HarnessBody } from './body';
 
 /**
  * Collision radius of the body about its long axis, m: about half a person's shoulder depth-to-width. The
@@ -77,6 +76,11 @@ export interface ShipMotion {
   /** Angular velocity, rad/s, and angular acceleration, rad/s². */
   w: V3;
   alpha: V3;
+  /** Unit local vertical (away from the primary) and n² = μ/r³ (1/s²): W1-C item 9, for W2-E's tides. */
+  rhat?: V3;
+  n2?: number;
+  /** Upper bound of |d(felt)/dt| in the cabin, m/s³ (0 in wave 1: no slow forces yet). */
+  fDot?: number;
 }
 
 export interface CrewInput {
@@ -85,7 +89,9 @@ export interface CrewInput {
   moveZ: number;
 }
 
-export const createShipMotion = (): ShipMotion => ({ a: { x: 0, y: 0, z: 0 }, w: { x: 0, y: 0, z: 0 }, alpha: { x: 0, y: 0, z: 0 } });
+export const createShipMotion = (): ShipMotion => ({
+  a: { x: 0, y: 0, z: 0 }, w: { x: 0, y: 0, z: 0 }, alpha: { x: 0, y: 0, z: 0 }, rhat: { x: 0, y: 1, z: 0 }, n2: 0, fDot: 0,
+});
 
 export function createCrew(layout: InteriorLayout, shipId: string): CrewState {
   const s = layout.spawn;
@@ -97,44 +103,41 @@ export function createCrew(layout: InteriorLayout, shipId: string): CrewState {
 
 // ------------------------------------------------------------------------------------------------ the ship's motion
 
+const LI: V3 = { x: 0, y: 0, z: 0 };
+const LF: V3 = { x: 0, y: 0, z: 0 };
+const LT: V3 = { x: 0, y: 0, z: 0 };
+
 /**
- * Proper acceleration and rotation of a craft in its own axes, from its state and commands: main drive and RCS
- * (while there is propellant), the ground's push when it rests on a surface, torque through Euler's equations.
- * Aerodynamic and contact forces during flight are not included.
+ * Proper acceleration and rotation of a craft in its own axes, from what was actually applied (SIMULATION.md §1.4,
+ * W1-C 1): a = f̄/m and α = I⁻¹(τ̄ − ω × Iω) from the tick's consumed ledger mean (`mean`, dynamics.ts consumeLedger);
+ * without one, from the craft's own unconsumed accumulators (fAcc/accT, a peek that consumes nothing). Engines,
+ * jets, drag and the docked joint all reach the body this way; nothing is rebuilt from commands. Landed, the exact
+ * ground reaction −g + Ω×(Ω×r) (the ground co-rotates). Also the local vertical r̂ and n² = μ/r³ (item 9).
  */
 export function craftMotion(world: World, c: Craft, out: ShipMotion, mean?: LedgerMean | null): ShipMotion {
-  void mean; // W1-C fills: the motion from the tick's consumed ledger (body.ts motionFromLedger) replaces the rebuild below
   const a = out.a, al = out.alpha, w = c.w;
   a.x = a.y = a.z = 0;
   al.x = al.y = al.z = 0;
   out.w.x = w.x; out.w.y = w.y; out.w.z = w.z;
+  if (out.fDot !== undefined) out.fDot = 0;
+  const b = world.bodies[c.primary];
+  if (b) {
+    if (out.rhat) out.n2 = localVertical(c.rel, b.mu, c.q, out.rhat);
+    else out.n2 = 0;
+  }
   if (c.destroyed) return out;
   const m = craftMass(c);
   if (c.landedOn !== null) {
-    // Held up by the ground: the proper acceleration is minus gravity, so the crew feels the body's pull.
-    const b = world.bodies[c.primary], r = c.rel;
-    const d = Math.sqrt(r.x * r.x + r.y * r.y + r.z * r.z);
-    if (b && d > 0) {
-      const g = b.mu / (d * d * d);
-      qRotInv(a, c.q, r.x * g, r.y * g, r.z * g);
-    }
+    if (b) landedProperAccel(b.mu, c.rel, b.spinAxis, b.spinRate, c.q, a);
     return out;
   }
-  if (c.dockedTo !== null) return out; // the latch interlocks drive and RCS; the joint carries the attitude
-  if (c.propellant > 0) {
-    const thr = c.throttle > 1 ? 1 : c.throttle > 0 ? c.throttle : 0;
-    a.x = (clamp1(c.rcs.x) * c.rcsThrust) / m;
-    a.y = (clamp1(c.rcs.y) * c.rcsThrust) / m;
-    a.z = (clamp1(c.rcs.z) * c.rcsThrust - thr * c.mainThrust) / m;
-  }
   const g = c.gyration;
-  const Ix = m * g.x, Iy = m * g.y, Iz = m * g.z;
-  if (Ix > 0 && Iy > 0 && Iz > 0) {
-    al.x = (clamp1(c.torque.x) * c.maxTorque.x + (Iy - Iz) * w.y * w.z) / Ix;
-    al.y = (clamp1(c.torque.y) * c.maxTorque.y + (Iz - Ix) * w.z * w.x) / Iy;
-    al.z = (clamp1(c.torque.z) * c.maxTorque.z + (Ix - Iy) * w.x * w.y) / Iz;
-  }
-  return out;
+  LI.x = m * g.x; LI.y = m * g.y; LI.z = m * g.z;
+  if (mean) return motionFromLedger(mean.f, mean.tau, mean.T > 0 ? 1 : 0, m, LI, w, out);
+  const T = c.accT;
+  if (!(T > 0)) return motionFromLedger(c.fAcc, c.tauAcc, 0, m, LI, w, out);
+  LF.x = c.fAcc.x; LF.y = c.fAcc.y; LF.z = c.fAcc.z; LT.x = c.tauAcc.x; LT.y = c.tauAcc.y; LT.z = c.tauAcc.z;
+  return motionFromLedger(LF, LT, T, m, LI, w, out);
 }
 
 /** Acceleration felt at ship-local point (px,py,pz) by something moving at (vx,vy,vz) relative to the ship. */

@@ -428,7 +428,7 @@ const TO: ThrustOut = makeThrustOut();
 const EDGES = { on: 0, off: 0 };
 const DV = { x: 0, y: 0, z: 0 };
 const DW = { x: 0, y: 0, z: 0 };
-let _jets = false, _pw = false, _tq = false;
+let _jets = false, _main = false, _pw = false, _tq = false;
 
 /**
  * What the thrusters of c will do in its next step (into _jets, _pw, _tq): the jets fire when the craft is live, has
@@ -440,8 +440,10 @@ function thrustFlags(c: Craft, prop: number): void {
   const live = !c.destroyed, rc = c.rcs, tq = c.torque, ne = c.engines.length;
   const cmdF = rc.x !== 0 || rc.y !== 0 || rc.z !== 0, cmdT = tq.x !== 0 || tq.y !== 0 || tq.z !== 0;
   _jets = live && c.jets.length > 0 && c.rcsPropellant > 0 && (cmdF || cmdT);
+  // (a destroyed craft's lit engine still takes one step: the update that shuts it)
   let main = false;
-  if (live && ne > 0) main = engineActive(c.engineThrust, c.engineTimer, ne) || (prop > 0 && c.throttle >= c.engines[0].minThrottle);
+  if (ne > 0) main = engineActive(c.engineThrust, c.engineTimer, ne) || (live && prop > 0 && c.throttle >= c.engines[0].minThrottle);
+  _main = main;
   _pw = (_jets && cmdF) || main;
   _tq = _jets && cmdT;
 }
@@ -474,6 +476,14 @@ function thrustOver(c: Craft, jetsOn: boolean, mainOn: boolean): void {
     for (let i = 0; i < ne; i++) engineUpdate(defs[i], th, tm, i, mainOn, inp, EMEAN);
     applyEngines(defs, EMEAN, inp, TO);
   }
+}
+
+/** Σ of c.jetDuty[1..] (with [0] the caller's): 0 iff every duty is 0 (duties are ≥ 0). */
+function dutySum(c: Craft): number {
+  const jd = c.jetDuty;
+  let s = 0;
+  for (let j = 1; j < jd.length; j++) s += jd[j];
+  return s;
 }
 
 function restoreEngines(c: Craft): void {
@@ -556,64 +566,81 @@ export function integrateCraft(world: World, eph: Ephemeris, c: Craft, t0: numbe
     }
     let last = false;
     if (t + dt >= t1) { dt = t1 - t; last = true; if (why === WHY_FREE) why = cutWhy; }
-    const m0 = P.m;
-    const inp = fillInput(c, m0, dt);
-    if (nE > 0) {
-      // an ignition delay ends exactly on a step boundary
-      engineCutStep(c.engineTimer, nE, inp);
-      if (inp[IN_H] < dt) { dt = inp[IN_H]; last = false; why = WHY_THRUST; }
-    }
-    const mainOn = live && P.prop > 0;
-    thrustOver(c, jetsOn, mainOn);
-    // a pool that runs dry inside the step ends it there (the jets' output does not depend on h; the engines are redone)
-    let cut = dt;
-    if (TO.mdotRcs * dt > c.rcsPropellant) cut = c.rcsPropellant / TO.mdotRcs;
-    if (TO.mdotMain * dt > P.prop) { const k = P.prop / TO.mdotMain; if (k < cut) cut = k; }
-    if (cut < dt) {
-      dt = cut; last = false; why = WHY_THRUST;
-      inp[IN_H] = dt;
-      if (nE > 0) restoreEngines(c);
-      thrustOver(c, jetsOn, mainOn);
-    }
-    const lx = TO.fx, ly = TO.fy, lz = TO.fz;
-    const thrusting = lx !== 0 || ly !== 0 || lz !== 0;
-    const torquing = TO.tx !== 0 || TO.ty !== 0 || TO.tz !== 0;
-    if (thrusting) qRot(F0, c.q, lx, ly, lz);
-    const w = c.w;
-    if (torquing || w.x !== 0 || w.y !== 0 || w.z !== 0) {
-      _Tx = TO.tx; _Ty = TO.ty; _Tz = TO.tz;
-      const ns = rotateCraft(c, m0, dt, torquing);
-      if (ns > 1) { tally[WHY_ROTATION] += ns - 1; n += ns - 1; }
-    }
-    if (thrusting) {
-      // Thrust direction held over the step: the mean of the attitude before and after the rotation.
-      qRot(F1, c.q, lx, ly, lz);
-      const sx = F0.x + F1.x, sy = F0.y + F1.y, sz = F0.z + F1.z;
-      const sm = Math.sqrt(sx * sx + sy * sy + sz * sz);
-      const k = sm > 0 ? Math.sqrt(lx * lx + ly * ly + lz * lz) / sm : 0;
-      P.fx = sx * k; P.fy = sy * k; P.fz = sz * k;
-    } else {
+    const m0 = P.m, w = c.w;
+    if (!jetsOn && !_main && !P.inAtm) {
+      // Coasting: nothing fires (no jet commanded, no engine lit, spooling or about to light) and no air. The free step
+      // as before, plus the ledger's time (zero force over it).
+      if (w.x !== 0 || w.y !== 0 || w.z !== 0) {
+        const ns = rotateCraft(c, m0, dt, false);
+        if (ns > 1) { tally[WHY_ROTATION] += ns - 1; n += ns - 1; }
+      }
       P.fx = P.fy = P.fz = 0;
+      P.mdot = 0;
+      stepCoast(P, eph, t, dt);
+      c.accT += dt;
+      if (nJ > 0 && c.jetDuty[0] + dutySum(c) !== 0) {
+        for (let j = 0; j < nJ; j++) DUTY[j] = 0;
+        TO.pRatio = 1;
+        commitDuties(world, c, t);
+      }
+    } else {
+      const inp = fillInput(c, m0, dt);
+      if (nE > 0 && _main) {
+        // an ignition delay ends exactly on a step boundary
+        engineCutStep(c.engineTimer, nE, inp);
+        if (inp[IN_H] < dt) { dt = inp[IN_H]; last = false; why = WHY_THRUST; }
+      }
+      const mainOn = live && P.prop > 0;
+      thrustOver(c, jetsOn, mainOn);
+      // a pool that runs dry inside the step ends it there (the jets' output does not depend on h; the engines are redone)
+      let cut = dt;
+      if (TO.mdotRcs * dt > c.rcsPropellant) cut = c.rcsPropellant / TO.mdotRcs;
+      if (TO.mdotMain * dt > P.prop) { const k = P.prop / TO.mdotMain; if (k < cut) cut = k; }
+      if (cut < dt) {
+        dt = cut; last = false; why = WHY_THRUST;
+        inp[IN_H] = dt;
+        if (nE > 0) restoreEngines(c);
+        thrustOver(c, jetsOn, mainOn);
+      }
+      const lx = TO.fx, ly = TO.fy, lz = TO.fz;
+      const thrusting = lx !== 0 || ly !== 0 || lz !== 0;
+      const torquing = TO.tx !== 0 || TO.ty !== 0 || TO.tz !== 0;
+      if (thrusting) qRot(F0, c.q, lx, ly, lz);
+      if (torquing || w.x !== 0 || w.y !== 0 || w.z !== 0) {
+        _Tx = TO.tx; _Ty = TO.ty; _Tz = TO.tz;
+        const ns = rotateCraft(c, m0, dt, torquing);
+        if (ns > 1) { tally[WHY_ROTATION] += ns - 1; n += ns - 1; }
+      }
+      if (thrusting) {
+        // Thrust direction held over the step: the mean of the attitude before and after the rotation.
+        qRot(F1, c.q, lx, ly, lz);
+        const sx = F0.x + F1.x, sy = F0.y + F1.y, sz = F0.z + F1.z;
+        const sm = Math.sqrt(sx * sx + sy * sy + sz * sz);
+        const k = sm > 0 ? Math.sqrt(lx * lx + ly * ly + lz * lz) / sm : 0;
+        P.fx = sx * k; P.fy = sy * k; P.fz = sz * k;
+      } else {
+        P.fx = P.fy = P.fz = 0;
+      }
+      P.mdot = TO.mdotRcs + TO.mdotMain;
+      const forced = thrusting || P.inAtm;
+      if (forced) stepForced(P, b, eph, t, dt);
+      else stepCoast(P, eph, t, dt);
+      if (TO.mdotMain > 0) { P.prop -= TO.mdotMain * dt; if (P.prop < 1e-9) P.prop = 0; }
+      if (TO.mdotRcs > 0) { const r = c.rcsPropellant - TO.mdotRcs * dt; c.rcsPropellant = r < 1e-9 ? 0 : r; }
+      P.m = c.dryMass + P.prop + c.rcsPropellant;
+      // The ledger: what was applied over this step, craft axes — the thrusters' force and torque, plus the RK4-weighted
+      // mean drag force rotated by the attitude at the end of the step (the snapshot its readers see).
+      if (forced && (P.dfx !== 0 || P.dfy !== 0 || P.dfz !== 0)) {
+        qRotInv(DV, c.q, P.dfx, P.dfy, P.dfz);
+        TO.fx += DV.x; TO.fy += DV.y; TO.fz += DV.z;
+      }
+      ledgerAdd(c, TO, inp);
+      if (forced) {
+        const fx = TO.fx, fy = TO.fy, fz = TO.fz;
+        P.load = Math.sqrt(fx * fx + fy * fy + fz * fz) / m0;
+      }
+      commitDuties(world, c, t);
     }
-    P.mdot = TO.mdotRcs + TO.mdotMain;
-    const forced = thrusting || P.inAtm;
-    if (forced) stepForced(P, b, eph, t, dt);
-    else stepCoast(P, eph, t, dt);
-    if (TO.mdotMain > 0) { P.prop -= TO.mdotMain * dt; if (P.prop < 1e-9) P.prop = 0; }
-    if (TO.mdotRcs > 0) { const r = c.rcsPropellant - TO.mdotRcs * dt; c.rcsPropellant = r < 1e-9 ? 0 : r; }
-    P.m = c.dryMass + P.prop + c.rcsPropellant;
-    // The ledger: what was applied over this step, craft axes — the thrusters' force and torque, plus the RK4-weighted
-    // mean drag force rotated by the attitude at the end of the step (the snapshot its readers see).
-    if (forced && (P.dfx !== 0 || P.dfy !== 0 || P.dfz !== 0)) {
-      qRotInv(DV, c.q, P.dfx, P.dfy, P.dfz);
-      TO.fx += DV.x; TO.fy += DV.y; TO.fz += DV.z;
-    }
-    ledgerAdd(c, TO, inp);
-    if (forced) {
-      const fx = TO.fx, fy = TO.fy, fz = TO.fz;
-      P.load = Math.sqrt(fx * fx + fy * fy + fz * fz) / m0;
-    }
-    commitDuties(world, c, t);
     t = last ? t1 : t + dt;
     n++;
     tally[why]++;

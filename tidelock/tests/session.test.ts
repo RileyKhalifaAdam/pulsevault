@@ -85,13 +85,17 @@ describe('session on the physical world', () => {
 
     const f0 = s.flight();
     const body = s.bodies().find((b) => b.id === f0.primaryId)!.def;
-    const r0 = f0.altitude + body.radius, v0 = f0.speed, apo0 = f0.apoapsisAlt, m0 = s.player().mass;
+    const r0 = f0.altitude + body.radius, v0 = f0.speed, apo0 = f0.apoapsisAlt, m0 = s.player().mass, p0 = s.player().propellant;
     s.setControls({ throttle: 1 });
     run(s, 20);
     s.setControls({ throttle: 0 });
     run(s, 0.1);
     // Rocket equation for the propellant that went, vis-viva for the orbit it buys.
-    const m1 = m0 - (STATS.mainThrust / STATS.exhaustVelocity) * 20;
+    // W1-B hook: the drive lights after a 0.5 s ignition delay, spools up with τ 0.8 s and down with τ 0.3 s (the tail
+    // goes on after these 0.1 s); the hold's corrections burn the RCS pool, not this one.
+    const burnT = 19.5 - 0.8 * (1 - Math.exp(-19.5 / 0.8)) + 0.3 * (1 - Math.exp(-0.1 / 0.3));
+    expect(p0 - s.player().propellant).toBeCloseTo((STATS.mainThrust / STATS.exhaustVelocity) * burnT, 1);
+    const m1 = m0 - (p0 - s.player().propellant);
     const dv = STATS.exhaustVelocity * Math.log(m0 / m1);
     const a = 1 / (2 / r0 - ((v0 + dv) * (v0 + dv)) / body.mu);
     const expected = 2 * a - r0 - body.radius - apo0;
@@ -99,7 +103,7 @@ describe('session on the physical world', () => {
     const rise = f1.apoapsisAlt - apo0;
     expect(expected).toBeGreaterThan(100e3);
     expect(Math.abs(rise / expected - 1)).toBeLessThan(0.02);
-    expect(s.player().mass).toBeCloseTo(m1, 0);
+    expect(s.player().mass).toBeCloseTo(m1, -1); // W1-B hook: less the RCS the hold spent (a few kg)
     expect(progradeError(s)).toBeLessThan(0.05);
 
     // Converged hold: no torque demand, so nothing holds time acceleration down.
@@ -115,15 +119,15 @@ describe('session on the physical world', () => {
     // …the nose stays near prograde round the orbit (loosely, under time acceleration)…
     run(s, 2);
     expect(s.time()).toBeGreaterThan(3900);
-    expect(progradeError(s)).toBeLessThan(0.35);
+    expect(progradeError(s)).toBeLessThan(0.035); // W1-B hook: one deadband (0.03 rad) at every warp
     s.warpDown();
     expect(s.warp().requested).toBe(100);
     s.setWarp(1);
     run(s, 1);
     expect(s.warp().achieved).toBeCloseTo(1, 6);
-    // …and is brought back onto it with real torque once time runs at 1x again.
+    // …and stays on it at 1x, inside the same deadband (W1-B hook: no special law for time acceleration).
     run(s, 20);
-    expect(progradeError(s)).toBeLessThan(0.01);
+    expect(progradeError(s)).toBeLessThan(0.035);
   });
 
   it('one simulated day at 100 000x leaves the orbit as it was', () => {
@@ -378,7 +382,7 @@ describe('the pilot, hands on the physical controls', () => {
 
     // drive safe: the lever moves, the valves stay shut
     const lever = idOf(s, 'throttle');
-    const m0 = s.player().mass;
+    const m0 = s.player().mass, p0 = s.player().propellant;
     expect(s.grabDevice(lever, 7)).toBe(true);
     expect(s.grabDevice(lever, 8)).toBe(false); // one hand to a control
     s.moveDevice(7, 1, 0);
@@ -387,7 +391,7 @@ describe('the pilot, hands on the physical controls', () => {
     expect(dev(s, 'throttle').held).toBe(true);
     expect(s.player().throttle).toBe(0);
     expect(s.flight().accel).toBeLessThan(1e-6);
-    expect(s.player().mass).toBe(m0);
+    expect(s.player().propellant).toBe(p0); // W1-B hook: the main valves stay shut (the hold's jets burn the RCS pool)
     s.moveDevice(7, 0, 0);
     run(s, 1);
     s.releaseDevice(7);
@@ -409,12 +413,13 @@ describe('the pilot, hands on the physical controls', () => {
     run(s, 20 - 1 / 60);
     expect(s.player().throttle).toBe(1);
     expect(dev(s, 'throttle').lit).toBe(true);
-    expect(s.crew().felt.z).toBeCloseTo(s.player().maxAccel, 4); // pressed into the seat
+    // pressed into the seat (W1-B hook: the pods are canted 0.73° so the thrust passes through the CoM)
+    expect(s.crew().felt.z).toBeCloseTo(s.player().maxAccel * Math.cos(Math.atan2(0.2, 15.6)), 4);
     s.moveDevice(7, 0, 0);
     run(s, 1);
     s.releaseDevice(7);
     expect(s.player().throttle).toBe(0);
-    const m1 = m0 - (STATS.mainThrust / STATS.exhaustVelocity) * 20;
+    const m1 = m0 - (p0 - s.player().propellant); // W1-B hook: what the spooled drive actually burned (lever travel, delay, spool)
     const dv = STATS.exhaustVelocity * Math.log(m0 / m1);
     const a = 1 / (2 / r0 - ((v0 + dv) * (v0 + dv)) / body.mu);
     const expected = 2 * a - r0 - body.radius - apo0;
@@ -437,6 +442,7 @@ describe('the pilot, hands on the physical controls', () => {
     tap(s, 'driveArm');
     expect(dev(s, 'driveArm').lit).toBe(false);
     expect(s.player().throttle).toBe(0);
+    run(s, 4); // W1-B hook: the shut-down tail (τ 0.3 s) runs out at exactly zero thrust after τ·ln(F/ε) ≈ 3.9 s
     expect(s.flight().accel).toBeLessThan(1e-6);
     // save / load keeps the controls where they were
     const again = loadSession(s.save(), FREE)!;
@@ -624,10 +630,11 @@ describe('the pilot, hands on the physical controls', () => {
     expect(tUp).toBeLessThan(6.5); // 1 m/s² of RCS
     const drift = speedRel(s);
     expect(drift).toBeGreaterThan(4.9);
-    const p0 = s.player().propellant;
+    const p0 = s.player().propellant, r0 = s.flight().rcsPropellant; // W1-B hook: the RCS has its own (hydrazine) pool
     run(s, 10);
     expect(Math.abs(speedRel(s) - drift)).toBeLessThan(0.02); // off: nobody touches it
     expect(s.player().propellant).toBe(p0);
+    expect(s.flight().rcsPropellant).toBe(r0);
     expect(quiet(s)).toBe(true);
     // on: the computer stops the ship relative to the station
     tap(s, 'flightAssist');
@@ -638,13 +645,14 @@ describe('the pilot, hands on the physical controls', () => {
     const tStop = 0.3 + until(s, () => speedRel(s) < 0.1, 30);
     console.log(`flight assist: 5 m/s sideways nulled to < 0.1 m/s in ${tStop.toFixed(1)} s`);
     expect(tStop).toBeLessThan(8);
-    expect(s.player().propellant).toBeLessThan(p0);
+    expect(s.flight().rcsPropellant).toBeLessThan(r0); // W1-B hook
+    expect(s.player().propellant).toBe(p0);
     run(s, 6);
     expect(speedRel(s)).toBeLessThan(0.06);
     expect(quiet(s)).toBe(true); // inside the dead-band: no chatter
-    const p1 = s.player().propellant;
+    const p1 = s.flight().rcsPropellant;
     run(s, 5);
-    expect(s.player().propellant).toBe(p1);
+    expect(s.flight().rcsPropellant).toBe(p1);
     // off again by the same button
     tap(s, 'flightAssist');
     expect(dev(s, 'flightAssist').lit).toBe(false);
@@ -729,14 +737,15 @@ describe('the pilot, hands on the physical controls', () => {
     expect(s.player().propellant).toBe(p0);
     expect(s.player().throttle).toBe(0);
     expect(v0).toBeDefined();
-    // a craft target is a reference at any range: the assist wakes up
+    // W1-B hook (SIMULATION.md W1-B 8): a targeted craft is a reference only within 100 km and in sight, so targeting
+    // the Wheel from 500 km changes nothing
     s.setTarget(START_STATION_ID);
     run(s, 0.2);
-    expect(s.player().assist).toBe('on');
-    expect(dev(s, 'flightAssist').lit).toBe(true);
-    // and the latch is saved
+    expect(s.player().assist).toBe('noRef');
+    expect(s.player().propellant).toBe(p0);
+    // and the latch is saved (latched on, still no reference)
     const again = loadSession(s.save(), FREE)!;
-    expect(again.player().assist).toBe('on');
+    expect(again.player().assist).toBe('noRef');
   });
 });
 
@@ -1012,30 +1021,36 @@ describe('the spine: budget, prediction slices, perf honesty, autosave (W1-A)', 
   });
 
   it('no frame spends more than 0.5 ms in the predictor (node); hidden, it does nothing', () => {
-    const s = createSession({ budgetMs: 1e9 });
-    const probe = s as unknown as { runPrediction(): void };
-    const frame = (): number => {
-      s.setPredictionVisible(false);
-      s.step(1 / 60);
-      s.setPredictionVisible(true);
-      const a = performance.now();
-      probe.runPrediction();
-      return performance.now() - a;
-    };
-    // warm every path (JIT) and learn the cost per step: a restart, a burn edit, a hold
-    for (let i = 0; i < 600; i++) { if (i === 100) s.addBurn(s.time() + 600, { radial: 1 }); if (i === 300) s.clearBurns(); frame(); }
-    let worst = 0, sum = 0;
-    for (let i = 0; i < 1200; i++) {
-      if (i === 300) s.addBurn(s.time() + 900, { prograde: 15 }); // a disturbance: restart in slices
-      if (i === 600) s.setHold('prograde');
-      const ms = frame();
-      sum += ms;
-      if (ms > worst) worst = ms;
+    // three passes; the best pass's worst frame counts (a loaded test machine stalls any one frame now and then)
+    let best = Infinity, mean = 0;
+    let s = createSession({ budgetMs: 1e9 });
+    for (let pass = 0; pass < 3; pass++) {
+      s = createSession({ budgetMs: 1e9 });
+      const probe = s as unknown as { runPrediction(): void };
+      const frame = (): number => {
+        s.setPredictionVisible(false);
+        s.step(1 / 60);
+        s.setPredictionVisible(true);
+        const a = performance.now();
+        probe.runPrediction();
+        return performance.now() - a;
+      };
+      // warm every path (JIT) and learn the cost per step: a restart, a burn edit, a hold
+      for (let i = 0; i < 600; i++) { if (i === 100) s.addBurn(s.time() + 600, { radial: 1 }); if (i === 300) s.clearBurns(); frame(); }
+      let worst = 0, sum = 0;
+      for (let i = 0; i < 1200; i++) {
+        if (i === 300) s.addBurn(s.time() + 900, { prograde: 15 }); // a disturbance: restart in slices
+        if (i === 600) s.setHold('prograde');
+        const ms = frame();
+        sum += ms;
+        if (ms > worst) worst = ms;
+      }
+      if (worst < best) { best = worst; mean = sum / 1200; }
+      expect(s.prediction().events.some((e) => e.kind === 'burn')).toBe(true);
     }
-    console.log(`predictor per frame: mean ${(sum / 1200 * 1000).toFixed(1)} µs, worst ${(worst * 1000).toFixed(0)} µs`);
-    expect(worst).toBeLessThan(0.5 * 1.2); // 0.4 ms of steps by the learnt cost + start/hand-over; 20% for vitest jitter
-    expect(sum / 1200).toBeLessThan(0.1);
-    expect(s.prediction().events.some((e) => e.kind === 'burn')).toBe(true);
+    console.log(`predictor per frame: mean ${(mean * 1000).toFixed(1)} µs, worst ${(best * 1000).toFixed(0)} µs (best of 3 passes)`);
+    expect(best).toBeLessThan(0.5); // 0.4 ms of steps by the learnt cost + the start and the hand-over
+    expect(mean).toBeLessThan(0.05);
     // hidden: the view stays as it was
     const v = s.prediction().version;
     s.setPredictionVisible(false);
