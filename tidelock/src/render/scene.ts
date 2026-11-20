@@ -2478,8 +2478,10 @@ const AUTO_EXPOSURE = { key: 0.16, minEv: -2.5, maxEv: 3, compensation: 0 };
  * readable; inside, the cabin lamps are baked at a few hundred lux while direct starlight through a window is
  * tens of thousands. sunGain puts the light through the windows back above the lamps (a sun patch reads several
  * stops brighter than a lamp-lit wall, as a camera sees it; the cabin's auto exposure then meters the mix).
+ * 8 (three stops; measured in the lounge: a lamp-lit rug at 84/255 reads 234/255 in the patch, traced or
+ * shadow-mapped alike). At 1 the patch was within a few per cent of the lamps and read as no sun at all.
  */
-export const interiorLight = { sunGain: 1 };
+export const interiorLight = { sunGain: 8 };
 /** GPU memory budget of the whole page on an iPhone 15 (docs/ARCHITECTURE.md §4), bytes. */
 const MEMORY_BUDGET = 300 * 1048576;
 

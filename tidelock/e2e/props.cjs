@@ -59,6 +59,8 @@ async function run() {
   try {
     await page.goto(`${baseUrl}/index.html?q=low&fresh=1`);
     await page.waitForFunction(() => window.__ready === true, null, { timeout: 240000 });
+    const programs = () => f.evaluate(() => window.__tidelock.pipeline.renderer.info.programs.length);
+    const prog0 = await programs();
     const h = await fingers(page);
     const vw = page.viewportSize();
     await h.tapAt(vw.width / 2, vw.height * 0.45);
@@ -100,10 +102,15 @@ async function run() {
     // ---- throw: a quick flick up and let go
     // (the finger keeps moving as it lifts: the last move and the lift go out together, so no idle frame of the
     // software renderer comes between them — on the phone the finger moves every frame until it leaves the glass)
+    // (the app's own frames are held meanwhile — a software-rendered frame takes far longer than the clamped
+    // 0.1 s it simulates, so idle frames between two CDP touches would read as the hand stopping; the test steps
+    // the session itself, one frame per finger sample, as the phone's 60 Hz touch events do)
     const crew0 = (await mug(f)).crewV;
+    await f.evaluate(() => { window.__tidelock.hooks.holdSim = true; });
     for (let i = 0; i < 5; i++) { await h.move(3, cx + 60 + 12 * (i + 1), cy - 84 - 30 * (i + 1)); await pump(f, 1); }
     await Promise.all([h.move(3, cx + 60 + 12 * 6, cy - 84 - 30 * 6), h.up(3)]);
     await pump(f, 1);
+    await f.evaluate(() => { window.__tidelock.hooks.holdSim = false; });
     const m3 = await mug(f);
     const speed = m3 && m3.v ? Math.hypot(m3.v.x, m3.v.y, m3.v.z) : 0;
     const crewDv = Math.hypot(m3.crewV.x - crew0.x, m3.crewV.y - crew0.y, m3.crewV.z - crew0.z);
@@ -141,6 +148,8 @@ async function run() {
     await shot('3-landed');
     s = await st(f);
     check(!s.err && !s.destroyed, 'no error panel, ship intact');
+    const prog1 = await programs();
+    check(prog1 <= prog0, `every shader program was compiled while loading (${prog0} before the tap, ${prog1} after the walk, the grab and the throw)`);
   } catch (err) {
     fail.push(String((err && err.stack) || err));
     console.log(String((err && err.stack) || err));

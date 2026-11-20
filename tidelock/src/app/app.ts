@@ -64,6 +64,9 @@ function hasWebGL2(): boolean {
   }
 }
 
+/** Hooks for the end-to-end checks only (e2e/*.cjs); nothing in the game sets them. */
+const testHooks = { holdSim: false };
+
 export async function boot(): Promise<void> {
   const params = new URLSearchParams(location.search);
   const bootEl = document.getElementById('boot');
@@ -482,7 +485,8 @@ export async function boot(): Promise<void> {
       let simMs = 0;
       let steps = 0;
       if (running) {
-        const info = session.step(dt);
+        // (e2e hook: while holdSim is set the test drives the clock itself, session.step per pumped frame)
+        const info = session.step(testHooks.holdSim ? 0 : dt);
         simMs = info.simMs;
         steps = info.steps;
         input?.update(dt);
@@ -581,6 +585,7 @@ export async function boot(): Promise<void> {
     input,
     get screen() { return current; },
     frame,
+    hooks: testHooks,
   };
   w.__ready = true;
 }

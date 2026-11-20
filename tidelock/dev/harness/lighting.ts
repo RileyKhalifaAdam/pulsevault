@@ -11,6 +11,7 @@
 //          corridor   in the corridor looking forward through the lounge door (room culling)
 //          cargo      in the cargo bay looking forward
 //          dark       the lounge view with the cabin lights off
+//          sofa       the star high to starboard: through the big window onto the red sofa
 //   sx sy sz            star direction override, ship-local      nx ny nz   planet (nadir) direction override
 //   ex ey ez            eye override, ship-local m               yaw pitch  look override, deg
 //   lights=0|1          cabin lights          q=low|medium|high|ultra      interior=proxy (default) | real
@@ -96,6 +97,8 @@ const PRESETS: Record<string, Preset> = {
   dark: { ...lounge, lights: false },
   sunny,
   night: { ...sunny, sun: { x: 0.2, y: -0.95, z: 0.2 }, lights: true },
+  // the star high on the starboard side: through the big window over the sofa back onto the red seat
+  sofa: { eye: { x: -1.0, y: 0.62, z: -6.2 }, yaw: -70, pitch: -14, nadir: { x: 0.6, y: -0.75, z: 0.2 }, sun: { x: 0.75, y: 0.62, z: -0.15 }, lights: true },
 };
 const preset = PRESETS[view] ?? lounge;
 const eye: V3 = { x: num('ex', preset.eye.x), y: num('ey', preset.eye.y), z: num('ez', preset.eye.z) };
@@ -382,6 +385,7 @@ function propViewsNow(): readonly PropView[] {
 async function main(): Promise<void> {
   const t0 = performance.now();
   if (has('sungain')) interiorLight.sunGain = num('sungain', interiorLight.sunGain);
+  (window as unknown as { __lighting: unknown }).__lighting = { scene, pipeline, interiorLight };
   scene.setRayTracing(rtTier);
   // fx=SBR: per-effect switches of the tracer (sun, bounce, reflections), e.g. fx=100 for the sun alone
   const fxp = params.get('fx');

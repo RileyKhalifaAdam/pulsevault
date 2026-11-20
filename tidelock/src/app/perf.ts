@@ -12,7 +12,7 @@ const N = 240;
  */
 const OVER_MS = 17;
 const UNDER_MS = 12;
-/** The 60 fps frame budget, and the 30 fps one used while ray tracing at medium / high (the owner's choice). */
+/** The 60 fps frame budget, and the 30 fps one used while ray tracing at High (the owner's choice). */
 export const BUDGET_60 = 1000 / 60;
 export const BUDGET_30 = 1000 / 30;
 const VSYNC_MS = 17.4;
@@ -40,7 +40,7 @@ const RT_UNDER_SECONDS = 30;
 const RT_RETRY_SECONDS = 180;
 /** Frame budget the resolution controller works to for a ray-tracing tier. */
 export function frameBudgetFor(rt: RtTier): number {
-  return rt === 'high' || rt === 'medium' ? BUDGET_30 : BUDGET_60;
+  return rt === 'high' ? BUDGET_30 : BUDGET_60;
 }
 
 // ---------------------------------------------------------------------------------------------- tiers
@@ -284,7 +284,7 @@ export class PerfMonitor {
   autoTier = true;
   /**
    * Frame budget the resolution / tier controller works to, ms: 16.7 (60 fps) normally, 33.3 while ray tracing at
-   * medium or high (the owner's ~30 fps choice). The thresholds scale with it.
+   * High (the owner's ~30 fps choice). The thresholds scale with it.
    */
   budgetMs = BUDGET_60;
   /** Free-form lines for the report (device, renderer). */

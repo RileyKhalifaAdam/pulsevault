@@ -210,7 +210,9 @@ describe('contact', () => {
     const vnAfter = ship.relV.y - st.relV.y;
     console.log(`impact: normal speed -3 -> ${vnAfter.toFixed(3)} m/s, momentum error ${(len(sub(p1, p0)) / (3 * m)).toExponential(2)}, KE ${k0.toFixed(0)} -> ${ke().toFixed(0)} J, hull ${ship.hull.toFixed(4)}`);
     expect(len(sub(p1, p0)) / (3 * m)).toBeLessThan(1e-6);
-    expect(vnAfter / 3).toBeCloseTo(RESTITUTION, 2);
+    // the centre's rebound: with the hull's own inertia (compoundGyration, a small roll moment) the manifold's
+    // off-centre points turn part of the friction impulse into spin, so the centre comes off within 1.5 % of e
+    expect(Math.abs(vnAfter / 3 - RESTITUTION)).toBeLessThan(0.015);
     expect(ke()).toBeLessThan(k0);
     expect(len(ship.w)).toBeGreaterThan(0); // friction on the slide spins the ship
     expect(ship.hull).toBeLessThan(1);

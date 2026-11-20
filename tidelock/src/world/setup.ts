@@ -6,6 +6,7 @@ import { cross, norm, qFromTo, qFromAxisAngle, qMul, qRotate, Y_AXIS, X_AXIS, do
 import { elementsToState } from '../sim/orbit';
 import { STATION_LAYOUTS } from '../data/stationLayouts';
 import { DEFAULT_MAX_LOAD } from './atmosphere';
+import { compoundGyration, hullCompound } from './compound';
 import { bodyIndex, type Body, type Craft, type CraftKind, type World } from './state';
 
 /** Body steps per shortest orbital period. */
@@ -76,9 +77,13 @@ export function addCraft(world: World, def: CraftDef): Craft {
   const b = world.bodies[p];
   const R = def.radius;
   const s = def.size;
-  const gyration = s
-    ? { x: (s.y * s.y + s.z * s.z) / 12, y: (s.x * s.x + s.z * s.z) / 12, z: (s.x * s.x + s.y * s.y) / 12 }
-    : { x: 0.4 * R * R, y: 0.4 * R * R, z: 0.4 * R * R };
+  // the hull's own shape (its collision compound as a uniform solid) when it has one, else the layout's box
+  const hull = (def.kind ?? 'ship') === 'ship' ? hullCompound(def.shipVisual ?? null) : null;
+  const gyration = hull
+    ? compoundGyration(hull, { x: 0, y: 0, z: 0 })
+    : s
+      ? { x: (s.y * s.y + s.z * s.z) / 12, y: (s.x * s.x + s.z * s.z) / 12, z: (s.x * s.x + s.y * s.y) / 12 }
+      : { x: 0.4 * R * R, y: 0.4 * R * R, z: 0.4 * R * R };
   const alpha = def.maxAngularAccel ?? 0;
   const dragArea = def.dragArea ?? 0;
   const c: Craft = {
