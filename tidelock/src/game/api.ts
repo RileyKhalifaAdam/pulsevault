@@ -6,8 +6,11 @@
 import type { EventBus } from '../core/events';
 import type { BodyDef, Quat, ShipVisualId, StationVisualId, SystemDef, V3 } from '../core/types';
 import type { PropView } from '../world/props';
+import type { SimEvent } from '../world/events';
+import type { EngineDef, JetDef } from '../world/jets';
+import type { DutyTape } from '../world/dutyTape';
 
-export type { PropView };
+export type { PropView, SimEvent, JetDef, EngineDef, DutyTape };
 
 /** Attitude hold: a controller that commands real torque toward a direction. It never sets orientation. */
 export type HoldMode =
@@ -29,7 +32,7 @@ export type HoldMode =
  * (they are simulated at full rate, so time can only go as fast as the CPU budget lets them; asleep they cost
  * nothing and never limit it).
  */
-export type WarpLimit = '' | 'thrust' | 'rotation' | 'contact' | 'atmosphere' | 'proximity' | 'cpu' | 'docked' | 'crew' | 'props';
+export type WarpLimit = '' | 'thrust' | 'rotation' | 'contact' | 'atmosphere' | 'proximity' | 'cpu' | 'docked' | 'crew' | 'props' | 'capture' | 'venting' | 'systems';
 
 export interface StepInfo {
   /** Sim seconds actually covered by this call. */
@@ -38,6 +41,8 @@ export interface StepInfo {
   simMs: number;
   /** Integration steps taken (bodies + craft). */
   steps: number;
+  /** Work units the budget counted (SIMULATION.md §1.2.1; perf.ts keeps ms per unit). */
+  units: number;
   limitedBy: WarpLimit;
 }
 
@@ -86,6 +91,20 @@ export interface CraftView {
   dockedTo: string | null;
   /** Bounding radius, m. */
   radius: number;
+  // ---- wave 1 (SIMULATION.md §1.4): records of what the world actually applied, never commands ----
+  /** Angular velocity, craft axes, rad/s (the renderer extrapolates attitude by it, §1.3). */
+  w: V3;
+  /** Duty each RCS jet applied over the last step, 0..1, in `jets` order (0 when landed, docked or dry). */
+  jetDuty: Float64Array;
+  /** Thrust state of each main engine as a fraction of its maximum, F_s/F_max, in `engines` order. */
+  engineLevel: Float64Array;
+  /** Air-relative velocity u = v_rel − ω_body × r_rel, inertial axes, m/s (zero outside air). */
+  airVelocity: V3;
+  /** Instantaneous stagnation heat flux, W/m². */
+  heatFlux: number;
+  /** The craft's RCS jets and main engines (fixed per craft, rebuilt at load; empty for stations). Do not modify. */
+  jets: readonly JetDef[];
+  engines: readonly EngineDef[];
 }
 
 export type Situation = 'docked' | 'landed' | 'orbit' | 'suborbital' | 'escape' | 'atmosphere' | 'destroyed';
@@ -115,6 +134,15 @@ export interface FlightView {
   /** Air density, kg/m³, and dynamic pressure, Pa (0 in vacuum). */
   airDensity: number;
   dynamicPressure: number;
+  /**
+   * The IMU reading: specific force f = −felt at the IMU (ShipLayout.imuPos, under the cockpit deck), craft axes,
+   * m/s². What an accelerometer there measures: thrust, drag, contact and the rotation's centripetal and Euler terms;
+   * zero in free fall.
+   */
+  specificForce: V3;
+  /** RCS (hydrazine) pool and its capacity, kg. `PlayerView.propellant` is the main (LH2) pool. */
+  rcsPropellant: number;
+  rcsPropellantCapacity: number;
 }
 
 export interface PlayerView {
@@ -238,8 +266,12 @@ export interface SessionEvents {
 
 export interface SessionOptions {
   seed?: number;
-  /** Per-frame simulation budget, ms (default 3). */
+  /** Per-frame simulation budget, ms (default 3; Session.setBudget changes it). */
   budgetMs?: number;
+  /** Wall clock for the budget (default performance.now). The world never reads it: only how much fits in a frame. */
+  now?: () => number;
+  /** Pin the cost per work unit, ms (tests and benchmarks; default: learnt from 2 s means of the wall clock). */
+  unitMs?: number;
 }
 
 export interface Session {
@@ -248,7 +280,21 @@ export interface Session {
 
   /** Advance the world by one rendered frame of `realDt` seconds at the requested time acceleration. */
   step(realDt: number): StepInfo;
+  /** Sim time of the latest tick state the views hold, s (= tick / 120). */
   time(): number;
+  /** The world's tick index (SIMULATION.md §1.3: Q = 1/120 s). */
+  tick(): number;
+  /** The per-frame simulation budget, ms: 3 awake, 8 asleep with the eyes closed (SIMULATION.md §1.2.1). */
+  setBudget(ms: number): void;
+  /** The cost estimate the budget counts work units with, ms per unit (from 2 s means of the wall clock). */
+  costPerUnit(): number;
+  /** The page was hidden for this many real seconds: catch up on it (at most one sim day) under honest warp (D6). */
+  catchUp(realSeconds: number): void;
+  /**
+   * Whether anything shows the predicted path (a NAV screen or the hologram in view, the pilot awake). The predictor
+   * works only while it is (≤ 0.3 ms slices, SIMULATION.md W1-A 3); hidden, it costs nothing and resumes when seen.
+   */
+  setPredictionVisible(on: boolean): void;
 
   warp(): WarpView;
   setWarp(multiplier: number): void;
@@ -285,6 +331,21 @@ export interface Session {
   reset(): void;
   save(): string;
 
+  // ---- wave 1: senses read what the world recorded (SIMULATION.md §1.4) ------------------------------------
+  /**
+   * Hand every discrete world event since the last call (contacts, jet edges, boots, detents, latch…; the event
+   * ring of src/world/events.ts) to `cb`, oldest first; returns how many. Output only: draining never changes the
+   * simulation. Call once per frame. The record is reused: read it inside the callback.
+   */
+  drainEvents(cb: (e: SimEvent, seq: number) => void): number;
+  /** The per-tick applied jet duties of the player (slot 0) and nearby craft, for the RCS puffs (output only). */
+  dutyTape(): DutyTape;
+  /**
+   * The sim time this frame shows, s: time() plus the fraction of a tick the renderer extrapolates the views by
+   * (§1.3: 0 ≤ frameTime() − time() < 1/120 s at 1×; 0 under warp).
+   */
+  frameTime(): number;
+
   // ---- the pilot as a body inside the ship ---------------------------------------------------------------
   /** 'helm': strapped into the pilot seat, flying. 'onFoot': a body moving inside the ship. */
   mode(): PlayerMode;
@@ -297,6 +358,11 @@ export interface Session {
   addLook(dYaw: number, dPitch: number): void;
   /** Magnetic boots: on = feet grip any deck within reach; off = float free. */
   setBoots(on: boolean): void;
+  /**
+   * Lean (the pinch, W1-C): how far the torso flexes toward where the pilot looks, 0 (upright) … 1 (the posture's
+   * limit). A target for the body's own force-limited lean, never a set eye position; latched per tick.
+   */
+  setLean(amount: number): void;
   /** Jump from the deck, or push off whatever surface is within reach when floating, along the look direction. */
   pushOff(): void;
   /** Use the interactable currently in reach (CrewView.prompt). False when there is none. */
@@ -337,6 +403,11 @@ export interface CrewView {
   prompt: { id: string; kind: string; label: string } | null;
   /** True while asleep in the bunk (time is being accelerated until woken). */
   asleep: boolean;
+  /**
+   * The eye's displacement by the body (harness, torso and head springs, lean, gait), ship axes, m: already
+   * included in `eye`; the view never tilts with it (the vestibulo-ocular reflex holds gaze). W1-C writes it.
+   */
+  eyeOffset: V3;
 }
 
 // ---- physical controls (no on-screen flight UI) -------------------------------------------------------------

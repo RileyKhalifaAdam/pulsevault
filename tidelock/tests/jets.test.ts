@@ -47,7 +47,7 @@ const ALBATROSS_ROLL_JETS = [
   { pos: v(14.5, -0.26, 9.775), dir: v(0, -1, 0) },
   { pos: v(-14.5, -0.26, 9.775), dir: v(0, -1, 0) },
 ];
-const WREN_JETS = jetsFromLayout([...SHIP_LAYOUTS.wren.rcs, ...WREN_Z_JETS]);
+const WREN_JETS = jetsFromLayout(SHIP_LAYOUTS.wren.rcs); // the 10 old jets, then the 4 Z jets (checked below)
 const T = buildJetTable(WREN_JETS, ZERO);
 const ENGINES = SHIP_LAYOUTS.wren.engines.map((e) => engineDef(e.pos, ZERO));
 
@@ -164,23 +164,34 @@ describe('jet geometry and the allocation table', () => {
   });
 });
 
-describe('every hull: torque authority on all six torque columns (D3)', () => {
+describe('every hull: authority on all twelve columns (D3)', () => {
   const hulls = Object.keys(SHIP_LAYOUTS) as (keyof typeof SHIP_LAYOUTS)[];
-  const extra: Record<string, { pos: V3; dir: V3 }[]> = { wren: WREN_Z_JETS, albatross: ALBATROSS_ROLL_JETS };
   const cols = (m: number) => Array.from({ length: 12 }, (_, k) => (m >> k) & 1 ? ['+Fx', '-Fx', '+Fy', '-Fy', '+Fz', '-Fz', '+τx', '-τx', '+τy', '-τy', '+τz', '-τz'][k] : '').filter(Boolean).join(' ');
+  const isNew = (id: string, j: { pos: V3; dir: V3 }) => j.dir.z !== 0 || (id === 'albatross' && Math.abs(j.pos.x) > 14);
 
-  it('today: only the Albatross has a dead torque axis (roll); with its wing-tip jets every hull has all six', () => {
+  it('the layouts carry the wave-1 jets in table order (Wren: 10 old, then the 4 Z jets; Albatross: 8 old, then the wing-tip roll jets)', () => {
+    expect(SHIP_LAYOUTS.wren.rcs.slice(10)).toEqual(WREN_Z_JETS);
+    expect(SHIP_LAYOUTS.albatross.rcs.slice(8, 12)).toEqual(ALBATROSS_ROLL_JETS);
+    for (const id of hulls) {
+      const L = SHIP_LAYOUTS[id].rcs;
+      expect(L.filter((j) => j.dir.z < 0).length, id).toBe(2);
+      expect(L.filter((j) => j.dir.z > 0).length, id).toBe(2);
+    }
+  });
+
+  it('before wave 1 every hull lacked ±Fz and the Albatross roll; now every hull has all twelve', () => {
     const report: string[] = [];
     for (const id of hulls) {
+      const before = buildJetTable(jetsFromLayout(SHIP_LAYOUTS[id].rcs.filter((j) => !isNew(id, j))), ZERO);
       const now = buildJetTable(jetsFromLayout(SHIP_LAYOUTS[id].rcs), ZERO);
-      const fixed = buildJetTable(jetsFromLayout([...SHIP_LAYOUTS[id].rcs, ...(extra[id] ?? [])]), ZERO);
-      report.push(`${id}: dead today [${cols(now.deadCols)}] → with wave-1 jets [${cols(fixed.deadCols)}]`);
-      expect(now.deadCols & 0xfc0).toBe(id === 'albatross' ? (1 << 10) | (1 << 11) : 0);
-      expect(fixed.deadCols & 0xfc0).toBe(0);
-      for (let k = 6; k < 12; k++) expect(fixed.authority[k]).toBeGreaterThan(0);
+      const a = now.authority;
+      report.push(`${id}: dead before [${cols(before.deadCols)}] → now [${cols(now.deadCols)}]; τ authority ` +
+        `${(Math.min(a[6], a[7]) / 1e3).toFixed(0)} / ${(Math.min(a[8], a[9]) / 1e3).toFixed(0)} / ${(Math.min(a[10], a[11]) / 1e3).toFixed(0)} kN·m`);
+      expect(before.deadCols & 0x30).toBe(0x30);
+      expect(before.deadCols & 0xfc0).toBe(id === 'albatross' ? (1 << 10) | (1 << 11) : 0);
+      expect(now.deadCols).toBe(0);
+      for (let k = 0; k < 12; k++) expect(now.authority[k]).toBeGreaterThan(0);
     }
-    const alb = buildJetTable(jetsFromLayout([...SHIP_LAYOUTS.albatross.rcs, ...ALBATROSS_ROLL_JETS]), ZERO);
-    report.push(`albatross roll authority with the tip jets: ${(Math.min(alb.authority[10], alb.authority[11]) / 1e3).toFixed(1)} kN·m (68 kN pack)`);
     console.log(report.join('\n'));
   });
 
@@ -227,25 +238,22 @@ describe('the jets sit on the hull with a clear plume (D8)', () => {
     return worst;
   };
 
-  it('the new Wren Z jets and Albatross roll jets: on the skin (|d| ≤ 0.3 m) and the plume cone clear', () => {
+  it('the wave-1 jets sit on the skin (|d| ≤ 0.3 m) with ≥ 5 cm of plume clearance; no other jet fires into the hull but two known grazers', () => {
     const rows: string[] = [];
-    for (const [id, jets] of [['wren', WREN_Z_JETS], ['albatross', ALBATROSS_ROLL_JETS]] as const) {
-      for (const j of jets) {
-        const s = sd(id, [j.pos.x, j.pos.y, j.pos.z]), c = plume(id, j.pos, j.dir);
-        rows.push(`${id} (${j.pos.x}, ${j.pos.y}, ${j.pos.z}) → (${j.dir.x}, ${j.dir.y}, ${j.dir.z}): skin ${s.toFixed(3)} m, plume clearance ${c.toFixed(3)} m`);
-        expect(Math.abs(s)).toBeLessThanOrEqual(0.3);
-        expect(c).toBeGreaterThan(0.05);
-      }
+    for (const id of Object.keys(SHIP_LAYOUTS) as (keyof typeof SHIP_LAYOUTS)[]) for (const j of SHIP_LAYOUTS[id].rcs) {
+      const s = sd(id, [j.pos.x, j.pos.y, j.pos.z]), c = plume(id, j.pos, j.dir);
+      const fresh = j.dir.z !== 0 || (id === 'albatross' && Math.abs(j.pos.x) > 14);
+      if (fresh || c < 0.3) rows.push(`${id} (${j.pos.x}, ${j.pos.y}, ${j.pos.z}) → (${j.dir.x}, ${j.dir.y}, ${j.dir.z}): skin ${s.toFixed(3)} m, plume clearance ${c.toFixed(3)} m`);
+      // two existing pairs graze the hull with the 15° cone edge (Wren tail X into the wing trailing edge, Magpie aft X
+      // into the hopper): kept where the damage model and the reviewed authority expect them until plume impingement
+      if (fresh) expect(c, `${id} jet at (${j.pos.x}, ${j.pos.y}, ${j.pos.z})`).toBeGreaterThan(0.05);
+      else if (!((id === 'wren' && j.pos.z === 11 && j.dir.x !== 0) || (id === 'magpie' && j.pos.z === 6.8 && j.dir.x !== 0))) expect(c, `${id} jet at (${j.pos.x}, ${j.pos.y}, ${j.pos.z})`).toBeGreaterThan(0);
+      if (fresh) expect(Math.abs(s), `${id} jet at (${j.pos.x}, ${j.pos.y}, ${j.pos.z})`).toBeLessThanOrEqual(0.3);
     }
     // the rejected positions, for the record
     expect(sd('wren', [1.0, 0, -14.8])).toBeLessThan(-0.2); // inside the nose / windscreen
     expect(sd('wren', [2.2, -0.3, -14.6])).toBeLessThan(0); // inside cheek-fwd (the first proposal)
     expect(plume('wren', v(6.0, -0.2, 13.0), v(0, 0, 1))).toBeLessThan(0); // fires into the pod stern
-    // existing jets whose plume touches the hull (wave 1's shipLayouts work, not fixed here)
-    for (const id of Object.keys(SHIP_LAYOUTS) as (keyof typeof SHIP_LAYOUTS)[]) for (const j of SHIP_LAYOUTS[id].rcs) {
-      const c = plume(id, j.pos, j.dir);
-      if (c < 0) rows.push(`existing ${id} jet at (${j.pos.x}, ${j.pos.y}, ${j.pos.z}): plume clearance ${c.toFixed(3)} m`);
-    }
     console.log(rows.join('\n'));
   });
 });
@@ -307,7 +315,7 @@ describe('per-step allocation and what the jets actually do', () => {
   });
 
   it('holdCmdToJets: the hold output (normalised by min ±) delivers exactly hold·authority on an asymmetric hull (D9)', () => {
-    const A = buildJetTable(jetsFromLayout([...SHIP_LAYOUTS.albatross.rcs, ...ALBATROSS_ROLL_JETS]), ZERO);
+    const A = buildJetTable(jetsFromLayout(SHIP_LAYOUTS.albatross.rcs), ZERO);
     const asym = A.authority[6] / A.authority[7];
     const inp = makeStepIn(); inp[IN_RCS] = 700; inp[IN_H] = Q; setPressure(A, inp);
     const auth = torqueAuthority(A, inp, v(0, 0, 0));
@@ -425,7 +433,7 @@ describe('the hydrazine blowdown pool', () => {
 
 describe('fitted modules drive the numbers, not the Wren constants (D4)', () => {
   it('RCS pack thrust / vₑ, the drive share per nozzle and the tank all come from the fit', () => {
-    const big = buildJetTable(jetsFromLayout([...SHIP_LAYOUTS.wren.rcs, ...WREN_Z_JETS], 920e3, 2400), ZERO, { rcsCapacity: 4000 });
+    const big = buildJetTable(jetsFromLayout(SHIP_LAYOUTS.wren.rcs, 920e3, 2400), ZERO, { rcsCapacity: 4000 });
     for (let k = 0; k < N_COLS; k++) expect(big.authority[k] / T.authority[k]).toBeCloseTo(920 / 68, 9);
     expect(big.cost[0] / T.cost[0]).toBeCloseTo((920 / 68) * (2250 / 2400), 9);
     expect(big.tankVolume).toBeCloseTo((4000 * 3) / (2 * RCS_DENSITY), 12);
@@ -762,7 +770,7 @@ describe('save → load → step is bit-identical', () => {
   });
 
   it('the table rebuilt at load is the same table', () => {
-    const T2 = buildJetTable(jetsFromLayout([...SHIP_LAYOUTS.wren.rcs, ...WREN_Z_JETS]), ZERO);
+    const T2 = buildJetTable(jetsFromLayout(SHIP_LAYOUTS.wren.rcs), ZERO);
     for (let i = 0; i < T.table.length; i++) expect(Object.is(T.table[i], T2.table[i])).toBe(true);
     for (let i = 0; i < N_COLS; i++) expect(Object.is(T.authority[i], T2.authority[i])).toBe(true);
   });

@@ -231,8 +231,28 @@ export class RtGovernor {
   }
 }
 
+/** Means over this long of real time (SIMULATION.md W1-A 4: Safari's clock is 1 ms coarse; means, not percentiles). */
+export const MEAN_SECONDS = 2;
+/** The thermal proxy: one p50 of frame and render per minute, for the last TREND_MINUTES. */
+export const TREND_MINUTES = 20;
+/**
+ * GPU-bound: the frame is over its target interval while the main thread idles at least this share of it (the CPU
+ * waits on the GPU). Then the resolution goes down, and the CPU (the simulation budget) is never blamed.
+ */
+export const GPU_IDLE_SHARE = 0.25;
+
 export interface PerfSnapshot {
   samples: number;
+  /** 2 s means (ms): frame interval, simulation, render CPU, idle = frame − sim − render; work units, ms per unit. */
+  frameMean: number;
+  simMean: number;
+  renderMean: number;
+  idleMean: number;
+  unitsMean: number;
+  msPerUnit: number;
+  /** The target interval of this tier (33.3 ms ray tracing at High, else 16.7) and the GPU-bound inference. */
+  target: number;
+  gpuBound: boolean;
   fps: number;
   frameP50: number;
   frameP95: number;
@@ -259,6 +279,15 @@ export interface QualityChange {
 export class PerfMonitor {
   private frame = new Float32Array(N);
   private sim = new Float32Array(N);
+  // 2 s means (accumulating, and the last complete window) and the 20 min trend (per-minute p50s, a ring)
+  private acc2 = new Float64Array(6);
+  private mean2 = new Float64Array(6);
+  private meanReady = false;
+  private minuteAcc = 0;
+  private readonly trendFrame = new Float32Array(TREND_MINUTES);
+  private readonly trendRender = new Float32Array(TREND_MINUTES);
+  private trendHead = 0;
+  private trendCount = 0;
   private render = new Float32Array(N);
   private stepsRing = new Float32Array(N);
   private scratch = new Float32Array(N);
@@ -293,12 +322,33 @@ export class PerfMonitor {
   constructor(tier: PerfTier) {
     this.tier = tier;
     this.maxTier = tier;
-    this.snap = { samples: 0, fps: 0, frameP50: 0, frameP95: 0, simP50: 0, simP95: 0, renderP50: 0, renderP95: 0, steps: 0, drawCalls: 0, triangles: 0, scale: 1, tier, note: '' };
+    this.snap = { samples: 0, frameMean: 0, simMean: 0, renderMean: 0, idleMean: 0, unitsMean: 0, msPerUnit: 0, target: BUDGET_60, gpuBound: false, fps: 0, frameP50: 0, frameP95: 0, simP50: 0, simP95: 0, renderP50: 0, renderP95: 0, steps: 0, drawCalls: 0, triangles: 0, scale: 1, tier, note: '' };
   }
 
-  /** One rendered frame: the interval since the previous one, simulation and render CPU time (ms), steps taken. */
-  record(frameMs: number, simMs: number, renderMs: number, steps: number): void {
+  /**
+   * One rendered frame: the interval since the previous one, simulation and render CPU time (ms), integration steps
+   * and work units (the session's budget currency) taken.
+   */
+  record(frameMs: number, simMs: number, renderMs: number, steps: number, units = 0): void {
     if (!(frameMs > 0) || frameMs > 250) return; // a hidden tab or a stall is not a frame
+    // 2 s means: [real ms, frames, sim ms, render ms, idle ms, units]
+    const a = this.acc2;
+    const idle = frameMs - simMs - renderMs;
+    a[0] += frameMs; a[1] += 1; a[2] += simMs; a[3] += renderMs; a[4] += idle > 0 ? idle : 0; a[5] += units;
+    if (a[0] >= MEAN_SECONDS * 1000) {
+      const m = this.mean2;
+      for (let k = 0; k < 6; k++) { m[k] = a[k]; a[k] = 0; }
+      this.meanReady = true;
+    }
+    this.minuteAcc += frameMs;
+    if (this.minuteAcc >= 60000 && this.count >= 30) {
+      this.minuteAcc = 0;
+      const t = this.trendHead;
+      this.trendFrame[t] = this.pct(this.frame, 0.5);
+      this.trendRender[t] = this.pct(this.render, 0.5);
+      this.trendHead = (t + 1) % TREND_MINUTES;
+      if (this.trendCount < TREND_MINUTES) this.trendCount++;
+    }
     const i = this.head;
     this.frame[i] = frameMs;
     this.sim[i] = simMs;
@@ -329,10 +379,42 @@ export class PerfMonitor {
     return view[Math.min(n - 1, Math.floor(p * n))];
   }
 
+  /** The 2 s means (the last complete window; before the first, the running one). */
+  private means(o: PerfSnapshot): void {
+    const m = this.meanReady ? this.mean2 : this.acc2, f = m[1] > 0 ? m[1] : 1;
+    o.frameMean = m[0] / f;
+    o.simMean = m[2] / f;
+    o.renderMean = m[3] / f;
+    o.idleMean = m[4] / f;
+    o.unitsMean = m[5] / f;
+    o.msPerUnit = m[5] > 0 ? m[2] / m[5] : 0;
+    o.target = this.budgetMs;
+    o.gpuBound = PerfMonitor.gpuBound(o.frameMean, o.idleMean, this.budgetMs);
+  }
+
+  /**
+   * The inference (SIMULATION.md W1-A 4): over the target interval with the main thread idle for ≥ GPU_IDLE_SHARE of
+   * the target means the GPU is the limit, not the CPU.
+   */
+  static gpuBound(frameMean: number, idleMean: number, target: number): boolean {
+    return frameMean > target * 1.06 && idleMean >= GPU_IDLE_SHARE * target;
+  }
+
+  /** The thermal proxy: per-minute p50 of frame and render, oldest first ("f/r" ms), up to 20 minutes. */
+  trend(): string {
+    const out: string[] = [];
+    for (let k = 0; k < this.trendCount; k++) {
+      const i = (this.trendHead - this.trendCount + k + TREND_MINUTES) % TREND_MINUTES;
+      out.push(`${this.trendFrame[i].toFixed(1)}/${this.trendRender[i].toFixed(1)}`);
+    }
+    return out.join(' ');
+  }
+
   snapshot(): PerfSnapshot {
     const o = this.snap;
     const n = this.count;
     o.samples = n;
+    this.means(o);
     o.frameP50 = this.pct(this.frame, 0.5);
     o.frameP95 = this.pct(this.frame, 0.95);
     o.simP50 = this.pct(this.sim, 0.5);
@@ -378,16 +460,19 @@ export class PerfMonitor {
     const overMs = OVER_MS * k;
     const underMs = UNDER_MS * k;
     const capped = k < 1.5 && p50 > 30 && p50 < 36.5 && p95 < 40 && work < UNDER_MS;
+    // RT High (33 ms target): frames at ≈ 33 ms with the CPU idle are the owner's choice working, not a miss
+    this.means(this.snap);
+    const rtOnTarget = k >= 1.5 && p50 < this.budgetMs * 1.06 && p95 < RT_OVER_MS && this.snap.idleMean >= GPU_IDLE_SHARE * this.budgetMs;
     const ch = this.change;
     ch.tier = null;
-    if (p95 > overMs && !capped) {
+    if (p95 > overMs && !capped && !rtOnTarget) {
       this.under = this.calm = 0;
       this.over += step;
       if (this.over < OVER_SECONDS) return null;
       this.over = 0;
       if (this.scale > MIN_SCALE + 1e-3) {
         this.scale = Math.max(MIN_SCALE, Math.round((this.scale - 0.1) * 100) / 100);
-        this.note = `scale down to ${this.scale.toFixed(2)} (p95 ${p95.toFixed(1)} ms)`;
+        this.note = `scale down to ${this.scale.toFixed(2)} (p95 ${p95.toFixed(1)} ms${this.snap.gpuBound ? ', GPU-bound: idle ' + this.snap.idleMean.toFixed(1) + ' ms' : ''})`;
         ch.scale = this.scale;
         return ch;
       }
@@ -449,14 +534,66 @@ export class PerfMonitor {
       'TIDELOCK performance report',
       ...this.device,
       `fps ${f(s.fps)} over ${s.samples} frames`,
-      `frame ms p50 ${f(s.frameP50)} p95 ${f(s.frameP95)}`,
-      `sim ms p50 ${s.simP50.toFixed(2)} p95 ${s.simP95.toFixed(2)} · steps/frame ${f(s.steps)}`,
-      `render cpu ms p50 ${f(s.renderP50)} p95 ${f(s.renderP95)}`,
+      `2 s means: frame ${f(s.frameMean)} ms (target ${f(s.target)}) · sim ${s.simMean.toFixed(2)} · render cpu ${f(s.renderMean)} · idle ${f(s.idleMean)}${s.gpuBound ? ' · GPU-bound' : ''}`,
+      `sim work ${s.unitsMean.toFixed(0)} units/frame · ${(s.msPerUnit * 1000).toFixed(2)} µs/unit · steps/frame ${f(s.steps)}`,
+      `frame ms p50 ${f(s.frameP50)} p95 ${f(s.frameP95)} (the governors' input)`,
+      `trend (per minute, frame/render p50 ms): ${this.trend() || 'not yet'}`,
       `draw calls ${s.drawCalls} · triangles ${s.triangles}`,
       `tier ${s.tier} · resolution scale ${s.scale.toFixed(2)} · auto tier ${this.autoTier ? 'on' : 'off'} · frame budget ${this.budgetMs.toFixed(1)} ms`,
       ...renderInfoText().split('\n'),
       s.note ? `last auto change: ${s.note}` : 'no auto change yet',
       ...extra,
     ].join('\n');
+  }
+}
+
+// ---------------------------------------------------------------------------------------------- autosave
+
+/** The periodic save: every AUTOSAVE_SECONDS of play, on a frame with at least AUTOSAVE_IDLE_MS of idle main thread. */
+export const AUTOSAVE_SECONDS = 60;
+export const AUTOSAVE_IDLE_MS = 4;
+/** After this long overdue, the save goes on the next frame whatever its idle (never lost to a busy stretch). */
+const AUTOSAVE_OVERDUE = 30;
+
+/**
+ * The periodic save without a hitch (SIMULATION.md W1-A 6, perf-autosave-hitch). Storage is probed once: when the
+ * probe fails (the viewer blocks localStorage) nothing is ever serialised, because the string would go nowhere.
+ * Otherwise the session is serialised on a frame that left idle time, and written in a following setTimeout(0) so
+ * the write is not inside the frame either. Pure: the storage, the timer and the serialiser are injected.
+ */
+export class Autosave {
+  /** False when the storage probe failed: no periodic stringify at all. */
+  readonly enabled: boolean;
+  private since = 0;
+  private pending: string | null = null;
+  /** Serialisations made (tests and the report). */
+  count = 0;
+  constructor(
+    probe: () => boolean,
+    private readonly write: (json: string) => boolean,
+    private readonly later: (fn: () => void) => void = (fn) => { setTimeout(fn, 0); },
+  ) {
+    let ok = false;
+    try { ok = probe(); } catch { ok = false; }
+    this.enabled = ok;
+  }
+  /** A save was made some other way (an event, the menu): the period starts again. */
+  saved(): void {
+    this.since = 0;
+  }
+  /** Once per running frame: real seconds since the last, the idle the last frame left (ms), the serialiser. */
+  frame(dt: number, idleMs: number, serialise: () => string): void {
+    if (!this.enabled || this.pending !== null) return;
+    this.since += dt;
+    if (this.since < AUTOSAVE_SECONDS) return;
+    if (idleMs < AUTOSAVE_IDLE_MS && this.since < AUTOSAVE_SECONDS + AUTOSAVE_OVERDUE) return;
+    this.since = 0;
+    this.pending = serialise();
+    this.count++;
+    this.later(() => {
+      const j = this.pending;
+      this.pending = null;
+      if (j !== null) { try { this.write(j); } catch { /* the next period tries again */ } }
+    });
   }
 }

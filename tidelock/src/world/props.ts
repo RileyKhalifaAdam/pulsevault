@@ -27,7 +27,7 @@
 import type { Quat, V3 } from '../core/types';
 import { INTERIORS, type InteriorLayout } from '../data/interiors';
 import { PROP_TYPES, PROPS, type PropDef, type PropType } from '../data/props';
-import { CREW_EYE, CREW_FRICTION, CREW_HEIGHT, CREW_RADIUS, CREW_RESTITUTION, feltAt, type CrewState, type ShipMotion } from './crew';
+import { CREW_EYE, CREW_FRICTION, CREW_HEIGHT, CREW_RADIUS, CREW_RESTITUTION, feltAt, type BodyTick, type CrewState, type ShipMotion } from './crew';
 
 /** Mass of the crew body (with clothes and kit), kg. */
 export const CREW_MASS = 80;
@@ -1189,7 +1189,8 @@ function sub(s: PropsState, rt: Rt, m: ShipMotion, crew: CrewState | null, gi: n
  * still) only that motion bound, ROT_STEP of turn and COAST_DT set the step, and a pure free flight clear of every
  * surface goes from gap to gap (freeStep). Returns the number of sub-steps taken (0 when everything slept).
  */
-export function stepProps(s: PropsState, ship: ShipMotion, crew: CrewState | null, dt: number): number {
+export function stepProps(s: PropsState, ship: ShipMotion, crew: CrewState | null, dt: number, tk?: BodyTick): number {
+  void tk; // W1-C fills: the tick context (impulses via quasistatic serviceBodies, events)
   try {
     if (!(dt > 0) || !Number.isFinite(dt)) return 0;
     const rt = runtime(s.layoutId);
@@ -1536,4 +1537,27 @@ export function propViews(s: PropsState): PropView[] {
 export function propInfo(s: PropsState, propId: string): { type: PropType; mass: number; bound: number } | null {
   const rt = runtime(s.layoutId), i = rt ? rt.index.get(propId) ?? -1 : -1;
   return rt && i >= 0 ? { type: rt.types[i], mass: rt.mass[i], bound: rt.bound[i] } : null;
+}
+
+// ================================================================================================ day-1 contract (W1-A)
+
+/** Why the last nextBodyEvent result was short: '' (nothing due), a loose object ('props') or the crew body ('crew'). */
+export const bodyEvent: { why: '' | 'props' | 'crew' } = { why: '' };
+
+/**
+ * The drift/rest scheduler (SIMULATION.md W1-C 6, §1.4): how many ticks (1 ≤ n ≤ maxTicks) the world may advance
+ * before a loose body or the crew body (on foot, not seated) next needs servicing; bodyEvent.why says who asked when
+ * the answer is short. The session's tick loop (W1-A) takes min(warp quantum, this). W1-C fills it with quasistatic.ts
+ * nextBodyEvent; until then it is today's propsChunk (contact chunks while anything is awake, maxTicks when all sleep).
+ */
+export function nextBodyEvent(s: PropsState, ship: ShipMotion, crew: CrewState | null, tk: BodyTick, maxTicks: number): number {
+  void tk; // W1-C fills
+  bodyEvent.why = '';
+  let awake = s.grab.id !== '';
+  for (let i = 0; i < s.bodies.length && !awake; i++) if (!s.bodies[i].asleep && !s.bodies[i].stowed) awake = true;
+  if (!awake) return maxTicks;
+  const n = Math.floor(propsChunk(s, ship, crew) * 120 + 1e-9);
+  if (n >= maxTicks) return maxTicks;
+  bodyEvent.why = 'props';
+  return n > 1 ? n : 1;
 }

@@ -9,15 +9,20 @@
 import type { Quat, V3 } from '../core/types';
 import type { Craft } from './state';
 import { clamp1, qRotInv } from './math';
+import { holdAlpha } from './jets';
 
 /** Rate-loop gain K, 1/s. The attitude stiffness is K/4 (critical damping). */
 export const HOLD_RATE_GAIN = 6;
 /** Fraction of the available angular acceleration the braking curve plans with. */
 export const HOLD_BRAKE = 0.4;
-/** Default slew rate limit, rad/s. */
-export const HOLD_MAX_RATE = 0.6;
+/**
+ * Default slew rate limit of a hold, rad/s. Turning costs propellant (SIMULATION.md D3): a 90° hold slew at 0.1 rad/s
+ * costs the Wren about 40 kg of hydrazine (150 kg at 0.375). The stick keeps full authority.
+ */
+export const HOLD_MAX_RATE = 0.1;
 
 const T = { x: 0, y: 0, z: 0 };
+const ALPHA = new Float64Array(1);
 
 /** Rotation vector (craft-local axes, rad) that would take attitude `q` to `qTarget`. */
 export function attitudeError(q: Quat, qTarget: Quat, out: V3): V3 {
@@ -51,19 +56,22 @@ export function pointingError(q: Quat, dir: V3, out: V3): V3 {
 
 /** Principal moments of inertia of a craft at its current mass, kg·m². */
 export function craftInertia(c: Craft, out: V3): V3 {
-  const m = c.dryMass + c.propellant;
+  const m = c.dryMass + c.propellant + c.rcsPropellant; // W1-A hook: the RCS pool is mass too
   out.x = m * c.gyration.x; out.y = m * c.gyration.y; out.z = m * c.gyration.z;
   return out;
 }
 
 /**
- * Torque command (-1..1 per local axis) that drives the attitude error `err` (rotation vector, local axes)
- * and the body rates `w` to zero. Pass a zero error to damp rotation only.
+ * Torque command (-1..1 per local axis, as a fraction of `maxTorque`) that drives the attitude error `err` (rotation
+ * vector, local axes) and the body rates `w` to zero. Pass a zero error to damp rotation only. `maxTorque` is the
+ * attitude system's CURRENT authority per axis (for jets: jets.ts torqueAuthority at the pool's pressure, the smaller
+ * of ±; convert the result for the jets with holdCmdToJets). The braking curve plans with the smallest angular
+ * acceleration over the axes that have authority (a dead axis does not freeze the other two).
  */
 export function holdTorque(err: V3, w: V3, inertia: V3, maxTorque: V3, out: V3, maxRate = HOLD_MAX_RATE): V3 {
   const K = HOLD_RATE_GAIN, k = K / 4;
-  const ax = maxTorque.x / inertia.x, ay = maxTorque.y / inertia.y, az = maxTorque.z / inertia.z;
-  const alpha = Math.min(ax, ay, az);
+  holdAlpha(maxTorque, inertia, ALPHA);
+  const alpha = ALPHA[0];
   const th = Math.sqrt(err.x * err.x + err.y * err.y + err.z * err.z);
   let wdx = 0, wdy = 0, wdz = 0;
   if (th > 1e-9) {

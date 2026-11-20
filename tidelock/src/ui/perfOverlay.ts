@@ -89,13 +89,14 @@ export function createPerfOverlay(host: UiHost, extra: () => string[]): PerfOver
       const cls = s.frameP95 > 34 ? 'pf-bad' : s.frameP95 < 20 ? 'pf-ok' : '';
       l1.innerHTML = `<b class="${cls}">${s.fps.toFixed(0)} fps</b> · ${s.tier} · ×${s.scale.toFixed(2)}`;
       body.textContent =
-        `frame  ${s.frameP50.toFixed(1)} / ${s.frameP95.toFixed(1)} ms\n` +
-        `sim    ${s.simP50.toFixed(2)} / ${s.simP95.toFixed(2)} ms\n` +
-        `render ${s.renderP50.toFixed(1)} / ${s.renderP95.toFixed(1)} ms\n` +
+        `frame  ${s.frameMean.toFixed(1)} ms (p95 ${s.frameP95.toFixed(1)}, target ${s.target.toFixed(1)})\n` +
+        `sim    ${s.simMean.toFixed(2)} ms · ${s.unitsMean.toFixed(0)} units\n` +
+        `render ${s.renderMean.toFixed(1)} ms cpu\n` +
+        `idle   ${s.idleMean.toFixed(1)} ms${s.gpuBound ? ' · GPU-bound' : ''}\n` +
         `steps ${s.steps.toFixed(1)} · draws ${s.drawCalls}\n` +
         `${rtInfoText()}\n` +
         `gpu mem ${(renderInfo.totalBytes / 1048576).toFixed(0)} MB · msaa ${renderInfo.msaa}x\n` +
-        `(p50 / p95 of ${s.samples} frames)`;
+        `(2 s means; ${s.samples} frames)`;
     },
   };
 }

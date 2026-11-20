@@ -28,6 +28,56 @@ const kinds = (p: Prediction, k: number): ReturnType<typeof predictionEvent>[] =
 const flyTo = (w: World, t: number, chunk = 250): void => { while (w.t < t) advance(w, Math.min(chunk, t - w.t)); };
 
 describe('prediction', () => {
+  it('incremental (SIMULATION.md W1-A 3): a path extended in step-count slices equals one long run, bit for bit', () => {
+    const { w, T } = elliptic(300e3, 2000e3);
+    advance(w, 500);
+    const opts = { duration: 3 * T, targetCraftId: WHEEL };
+    const long = createPrediction(512), inc = createPrediction(512);
+    const a = new Predictor();
+    a.start(w, 'player', opts, long);
+    expect(a.run()).toBe(true);
+    // the same start, first to one orbit, then extended twice, in slices of 37 steps
+    const b = new Predictor();
+    b.start(w, 'player', { ...opts, duration: T }, inc);
+    let slices = 0;
+    while (!b.run(37)) slices++;
+    expect(inc.horizon).toBeCloseTo(T, 6);
+    expect(b.extend(w.t + 2 * T)).toBe(true);
+    while (!b.run(37)) slices++;
+    expect(b.extend(w.t + 3 * T)).toBe(true);
+    while (!b.run(37)) slices++;
+    expect(slices).toBeGreaterThan(5);
+    expect(inc.steps).toBe(long.steps);
+    expect(inc.count).toBe(long.count);
+    expect(Array.from(inc.points.subarray(0, 4 * inc.count))).toEqual(Array.from(long.points.subarray(0, 4 * long.count)));
+    expect(Array.from(inc.targetPoints.subarray(0, 4 * inc.count))).toEqual(Array.from(long.targetPoints.subarray(0, 4 * long.count)));
+    expect(inc.eventCount).toBe(long.eventCount);
+    expect(Array.from(inc.events.subarray(0, 6 * inc.eventCount))).toEqual(Array.from(long.events.subarray(0, 6 * long.eventCount)));
+    expect(inc.horizon).toBe(long.horizon);
+    // dropping the points behind the present keeps the path from the last point at or before it
+    const t1 = long.points[4 * 40 + 3] + 1;
+    b.dropBefore(t1);
+    expect(inc.points[3]).toBeLessThanOrEqual(t1);
+    expect(inc.points[7]).toBeGreaterThan(t1);
+    expect(inc.count).toBe(long.count - 40);
+  });
+
+  it('held thrust: the ghost burns for the time given at the powered step, then coasts', () => {
+    const { w, ship, T } = elliptic(300e3, 300e3, false);
+    const coast = createPrediction(512), burn = createPrediction(512);
+    predict(w, 'player', { duration: T }, coast);
+    const F = stats.mainThrust, md = F / stats.exhaustVelocity, v = ship.relV, vl = len(v);
+    predict(w, 'player', { duration: T, thrust: { fx: (F * v.x) / vl, fy: (F * v.y) / vl, fz: (F * v.z) / vl, mdot: md, until: w.t + 20 } }, burn);
+    // a prograde burn of 20 s raises the far side of the orbit: half an orbit on, the path is higher
+    const at = (p: Prediction, t: number): number => {
+      let i = 0;
+      while (i + 1 < p.count && p.points[4 * (i + 1) + 3] <= t) i++;
+      return Math.hypot(p.points[4 * i], p.points[4 * i + 1], p.points[4 * i + 2]);
+    };
+    expect(at(burn, w.t + T / 2) - at(coast, w.t + T / 2)).toBeGreaterThan(50e3);
+    expect(burn.steps).toBeGreaterThan(coast.steps);
+  });
+
   it('the predicted path is the path that is flown', () => {
     const { w, ship, T } = elliptic(300e3, 2000e3);
     advance(w, 500);
@@ -207,7 +257,10 @@ describe('benchmark', () => {
       `  body steps/s            ${(bodyRate / 1e6).toFixed(2)} M  (${n} bodies, H = ${w0.h} s -> ${(bodyRate * w0.h / 86400 / 365.25).toFixed(1)} sim years per CPU second)`,
       `  craft steps/s           ${(craftRate / 1e6).toFixed(2)} M  (coasting, low orbit of Wick, ${(4e6 / craftSteps).toFixed(1)} s per step)`,
       `  advance() at 1x         ${(frame * 1000).toFixed(1)} µs per frame (worst ${(worst * 1000).toFixed(0)} µs), 5 craft; under thrust + torque ${(frameBurn * 1000).toFixed(1)} µs`,
-      `  heap change, 6000 frames ${(heap / 1024).toFixed(0)} kB (no GC forced; the stepping loops allocate nothing)`,
+      // V8 boxes a double that crosses a non-inlined call or lands in a generic field; JavaScriptCore (Safari) NaN-boxes
+      // every double in place, so these heap and GC figures are V8 artefacts and say little about the phone
+      // (SIMULATION.md W1-A 7, perf-v8-double-boxing-benchmarks)
+      `  heap change, 6000 frames ${(heap / 1024).toFixed(0)} kB (no GC forced; the stepping loops allocate nothing; a V8 figure, see above)`,
       `  time acceleration       ${warp.toExponential(2)}x sustained in a 3 ms budget (mean ${(used / 300).toFixed(2)} ms used, limited by '${limited}')`,
       `  prediction, 3 orbits    ${predMs.toFixed(3)} ms with target (${pred.steps} steps), ${predSolo.toFixed(3)} ms alone`,
     ].join('\n'));

@@ -21,18 +21,35 @@ import { createRoot, Splash } from '../ui/kit';
 import type { UiHost, UiScreen } from '../ui/host';
 import { createPauseMenu, createTitleScreen, type PauseMenu } from '../ui/screens';
 import { createPerfOverlay } from '../ui/perfOverlay';
-import { PerfMonitor, RT_CHOICES, RT_DEFAULT, RtGovernor, frameBudgetFor, rtInfoText, renderInfo, startTier, type RtTier } from './perf';
+import { Autosave, MIN_SCALE, PerfMonitor, RT_CHOICES, RT_DEFAULT, RtGovernor, frameBudgetFor, rtInfoText, renderInfo, startTier, type RtTier } from './perf';
+import { setEyeFields } from '../render/space/honest';
 import { noteForReport, showFatal, showPlainMessage } from './errors';
 import { createInstrumentData, readInstruments } from '../render/space/instruments';
 import { createPlayInput, type DevicePick, type PlayInput } from './input';
+import { attachAudio, audioShipFromData, createAudioFrame, fillAudioFrame, type AudioFrame, type AudioHandle } from '../audio';
+import type { BodyDef, ShipVisualId } from '../core/types';
+import type { CraftView } from '../game/api';
 
 const SAVE_KEY = 'tidelock.save.v1';
 const SETTINGS_KEY = 'tidelock.settings.v1';
 const QUALITIES: Quality[] = ['low', 'medium', 'high', 'ultra'];
 type ScreenName = 'title' | 'flight';
-/** A wrecked ship: seconds of black before the restart. Asleep: how dark closed eyes are. */
+/** A wrecked ship: seconds of black before the restart. */
 const WRECK_SECONDS = 3.5;
-const SLEEP_SHADE = 0.94;
+/**
+ * Eyes closed in sleep (SIMULATION.md W1-A 5): from this lid closedness the frame is drawn only every
+ * EYES_CLOSED_EVERY-th frame at the lowest resolution scale, and the simulation may use SLEEP_BUDGET_MS a frame
+ * (the GPU idles; 3 ms awake on every tier, §1.2.1). The lid closes slowly and opens fast.
+ */
+const EYES_CLOSED_LID = 0.9;
+const EYES_CLOSED_EVERY = 3;
+const AWAKE_BUDGET_MS = 3;
+const SLEEP_BUDGET_MS = 8;
+const LID_CLOSE_RATE = 0.6;
+const LID_OPEN_RATE = 2.5;
+/** A frame gap longer than this (s) without a hidden-page event is a suspended page: the world catches it up (D6). */
+const SUSPEND_GAP = 1;
+const STORAGE_PROBE_KEY = 'tidelock.probe';
 
 // ------------------------------------------------------------------------------------------------ storage (guarded)
 
@@ -189,7 +206,12 @@ export async function boot(): Promise<void> {
   };
   let current: ScreenName | null = null;
   let menuOpen = false;
-  let sinceSave = 0;
+  // the periodic save (perf.ts Autosave): storage probed once; serialised on an idle frame, written after it
+  const autosave = new Autosave(
+    () => lsSet(STORAGE_PROBE_KEY, '1') && lsGet(STORAGE_PROBE_KEY) === '1',
+    (json) => lsSet(SAVE_KEY, json),
+  );
+  if (!autosave.enabled) noteForReport('storage unavailable: no autosave');
   let title: UiScreen | null = null;
   let menu: PauseMenu | null = null;
   let input: PlayInput | null = null;
@@ -248,7 +270,8 @@ export async function boot(): Promise<void> {
       if (current !== 'flight') host.go('flight');
     },
     saveNow() {
-      sinceSave = 0;
+      autosave.saved();
+      if (!autosave.enabled) return; // nowhere to put it: do not stringify
       try {
         lsSet(SAVE_KEY, session.save());
       } catch (err) {
@@ -343,19 +366,29 @@ export async function boot(): Promise<void> {
     invertPitch: () => !!host.settings.get<boolean>('invertPitch', false),
     onMenu: openMenu,
   });
-  // closed eyes and the end of a wreck: a black shade between the canvas and the (empty) UI layer
+  // the end of a wreck and the title fade: a black shade between the canvas and the (empty) UI layer. Closed eyes
+  // are not painted here: the lid closedness goes to the renderer (frame.lid / eyesClosed, W1-E's eyelid transmission)
   const shade = document.createElement('div');
   shade.style.cssText = 'position:fixed;left:0;top:0;width:100%;height:100%;background:#000;opacity:0;pointer-events:none;';
   document.body.insertBefore(shade, root);
   let shadeNow = 0;
   let wreckT = 0;
   const shadeToward = (target: number, dt: number): void => {
-    const rate = target > shadeNow ? 0.6 : 2.5; // eyes close slowly and open fast
+    const rate = target > shadeNow ? 0.6 : 2.5; // fades in slowly and out fast
     const next = shadeNow + Math.max(-rate * dt, Math.min(rate * dt, target - shadeNow));
     if (next === shadeNow) return;
     shadeNow = next;
     shade.style.opacity = next.toFixed(3);
   };
+
+  // the eyelids: closedness 0..1, toward 1 while the pilot sleeps
+  let lidNow = 0;
+  const lidToward = (target: number, dt: number): void => {
+    const rate = target > lidNow ? LID_CLOSE_RATE : LID_OPEN_RATE;
+    lidNow += Math.max(-rate * dt, Math.min(rate * dt, target - lidNow));
+  };
+  let closedFrame = 0;
+  let closedScale = false;
 
   // ---------------------------------------------------------------------------------------------- frame
   const frame = createSceneFrame();
@@ -419,7 +452,14 @@ export async function boot(): Promise<void> {
 
   /** Refill the frame from the session: the world as it is, seen from the pilot's eyes. Always first person. */
   const fill = (dt: number): void => {
-    beginFrame(frame, session.time(), dt, session.warp().achieved);
+    // §1.3: the views hold the latest tick state; the frame's own time lies r < 1 tick past it (0 under warp), and the
+    // renderer extrapolates by r from each view's own v and w
+    const tTick = session.time(), tFrame = session.frameTime();
+    beginFrame(frame, tFrame, dt, session.warp().achieved);
+    frame.tickTime = tTick;
+    frame.extrapolate = tFrame - tTick;
+    frame.dutyTape = session.dutyTape();
+    setEyeFields(frame, lidNow);
     frame.bodies = session.bodies();
     frame.craft = session.craft();
     const p = session.player();
@@ -437,7 +477,7 @@ export async function boot(): Promise<void> {
     cam.eye.z = cv.eye.z;
     cam.lookYaw = cv.yaw;
     cam.lookPitch = cv.pitch;
-    cam.zoom = input ? input.zoom : 1;
+    cam.zoom = 1; // no zoom: the pinch leans the body (W1-C), the field of view stays the eye's
     finishFill(dt);
   };
   /** The part of the frame that does not depend on the camera: the pilot's controls and screens, lights, docking. */
@@ -465,7 +505,50 @@ export async function boot(): Promise<void> {
     setDockingGuide(frame, null);
   };
 
+  // ---------------------------------------------------------------------------------------------- sound (W1-D's, hooked here)
+  // Every sound has a cause in the world: the audio reads only the views and the event ring. attachAudio bakes in the
+  // background and creates nothing audible until the first finger lifts (W1-D, src/audio/index.ts). A failure here
+  // must never stop the game: it is noted for the report and the ship stays silent.
+  let audio: AudioHandle | null = null;
+  let audioFrame: AudioFrame | null = null;
+  let primaryDef: BodyDef | null = null;
+  const playerCraft = (cs: readonly CraftView[]): CraftView | null => {
+    for (let i = 0; i < cs.length; i++) if (cs[i].isPlayer) return cs[i];
+    return null;
+  };
+  try {
+    const pc = playerCraft(session.craft());
+    if (pc) {
+      audio = attachAudio(audioShipFromData((pc.shipVisual ?? 'wren') as ShipVisualId, pc.jets, pc.engines));
+      audioFrame = createAudioFrame(pc.jets.length, pc.engines.length);
+    }
+  } catch (err) {
+    audio = null;
+    noteForReport(`sound off: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const drainSim = (cb: Parameters<Session['drainEvents']>[0]): void => { session.drainEvents(cb); };
+  const sound = (dt: number, running: boolean): void => {
+    if (!audio || !audioFrame) return;
+    const flight = session.flight();
+    if (!primaryDef || primaryDef.id !== flight.primaryId) {
+      const bs = session.system.bodies;
+      primaryDef = null;
+      for (let i = 0; i < bs.length; i++) if (bs[i].id === flight.primaryId) primaryDef = bs[i];
+    }
+    fillAudioFrame(audioFrame, dt, {
+      craft: playerCraft(frame.craft), flight, warp: session.warp(), crew: session.crew(), simTime: session.time(), primary: primaryDef,
+    });
+    if (!running) {
+      // paused (menu, title): the ship's machinery is still, nothing fires
+      audioFrame.jetDuty.fill(0);
+      audioFrame.engineLevel.fill(0);
+      audioFrame.dynamicPressure = 0;
+    }
+    audio.update(audioFrame, drainSim);
+  };
+
   let lastMode: string | null = null;
+  let lastIdle = 0;
   let rtAcc = 0;
   let last = performance.now();
   let raf = 0;
@@ -484,11 +567,14 @@ export async function boot(): Promise<void> {
       const running = current === 'flight' && !menuOpen;
       let simMs = 0;
       let steps = 0;
+      let units = 0;
+      if (running && frameMs > SUSPEND_GAP * 1000 && !testHooks.holdSim) session.catchUp(frameMs / 1000 - dt); // a suspended page (D6)
       if (running) {
         // (e2e hook: while holdSim is set the test drives the clock itself, session.step per pumped frame)
         const info = session.step(testHooks.holdSim ? 0 : dt);
         simMs = info.simMs;
         steps = info.steps;
+        units = info.units;
         input?.update(dt);
         // sitting down, the pilot's eyes fall on the console: screens in the middle of the view, the windscreen
         // above them, the hand controllers below (a wide phone needs the head a little lower to see the desk)
@@ -501,8 +587,7 @@ export async function boot(): Promise<void> {
             session.addLook(-cv.yaw, want - cv.pitch);
           }
         }
-        sinceSave += dt;
-        if (sinceSave >= 60) host.saveNow();
+        autosave.frame(dt, lastIdle, () => session.save());
         if (session.player().destroyed) {
           // the wreck fades out; then the pilot is back in the starting orbit
           wreckT += dt;
@@ -513,20 +598,43 @@ export async function boot(): Promise<void> {
           }
         } else {
           wreckT = 0;
-          shadeToward(session.crew().asleep ? SLEEP_SHADE : 0, dt);
+          shadeToward(0, dt);
         }
+        const cv = session.crew(), asleep = cv.asleep;
+        lidToward(asleep ? 1 : 0, dt);
+        session.setBudget(asleep && lidNow >= EYES_CLOSED_LID ? SLEEP_BUDGET_MS : AWAKE_BUDGET_MS);
+        // the path is predicted only while something shows it: the pilot awake at the helm or in the cockpit (and, once
+        // the renderer offers it, a NAV screen or the hologram actually in view: W1-E's cockpitScreensVisible)
+        const vis = (scene as unknown as { cockpitScreensVisible?: () => boolean }).cockpitScreensVisible;
+        session.setPredictionVisible(!asleep && (cv.mode === 'helm' || cv.roomId === 'cockpit') && (vis ? vis.call(scene) : true));
+      } else lidToward(0, dt);
+      // eyes closed: draw every third frame at the lowest scale (the GPU rests; W1-E skips RT, shadows and probes)
+      const closed = running && lidNow >= EYES_CLOSED_LID;
+      if (closed !== closedScale) {
+        closedScale = closed;
+        pipeline.setDynamicResolution(false, closed ? MIN_SCALE : perf.scale);
+        if (!closed) perf.clear(2);
       }
       layout();
       let renderMs = 0;
-      if (!lost) {
+      const draw = !closed || closedFrame++ % EYES_CLOSED_EVERY === 0;
+      if (!lost && draw) {
         const r0 = performance.now();
         fill(dt);
         scene.render(frame);
         renderMs = performance.now() - r0;
       }
+      lastIdle = frameMs - simMs - renderMs;
+      try {
+        sound(dt, running);
+      } catch (err) {
+        audio?.dispose();
+        audio = null;
+        noteForReport(`sound off: ${err instanceof Error ? err.message : String(err)}`);
+      }
       // the record, and the automatic quality it drives (not while baking, in the menu or on the title)
-      if (running && !lost && !scene.busy()) {
-        perf.record(frameMs, simMs, renderMs, steps);
+      if (running && !lost && !scene.busy() && !closed) {
+        perf.record(frameMs, simMs, renderMs, steps, units);
         const ch = perf.auto(dt);
         if (ch) {
           pipeline.setDynamicResolution(false, ch.scale);
@@ -560,12 +668,22 @@ export async function boot(): Promise<void> {
     }
   };
 
+  // D6: a hidden page (or a locked phone) does not stop the world: on return it catches up on the time missed, at
+  // most one sim day, under honest warp (Session.catchUp)
+  let hiddenAt = -1;
   const onHide = (): void => {
     if (current === 'flight') host.saveNow();
   };
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden) onHide();
-    else last = performance.now();
+    if (document.hidden) {
+      onHide();
+      hiddenAt = performance.now();
+    } else {
+      const now = performance.now();
+      if (hiddenAt >= 0 && current === 'flight' && !menuOpen) session.catchUp((now - hiddenAt) / 1000);
+      hiddenAt = -1;
+      last = now;
+    }
   });
   window.addEventListener('pagehide', onHide);
 

@@ -23,6 +23,8 @@ import type { DeviceView } from '../game/api';
 import type { InstrumentData } from './space/instruments';
 import type { Quat, RGB, ShipVisualId, V3 } from '../core/types';
 import type { BodyView, CraftView } from '../game/api';
+import type { DutyTape } from '../world/dutyTape';
+import type { EyeFrameFields } from './space/honest';
 
 export type CameraMode = 'chase' | 'orbit' | 'cockpit' | 'dock' | 'flyby' | 'interior';
 
@@ -120,9 +122,21 @@ export interface FrameFx {
   color: RGB;
 }
 
-export interface SceneFrame {
-  /** Sim seconds since the epoch. */
+export interface SceneFrame extends EyeFrameFields {
+  // EyeFrameFields (W1-E, render/space/honest.ts): `eyesClosed` (the lids are shut: skip RT, shadow and probe
+  // updates) and `lid` (closedness 0..1; the composite multiplies by the eyelid transmission). app.ts writes them
+  // from the sleep shade (setEyeFields). W1-E fills the use.
+  /** Sim seconds since the epoch: the frame's own time (Session.frameTime()), i.e. `tickTime + extrapolate`. */
   time: number;
+  /**
+   * Interpolation inputs (SIMULATION.md §1.3). The views hold the latest tick state at `tickTime` (Session.time());
+   * the renderer draws them extrapolated by `extrapolate` = time − tickTime sim seconds (0 ≤ it < 1/120 s at 1×, 0
+   * under warp), to first order from each view's own v and w (CraftView.w, craft axes). W1-E fills the use.
+   */
+  tickTime: number;
+  extrapolate: number;
+  /** The per-tick applied jet duties (Session.dutyTape(), not copied) for the RCS puffs; null: no puffs. */
+  dutyTape: DutyTape | null;
   /** Real seconds since the previous frame (drives animation, springs and exposure; not multiplied by warp). */
   dt: number;
   /** Time-warp multiplier in effect (1 = real time). */
@@ -170,6 +184,11 @@ const newShip = (): FrameShip => ({
 export function createSceneFrame(): SceneFrame {
   return {
     time: 0,
+    tickTime: 0,
+    extrapolate: 0,
+    dutyTape: null,
+    eyesClosed: false,
+    lid: 0,
     dt: 0,
     warp: 1,
     bodies: [],

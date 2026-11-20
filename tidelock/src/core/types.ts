@@ -428,7 +428,10 @@ export interface ShipDef {
 export interface VesselStats {
   /** Hull + modules, kg (no propellant, no cargo). */
   dryMass: number;
-  /** Propellant capacity, kg. One tank feeds the main drive, RCS and the jump drive. */
+  /**
+   * Total propellant capacity, kg. Wave 1 splits it into two pools at craft construction (world/setup.ts rcsShare):
+   * the RCS hydrazine pool, min(1.5 t, fuelCapacity/16), and the main LH2 pool (the rest).
+   */
   fuelCapacity: number;
   /** Main drive thrust at full throttle, N. */
   mainThrust: number;
@@ -494,6 +497,8 @@ export interface ShipLayout {
   engines: { pos: V3; radius: number }[];
   /** RCS quads: position and the direction the jet fires. */
   rcs: { pos: V3; dir: V3 }[];
+  /** Inertial measurement unit, ship-local m (W1-B adds it; FlightView.specificForce is read there). Absent = (0, −1.2, −12). */
+  imuPos?: V3;
   /** Weapon mounts, index-aligned with the ShipDef's 'weapon' slots. */
   hardpoints: { pos: V3; size: number }[];
   /** Docking collar: position and outward normal. */

@@ -77,16 +77,32 @@ Dependencies point downward only. `world/` knows nothing about the player, the s
   symplectic (Yoshida). Their states are computed ahead of the present and kept in a ring buffer — the
   **ephemeris** — and read back anywhere in a step by cubic Hermite interpolation. Fixed step + fixed order of
   operations = deterministic, and long-term stable (no secular energy drift).
-- **Craft:** each craft takes its own adaptive steps across the frame, sampling the ephemeris:
+- **The fixed tick** (SIMULATION.md §1.3, amended in wave 1). Sim time advances in whole ticks of
+  `Q = 1/120 s`, counted as the integer `world.tick`; `t = tick / 120` is derived, never accumulated. Inputs
+  set between frames are latched at the next tick boundary; the controller (holds, Flight Assist) runs every
+  2 ticks (60 Hz) with a zero-order hold between; crew, loose objects and devices step at `h = Q` with fixed
+  sub-steps. Under time acceleration the world advances in quanta of `Q·2ⁿ` ticks (n from the warp level:
+  2048 ticks ≈ 17 s at 1e4), cut short by the controller grid while it works, a settled hold's wake tick and
+  the bodies' next contact event. The budget decides only how many steps fit in a frame, never the steps: the
+  same input log gives the same world, bit for bit, at 30, 60 or a jittered frame rate
+  (`tests/determinism.test.ts`). Saves are made at a tick boundary with the tick, the latched inputs and the
+  controller state.
+- **Craft:** each craft takes its own adaptive steps between tick boundaries, sampling the ephemeris:
   step ≤ a small fraction of the local dynamical time `√(r³/GM)`; ≤ 1/60 s while thrusting or turning;
   finer still in contact or in atmosphere. Coasting uses a symplectic scheme; thrust and drag phases a
   4th-order one. Rotation is sub-stepped by angular rate.
-- **Time acceleration** is limited only by honesty and by the CPU: `advance()` gets a millisecond budget and
-  reports the sim time it actually covered and why it was limited (`thrust`, `rotation`, `contact`,
-  `atmosphere`, `proximity`, `cpu`). The request is a wish; the world never cuts corners to meet it.
+- **Time acceleration** is limited only by honesty and by the CPU. The session budgets whole steps in work
+  units (craft and body integration steps, loose-object sub-steps) against a cost per unit learnt from 2 s
+  means of the wall clock (Safari's clock is 1 ms coarse; the clock is only a backstop), and reports the sim
+  time it actually covered and why it was limited (`thrust`, `rotation`, `contact`, `atmosphere`, `proximity`,
+  `props`, `crew`, `capture`, `venting`, `systems`, `cpu`). The request is a wish; the world never cuts
+  corners to meet it. Budget: 3 ms a frame awake on every tier, 8 ms asleep with the eyes closed.
 - **Prediction** is the same integrator run on a ghost: it yields a polyline in the frame of a chosen body
   plus events (periapsis, apoapsis, closest approach to a target, atmosphere entry, impact). Planned burns are
-  impulses applied to the ghost. Because the laws are identical, the drawn path is what will happen.
+  impulses applied to the ghost; held thrust is flown for up to 30 s. Because the laws are identical, the drawn
+  path is what will happen. It is incremental: the shown path is extended at its far end and trimmed behind
+  the present (≤ 0.3 ms of steps a frame), a disturbance restarts it in ≤ 0.5 ms slices while the old path stays
+  shown, and it is computed only while a NAV screen or the hologram can be seen.
 - **Read-outs** (apoapsis, periapsis, period, inclination) are osculating elements computed from the state
   relative to the primary. They are information for the pilot and are never fed back into the motion.
 
@@ -107,8 +123,11 @@ only inside its tolerances; save → load → continue is bit-identical; predict
 - three.js 0.180.0, WebGL2. **Far scene** (sky, star, bodies as unit spheres placed camera-relative so angular
   size is exact) and **near scene** (craft, effects; metres; floating origin at the camera), depth cleared
   between; one HDR half-float target → bloom → filmic tone map → AA → sRGB.
-- The renderer reads positions, attitudes, spins and thruster states from the world each frame and
-  interpolates nothing itself. Lighting comes from geometry: star direction, eclipse factor, planetshine.
+- The renderer reads positions, attitudes, spins and thruster states from the world each frame. *Amended
+  (SIMULATION.md §1.3):* the views hold the latest tick state `t_k ≤ t_frame`; **the renderer extrapolates by
+  less than one tick (`r = t_frame − t_k < 1/120 s`, 0 under warp) from the world's own v and ω; it computes
+  no motion of its own.** Look yaw and pitch from the finger are applied to the camera at render time, so the
+  look gains no latency (every sim use of the look reads the value latched at the tick). Lighting comes from geometry: star direction, eclipse factor, planetshine.
 - Budget: device pixel ratio ≤ 2 with dynamic resolution 0.6–1.0; ≤ 200 draw calls, ≤ 500k triangles,
   ≤ 300 MB GPU memory; baked planet textures; no per-frame allocation.
 
@@ -116,8 +135,12 @@ only inside its tolerances; save → load → continue is bit-identical; predict
 
 - Target: 60 fps on an iPhone 15, never below 30. Frame time is measured, not assumed: the app keeps a rolling
   record of frame, simulation and render time, steps per frame, resolution scale and quality tier.
-- **Perf overlay** (toggle in the menu): fps, frame-time p50/p95, sim ms, render ms, draw calls, resolution
-  scale, tier, and a "Copy performance report" button — the owner's phone is the only real test device.
+- **Perf overlay** (toggle in the menu): fps, 2 s means of frame, sim, render and idle (= frame − sim −
+  render) against the tier's target interval (33.3 ms ray tracing at High, else 16.7), work units and µs per
+  unit, frame p95 (the governors' input), draw calls, resolution scale, tier, and a "Copy performance report"
+  button with a 20-minute per-minute trend of frame and render p50 (a thermal proxy) — the owner's phone is the
+  only real test device. A frame over target with a large idle is GPU-bound: resolution goes down; the CPU is
+  never blamed for it, and RT High at ≈ 33 ms with the CPU idle is not cut.
 - **Automatic quality:** start at a safe tier; drop resolution scale first, then tier, when p95 frame time
   stays above budget; climb back slowly. Expensive bakes are spread over frames behind a progress bar.
 - The delivery rules for the iPhone page viewer in `CLAUDE.md` are binding for all client code.

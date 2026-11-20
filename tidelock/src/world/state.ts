@@ -2,6 +2,8 @@
 // Everything is SI. Typed-array scratch and the ephemeris cache live outside this state (ephemeris.ts).
 
 import type { DockingPortDef, PadSize, Quat, StationCollider, V3 } from '../core/types';
+import { createEventRing, type EventRing } from './events';
+import type { EngineDef, JetDef, JetTable } from './jets';
 
 export interface Atmosphere {
   /** Density at the surface, kg/m³. */
@@ -119,7 +121,50 @@ export interface Craft {
   dockPortId: string | null;
   /** Body id while resting on a surface. */
   landedOn: string | null;
+
+  // ---- wave 1 (docs/SIMULATION.md §1.4). Saved; loader defaults in world.ts migrateCraft. ----------------------
+  // `propellant` / `propellantCapacity` above are the MAIN (LH2) pool; the RCS has its own hydrazine pool here.
+  /** Duty each RCS jet actually applied over the last step, 0..1, JetDef order (0 when landed, docked or dry). W1-B writes. */
+  jetDuty: number[];
+  /** Thrust state F_s of each main engine, N, and its ignition timer, s (jets.ts ENGINE_UNLIT = −1: not lit). W1-B writes. */
+  engineThrust: number[];
+  engineTimer: number[];
+  /** RCS (hydrazine blowdown) pool and its capacity, kg. Counted in craftMass. */
+  rcsPropellant: number;
+  rcsPropellantCapacity: number;
+  /**
+   * The applied-force ledger, craft axes: ∫F·dt (N·s) and ∫τ·dt (N·m·s) of the proper (non-gravitational) force and
+   * torque actually applied, and the time accumulated (s), since the session last consumed it (dynamics.ts
+   * consumeLedger, once per tick). W1-B writes.
+   */
+  fAcc: V3;
+  tauAcc: V3;
+  accT: number;
+  /** Impulsive Δv (m/s) and Δω (rad/s) from contacts, latch and undock since the last consumption, craft axes. */
+  dvImpulse: V3;
+  dwImpulse: V3;
+  /** Air-relative velocity u = v_rel − ω_body × r_rel, inertial axes, m/s (zero outside air). W1-B writes per forced step. */
+  airVel: V3;
+  /** Instantaneous stagnation heat flux, W/m². W1-B writes per forced step. */
+  heatFlux: number;
+  /** Sim time at which a settled hold must wake, s (+∞ while awake; saved as null). W1-B writes. */
+  holdWakeT: number;
+
+  // ---- wave 1, rebuilt at load and never saved (setup.ts buildThrusters; saveWorld strips DERIVED_CRAFT_KEYS) ----
+  /** RCS jets {pos, dir (exhaust), thrust, ve} from the hull layout. */
+  jets: JetDef[];
+  /** Main engines {pos, dir, maxThrust, ve, tauUp, tauDown, delay, minThrottle}. */
+  engines: EngineDef[];
+  /** The 12 × N allocation table (jetAlloc.table). */
+  jetTable: Float64Array;
+  /** The whole allocation record the table belongs to (geometry, authority, cost, tank). */
+  jetAlloc: JetTable;
+  /** Per-step input scratch of jets.ts (makeStepIn). */
+  jetIn: Float64Array;
 }
+
+/** Craft fields that are derived at load and must never reach a save. */
+export const DERIVED_CRAFT_KEYS: readonly string[] = ['jets', 'engines', 'jetTable', 'jetAlloc', 'jetIn'];
 
 /** A constraint created and released by physical conditions: a docking latch or resting contact. */
 export interface Joint {
@@ -145,8 +190,13 @@ export type WorldEvent =
 
 export interface World {
   version: 1;
-  /** Sim seconds since the epoch. */
+  /** Sim seconds since the epoch. Under the session's fixed tick it is always tick / 120 (never accumulated). */
   t: number;
+  /**
+   * The fixed-tick index (SIMULATION.md §1.3: Q = 1/120 s; world.ts worldTick, advanceTicks). Saved. Absent in a
+   * world from createWorld and in older saves: worldTick() derives it as the last whole tick at or before t.
+   */
+  tick?: number;
   /** Fixed step of the body integrator, s. */
   h: number;
   /** An integration node of the bodies at or before `t`: step index and packed [positions 3n][velocities 3n]. */
@@ -180,7 +230,20 @@ export function bodyIndex(world: World, id: string): number {
   return -1;
 }
 
-export const craftMass = (c: Craft): number => c.dryMass + c.propellant;
+/** Total mass: dry structure, the main pool and the RCS pool, kg. */
+export const craftMass = (c: Craft): number => c.dryMass + c.propellant + c.rcsPropellant;
+
+const rings = new WeakMap<World, EventRing>();
+/**
+ * The world's event ring (src/world/events.ts, SIMULATION.md §1.4): output only, never saved, never read by the
+ * world. Writers (dynamics' jet edges, contact, props, crew, devices) emit into it; the session drains it once per
+ * frame (Session.drainEvents). A loaded world starts with an empty ring.
+ */
+export function eventRing(world: World): EventRing {
+  let r = rings.get(world);
+  if (!r) { r = createEventRing(); rings.set(world, r); }
+  return r;
+}
 
 /** Mark a craft destroyed (it stays in the world as inert wreckage under the same laws). */
 export function destroyCraft(world: World, c: Craft, cause: string, t: number): void {

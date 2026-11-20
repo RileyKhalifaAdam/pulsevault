@@ -5,7 +5,6 @@
 import type { Ephemeris } from './ephemeris';
 import { ephemerisOf } from './ephemeris';
 import { chooseDt, loadParticle, Particle, stepCoast, stepForced, updatePrimary } from './dynamics';
-import { perfNow } from './math';
 import { bodyIndex, findCraft, type World } from './state';
 
 export const EV_PERIAPSIS = 0;
@@ -69,14 +68,32 @@ export interface PredictOptions {
   burns?: readonly PredictBurn[];
   /** Craft whose path is predicted alongside, for closest approaches. */
   targetCraftId?: string | null;
+  /**
+   * Held thrust (SIMULATION.md W1-A 3): from the start until `until` (sim time) the ghost flies under this force (N,
+   * inertial axes, held fixed) and burns mdot kg/s (stepForced at the powered step), then coasts. Absent: it coasts.
+   */
+  thrust?: { fx: number; fy: number; fz: number; mdot: number; until: number } | null;
 }
 
 const MAX_BURNS = 16;
 
-/** An incremental prediction: start() it, then run() it in slices of a millisecond budget until it returns true. */
+/**
+ * An incremental prediction: start() it, then run() it in slices of a STEP COUNT (SIMULATION.md W1-A 11: the caller
+ * budgets steps against its own cost-per-step estimate; Safari's clock is 1 ms coarse) until it returns true.
+ * Incremental (W1-A 3): extend() moves the far end on and run() continues from where the ghost is, and dropBefore()
+ * discards the points behind the present. The ghost never takes the shortened last step to the horizon: that step is
+ * taken on a copy and gives only the TIP (the last point, its events, `horizon`), which the next extend() replaces.
+ * So an extended prediction is a prefix-continuation of one long run: the same steps, the same points, bit for bit.
+ */
 export class Predictor {
-  private readonly G = new Particle();
-  private readonly T = new Particle();
+  private G = new Particle();
+  private T = new Particle();
+  private GT = new Particle();
+  private TT = new Particle();
+  private committed = 0;
+  private evCommitted = 0;
+  private thrustUntil = -Infinity;
+  private tfx = 0; private tfy = 0; private tfz = 0; private tmd = 0;
   private readonly burns = new Float64Array(4 * MAX_BURNS);
   private F = new Float64Array(96);
   private F2 = new Float64Array(96);
@@ -84,6 +101,8 @@ export class Predictor {
   private eph: Ephemeris | null = null;
   private out: Prediction = createPrediction(2, 1);
   private hasT = false;
+  /** The path ended for good (impact, landed, the ephemeris ring full): extend() does nothing. */
+  private stopped = false;
   private frame = 0;
   private t = 0;
   private tEnd = 0;
@@ -105,8 +124,9 @@ export class Predictor {
     this.world = world; this.eph = eph; this.out = out;
     if (this.F.length < eph.n3) { this.F = new Float64Array(eph.n3); this.F2 = new Float64Array(eph.n3); }
     out.count = 0; out.targetCount = 0; out.eventCount = 0; out.t0 = world.t; out.horizon = 0; out.steps = 0; out.done = false;
+    this.stopped = false;
     const c = findCraft(world, craftId);
-    if (!c) { out.done = true; return; }
+    if (!c) { out.done = true; this.stopped = true; return; }
     const G = this.G, T = this.T;
     loadParticle(G, c);
     G.heat = 0; G.heatCap = 1e300;
@@ -115,7 +135,7 @@ export class Predictor {
     if (tc && this.hasT) { loadParticle(T, tc); T.heat = 0; T.heatCap = 1e300; }
     const f = opts.frameBodyId ? bodyIndex(world, opts.frameBodyId) : -1;
     this.frame = out.frameBody = f >= 0 ? f : c.primary;
-    this.maxPts = Math.max(4, Math.min(opts.maxPoints ?? 1e9, out.points.length >> 2));
+    this.maxPts = Math.max(4, Math.min(opts.maxPoints ?? 1e9, (out.points.length >> 2) - 1)); // one slot for the tip
     this.stride = 1; this.since = 0;
     this.t = world.t; this.tEnd = world.t + opts.duration; this.n = 0;
     this.cov = eph.ensure(world.t);
@@ -135,9 +155,56 @@ export class Predictor {
         this.burns[4 * k] = b.t; this.burns[4 * k + 1] = b.prograde; this.burns[4 * k + 2] = b.normal; this.burns[4 * k + 3] = b.radial;
       }
     }
+    const th = opts.thrust;
+    if (th && th.until > world.t && c.landedOn === null) {
+      this.thrustUntil = th.until; this.tfx = th.fx; this.tfy = th.fy; this.tfz = th.fz; this.tmd = th.mdot;
+    } else { this.thrustUntil = -Infinity; this.tfx = this.tfy = this.tfz = this.tmd = 0; }
+    G.fx = G.fy = G.fz = G.mdot = 0;
+    this.committed = 0; this.evCommitted = 0;
     this.place(world.t);
     this.emit(world.t, true);
-    if (c.landedOn !== null) { out.done = true; }
+    out.count = this.committed;
+    if (c.landedOn !== null) { out.done = true; this.stopped = true; }
+  }
+
+  /** The sim time the prediction runs to. */
+  end(): number {
+    return this.tEnd;
+  }
+
+  /** Move the far end on to `tEnd` (later than now): run() then continues the same ghost. False if nothing to do. */
+  extend(tEnd: number): boolean {
+    const o = this.out;
+    if (!this.world || !(tEnd > this.tEnd) || this.stopped) return false;
+    this.tEnd = tEnd;
+    o.count = this.committed;
+    o.eventCount = this.evCommitted;
+    o.targetCount = this.hasT ? o.count : 0;
+    o.done = false;
+    return true;
+  }
+
+  /** Drop the points (and events) before time t, keeping the last point at or before it so the path starts there. */
+  dropBefore(t: number): void {
+    const o = this.out, p = o.points, q = o.targetPoints;
+    let i = 0;
+    while (i + 1 < this.committed && p[4 * (i + 1) + 3] <= t) i++;
+    if (i > 0) {
+      const n = o.count; // committed + the tip
+      p.copyWithin(0, 4 * i, 4 * n);
+      if (this.hasT) q.copyWithin(0, 4 * i, 4 * n);
+      this.committed -= i;
+      o.count = n - i;
+      o.targetCount = this.hasT ? o.count : 0;
+    }
+    const e = o.events;
+    let k = 0;
+    while (k < this.evCommitted && e[6 * k + 1] < t) k++;
+    if (k > 0) {
+      e.copyWithin(0, 6 * k, 6 * o.eventCount);
+      this.evCommitted -= k;
+      o.eventCount -= k;
+    }
   }
 
   /** Frame-relative positions of the ghost (and target) at time t into gx.. / hx.. */
@@ -153,21 +220,24 @@ export class Predictor {
     if (!force && ++this.since < this.stride) return;
     this.since = 0;
     const p = o.points, q = o.targetPoints;
-    if (o.count >= this.maxPts) {
+    if (this.committed >= this.maxPts) {
       let k = 0;
-      for (let i = 0; i < o.count; i += 2, k++) {
+      for (let i = 0; i < this.committed; i += 2, k++) {
         const a = 4 * i, b = 4 * k;
         p[b] = p[a]; p[b + 1] = p[a + 1]; p[b + 2] = p[a + 2]; p[b + 3] = p[a + 3];
         q[b] = q[a]; q[b + 1] = q[a + 1]; q[b + 2] = q[a + 2]; q[b + 3] = q[a + 3];
       }
-      o.count = k;
+      this.committed = k;
       this.stride *= 2;
     }
-    const b = 4 * o.count;
+    this.point(this.committed++, t);
+  }
+
+  /** Write the current ghost (and target) position at point slot i. */
+  private point(i: number, t: number): void {
+    const o = this.out, p = o.points, q = o.targetPoints, b = 4 * i;
     p[b] = this.gx; p[b + 1] = this.gy; p[b + 2] = this.gz; p[b + 3] = t;
     if (this.hasT) { q[b] = this.hx; q[b + 1] = this.hy; q[b + 2] = this.hz; q[b + 3] = t; }
-    o.count++;
-    o.targetCount = this.hasT ? o.count : 0;
   }
 
   /** Record an event at frame-relative position (x, y, z). */
@@ -200,65 +270,65 @@ export class Predictor {
     this.eventAt(EV_BURN, t, G.p, G.x, G.y, G.z, Math.sqrt(pro * pro + nor * nor + rad * rad));
   }
 
-  /** Continue for at most `budgetMs` of wall clock. Returns true when the prediction is complete. */
-  run(budgetMs = Infinity, now: () => number = perfNow): boolean {
+  /**
+   * Continue for at most `maxSteps` ghost steps. Returns true when the prediction reaches its end (the tip written).
+   * (A function as the first argument is the old millisecond form, kept for tools: run(ms, now).)
+   */
+  run(maxSteps = Infinity, now?: () => number): boolean {
     const o = this.out;
     if (o.done || !this.world || !this.eph) return true;
-    const limited = budgetMs < Infinity;
-    const start = limited ? now() : 0;
+    const clock = now !== undefined && maxSteps < Infinity;
+    const start = clock ? now!() : 0;
     const world = this.world, eph = this.eph, bodies = world.bodies, G = this.G, T = this.T, hasT = this.hasT;
-    let t = this.t, n = this.n;
+    let t = this.t, n = this.n, taken = 0;
     for (;;) {
       while (this.ib < this.nb && this.burns[4 * this.ib] <= t) this.applyBurn(t);
-      if (t >= this.tEnd) break;
       if ((n & 15) === 0) {
         updatePrimary(world, eph, null, G, t);
         if (hasT) updatePrimary(world, eph, null, T, t);
       }
       const b = bodies[G.p];
-      let dt = chooseDt(G, b, false, false);
+      const thrusting = t < this.thrustUntil && G.prop > 0;
+      let dt = chooseDt(G, b, thrusting, false);
       if (hasT) { const d2 = chooseDt(T, bodies[T.p], false, false); if (d2 < dt) dt = d2; }
       if (this.ib < this.nb && t + dt > this.burns[4 * this.ib]) dt = this.burns[4 * this.ib] - t;
-      let last = false;
-      if (t + dt >= this.tEnd) { dt = this.tEnd - t; last = true; }
+      if (thrusting) {
+        if (t + dt > this.thrustUntil) dt = this.thrustUntil - t;
+        G.fx = this.tfx; G.fy = this.tfy; G.fz = this.tfz; G.mdot = this.tmd;
+      } else if (G.mdot !== 0) { G.fx = G.fy = G.fz = G.mdot = 0; }
       if (t + dt > this.cov) {
-        const want = Math.min(this.tEnd, t + dt + 64 * eph.h);
-        this.cov = eph.ensure(want);
-        if (this.cov < t + dt) {
+        const want = t + dt + 64 * eph.h;
+        this.cov = eph.ensure(want < this.tEnd + dt ? want : this.tEnd + dt);
+        if (this.cov < t + dt && this.cov < this.tEnd) {
           // The ephemeris ring is full: the prediction ends where the cache does.
-          if (this.cov <= t) break;
-          this.tEnd = this.cov; dt = this.cov - t; last = true;
+          this.tEnd = this.cov; this.stopped = true;
+          if (this.cov <= t) { this.finish(t, t); return true; }
         }
+      }
+      if (t + dt >= this.tEnd) {
+        // the last, shortened step: on a copy (the tip); the ghost stays on its own step grid
+        this.tip(t, this.tEnd - t, b, thrusting);
+        this.t = t; this.n = n;
+        o.steps = n;
+        return true;
       }
       const x0 = G.x, y0 = G.y, z0 = G.z, vx0 = G.vx, vy0 = G.vy, vz0 = G.vz;
-      const r0 = Math.sqrt(x0 * x0 + y0 * y0 + z0 * z0), rv0 = x0 * vx0 + y0 * vy0 + z0 * vz0;
-      if (G.inAtm) stepForced(G, b, eph, t, dt); else stepCoast(G, eph, t, dt);
+      if (G.inAtm || thrusting) stepForced(G, b, eph, t, dt); else stepCoast(G, eph, t, dt);
+      if (thrusting) G.prop -= this.tmd * dt;
       if (hasT) { if (T.inAtm) stepForced(T, bodies[T.p], eph, t, dt); else stepCoast(T, eph, t, dt); }
-      const tn = last ? this.tEnd : t + dt;
-      const r1 = Math.sqrt(G.x * G.x + G.y * G.y + G.z * G.z), rv1 = G.x * G.vx + G.y * G.vy + G.z * G.vz;
-      if ((rv0 < 0 && rv1 >= 0) || (rv0 > 0 && rv1 <= 0)) {
-        // Apsis inside the step: root of r·v by linear interpolation, position by the cubic through both ends.
-        const f = rv0 / (rv0 - rv1), u = 1 - f;
-        const h00 = (1 + 2 * f) * u * u, h10 = f * u * u * dt, h01 = f * f * (3 - 2 * f), h11 = -f * f * u * dt;
-        const ex = h00 * x0 + h10 * vx0 + h01 * G.x + h11 * G.vx;
-        const ey = h00 * y0 + h10 * vy0 + h01 * G.y + h11 * G.vy;
-        const ez = h00 * z0 + h10 * vz0 + h01 * G.z + h11 * G.vz;
-        this.eventAt(rv0 < 0 ? EV_PERIAPSIS : EV_APOAPSIS, t + f * dt, G.p, ex, ey, ez, Math.sqrt(ex * ex + ey * ey + ez * ez) - b.radius);
-      }
-      const atm = b.atmosphere;
-      if (atm !== null) {
-        const top = b.radius + atm.height;
-        if (r0 >= top && r1 < top) {
-          const f = (r0 - top) / (r0 - r1);
-          this.eventAt(EV_ATMOSPHERE, t + f * dt, G.p, x0 + f * (G.x - x0), y0 + f * (G.y - y0), z0 + f * (G.z - z0), atm.height);
-        }
-      }
+      const tn = t + dt;
       this.place(tn);
+      const r1 = Math.sqrt(G.x * G.x + G.y * G.y + G.z * G.z);
+      this.stepEvents(G, b, t, dt, x0, y0, z0, vx0, vy0, vz0);
       if (r1 < b.radius + G.contactH) {
         this.event(EV_IMPACT, tn, this.gx, this.gy, this.gz, Math.sqrt(G.vx * G.vx + G.vy * G.vy + G.vz * G.vz));
         this.emit(tn, true);
+        this.evCommitted = o.eventCount;
+        this.stopped = true;
         t = tn; n++;
-        break;
+        this.t = t; this.n = n;
+        this.finish(t, -1);
+        return true;
       }
       if (hasT) {
         const sx = this.gx - this.hx, sy = this.gy - this.hy, sz = this.gz - this.hz;
@@ -279,17 +349,80 @@ export class Predictor {
         this.tb = tn; this.db = dc;
         this.bx = this.gx; this.by = this.gy; this.bz = this.gz;
       }
-      this.emit(tn, last || (this.ib < this.nb && this.burns[4 * this.ib] <= tn));
-      t = tn; n++;
-      if (limited && (n & 7) === 0 && now() - start > budgetMs) {
-        this.t = t; this.n = n; o.horizon = t - o.t0; o.steps = n;
-        return false;
-      }
+      this.emit(tn, (this.ib < this.nb && this.burns[4 * this.ib] <= tn) || (thrusting && tn >= this.thrustUntil));
+      this.evCommitted = o.eventCount;
+      t = tn; n++; taken++;
+      if (taken >= maxSteps && !clock) break;
+      if (clock && (taken & 7) === 0 && now!() - start > maxSteps) break;
     }
     this.t = t; this.n = n;
-    o.horizon = t - o.t0; o.steps = n; o.done = true;
-    return true;
+    o.count = this.committed;
+    o.targetCount = hasT ? o.count : 0;
+    o.horizon = t - o.t0; o.steps = n;
+    return false;
   }
+
+  /** Apsis and atmosphere-entry events inside the step just taken from (x0…, v0…) at t over dt (G is at its end). */
+  private stepEvents(G: Particle, b: World['bodies'][number], t: number, dt: number, x0: number, y0: number, z0: number, vx0: number, vy0: number, vz0: number): void {
+    const r0 = Math.sqrt(x0 * x0 + y0 * y0 + z0 * z0), rv0 = x0 * vx0 + y0 * vy0 + z0 * vz0;
+    const r1 = Math.sqrt(G.x * G.x + G.y * G.y + G.z * G.z), rv1 = G.x * G.vx + G.y * G.vy + G.z * G.vz;
+    if ((rv0 < 0 && rv1 >= 0) || (rv0 > 0 && rv1 <= 0)) {
+      // Apsis inside the step: root of r·v by linear interpolation, position by the cubic through both ends.
+      const f = rv0 / (rv0 - rv1), u = 1 - f;
+      const h00 = (1 + 2 * f) * u * u, h10 = f * u * u * dt, h01 = f * f * (3 - 2 * f), h11 = -f * f * u * dt;
+      const ex = h00 * x0 + h10 * vx0 + h01 * G.x + h11 * G.vx;
+      const ey = h00 * y0 + h10 * vy0 + h01 * G.y + h11 * G.vy;
+      const ez = h00 * z0 + h10 * vz0 + h01 * G.z + h11 * G.vz;
+      this.eventAt(rv0 < 0 ? EV_PERIAPSIS : EV_APOAPSIS, t + f * dt, G.p, ex, ey, ez, Math.sqrt(ex * ex + ey * ey + ez * ez) - b.radius);
+    }
+    const atm = b.atmosphere;
+    if (atm !== null) {
+      const top = b.radius + atm.height;
+      if (r0 >= top && r1 < top) {
+        const f = (r0 - top) / (r0 - r1);
+        this.eventAt(EV_ATMOSPHERE, t + f * dt, G.p, x0 + f * (G.x - x0), y0 + f * (G.y - y0), z0 + f * (G.z - z0), atm.height);
+      }
+    }
+  }
+
+  /** The shortened last step from t over dt, on copies of the ghost (and target): the tip point and its events. */
+  private tip(t: number, dt: number, b: World['bodies'][number], thrusting: boolean): void {
+    const G = this.G, T = this.T, GT = this.GT, TT = this.TT, eph = this.eph!, hasT = this.hasT;
+    copyParticle(GT, G);
+    if (hasT) copyParticle(TT, T);
+    if (dt > 0) {
+      if (GT.inAtm || thrusting) stepForced(GT, b, eph, t, dt); else stepCoast(GT, eph, t, dt);
+      if (hasT) { if (TT.inAtm) stepForced(TT, this.world!.bodies[TT.p], eph, t, dt); else stepCoast(TT, eph, t, dt); }
+    }
+    // place() and the event helpers read G/T: point them at the copies for the tip
+    this.swapGhosts();
+    this.place(t + dt);
+    if (dt > 0) this.stepEvents(this.G, b, t, dt, G.x, G.y, G.z, G.vx, G.vy, G.vz);
+    this.swapGhosts();
+    this.finish(t + dt, t + dt);
+  }
+
+  private swapGhosts(): void {
+    const g = this.G, h = this.T;
+    this.G = this.GT; this.GT = g;
+    this.T = this.TT; this.TT = h;
+  }
+
+  /** Close the output: committed points plus (tipT ≥ 0) the tip at slot `committed`; horizon to `end`. */
+  private finish(end: number, tipT: number): void {
+    const o = this.out;
+    if (tipT >= 0) this.point(this.committed, tipT);
+    o.count = this.committed + (tipT >= 0 ? 1 : 0);
+    o.targetCount = this.hasT ? o.count : 0;
+    o.horizon = end - o.t0;
+    o.done = true;
+  }
+}
+
+function copyParticle(a: Particle, b: Particle): void {
+  a.p = b.p; a.x = b.x; a.y = b.y; a.z = b.z; a.vx = b.vx; a.vy = b.vy; a.vz = b.vz; a.m = b.m; a.prop = b.prop; a.heat = b.heat;
+  a.fx = b.fx; a.fy = b.fy; a.fz = b.fz; a.mdot = b.mdot; a.cdA = b.cdA; a.heatArea = b.heatArea; a.heatCap = b.heatCap; a.heatDiss = b.heatDiss;
+  a.contactH = b.contactH; a.reachMax = b.reachMax; a.inAtm = b.inAtm; a.drag = b.drag; a.load = b.load;
 }
 
 const SHARED = new Predictor();

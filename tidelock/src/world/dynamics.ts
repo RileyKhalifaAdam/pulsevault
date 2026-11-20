@@ -7,14 +7,29 @@
 // finer under thrust, in air and near the ground); coasting uses 4th-order symplectic Yoshida steps, thrust
 // and drag phases classical RK4 on (position, velocity, mass, heat). Rotation: Euler's equations with a
 // diagonal inertia tensor, RK4 on (ω, q), sub-stepped by angular rate. Nothing here allocates.
+//
+// Thrust (SIMULATION.md W1-B) comes only from jets and engines that exist (world/jets.ts): every step the RCS command
+// (c.rcs, c.torque: −1..1 per signed table column) is allocated to the hull's jets, which burn the hydrazine
+// blowdown pool, and each main engine follows its own spool (ignition delay, τ_up/τ_down, minimum throttle) on the
+// main pool. What they ACTUALLY applied — force, torque about the CoM with jet damping, mass flow — drives the
+// integration, is written to c.jetDuty / c.engineThrust, and goes into the applied-force ledger (c.fAcc, c.tauAcc,
+// c.accT, with the RK4-weighted step mean of drag) that everything felt reads (consumeLedger). Jet on/off edges go
+// to the event ring. Air-relative velocity and the stagnation heat flux are written per step in air.
 
+import type { V3 } from '../core/types';
 import type { Body, Craft, World } from './state';
-import { destroyCraft, pushEvent } from './state';
+import { destroyCraft, eventRing, pushEvent } from './state';
 import type { Ephemeris } from './ephemeris';
 import { YC1, YC2, YD1, YD2 } from './ephemeris';
 import { airDensity, HEAT_FLUX_COEFF } from './atmosphere';
-import { clamp1, qRot, qRotInv } from './math';
+import { qRot, qRotInv } from './math';
 import { compoundSupport, craftCompound } from './compound';
+import { emitEvent } from './events';
+import {
+  applyEngines, clearThrustOut, consumeLedgerInto, engineActive, engineCutStep, engineUpdate, IN_H, IN_IX, IN_IY, IN_IZ, IN_M,
+  IN_RCS, IN_THROTTLE, IN_WX, IN_WY, IN_WZ, jetEdgeMasks, jetsStep, ledgerAdd, ledgerAddInertialForce, makeThrustOut,
+  type LedgerMean, type ThrustOut,
+} from './jets';
 
 /** Step as a fraction of the dynamical time √(r³/μ) of the primary (≈209 steps per circular orbit). */
 export const ETA = 0.03;
@@ -67,11 +82,15 @@ export class Particle {
   /** Set by a forced step: peak drag deceleration and proper acceleration, m/s². */
   drag = 0;
   load = 0;
+  /** Set by a forced step: the RK4-weighted step mean of the drag FORCE, (k₁ + 2k₂ + 2k₃ + k₄)/6, inertial axes, N. */
+  dfx = 0; dfy = 0; dfz = 0;
 }
 
 let D = new Float64Array(96);
 const S6 = new Float64Array(12);
 let _ax = 0, _ay = 0, _az = 0, _hd = 0, _drag = 0, _load = 0, _why = 0, _stop = 0, _steps = 0;
+/** Drag force of the last force() call, inertial axes, N. */
+let _dfx = 0, _dfy = 0, _dfz = 0;
 
 /** Result flags of the last integrateCraft call. */
 export const lastStop = (): number => _stop;
@@ -107,6 +126,7 @@ function force(P: Particle, b: Body, eph: Ephemeris, t: number, x: number, y: nu
   let nx = P.fx * im, ny = P.fy * im, nz = P.fz * im;
   let hd = (-P.heatDiss * heat) / P.heatCap;
   let drag = 0;
+  _dfx = _dfy = _dfz = 0;
   const atm = b.atmosphere;
   if (atm !== null) {
     const alt = Math.sqrt(x * x + y * y + z * z) - b.radius;
@@ -117,8 +137,9 @@ function force(P: Particle, b: Body, eph: Ephemeris, t: number, x: number, y: nu
       // Air-relative velocity: the atmosphere turns with the body.
       const ux = vx - (wy * z - wz * y), uy = vy - (wz * x - wx * z), uz = vz - (wx * y - wy * x);
       const sp = Math.sqrt(ux * ux + uy * uy + uz * uz);
-      const k = 0.5 * rho * sp * P.cdA * im;
+      const kf = 0.5 * rho * sp * P.cdA, k = kf * im;
       nx -= k * ux; ny -= k * uy; nz -= k * uz;
+      _dfx = -kf * ux; _dfy = -kf * uy; _dfz = -kf * uz;
       drag = k * sp;
       hd += HEAT_FLUX_COEFF * Math.sqrt(rho) * sp * sp * sp * P.heatArea;
     }
@@ -133,19 +154,23 @@ export function stepForced(P: Particle, b: Body, eph: Ephemeris, t: number, dt: 
   const md = P.mdot, h2 = dt / 2, h6 = dt / 6;
   force(P, b, eph, t, x0, y0, z0, vx0, vy0, vz0, m0, q0);
   const a1x = _ax, a1y = _ay, a1z = _az, g1 = _hd;
+  let dfx = _dfx, dfy = _dfy, dfz = _dfz;
   let drag = _drag;
   P.load = _load;
   const v2x = vx0 + h2 * a1x, v2y = vy0 + h2 * a1y, v2z = vz0 + h2 * a1z;
   force(P, b, eph, t + h2, x0 + h2 * vx0, y0 + h2 * vy0, z0 + h2 * vz0, v2x, v2y, v2z, m0 - md * h2, q0 + h2 * g1);
   const a2x = _ax, a2y = _ay, a2z = _az, g2 = _hd;
+  dfx += 2 * _dfx; dfy += 2 * _dfy; dfz += 2 * _dfz;
   if (_drag > drag) drag = _drag;
   const v3x = vx0 + h2 * a2x, v3y = vy0 + h2 * a2y, v3z = vz0 + h2 * a2z;
   force(P, b, eph, t + h2, x0 + h2 * v2x, y0 + h2 * v2y, z0 + h2 * v2z, v3x, v3y, v3z, m0 - md * h2, q0 + h2 * g2);
   const a3x = _ax, a3y = _ay, a3z = _az, g3 = _hd;
+  dfx += 2 * _dfx; dfy += 2 * _dfy; dfz += 2 * _dfz;
   if (_drag > drag) drag = _drag;
   const v4x = vx0 + dt * a3x, v4y = vy0 + dt * a3y, v4z = vz0 + dt * a3z;
   force(P, b, eph, t + dt, x0 + dt * v3x, y0 + dt * v3y, z0 + dt * v3z, v4x, v4y, v4z, m0 - md * dt, q0 + dt * g3);
   if (_drag > drag) drag = _drag;
+  P.dfx = (dfx + _dfx) / 6; P.dfy = (dfy + _dfy) / 6; P.dfz = (dfz + _dfz) / 6;
   P.x = x0 + h6 * (vx0 + 2 * v2x + 2 * v3x + v4x);
   P.y = y0 + h6 * (vy0 + 2 * v2y + 2 * v3y + v4y);
   P.z = z0 + h6 * (vz0 + 2 * v2z + 2 * v3z + v4z);
@@ -186,6 +211,7 @@ export function stepCoast(P: Particle, eph: Ephemeris, t: number, dt: number): v
   }
   P.drag = 0;
   P.load = 0;
+  P.dfx = P.dfy = P.dfz = 0;
 }
 
 /**
@@ -285,6 +311,8 @@ export function updatePrimary(world: World, eph: Ephemeris, c: Craft | null, P: 
 // ------------------------------------------------------------------------------------------------ rotation
 
 let _kx = 0, _ky = 0, _kz = 0, _tx = 0, _ty = 0, _tz = 0;
+/** The torque rotateCraft applies when `torquing`: what the jets and engines actually made, N·m, craft axes. */
+let _Tx = 0, _Ty = 0, _Tz = 0;
 let _d0 = 0, _d1 = 0, _d2 = 0, _d3 = 0, _d4 = 0, _d5 = 0, _d6 = 0;
 
 /** Euler's equations and the quaternion kinematics: derivative of (ω, q). */
@@ -299,17 +327,18 @@ function rotDeriv(wx: number, wy: number, wz: number, qx: number, qy: number, qz
 }
 
 /**
- * Rotate a craft through `dt`: I·ω̇ = τ − ω × Iω with the commanded torque (limited to maxTorque) when
- * `torquing`, RK4 on (ω, q), sub-stepped so that no step turns more than ROT_ANGLE. Returns the sub-steps taken.
+ * Rotate a craft through `dt`: I·ω̇ = τ − ω × Iω, with τ (held over the step) the torque the thrusters actually applied
+ * (set by integrateCraft in _Tx.._Tz: jets, engines, jet damping) when `torquing`, RK4 on (ω, q), sub-stepped so that
+ * no step turns more than ROT_ANGLE. Returns the sub-steps taken.
  */
-export function rotateCraft(c: Craft, mass: number, dt: number, torquing: boolean): number {
+function rotateCraft(c: Craft, mass: number, dt: number, torquing: boolean): number {
   const g = c.gyration;
   const Ix = mass * g.x, Iy = mass * g.y, Iz = mass * g.z;
   _kx = (Iz - Iy) / Ix; _ky = (Ix - Iz) / Iy; _kz = (Iy - Ix) / Iz;
   if (torquing) {
-    _tx = (clamp1(c.torque.x) * c.maxTorque.x) / Ix;
-    _ty = (clamp1(c.torque.y) * c.maxTorque.y) / Iy;
-    _tz = (clamp1(c.torque.z) * c.maxTorque.z) / Iz;
+    _tx = _Tx / Ix;
+    _ty = _Ty / Iy;
+    _tz = _Tz / Iz;
   } else {
     _tx = _ty = _tz = 0;
   }
@@ -353,7 +382,7 @@ export function loadParticle(P: Particle, c: Craft, world?: World): void {
   P.x = c.rel.x; P.y = c.rel.y; P.z = c.rel.z;
   P.vx = c.relV.x; P.vy = c.relV.y; P.vz = c.relV.z;
   P.prop = c.propellant;
-  P.m = c.dryMass + c.propellant;
+  P.m = c.dryMass + c.propellant + c.rcsPropellant; // W1-A hook: the RCS pool is mass too
   P.heat = c.heat;
   P.cdA = c.dragArea;
   P.heatArea = c.heatArea;
@@ -388,13 +417,110 @@ function storeParticle(P: Particle, c: Craft): void {
   c.load = P.load;
 }
 
+// ------------------------------------------------------------------------------------------------ thrusters (W1-B)
+
+const CMD = new Float64Array(6);
+/** Engine thrust / timer before a step (slots 0..7 / 8..15), to redo the step when a pool runs dry inside it. */
+const ESAVE = new Float64Array(16);
+const EMEAN = new Float64Array(8);
+let DUTY = new Float64Array(32);
+const TO: ThrustOut = makeThrustOut();
+const EDGES = { on: 0, off: 0 };
+const DV = { x: 0, y: 0, z: 0 };
+const DW = { x: 0, y: 0, z: 0 };
+let _jets = false, _pw = false, _tq = false;
+
+/**
+ * What the thrusters of c will do in its next step (into _jets, _pw, _tq): the jets fire when the craft is live, has
+ * jets, hydrazine and an RCS command; the main drive is active while an engine is lit or still spooling down, or when
+ * the throttle is enough to light one (≥ minimum throttle) and the main pool `prop` is not empty. Powered (translation
+ * thrust, the 1/60 s step) and torquing (rotation only) as chooseDt wants them.
+ */
+function thrustFlags(c: Craft, prop: number): void {
+  const live = !c.destroyed, rc = c.rcs, tq = c.torque, ne = c.engines.length;
+  const cmdF = rc.x !== 0 || rc.y !== 0 || rc.z !== 0, cmdT = tq.x !== 0 || tq.y !== 0 || tq.z !== 0;
+  _jets = live && c.jets.length > 0 && c.rcsPropellant > 0 && (cmdF || cmdT);
+  let main = false;
+  if (live && ne > 0) main = engineActive(c.engineThrust, c.engineTimer, ne) || (prop > 0 && c.throttle >= c.engines[0].minThrottle);
+  _pw = (_jets && cmdF) || main;
+  _tq = _jets && cmdT;
+}
+
+/** Per-step inputs of jets.ts for c at mass m over h (rates at the step start, the latched throttle, the pool). */
+function fillInput(c: Craft, m: number, h: number): Float64Array {
+  const inp = c.jetIn, w = c.w, g = c.gyration, thr = c.throttle;
+  inp[IN_H] = h;
+  inp[IN_RCS] = c.rcsPropellant;
+  inp[IN_WX] = w.x; inp[IN_WY] = w.y; inp[IN_WZ] = w.z;
+  inp[IN_THROTTLE] = thr > 1 ? 1 : thr > 0 ? thr : 0;
+  inp[IN_M] = m;
+  inp[IN_IX] = m * g.x; inp[IN_IY] = m * g.y; inp[IN_IZ] = m * g.z;
+  return inp;
+}
+
+/**
+ * The thrusters of c over inp[IN_H] into TO (craft axes) and DUTY: jets allocated from c.rcs / c.torque (`jetsOn`),
+ * each engine's spool (`mainOn`: the main pool is not empty and the drive is not interlocked). The engines' state
+ * before the step is kept in ESAVE (restoreEngines undoes the update).
+ */
+function thrustOver(c: Craft, jetsOn: boolean, mainOn: boolean): void {
+  const inp = c.jetIn, ne = c.engines.length, rc = c.rcs, tq = c.torque;
+  CMD[0] = rc.x; CMD[1] = rc.y; CMD[2] = rc.z; CMD[3] = tq.x; CMD[4] = tq.y; CMD[5] = tq.z;
+  if (c.jets.length > 0) jetsStep(c.jetAlloc, CMD, jetsOn, inp, DUTY, TO);
+  else clearThrustOut(TO);
+  if (ne > 0) {
+    const th = c.engineThrust, tm = c.engineTimer, defs = c.engines;
+    for (let i = 0; i < ne; i++) { ESAVE[i] = th[i]; ESAVE[8 + i] = tm[i]; }
+    for (let i = 0; i < ne; i++) engineUpdate(defs[i], th, tm, i, mainOn, inp, EMEAN);
+    applyEngines(defs, EMEAN, inp, TO);
+  }
+}
+
+function restoreEngines(c: Craft): void {
+  const th = c.engineThrust, tm = c.engineTimer;
+  for (let i = 0; i < c.engines.length; i++) { th[i] = ESAVE[i]; tm[i] = ESAVE[8 + i]; }
+}
+
+/** The duties the step applied become c.jetDuty; on/off edges go to the event ring (a = jet, b = craft index, J = N). */
+function commitDuties(world: World, c: Craft, t: number): void {
+  const n = c.jets.length;
+  if (n === 0) return;
+  const jd = c.jetDuty;
+  jetEdgeMasks(jd, DUTY, n, EDGES);
+  if ((EDGES.on | EDGES.off) !== 0) {
+    const ring = eventRing(world), ci = world.craft.indexOf(c), jets = c.jets, on = EDGES.on, off = EDGES.off, p = TO.pRatio;
+    for (let j = 0; j < n && j < 31; j++) {
+      const bit = 1 << j;
+      if (on & bit) emitEvent(ring, 'jetOn', t, j, ci, jets[j].thrust * p, jets[j].pos, null, 0, 0, 0);
+      else if (off & bit) emitEvent(ring, 'jetOff', t, j, ci, jets[j].thrust * p, jets[j].pos, null, 0, 0, 0);
+    }
+  }
+  for (let j = 0; j < n; j++) jd[j] = DUTY[j];
+}
+
+/** c.airVel = v_rel − Ω × r_rel and c.heatFlux (Sutton–Graves, R_n = 1 m) at the particle's state; zero outside air. */
+function airState(c: Craft, P: Particle, b: Body): void {
+  const atm = b.atmosphere, u = c.airVel;
+  if (atm !== null) {
+    const x = P.x, y = P.y, z = P.z, alt = Math.sqrt(x * x + y * y + z * z) - b.radius;
+    if (alt < atm.height) {
+      const rho = airDensity(atm, alt), w = b.spinRate, sa = b.spinAxis;
+      const wx = w * sa.x, wy = w * sa.y, wz = w * sa.z;
+      u.x = P.vx - (wy * z - wz * y); u.y = P.vy - (wz * x - wx * z); u.z = P.vz - (wx * y - wy * x);
+      const sp = Math.sqrt(u.x * u.x + u.y * u.y + u.z * u.z);
+      c.heatFlux = HEAT_FLUX_COEFF * Math.sqrt(rho) * sp * sp * sp;
+      return;
+    }
+  }
+  if (c.heatFlux !== 0 || u.x !== 0 || u.y !== 0 || u.z !== 0) { u.x = u.y = u.z = 0; c.heatFlux = 0; }
+}
+
 /** The step a free craft would take right now (what advance() sizes its synchronisation spans with). */
 export function stepEstimate(world: World, c: Craft): number {
-  const P = P0, rc = c.rcs, tq = c.torque;
+  const P = P0;
   loadParticle(P, c, world);
-  const live = !c.destroyed;
-  const powered = live && c.propellant > 0 && (c.throttle > 0 || rc.x !== 0 || rc.y !== 0 || rc.z !== 0);
-  return chooseDt(P, world.bodies[c.primary], powered, live && (tq.x !== 0 || tq.y !== 0 || tq.z !== 0));
+  thrustFlags(c, c.propellant);
+  return chooseDt(P, world.bodies[c.primary], _pw, _tq);
 }
 
 /** Steps (translation + rotation sub-steps) taken by integrateCraft since the last call of this function. */
@@ -408,9 +534,11 @@ export function takeSteps(): number {
  * Integrate one free craft from t0 to t1 with its own adaptive steps. Returns the time reached: t1, or earlier
  * when it met the ground (lastStop() === STOP_SURFACE; contact.ts decides what happens next).
  * `tally[why]` counts steps by what limited them; a step cut short by t1 counts as `cutWhy`.
+ * A step also ends where an engine's ignition delay ends and where a pool runs dry (both exactly).
  */
 export function integrateCraft(world: World, eph: Ephemeris, c: Craft, t0: number, t1: number, tally: Float64Array, cutWhy: number): number {
-  const bodies = world.bodies, P = P0;
+  const bodies = world.bodies, P = P0, nJ = c.jets.length, nE = c.engines.length;
+  if (DUTY.length < nJ) DUTY = new Float64Array(nJ);
   loadParticle(P, c, world);
   let t = t0, n = 0;
   _stop = STOP_NONE;
@@ -418,55 +546,78 @@ export function integrateCraft(world: World, eph: Ephemeris, c: Craft, t0: numbe
     if ((n & 15) === 0) updatePrimary(world, eph, c, P, t);
     const b = bodies[P.p];
     const live = !c.destroyed;
-    const rc = c.rcs, tq = c.torque, w = c.w;
-    const powered = live && P.prop > 0 && (c.throttle > 0 || rc.x !== 0 || rc.y !== 0 || rc.z !== 0);
-    const torquing = live && (tq.x !== 0 || tq.y !== 0 || tq.z !== 0);
-    let dt = chooseDt(P, b, powered, torquing);
+    thrustFlags(c, P.prop);
+    const jetsOn = _jets;
+    let dt = chooseDt(P, b, _pw, _tq);
     let why = _why;
     if (P.inAtm !== c.inAtmosphere) {
       c.inAtmosphere = P.inAtm;
       pushEvent(world, { type: 'atmosphere', t, craftId: c.id, bodyId: b.id, entered: P.inAtm });
     }
-    let mdot = 0, lx = 0, ly = 0, lz = 0;
-    if (powered) {
-      const thr = c.throttle > 1 ? 1 : c.throttle < 0 ? 0 : c.throttle;
-      const rx = clamp1(rc.x), ry = clamp1(rc.y), rz = clamp1(rc.z);
-      mdot = (c.mainThrust * thr) / c.exhaustVelocity + (c.rcsThrust * (Math.abs(rx) + Math.abs(ry) + Math.abs(rz))) / c.rcsExhaustVelocity;
-      if (mdot * dt > P.prop) dt = P.prop / mdot;
-      lx = rx * c.rcsThrust; ly = ry * c.rcsThrust; lz = rz * c.rcsThrust - thr * c.mainThrust;
-      qRot(F0, c.q, lx, ly, lz);
-    }
     let last = false;
     if (t + dt >= t1) { dt = t1 - t; last = true; if (why === WHY_FREE) why = cutWhy; }
+    const m0 = P.m;
+    const inp = fillInput(c, m0, dt);
+    if (nE > 0) {
+      // an ignition delay ends exactly on a step boundary
+      engineCutStep(c.engineTimer, nE, inp);
+      if (inp[IN_H] < dt) { dt = inp[IN_H]; last = false; why = WHY_THRUST; }
+    }
+    const mainOn = live && P.prop > 0;
+    thrustOver(c, jetsOn, mainOn);
+    // a pool that runs dry inside the step ends it there (the jets' output does not depend on h; the engines are redone)
+    let cut = dt;
+    if (TO.mdotRcs * dt > c.rcsPropellant) cut = c.rcsPropellant / TO.mdotRcs;
+    if (TO.mdotMain * dt > P.prop) { const k = P.prop / TO.mdotMain; if (k < cut) cut = k; }
+    if (cut < dt) {
+      dt = cut; last = false; why = WHY_THRUST;
+      inp[IN_H] = dt;
+      if (nE > 0) restoreEngines(c);
+      thrustOver(c, jetsOn, mainOn);
+    }
+    const lx = TO.fx, ly = TO.fy, lz = TO.fz;
+    const thrusting = lx !== 0 || ly !== 0 || lz !== 0;
+    const torquing = TO.tx !== 0 || TO.ty !== 0 || TO.tz !== 0;
+    if (thrusting) qRot(F0, c.q, lx, ly, lz);
+    const w = c.w;
     if (torquing || w.x !== 0 || w.y !== 0 || w.z !== 0) {
-      const ns = rotateCraft(c, P.m, dt, torquing);
+      _Tx = TO.tx; _Ty = TO.ty; _Tz = TO.tz;
+      const ns = rotateCraft(c, m0, dt, torquing);
       if (ns > 1) { tally[WHY_ROTATION] += ns - 1; n += ns - 1; }
     }
-    if (powered) {
+    if (thrusting) {
       // Thrust direction held over the step: the mean of the attitude before and after the rotation.
       qRot(F1, c.q, lx, ly, lz);
       const sx = F0.x + F1.x, sy = F0.y + F1.y, sz = F0.z + F1.z;
       const sm = Math.sqrt(sx * sx + sy * sy + sz * sz);
       const k = sm > 0 ? Math.sqrt(lx * lx + ly * ly + lz * lz) / sm : 0;
       P.fx = sx * k; P.fy = sy * k; P.fz = sz * k;
-      P.mdot = mdot;
     } else {
       P.fx = P.fy = P.fz = 0;
-      P.mdot = 0;
     }
-    if (powered || P.inAtm) {
-      stepForced(P, b, eph, t, dt);
-      if (powered) {
-        P.prop -= mdot * dt;
-        if (P.prop < 1e-9) P.prop = 0;
-        P.m = c.dryMass + P.prop;
-      }
-    } else {
-      stepCoast(P, eph, t, dt);
+    P.mdot = TO.mdotRcs + TO.mdotMain;
+    const forced = thrusting || P.inAtm;
+    if (forced) stepForced(P, b, eph, t, dt);
+    else stepCoast(P, eph, t, dt);
+    if (TO.mdotMain > 0) { P.prop -= TO.mdotMain * dt; if (P.prop < 1e-9) P.prop = 0; }
+    if (TO.mdotRcs > 0) { const r = c.rcsPropellant - TO.mdotRcs * dt; c.rcsPropellant = r < 1e-9 ? 0 : r; }
+    P.m = c.dryMass + P.prop + c.rcsPropellant;
+    // The ledger: what was applied over this step, craft axes — the thrusters' force and torque, plus the RK4-weighted
+    // mean drag force rotated by the attitude at the end of the step (the snapshot its readers see).
+    if (forced && (P.dfx !== 0 || P.dfy !== 0 || P.dfz !== 0)) {
+      qRotInv(DV, c.q, P.dfx, P.dfy, P.dfz);
+      TO.fx += DV.x; TO.fy += DV.y; TO.fz += DV.z;
     }
+    ledgerAdd(c, TO, inp);
+    if (forced) {
+      const fx = TO.fx, fy = TO.fy, fz = TO.fz;
+      P.load = Math.sqrt(fx * fx + fy * fy + fz * fz) / m0;
+    }
+    commitDuties(world, c, t);
     t = last ? t1 : t + dt;
     n++;
     tally[why]++;
+    if (P.inAtm || c.heatFlux !== 0) airState(c, P, b);
     if (live) {
       if (P.heat >= P.heatCap) destroyCraft(world, c, 'heat', t);
       else if (P.drag > c.maxLoad) destroyCraft(world, c, 'overload', t);
@@ -482,4 +633,109 @@ export function integrateCraft(world: World, eph: Ephemeris, c: Craft, t0: numbe
   storeParticle(P, c);
   _steps += n;
   return t;
+}
+
+// ------------------------------------------------------------------------------------------------ jointed craft (W1-B)
+
+/**
+ * The thrusters of a craft held by a joint over dt (contact.ts updateJoints): no jet fires (the duties go to 0 and the
+ * edges are emitted: no puffs on the ground or at the port); the engines run when `enginesOn` (landed: they fire
+ * against the ground) and are shut when not (docked: the latch interlocks the drive). The main pool is debited.
+ * Returns what was applied, craft axes (a shared object, valid until the next thrust call).
+ */
+export function jointedThrust(world: World, c: Craft, t: number, dt: number, enginesOn: boolean): ThrustOut {
+  const nJ = c.jets.length;
+  if (DUTY.length < nJ) DUTY = new Float64Array(nJ);
+  fillInput(c, c.dryMass + c.propellant + c.rcsPropellant, dt);
+  thrustOver(c, false, enginesOn && !c.destroyed && c.propellant > 0);
+  if (TO.mdotMain > 0) { const burn = TO.mdotMain * dt; c.propellant = burn < c.propellant ? c.propellant - burn : 0; }
+  commitDuties(world, c, t);
+  return TO;
+}
+
+/**
+ * The ledger of a craft held by a joint over dt: the proper (non-gravitational) acceleration `a` it has (m/s²,
+ * inertial axes) times its mass, and the torque ω × Iω that keeps its body rate constant; c.load = |a|.
+ */
+function ledgerHeld(c: Craft, a: V3, dt: number): void {
+  const m = c.dryMass + c.propellant + c.rcsPropellant, g = c.gyration, w = c.w, inp = c.jetIn;
+  inp[IN_H] = dt;
+  DV.x = a.x * m; DV.y = a.y * m; DV.z = a.z * m;
+  ledgerAddInertialForce(c, c.q, DV, inp);
+  const Lx = m * g.x * w.x, Ly = m * g.y * w.y, Lz = m * g.z * w.z;
+  c.tauAcc.x += (w.y * Lz - w.z * Ly) * dt;
+  c.tauAcc.y += (w.z * Lx - w.x * Lz) * dt;
+  c.tauAcc.z += (w.x * Ly - w.y * Lx) * dt;
+  c.accT += dt;
+  c.load = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+}
+
+/**
+ * Ledger of a craft resting on the turning ground of b (at c.rel) over dt: the ground holds it on a circle about the
+ * spin axis, so its proper acceleration is Ω × (Ω × r) + μ·r/r³ (the ground reaction plus any engine thrust; the
+ * other bodies' tidal pull is neglected). c.load becomes that (≈ 1 g on the ground, not thrust/m).
+ */
+export function ledgerLanded(c: Craft, b: Body, dt: number): void {
+  const r = c.rel, n = b.spinAxis, s = b.spinRate;
+  const wx = s * n.x, wy = s * n.y, wz = s * n.z;
+  const vx = wy * r.z - wz * r.y, vy = wz * r.x - wx * r.z, vz = wx * r.y - wy * r.x;
+  const r2 = r.x * r.x + r.y * r.y + r.z * r.z, k = b.mu / (r2 * Math.sqrt(r2));
+  DW.x = wy * vz - wz * vy + k * r.x;
+  DW.y = wz * vx - wx * vz + k * r.y;
+  DW.z = wx * vy - wy * vx + k * r.z;
+  ledgerHeld(c, DW, dt);
+}
+
+/**
+ * Ledger of a craft latched to station st at lp (station-local axes) over dt: it rides the station, whose own proper
+ * acceleration is zero, so it feels the centripetal term of the station's rotation, R(q)·(ω × (ω × lp)).
+ */
+export function ledgerDocked(c: Craft, st: Craft, lp: V3, dt: number): void {
+  const w = st.w;
+  const ux = w.y * lp.z - w.z * lp.y, uy = w.z * lp.x - w.x * lp.z, uz = w.x * lp.y - w.y * lp.x;
+  qRot(DW, st.q, w.y * uz - w.z * uy, w.z * ux - w.x * uz, w.x * uy - w.y * ux);
+  ledgerHeld(c, DW, dt);
+}
+
+/**
+ * A velocity jump a contact, latch or undock gave c (contact.ts): dv in inertial axes, dw in body axes. The ledger's
+ * impulses are craft axes: Δv += q⁻¹·dv, Δω += dw (= J/m and I⁻¹(r × J) summed over the solve's impulses).
+ */
+export function ledgerJump(c: Craft, dv: V3, dw: V3): void {
+  qRotInv(DV, c.q, dv.x, dv.y, dv.z);
+  const a = c.dvImpulse, b = c.dwImpulse;
+  a.x += DV.x; a.y += DV.y; a.z += DV.z;
+  b.x += dw.x; b.y += dw.y; b.z += dw.z;
+}
+
+/**
+ * The rest of a touchdown: after the impulse solve, the joint pins c to the turning ground of b, so its velocity
+ * becomes Ω × r and its body rate the ground's. That change is an impulse too; it goes into the ledger (not the jolt).
+ */
+export function ledgerToGround(c: Craft, b: Body): void {
+  const r = c.rel, n = b.spinAxis, s = b.spinRate;
+  const wx = s * n.x, wy = s * n.y, wz = s * n.z;
+  const v = c.relV;
+  DW.x = wy * r.z - wz * r.y - v.x; DW.y = wz * r.x - wx * r.z - v.y; DW.z = wx * r.y - wy * r.x - v.z;
+  qRotInv(DV, c.q, DW.x, DW.y, DW.z);
+  const a = c.dvImpulse;
+  a.x += DV.x; a.y += DV.y; a.z += DV.z;
+  qRotInv(DV, c.q, wx, wy, wz);
+  const bw = c.dwImpulse, w = c.w;
+  bw.x += DV.x - w.x; bw.y += DV.y - w.y; bw.z += DV.z - w.z;
+}
+
+// ================================================================================================ day-1 contract (W1-A)
+
+/**
+ * Consume the applied-force ledger of craft c (SIMULATION.md §1.4): the mean proper force (N) and torque (N·m) since
+ * the last consumption, the impulses Δv, Δω, the time covered (all craft axes) into `out`; the ledger is zeroed. Only
+ * the session calls it, once per tick (once per quantum under warp), after the world step and before the crew, props
+ * and views read the snapshot. The accumulation: integrateCraft (thrusters and drag, every step), jointedThrust /
+ * ledgerLanded / ledgerDocked (held by a joint) and ledgerJump / ledgerToGround (contact impulses). A free coasting
+ * step adds its time with zero force, so the mean is over all the time covered. Divide by the current mass for the
+ * mean proper acceleration (within ṁ·T/m of the exact mass-weighted mean: 4e-6 at full drive over one tick).
+ */
+export function consumeLedger(c: Craft, out: LedgerMean): LedgerMean {
+  return consumeLedgerInto(c, out);
 }

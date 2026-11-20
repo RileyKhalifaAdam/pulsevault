@@ -4,6 +4,11 @@
 //
 // Ship-local metres: forward = -Z, up = +Y, right (starboard) = +X, origin at the centre of mass.
 // Main-engine exhaust leaves toward +Z; `engines[i].pos` is the centre of the nozzle exit plane.
+//
+// RCS: `rcs[i].dir` is the EXHAUST direction (the push on the ship is opposite). Every hull carries ±X, ±Y and ±Z
+// jets (SIMULATION.md W1-B: two −Z-exhaust jets forward that push the ship aft, two +Z-exhaust jets aft). Each new
+// position sits on the hull's collision skin with a 15° plume cone clear of the hull for 6 m (checked against
+// HULL_COLLIDERS in tests/jets.test.ts); the jet table (world/jets.ts) is solved from these at load.
 
 import type { RGB, ShipLayout, ShipVisualId, V3 } from '../core/types';
 
@@ -18,6 +23,7 @@ const NX = v(-1, 0, 0);
 const PY = v(0, 1, 0);
 const NY = v(0, -1, 0);
 const NZ = v(0, 0, -1);
+const PZ = v(0, 0, 1);
 
 /** Mirror a list of starboard (+X) entries to both sides: starboard first, then port. */
 function both<T extends { pos: V3 }>(items: T[], flip?: (t: T) => T): T[] {
@@ -59,9 +65,13 @@ export const SHIP_LAYOUTS: Record<ShipVisualId, ShipLayout> = {
       ...both([{ pos: v(3.9, 0.2, -12.0), dir: PX }], flipDir),
       { pos: v(0, 2.0, -12.5), dir: PY },
       { pos: v(0, -1.7, -12.5), dir: NY },
+      // (the 15° plume edge of these tail X jets grazes the wing trailing edge: no consequence until plume impingement)
       ...both([{ pos: v(6.0, -0.2, 11.0), dir: PX }], flipDir),
       ...both([{ pos: v(4.8, 1.1, 12.0), dir: PY }]),
       ...both([{ pos: v(4.8, -1.5, 12.0), dir: NY }]),
+      // Z jets: nose cheeks outboard of the windscreen (the eye is at z −13.45), and the pod flanks aft
+      ...both([{ pos: v(2.8, -0.1, -14.45), dir: NZ }]),
+      ...both([{ pos: v(7.2, -0.6, 11.0), dir: PZ }]),
     ],
     hardpoints: both([{ pos: v(2.6, -1.7, -6.0), size: 1 }]),
     dockingPort: { pos: v(0, 1.95, 2.2), dir: PY },
@@ -93,6 +103,10 @@ export const SHIP_LAYOUTS: Record<ShipVisualId, ShipLayout> = {
       ...both([{ pos: v(3.78, 0, 12.6), dir: PX }], flipDir),
       ...both([{ pos: v(1.0, 1.75, 14.2), dir: PY }]),
       ...both([{ pos: v(1.0, -1.75, 14.2), dir: NY }]),
+      ...both([{ pos: v(1.6, 0, -19.2), dir: NZ }]),
+      // the aft cans are not mirror images: each jet sits on its own can's after face
+      { pos: v(3.6, 0, 14.35), dir: PZ },
+      { pos: v(-3.4, 0, 14.65), dir: PZ },
     ],
     hardpoints: both([{ pos: v(1.15, -2.42, -14.6), size: 1 }]),
     dockingPort: { pos: v(0, 2.51, -14.0), dir: PY },
@@ -119,6 +133,8 @@ export const SHIP_LAYOUTS: Record<ShipVisualId, ShipLayout> = {
       ...both([{ pos: v(3.7, -0.3, 6.8), dir: PX }], flipDir),
       ...both([{ pos: v(2.05, 3.0, 6.85), dir: PY }]),
       ...both([{ pos: v(0.9, -3.0, 6.85), dir: NY }]),
+      ...both([{ pos: v(2.1, 0, -7.3), dir: NZ }]),
+      ...both([{ pos: v(6.0, 0, 6.35), dir: PZ }]),
     ],
     hardpoints: both([{ pos: v(2.2, 3.3, -2.3), size: 1 }]),
     dockingPort: { pos: v(0, 3.31, 6.0), dir: PY },
@@ -145,6 +161,8 @@ export const SHIP_LAYOUTS: Record<ShipVisualId, ShipLayout> = {
       ...both([{ pos: v(1.62, 0.02, 5.9), dir: PX }], flipDir),
       ...both([{ pos: v(0.62, 0.68, 5.7), dir: PY }]),
       ...both([{ pos: v(0.62, -0.54, 5.7), dir: NY }]),
+      ...both([{ pos: v(0.7, 0, -5.95), dir: NZ }]),
+      ...both([{ pos: v(2.2, 0, 5.35), dir: PZ }]),
     ],
     hardpoints: both([
       { pos: v(2.6, -0.6, 1.9), size: 2 },
@@ -174,6 +192,11 @@ export const SHIP_LAYOUTS: Record<ShipVisualId, ShipLayout> = {
       ...both([{ pos: v(1.5, 0, 12.82), dir: PX }], flipDir),
       { pos: v(0, 1.5, 12.82), dir: PY },
       { pos: v(0, -1.5, 12.82), dir: NY },
+      // every jet above has a zero roll arm: ±Y jets on the radiator-wing tips give the hull roll authority
+      ...both([{ pos: v(14.5, 0.34, 9.775), dir: PY }]),
+      ...both([{ pos: v(14.5, -0.26, 9.775), dir: NY }]),
+      ...both([{ pos: v(0.7, 0, -16.1), dir: NZ }]),
+      ...both([{ pos: v(15.0, 0, 10.15), dir: PZ }]),
     ],
     hardpoints: both([{ pos: v(0.9, -1.58, -8.6), size: 1 }]),
     dockingPort: { pos: v(0, 1.72, -9.9), dir: PY },
@@ -202,6 +225,8 @@ export const SHIP_LAYOUTS: Record<ShipVisualId, ShipLayout> = {
       ...both([{ pos: v(5.8, 0, 31.8), dir: PX }], flipDir),
       ...both([{ pos: v(3.2, 4.8, 31.8), dir: PY }]),
       ...both([{ pos: v(3.2, -4.8, 31.8), dir: NY }]),
+      ...both([{ pos: v(2.7, 0, -36.45), dir: NZ }]),
+      ...both([{ pos: v(5.6, 0, 33.6), dir: PZ }]),
     ],
     hardpoints: [
       ...both([{ pos: v(5.0, 6.7, -30.5), size: 2 }]),
@@ -237,6 +262,9 @@ export const SHIP_LAYOUTS: Record<ShipVisualId, ShipLayout> = {
       ...both([{ pos: v(9.1, -0.3, 8.4), dir: PX }], flipDir),
       ...both([{ pos: v(7.6, 1.45, 8.4), dir: PY }]),
       ...both([{ pos: v(7.6, -2.05, 8.4), dir: NY }]),
+      ...both([{ pos: v(2.6, 0, -20.5), dir: NZ }]),
+      // above the drive bells, firing aft between them
+      ...both([{ pos: v(1.7, 1.4, 18.8), dir: PZ }]),
     ],
     hardpoints: [
       ...both([{ pos: v(7.6, -0.3, -6.9), size: 3 }]),

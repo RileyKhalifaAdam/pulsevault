@@ -14,72 +14,75 @@ import { START_STATION_ID, START_SYSTEM_ID } from '../data/systems/layout';
 import { computeStats, defaultLoadout, SHIPS } from '../sim/ships';
 import { generateGalaxy, getSystem } from '../sim/universe';
 import {
-  addCraft, advance, attitudeError, craftInertia, createPrediction, createWorld, dockingStatus, drainEvents, ephemerisOf, findCraft,
+  addCraft, advanceTicks, attitudeError, craftInertia, createPrediction, createWorld, dockingStatus, drainEvents, ephemerisOf, findCraft,
   flightReadout, holdTorque, loadWorld, pointingError, predictionEvent, Predictor, qRot, qRotInv, saveWorld, shipDef, takeJolt, undock,
-  type AdvanceOptions, type Jolt, type Craft, type PredictOptions, type World,
+  type Prediction,
+  TICK_HZ, worldTick, type Jolt, type Craft, type LimitedBy, type PredictOptions, type World,
 } from '../world';
+import { craftMass, eventRing } from '../world/state';
+import { consumeLedger } from '../world/dynamics';
+import { makeLedgerMean, type LedgerMean } from '../world/jets';
+import { createEventRing, drain, type SimEvent } from '../world/events';
+import { createDutyTape, tapeRecord, tapeReset, type DutyTape } from '../world/dutyTape';
+import {
+  createBodyTick, createSeatedBody, eyeOffsetOf, loadSeatedBody, saveSeatedBody, stepSeated, type BodyTick, type SeatedBody, type SeatKind,
+} from '../world/crew';
 import {
   craftMotion, createCrew, createDevice, createShipMotion, crewEye, crewFelt, CREW_COM, devGrab, devMove, devRelease, devTap, feltAt, findPrompt, leverValue, lookCrew,
   pushOffCrew, rockerValue, roomAt, sitCrew, standCrew, stepCrew, stepDevice, stickAxis,
   type CrewState, type DeviceState, type ShipMotion as ShipMotionT,
 } from '../world';
 import {
-  reachAlong, createPropsState, propsChunk, grab as propHandOn, loadPropsState, moveGrab, pickProp, propInfo, propViews, release as propHandOff,
-  savePropsState, stepProps, unstow, type PropsState, type PropView,
+  reachAlong, bodyEvent, createPropsState, grab as propHandOn, loadPropsState, moveGrab, pickProp, propInfo, propViews, release as propHandOff,
+  nextBodyEvent, savePropsState, stepProps, unstow, type PropsState, type PropView,
 } from '../world/props';
+import { FA_SPEED, FlightComputer, PLAYER_ID, type FlightDeviceIndex, type FlightHost } from './flight';
 import type {
   BodyView, CraftView, CrewView, DeviceView, DockingView, FlightView, HoldMode, PlannedBurn, PlayerMode, PlayerView, PredictionEvent, PredictionView, Session, SessionEvents,
   SessionOptions, StepInfo, TargetView, WarpLimit, WarpView,
 } from './api';
 
-export const PLAYER_ID = 'player';
+export { PLAYER_ID, FA_SPEED, FA_NUDGE, FA_RANGE } from './flight';
 /** Time-acceleration ladder. */
 export const WARP_LADDER: readonly number[] = [1, 2, 5, 10, 50, 100, 1000, 1e4, 1e5, 1e6];
 /** The start: the ship's own bounding sphere this far clear of the station's, ahead of it in the same orbit, m. */
 export const START_CLEARANCE = 200;
 
-const SAVE_VERSION = 3;
-/** Longest stretch of sim time the attitude controller's command is held while it is working, s. */
-const CONTROL_DT = 1 / 50;
+/** 4: wave 1 (two propellant pools, thruster state, the ledger, the seated body). Older saves load through migrate(). */
+export const SAVE_VERSION = 4;
+/** Longest real frame the session accepts, s (a longer gap is a hidden page: catchUp). */
+const MAX_FRAME = 0.1;
+/** D6: time missed while the page was hidden is caught up at this warp (on top), at most one sim day. */
+const CATCHUP_WARP = 1e4;
+const CATCHUP_MAX_TICKS = 86400 * 120;
+/** The largest warp quantum, ticks (2^14 ≈ 137 s). */
+const QUANTUM_MAX = 1 << 14;
 /**
- * Flight Assist. With FLT ASSIST lit the DRIVE lever is a speed command: the computer holds the ship's velocity
- * relative to the reference at nose x lever x FA_SPEED, plus FA_NUDGE per axis of the translation controller,
- * using only the real RCS and (armed) the main drive. Reference: the target if it is a craft, else the nearest
- * station within FA_RANGE. The loop is proportional (time constant FA_TAU) with saturation; each axis goes quiet
- * below FA_DB_OFF and wakes above FA_DB_ON, so a held velocity costs nothing and the jets never chatter. The
- * main drive takes over the forward component above FA_MAIN_ON and hands back to the RCS below FA_MAIN_OFF.
+ * The work-unit budget (SIMULATION.md §1.2.1: Safari's clock is 1 ms coarse). A unit is a craft or body integration
+ * step, a loose-object sub-step counts PROP_UNITS, and each step 1 for itself. The cost per unit is learnt from 2 s
+ * means of the wall clock (default: 2 µs, the A16 estimate of node's ~1 µs); the clock is only a backstop.
  */
-export const FA_SPEED = 50;
-export const FA_NUDGE = 3;
-export const FA_RANGE = 100e3;
-const FA_TAU = 0.6;
-const FA_DB_ON = 0.05;
-const FA_DB_OFF = 0.01;
-const FA_MAIN_ON = 1;
-const FA_MAIN_OFF = 0.25;
-/** Stick below this is no input. */
-const STICK_DEADZONE = 0.02;
-/** Rate a full stick deflection asks for while a hold is on (fly-by-wire through real torque), rad/s. */
-const STICK_RATE = 0.5;
-/** 'stability' captures the heading once the ship turns slower than this, rad/s. */
-const CAPTURE_RATE = 0.02;
-/** Deadband: the controller goes quiet inside the first pair and wakes outside the second (rad, rad/s). */
-const SETTLE_ANGLE = 0.003;
-const SETTLE_RATE = 2e-5;
-const WAKE_ANGLE = 0.03;
-const WAKE_RATE = 0.01;
-/** Under time acceleration nobody steers by the nose: from LOOSE_WARP a settled hold lets the heading drift this
- * far before it corrects, and from SUSPEND_WARP it sleeps until time slows down again (the ship coasts in rotation). */
-const LOOSE_WARP = 1000;
-const WAKE_ANGLE_LOOSE = 0.3;
-const SUSPEND_WARP = 1e4;
-/** The latch is armed within this distance of a station's bounding sphere, m. */
-const ARM_RANGE = 1000;
-/** After undocking the latch stays open until the collar is this far from the port, m. */
-const REARM_DISTANCE = 12;
-/** Prediction: refresh interval (real seconds), wall-clock budget per refresh (ms), points kept. */
+const UNIT_MS_DEFAULT = 0.002;
+const UNIT_MS_MIN = 1e-5;
+const UNIT_MS_MAX = 0.05;
+const PROP_UNITS = 4;
+const COST_WINDOW = 2;
+const CLOCK_SLACK_MS = 2;
+/**
+ * Prediction (SIMULATION.md W1-A 3): a restart after a disturbance runs in slices of PREDICT_RESTART_MS, extension at
+ * most PREDICT_EXTEND_MS a frame (a cap, not a spend), both counted in steps against the learnt cost per step
+ * (default 3 µs, the A16 estimate). While thrusting the path restarts at most every PREDICT_INTERVAL real seconds.
+ * The far end is extended once it falls PREDICT_SLACK of the horizon short. Held thrust is flown for ≤ 30 s.
+ */
 const PREDICT_INTERVAL = 0.5;
-const PREDICT_BUDGET_MS = 6;
+const PREDICT_RESTART_MS = 0.4; // + the start and the hand-over (≈ 0.1 ms) = the 0.5 ms a frame of the plan
+const PREDICT_EXTEND_MS = 0.3;
+const PREDICT_STEP_MS = 0.003;
+const PREDICT_SLACK = 0.002;
+const PREDICT_THRUST_S = 30;
+const PREDICT_REFRESH = 30;
+/** Ghost steps per update of the cost-per-step estimate (a few frames of slices: the 1 ms clock averages out). */
+const PREDICT_LEARN_STEPS = 400;
 const PREDICT_POINTS = 512;
 /** Frames the achieved time acceleration is averaged over, and frames a limit reason stays shown. */
 const WARP_WINDOW = 20;
@@ -97,15 +100,20 @@ const SEAT_REACH = 1.2;
 /** How far the head turns in the pilot seat, rad. */
 const HEAD_YAW = 2.2;
 const HEAD_PITCH = 1.1;
-// Loose objects: while any is awake (or in hand) the world advances in pieces no longer than props.ts says it can
-// cover cheaply (propsChunk: 0.1 s in contact, 10 s while everything awake drifts in free flight, stepped from gap to
-// gap), each followed by the objects' own integration, so under time acceleration they are as honest as at 1x and
-// the CPU budget, not a shortcut, is what limits the warp ('props'). Asleep they cost nothing.
+// Loose objects: while any is awake (or in hand) a step is no longer than props.ts nextBodyEvent allows (contact: one
+// tick; drift and rest in closed form: their next event), so under time acceleration they are as honest as at 1x and
+// the budget, not a shortcut, is what limits the warp ('props', 'crew'). Asleep they cost nothing.
 /** Smoothing of the hand's velocity (what a released object is thrown with), s. */
 const THROW_TAU = 0.05;
+/** Its per-tick smoothing factor, 1 − e^(−Q/τ) (a constant: the hand is stepped at Q). */
+const THROW_A = 1 - Math.exp(-1 / 120 / THROW_TAU);
 /** Fastest an arm moves the hand toward where the finger points, m/s (a throw is at most this fast). */
 const HAND_SPEED = 8;
 const NO_PROPS: PropView[] = [];
+/** Strapped in, the body's centre of mass sits this far below the eye (the felt point at the helm), m. */
+const HELM_COM_BELOW_EYE = 0.65;
+/** Where the IMU sits when the layout does not say (SIMULATION.md W1-A 8: under the cockpit deck), ship-local m. */
+const IMU_DEFAULT: V3 = { x: 0, y: -1.2, z: -12.0 };
 /** Hold lamps: the mode each one selects. */
 const HOLD_OF: Partial<Record<DeviceRole, HoldMode>> = {
   holdOff: 'off', holdStability: 'stability', holdPrograde: 'prograde', holdRetrograde: 'retrograde', holdNormal: 'normal', holdAntinormal: 'antinormal',
@@ -136,6 +144,16 @@ interface SessionState {
   head?: number[];
   /** Loose objects (src/world/props.ts); absent in older saves: the objects start where the ship's data puts them. */
   props?: unknown;
+  /** Wave 1: the seated body (crew.ts SeatedBody) and the pinch lean 0..1; absent in older saves (defaults: at rest, 0). */
+  seated?: unknown;
+  lean?: number;
+  /**
+   * Wave 1 (the fixed tick, SIMULATION.md §1.3): the latched inputs and the controller's state at the tick boundary the
+   * save was made on — direct inputs [pitch, yaw, roll, tx, ty, tz], Flight Assist's axes and main-drive latch, its
+   * last command, whether the controller worked at its last tick (the step grid), the time lain still in the bunk.
+   * The tick itself is world.tick. Absent in older saves: all at rest.
+   */
+  ctl?: { in?: number[]; faOn?: boolean[]; faMain?: boolean; faFiring?: boolean; cmd?: number; active?: boolean; restT?: number };
 }
 
 const galaxies = new Map<number, SystemDef>();
@@ -178,27 +196,27 @@ class WorldSession implements Session {
   readonly events = new EventBus<SessionEvents>();
   readonly system: SystemDef;
   private readonly seed: number;
-  private readonly budgetMs: number;
+  private budgetMs: number;
+  private readonly nowFn: () => number;
+  private unitMs: number;
+  private readonly unitFixed: boolean;
+  private costMs = 0;
+  private costUnits = 0;
+  private costReal = 0;
+  // the fixed tick (SIMULATION.md §1.3): ticks owed to real time (fractional), hidden-page catch-up still owed, whether
+  // the controller worked at its last tick (the 60 Hz grid limits the step), what cut the last step short, its steps
+  private due = 0;
+  private catchUpTicks = 0;
+  private ctlActive = false;
+  private stepWhy: WarpLimit = '';
+  private stepSteps = 0;
+  private busy: LimitedBy = '';
   private world!: World;
   private ship!: Craft;
 
-  // pilot input
-  private pitch = 0;
-  private yaw = 0;
-  private roll = 0;
-  private throttle = 0;
-  private readonly translate = v3();
-  /** Flight Assist latched on; which RCS axes it is working (x, y, z), whether it has the main drive, and whether it fires now. */
-  private assist = false;
-  private readonly faOn = [false, false, false];
-  private faMain = false;
-  private faFiring = false;
+  // the flight computer (src/game/flight.ts: pilot input, holds, Flight Assist, latch arming; W1-B's from day 3)
+  private readonly fc: FlightComputer = new FlightComputer(this.flightHost());
   private readonly FV = v3();
-  private hold: HoldMode = 'stability';
-  private holdQ: Quat = { x: 0, y: 0, z: 0, w: 1 };
-  private holdQValid = false;
-  private settled = false;
-  private rearmBlock = false;
 
   // time acceleration
   private warpIndex = 0;
@@ -208,23 +226,34 @@ class WorldSession implements Session {
   private winAt = 0;
   private limitFrames = 0;
   private clock = 0;
-  private readonly info: StepInfo = { simDt: 0, simMs: 0, steps: 0, limitedBy: '' };
+  private readonly info: StepInfo = { simDt: 0, simMs: 0, steps: 0, units: 0, limitedBy: '' };
   private readonly warpView: WarpView = { requested: 1, achieved: 1, limitedBy: '' };
-  private readonly advOpts: AdvanceOptions = { budgetMs: 3, now };
 
   // target, planned burns, prediction
   private targetId: string | null = null;
   private burnList: PlannedBurn[] = [];
   private burnSeq = 0;
   private predFrame: string | null = null;
-  private readonly predictor = new Predictor();
-  private readonly work = createPrediction(PREDICT_POINTS, 48);
-  private readonly predOpts: PredictOptions = { duration: 0, maxPoints: PREDICT_POINTS, frameBodyId: null, burns: [], targetCraftId: null };
-  private readonly pred: PredictionView = { version: 0, frameBodyId: '', points: this.work.points, count: 0, targetPoints: this.work.targetPoints, targetCount: 0, events: [], horizon: 0 };
+  // the predictor: the shown (live) path, extended and trimmed; a fresh one computed beside it after a disturbance
+  private live = new Predictor();
+  private fresh = new Predictor();
+  private liveWork = createPrediction(PREDICT_POINTS, 48);
+  private freshWork = createPrediction(PREDICT_POINTS, 48);
+  private readonly predOpts: PredictOptions = { duration: 0, maxPoints: PREDICT_POINTS, frameBodyId: null, burns: [], targetCraftId: null, thrust: null };
+  private readonly predThrustOpt = { fx: 0, fy: 0, fz: 0, mdot: 0, until: 0 };
+  private readonly pred: PredictionView = { version: 0, frameBodyId: '', points: this.liveWork.points, count: 0, targetPoints: this.liveWork.targetPoints, targetCount: 0, events: [], horizon: 0 };
   private predDirty = true;
   private predClock = -1e9;
-  private predT = NaN;
   private predThrust = false;
+  private predVisible = true;
+  private freshBusy = false;
+  private liveOk = false;
+  private liveRunning = false;
+  private predDuration = 0;
+  private freshDuration = 0;
+  private predStepMs = PREDICT_STEP_MS;
+  private predMs = 0;
+  private predSteps = 0;
 
   // views (reused between calls)
   private bodyViews: BodyView[] = [];
@@ -232,6 +261,7 @@ class WorldSession implements Session {
   private readonly flightView: FlightView = {
     primaryId: '', primaryName: '', situation: 'orbit', altitude: 0, speed: 0, verticalSpeed: 0, surfaceSpeed: 0, apoapsisAlt: 0, periapsisAlt: 0,
     timeToApoapsis: 0, timeToPeriapsis: 0, period: 0, inclination: 0, eccentricity: 0, accel: 0, airDensity: 0, dynamicPressure: 0,
+    specificForce: v3(), rcsPropellant: 0, rcsPropellantCapacity: 0,
   };
   private readonly playerView: PlayerView = {
     craftId: PLAYER_ID, name: '', mass: 0, propellant: 0, propellantFraction: 0, deltaV: 0, maxAccel: 0, throttle: 0, hold: 'stability', heat: 0, hull: 1,
@@ -243,14 +273,6 @@ class WorldSession implements Session {
     closing: 0, canLatch: false, dockedTo: null,
   };
 
-  // scratch
-  private readonly I = v3();
-  private readonly ERR = v3();
-  private readonly WFF = v3();
-  private readonly WE = v3();
-  private readonly D = v3();
-  private readonly OM = v3();
-  private readonly A = v3();
 
   // the pilot's body
   private playerMode: PlayerMode = 'helm';
@@ -272,8 +294,7 @@ class WorldSession implements Session {
   private devSeen: number[] = [];
   private devPage: number[] = [];
   private readonly hands = new Map<number, number>();
-  private readonly ix = { rot: -1, roll: -1, trans: -1, transZ: -1, throttle: -1, arm: -1, lights: -1, harness: -1, assist: -1 };
-  private cmdThrottle = 0;
+  private readonly ix: FlightDeviceIndex = { rot: -1, roll: -1, trans: -1, transZ: -1, throttle: -1, arm: -1, lights: -1, harness: -1, assist: -1 };
   private readonly walk = { moveX: 0, moveZ: 0 };
   private readonly motion = createShipMotion();
   private readonly jolt: Jolt = { dv: { x: 0, y: 0, z: 0 }, dw: { x: 0, y: 0, z: 0 }, n: 0 };
@@ -291,26 +312,38 @@ class WorldSession implements Session {
   private readonly PEYE = v3();
   private readonly crewView: CrewView = {
     mode: 'helm', posture: 'seated', pos: v3(), eye: v3(), yaw: 0, pitch: 0, vel: v3(), boots: true, gripped: false, roomId: '', roomName: '',
-    felt: v3(), prompt: null, asleep: false,
+    felt: v3(), prompt: null, asleep: false, eyeOffset: v3(),
   };
+  // wave 1 (SIMULATION.md §1.4): the tick's consumed ledger, the body steppers' tick context, the seated body, the
+  // pinch lean, and the output-only records the senses read (the event ring lives with the world: state.ts eventRing)
+  private readonly ledger: LedgerMean = makeLedgerMean();
+  private tk: BodyTick = createBodyTick(this.ledger, createEventRing());
+  private seated: SeatedBody = createSeatedBody();
+  private leanT = 0;
+  private readonly tape: DutyTape = createDutyTape();
+  private readonly IMU = v3();
+  private readonly EOFF = v3();
 
   constructor(system: SystemDef, world: World, opts: SessionOptions, seed: number, state?: SessionState) {
     this.system = system;
     this.seed = seed;
     this.budgetMs = opts.budgetMs ?? 3;
+    this.nowFn = opts.now ?? now;
+    this.unitFixed = typeof opts.unitMs === 'number' && opts.unitMs > 0;
+    this.unitMs = this.unitFixed ? opts.unitMs! : UNIT_MS_DEFAULT;
     this.bind(world);
     if (state) {
-      this.hold = state.hold;
-      if (state.holdQ) { this.holdQ = { ...state.holdQ }; this.holdQValid = true; }
+      this.fc.hold = state.hold;
+      if (state.holdQ) { const h = this.fc.holdQ, q = state.holdQ; h.x = q.x; h.y = q.y; h.z = q.z; h.w = q.w; this.fc.holdQValid = true; }
       this.targetId = state.targetId;
       this.predFrame = state.predFrame;
       this.burnList = state.burns.map((b) => ({ ...b }));
       this.burnSeq = state.burnSeq;
-      this.throttle = state.throttle;
-      this.rearmBlock = state.rearmBlock;
-      this.settled = state.settled;
+      this.fc.throttle = state.throttle;
+      this.fc.rearmBlock = state.rearmBlock;
+      this.fc.settled = state.settled;
       this.lights = state.lights !== false;
-      this.assist = state.assist === true;
+      this.fc.assist = state.assist === true;
       const num = (x: unknown): number => (typeof x === 'number' && x === x ? x : 0);
       if (Array.isArray(state.devices)) {
         for (const sd of state.devices) {
@@ -329,6 +362,19 @@ class WorldSession implements Session {
         const ps = loadPropsState(state.props);
         if (ps && ps.layoutId === this.loose.layoutId) this.loose = ps;
       }
+      this.seated = loadSeatedBody(state.seated);
+      const ctl = state.ctl && typeof state.ctl === 'object' ? state.ctl : null;
+      if (ctl) {
+        const fc = this.fc, inp = Array.isArray(ctl.in) ? ctl.in : [];
+        fc.pitch = num(inp[0]); fc.yaw = num(inp[1]); fc.roll = num(inp[2]);
+        fc.translate.x = num(inp[3]); fc.translate.y = num(inp[4]); fc.translate.z = num(inp[5]);
+        if (Array.isArray(ctl.faOn)) for (let i = 0; i < 3; i++) fc.faOn[i] = !!ctl.faOn[i];
+        fc.faMain = !!ctl.faMain; fc.faFiring = !!ctl.faFiring;
+        fc.cmdThrottle = num(ctl.cmd);
+        this.ctlActive = !!ctl.active;
+        this.restT = num(ctl.restT);
+      }
+      this.leanT = typeof state.lean === 'number' && state.lean > 0 ? (state.lean < 1 ? state.lean : 1) : 0;
       if (Array.isArray(state.head)) { this.headYaw = clamp(num(state.head[0]), -HEAD_YAW, HEAD_YAW); this.headPitch = clamp(num(state.head[1]), -HEAD_PITCH, HEAD_PITCH); }
       const b = state.crew;
       if (state.mode === 'helm' || !this.layout) { this.playerMode = 'helm'; this.body = null; }
@@ -342,11 +388,20 @@ class WorldSession implements Session {
     }
   }
 
+  /** What the flight computer asks the session (time acceleration, the target, the next burn). */
+  private flightHost(): FlightHost {
+    const s = this as unknown as { mult(): number; targetId: string | null; nextBurn(): PlannedBurn | null; targetState(): ReturnType<FlightHost['targetState']> };
+    return { mult: () => s.mult(), get targetId() { return s.targetId; }, nextBurn: () => s.nextBurn(), targetState: () => s.targetState() };
+  }
+
   private bind(world: World): void {
     const ship = findCraft(world, PLAYER_ID);
     if (!ship) throw new Error('session: the world has no player craft');
     this.world = world;
     this.ship = ship;
+    this.fc.world = world;
+    this.fc.ship = ship;
+    this.fc.ix = this.ix;
     this.layout = (ship.shipVisual && INTERIORS[ship.shipVisual as ShipVisualId]) || null;
     const defs = this.system.bodies;
     this.bodyViews = world.bodies.map((b, i) => ({ id: b.id, def: defs[i] && defs[i].id === b.id ? defs[i] : defs.find((d) => d.id === b.id)!, r: v3(), v: v3(), spinAxis: { ...b.spinAxis }, spinAngle: 0 }));
@@ -354,9 +409,23 @@ class WorldSession implements Session {
       id: c.id, name: c.name, kind: c.kind, shipVisual: c.shipVisual as ShipVisualId | null, stationVisual: c.stationVisual as StationVisualId | null,
       visualSeed: c.visualSeed, r: v3(), v: v3(), q: { x: 0, y: 0, z: 0, w: 1 }, throttle: 0, rcs: v3(), heat: 0, hull: 1, isPlayer: c.id === PLAYER_ID,
       dockedTo: null, radius: c.radius,
+      w: v3(), jetDuty: new Float64Array(c.jets.length), engineLevel: new Float64Array(c.engines.length), airVelocity: v3(), heatFlux: 0,
+      jets: c.jets, engines: c.engines,
     }));
+    this.tk = createBodyTick(this.ledger, eventRing(world));
+    this.tk.tick = Math.round(world.t * 120);
+    this.tk.q = ship.q;
+    const imu = (ship.shipVisual && SHIP_LAYOUTS[ship.shipVisual as ShipVisualId]?.imuPos) || IMU_DEFAULT;
+    this.IMU.x = imu.x; this.IMU.y = imu.y; this.IMU.z = imu.z;
+    tapeReset(this.tape, 0, ship.jetDuty, ship.jets.length, this.tk.tick); // output only: a new world starts an empty tape
     this.predDirty = true;
-    this.settled = false;
+    this.freshBusy = this.liveOk = this.liveRunning = false;
+    this.pred.count = this.pred.targetCount = 0;
+    (this.pred.events as PredictionEvent[]).length = 0;
+    this.pred.version++;
+    this.due = 0;
+    this.ctlActive = false;
+    this.fc.settled = false;
     this.winN = this.winAt = 0;
     this.limitFrames = 0;
     this.initDevices();
@@ -371,11 +440,12 @@ class WorldSession implements Session {
     this.cockpitLayout = ck;
     const defs = (this.devDefs = ck ? ck.devices : []);
     this.devs = defs.map((d) => createDevice(d.id, d.kind, d.role === 'cabinLights'));
+    this.fc.devs = this.devs;
     this.devViews = defs.map((d) => ({ id: d.id, x: 0, y: 0, lit: false, held: false, reachable: false, page: d.pages ? d.pages[0] : '' }));
     this.devSeen = defs.map(() => 0);
     this.devPage = defs.map(() => 0);
     this.hands.clear();
-    this.cmdThrottle = 0;
+    this.fc.cmdThrottle = 0;
     const ix = this.ix, at = (role: DeviceRole): number => defs.findIndex((d) => d.role === role);
     ix.rot = at('rotation'); ix.roll = at('roll'); ix.trans = at('translation'); ix.transZ = at('translationZ');
     ix.throttle = at('throttle'); ix.arm = at('driveArm'); ix.lights = at('cabinLights'); ix.harness = at('harness'); ix.assist = at('flightAssist');
@@ -394,50 +464,65 @@ class WorldSession implements Session {
 
   // ------------------------------------------------------------------------------------------ stepping
 
+  /**
+   * One rendered frame (SIMULATION.md §1.3). Real time owes the world `realDt · warp · 120` ticks; the world pays them
+   * in whole steps of k ticks, where k depends only on the state and the warp level — the quantum q = 2ⁿ ticks of the
+   * warp level, cut short by the 60 Hz controller grid while the controller works, by a settled hold's wake tick and
+   * by the loose objects' and the crew's next event — never on the frame rate or the budget. The budget (counted in
+   * work units, §1.2.1) only decides how many steps fit in this frame; when it runs out the frame stops on a step
+   * boundary and the debt is dropped, so the achieved warp is honest. Inputs set between frames are the commands of
+   * the next tick.
+   */
   step(realDt: number): StepInfo {
     const info = this.info;
-    info.simDt = 0; info.simMs = 0; info.steps = 0; info.limitedBy = '';
+    info.simDt = 0; info.simMs = 0; info.steps = 0; info.units = 0; info.limitedBy = '';
     if (!(realDt > 0)) return info;
-    if (realDt > 0.1) realDt = 0.1;
+    if (realDt > MAX_FRAME) realDt = MAX_FRAME;
     const world = this.world;
-    const start = now();
-    const want = realDt * this.mult();
-    const budget = this.budgetMs;
+    const start = this.clockNow();
     this.clock += realDt;
-    this.arm();
-    this.drowse(realDt);
-    this.handOnProp(realDt, want);
-    let why: WarpLimit = '';
-    for (let guard = 0; guard < 1e6; guard++) {
-      const left = want - info.simDt;
-      if (!(left > 1e-7)) break;
-      const active = this.command() || this.faFiring; // the assist loop is closed at the control rate too
-      const loose = this.propsAwake();
-      let chunk = active && left > CONTROL_DT ? CONTROL_DT : left;
-      if (loose && this.loose) {
-        const pc = propsChunk(this.loose, craftMotion(world, this.ship, this.motion), this.playerMode === 'onFoot' ? this.body : null);
-        if (chunk > pc) chunk = pc;
-      }
-      this.advOpts.budgetMs = budget - (now() - start);
-      const res = advance(world, chunk, this.advOpts);
-      info.simDt += res.simDt;
-      info.steps += res.steps;
-      if (res.simDt > 0) {
-        const mo = this.chunkMotion(res.simDt);
-        if (this.playerMode === 'onFoot') this.stepBody(res.simDt, mo);
-        this.stepLoose(res.simDt, mo);
-        this.stepDevices(res.simDt);
-      }
-      const limited = res.limitedBy;
-      if (world.events.length > 0) this.pump();
-      if (limited !== '') { why = limited === 'cpu' && loose ? 'props' : limited; break; }
-      if (want - info.simDt > 1e-7 && now() - start > budget) {
-        const c = this.ship;
-        why = active ? 'rotation' : c.propellant > 0 && c.dockedTo === null && (c.throttle > 0 || c.rcs.x !== 0 || c.rcs.y !== 0 || c.rcs.z !== 0) ? 'thrust' : loose ? 'props' : 'cpu';
-        break;
-      }
+    const mult = this.mult();
+    const normal = realDt * mult * TICK_HZ;
+    let extra = 0;
+    if (this.catchUpTicks > 0) {
+      // the page was hidden (D6): the missed time is paid at CATCHUP_WARP on top, under the same honest budget
+      extra = realDt * CATCHUP_WARP * TICK_HZ;
+      if (extra > this.catchUpTicks) extra = this.catchUpTicks;
     }
-    info.simMs = now() - start;
+    let due = this.due + normal + extra;
+    const near = Math.round(due);
+    if (Math.abs(due - near) < 1e-6) due = near; // the frame boundary lands on a tick: no float sliver delays it
+    const k0 = worldTick(world);
+    const maxUnits = this.budgetMs / this.unitMs;
+    let units = 0, why: WarpLimit = '', last: WarpLimit = '', stepUnits = 0, limited = false;
+    for (let guard = 0; guard < 1e7; guard++) {
+      const k = this.nextStep();
+      if (k > due - (worldTick(world) - k0) + 1e-9) break; // the next step lies beyond this frame
+      if (guard > 0 && (units + stepUnits > maxUnits || this.clockNow() - start > this.budgetMs + CLOCK_SLACK_MS)) { limited = true; break; }
+      last = this.stepWhy;
+      stepUnits = this.tickStep(k);
+      units += stepUnits;
+      info.steps += this.stepSteps;
+    }
+    const done = worldTick(world) - k0;
+    info.simDt = done / TICK_HZ;
+    if (limited) {
+      const c = this.ship;
+      why = this.ctlActive ? 'rotation' : last !== '' ? last : this.busy !== '' ? this.busy
+        : c.rcsPropellant + c.propellant > 0 && c.dockedTo === null && (c.throttle > 0 || c.rcs.x !== 0 || c.rcs.y !== 0 || c.rcs.z !== 0) ? 'thrust' : 'cpu';
+      this.due = 0; // the world is behind real time by what did not fit: dropped, and shown as the achieved warp
+    } else this.due = due - done;
+    if (this.catchUpTicks > 0) {
+      const paid = done - (normal < done ? normal : done);
+      this.catchUpTicks = limited ? this.catchUpTicks - paid : this.catchUpTicks - extra;
+      if (this.catchUpTicks < 1) this.catchUpTicks = 0;
+    }
+    // the cost per work unit (perf.ts reports the same means): ms of wall clock over units over ~2 s
+    const ms = this.clockNow() - start;
+    info.simMs = ms;
+    info.units = units;
+    this.learnCost(ms, units, realDt);
+    this.runPrediction();
     info.limitedBy = why;
     // achieved multiplier over the last frames
     const i = this.winAt;
@@ -450,8 +535,112 @@ class WorldSession implements Session {
     return info;
   }
 
+  /**
+   * The length of the next step, ticks (≥ 1), from the state and the warp level only: to the next quantum boundary;
+   * to the next controller tick (every 2 ticks) while the controller works; to a settled hold's wake tick; to the
+   * next loose-object or crew event (props.ts nextBodyEvent). Sets stepWhy to what cut it short ('' = the quantum).
+   */
+  private nextStep(): number {
+    const tick = worldTick(this.world), q = this.quantum();
+    let k = q - (tick % q), why: WarpLimit = '';
+    if (this.ctlActive) { const c = 2 - (tick & 1); if (c < k) { k = c; why = 'rotation'; } }
+    const wt = this.ship.holdWakeT;
+    if (wt < Infinity && wt === wt) {
+      const wk = Math.ceil(wt * TICK_HZ - 1e-9) - tick;
+      if (wk >= 1 && wk < k) k = wk;
+    }
+    if (k > 1 && this.loose && this.propsAwake()) {
+      const nb = nextBodyEvent(this.loose, craftMotion(this.world, this.ship, this.motion, this.ledger), this.playerMode === 'onFoot' ? this.body : null, this.tk, k);
+      if (nb < k) { k = nb > 1 ? nb : 1; why = bodyEvent.why === 'crew' ? 'crew' : 'props'; }
+    } else if (k === 1 && this.loose && this.propsAwake()) why = 'props';
+    this.stepWhy = why;
+    return k;
+  }
+
+  /** The warp level's quantum, ticks: the largest 2ⁿ with 2ⁿ·8 ≤ warp (1 at 1×…5×, 2048 ≈ 17 s at 1e4), ≤ 2^14. */
+  private quantum(): number {
+    const m = this.catchUpTicks > 0 && CATCHUP_WARP > this.mult() ? CATCHUP_WARP : this.mult();
+    let q = 1;
+    while (q * 8 <= m && q < QUANTUM_MAX) q *= 2;
+    return q;
+  }
+
+  /**
+   * One step of k ticks: the controller on its grid (every second tick, zero-order hold between), the world, the
+   * ledger consumed once, then the bodies, the hand, the loose objects and the mechanisms at h = k·Q, the duty
+   * tape and the events. Returns the work units it cost (perf.ts keeps ms per unit).
+   */
+  private tickStep(k: number): number {
+    const world = this.world;
+    const tick = worldTick(world);
+    if ((tick & 1) === 0) {
+      this.fc.arm();
+      this.ctlActive = this.fc.command() || this.fc.faFiring; // the assist loop is closed at the control rate too
+    }
+    const res = advanceTicks(world, k);
+    this.busy = res.busy;
+    const h = k / TICK_HZ;
+    this.consume(k);
+    const mo = this.chunkMotion(h);
+    if (this.playerMode === 'onFoot') this.stepBody(h, mo);
+    this.stepSeat(mo);
+    this.handOnProp(h, k);
+    const pu = this.stepLoose(h, mo);
+    this.stepDevices(h);
+    this.drowse(h);
+    const c = this.ship;
+    tapeRecord(this.tape, 0, c.jetDuty, c.jets.length, worldTick(world));
+    if (world.events.length > 0) this.pump();
+    this.stepSteps = res.steps;
+    return 1 + res.steps + PROP_UNITS * pu;
+  }
+
+  /** Wall clock for the budget backstop and the cost estimate (SessionOptions.now; never read by the world). */
+  private clockNow(): number {
+    return this.nowFn();
+  }
+
+  /** ms per work unit from ~2 s means (SessionOptions.unitMs pins it for tests and benchmarks). */
+  private learnCost(ms: number, units: number, realDt: number): void {
+    if (this.unitFixed) return;
+    this.costMs += ms; this.costUnits += units; this.costReal += realDt;
+    if (this.costReal < COST_WINDOW || this.costUnits < 200) return;
+    let u = this.costMs / this.costUnits;
+    if (!(u > UNIT_MS_MIN)) u = UNIT_MS_MIN; else if (u > UNIT_MS_MAX) u = UNIT_MS_MAX;
+    this.unitMs = u;
+    this.costMs = this.costUnits = this.costReal = 0;
+  }
+
+  /** The frame budget for the simulation, ms (3 awake; 8 asleep with the eyes closed, SIMULATION.md §1.2.1). */
+  setBudget(ms: number): void {
+    if (ms > 0 && Number.isFinite(ms)) this.budgetMs = ms;
+  }
+  /** The cost estimate the budget counts with, ms per work unit (perf report). */
+  costPerUnit(): number {
+    return this.unitMs;
+  }
+  /**
+   * The page was hidden or the phone locked for `realSeconds` (D6): the world catches up on that time, at most one sim
+   * day, under honest warp (CATCHUP_WARP on top of the warp in force, limited like any warp).
+   */
+  catchUp(realSeconds: number): void {
+    if (!(realSeconds > 0) || !Number.isFinite(realSeconds)) return;
+    const t = this.catchUpTicks + realSeconds * this.mult() * TICK_HZ;
+    this.catchUpTicks = t < CATCHUP_MAX_TICKS ? t : CATCHUP_MAX_TICKS;
+    this.winN = this.winAt = 0;
+  }
+
   time(): number {
     return this.world.t;
+  }
+  tick(): number {
+    return worldTick(this.world);
+  }
+
+  /** The warp changed from m0: the ticks still owed to real time are re-counted at the new warp (the real time stays). */
+  private rewarp(m0: number): void {
+    const m1 = this.mult();
+    if (m1 !== m0 && m0 > 0) this.due = (this.due * m1) / m0;
   }
 
   /** Time acceleration in force: SLEEP_WARP while the pilot sleeps, otherwise 1x (setWarp's ladder is for tests). */
@@ -459,16 +648,16 @@ class WorldSession implements Session {
     return this.asleep ? SLEEP_WARP : WARP_LADDER[this.warpIndex];
   }
 
-  /** Lying still in the bunk for SLEEP_AFTER real seconds is falling asleep. */
-  private drowse(realDt: number): void {
+  /** Lying still in the bunk for SLEEP_AFTER real seconds is falling asleep (counted per step: h of sim time is h/warp of real). */
+  private drowse(h: number): void {
     const b = this.body;
     if (this.asleep || this.playerMode !== 'onFoot' || !b || b.seat !== 'bunk' || this.ship.destroyed || this.hands.size > 0) { this.restT = 0; return; }
-    this.restT += realDt;
-    if (this.restT < SLEEP_AFTER) return;
+    this.restT += h / this.mult();
+    if (this.restT < SLEEP_AFTER - 1e-9) return;
     this.asleep = true;
     this.sleptFrom = this.world.t;
     this.walk.moveX = this.walk.moveZ = 0;
-    this.settled = false;
+    this.fc.settled = false;
     this.winN = this.winAt = 0;
     this.events.emit('sleep', { asleep: true, seconds: 0 });
   }
@@ -485,44 +674,13 @@ class WorldSession implements Session {
       if (hm) this.setHold(hm);
       else if (role === 'targetNext') this.nextTarget();
       else if (role === 'undock') this.undock();
-      else if (role === 'flightAssist') { this.assist = !this.assist; this.faIdle(); } // alternate action: each press latches the other way
+      else if (role === 'flightAssist') { this.fc.assist = !this.fc.assist; this.fc.faIdle(); } // alternate action: each press latches the other way
     }
     const li = this.ix.lights;
     if (li >= 0 && ds[li].made !== this.lights) {
       this.lights = ds[li].made;
       this.events.emit('cabinLights', { on: this.lights });
     }
-  }
-
-  /** Flight Assist's reference frame: the target if it is a craft, else the nearest station within FA_RANGE. */
-  private assistRef(): Craft | null {
-    const cs = this.world.craft, c = this.ship, id = this.targetId;
-    let best: Craft | null = null, bd = FA_RANGE * FA_RANGE;
-    for (let i = 0; i < cs.length; i++) {
-      const o = cs[i];
-      if (o === c || o.destroyed) continue;
-      if (id !== null && o.id === id) return o;
-      if (o.kind !== 'station') continue;
-      const dx = o.r.x - c.r.x, dy = o.r.y - c.r.y, dz = o.r.z - c.r.z, d2 = dx * dx + dy * dy + dz * dz;
-      if (d2 < bd) { bd = d2; best = o; }
-    }
-    return best;
-  }
-  private faIdle(): void {
-    this.faOn[0] = this.faOn[1] = this.faOn[2] = false;
-    this.faMain = false;
-    this.faFiring = false;
-  }
-  /** One RCS axis of the assist: thruster command (-1..1) for a velocity error e (m/s) with a m/s² available. */
-  private faAxis(i: number, e: number, a: number): number {
-    const on = this.faOn, mag = e < 0 ? -e : e;
-    if (on[i]) { if (mag < FA_DB_OFF) on[i] = false; } else if (mag > FA_DB_ON) on[i] = true;
-    return on[i] && a > 0 ? clamp(e / (a * FA_TAU), -1, 1) : 0;
-  }
-  /** The DRIVE lever as the assist reads it (speed command, whatever DRIVE ARM says). */
-  private faLever(): number {
-    const i = this.ix.throttle, l = i >= 0 ? leverValue(this.devs[i]) : 0;
-    return l > this.throttle ? l : this.throttle;
   }
 
   /** TARGET: the next station, then the bodies, round again. */
@@ -544,10 +702,38 @@ class WorldSession implements Session {
     return false;
   }
   /** The loose objects move with what the ship and the pilot's body just did (after the body, as props.ts asks). */
-  private stepLoose(dt: number, mo: ShipMotionT): void {
+  private stepLoose(dt: number, mo: ShipMotionT): number {
     const ps = this.loose;
-    if (!ps) return;
-    stepProps(ps, mo, this.playerMode === 'onFoot' ? this.body : null, dt);
+    if (!ps) return 0;
+    return stepProps(ps, mo, this.playerMode === 'onFoot' ? this.body : null, dt, this.tk);
+  }
+  /**
+   * Once per step (one tick at 1×, the quantum under warp): consume the ship's applied-force ledger (the only
+   * consumer, §1.4) and fill the body steppers' tick context — tick index, span, attitude, the look and lean latched
+   * at this boundary.
+   */
+  private consume(k: number): void {
+    const tk = this.tk, b = this.body;
+    consumeLedger(this.ship, this.ledger);
+    tk.tick = worldTick(this.world);
+    tk.ticks = k;
+    tk.h = k / TICK_HZ;
+    tk.q = this.ship.q;
+    const foot = this.playerMode === 'onFoot' && b !== null;
+    tk.yaw = foot ? b.yaw : this.headYaw;
+    tk.pitch = foot ? b.pitch : this.headPitch;
+    tk.lean = this.leanT;
+  }
+  /** Where the pilot sits now (helm, bunk, table) or '' on foot. */
+  private seatKind(): SeatKind | '' {
+    if (this.playerMode === 'helm') return this.layout ? 'helm' : '';
+    const b = this.body;
+    return b && b.seat !== '' ? b.seat : '';
+  }
+  /** The seated body (harness, straps, bench) moves with the ship (W1-C fills crew.ts stepSeated). */
+  private stepSeat(mo: ShipMotionT): void {
+    const k = this.seatKind(), layout = this.layout;
+    if (k !== '' && layout) stepSeated(this.seated, k, layout, mo, this.tk);
   }
   /**
    * What the ship did over the step just taken, as the crew and the loose objects feel it: its thrust and torque
@@ -555,7 +741,7 @@ class WorldSession implements Session {
    * undock spring) as the mean acceleration over that step — they keep their own velocity while the hull's changes.
    */
   private chunkMotion(dt: number): ShipMotionT {
-    const mo = craftMotion(this.world, this.ship, this.motion);
+    const mo = craftMotion(this.world, this.ship, this.motion, this.ledger);
     const j = this.jolt;
     if (dt > 0 && takeJolt(this.ship, j)) {
       const c = this.ship, a = qRotInv(this.FV, c.q, j.dv.x / dt, j.dv.y / dt, j.dv.z / dt);
@@ -567,250 +753,49 @@ class WorldSession implements Session {
   /** Where the eye is now, ship-local (on foot, or the helm eye when strapped in). */
   private eyeNow(out: V3): V3 {
     const b = this.body, layout = this.layout;
-    if (this.playerMode === 'onFoot' && b && layout) return crewEye(b, layout, out);
-    const e = layout ? layout.helmEye : null;
-    out.x = e ? e.x : 0; out.y = e ? e.y : 0; out.z = e ? e.z : 0;
+    if (this.playerMode === 'onFoot' && b && layout) crewEye(b, layout, out);
+    else {
+      const e = layout ? layout.helmEye : null;
+      out.x = e ? e.x : 0; out.y = e ? e.y : 0; out.z = e ? e.z : 0;
+    }
+    const d = this.eyeOffset(this.EOFF);
+    out.x += d.x; out.y += d.y; out.z += d.z;
     return out;
   }
+  /** The body's displacement of the eye (crew.ts eyeOffsetOf; W1-C fills), ship axes. */
+  private eyeOffset(out: V3): V3 {
+    const k = this.seatKind(), foot = this.playerMode === 'onFoot' ? this.body : null;
+    const yaw = foot ? foot.yaw : this.headYaw, pitch = foot ? foot.pitch : this.headPitch;
+    return eyeOffsetOf(foot, k !== '' ? this.seated : null, k, this.layout, yaw, pitch, out);
+  }
   /**
-   * Once per frame: the hand moves toward the point on the touch ray at the distance it took hold (an arm: at most
-   * HAND_SPEED), and its velocity is smoothed for a throw.
+   * Every step (the hand holds the objects at one tick per step: props.ts asks for it): the hand moves toward the
+   * point on the touch ray at the distance it took hold (an arm: at most HAND_SPEED), and its velocity is smoothed
+   * for a throw (time constant THROW_TAU, the per-tick factor a precomputed constant). The ray is the one latched at
+   * this tick boundary (propMove between frames sets it).
    */
-  private handOnProp(realDt: number, simDt: number): void {
+  private handOnProp(h: number, k: number): void {
     const ps = this.loose;
     if (!ps || this.propPointer < 0 || ps.grab.id === '') return;
-    const e = this.eyeNow(this.PEYE), d = this.propDir, k = this.propDist, t = this.propTarget;
-    const dt = simDt > 0 ? simDt : realDt;
-    let gx = e.x + d.x * k - t.x, gy = e.y + d.y * k - t.y, gz = e.z + d.z * k - t.z;
-    const gl = Math.sqrt(gx * gx + gy * gy + gz * gz), lim = HAND_SPEED * dt;
+    const e = this.eyeNow(this.PEYE), d = this.propDir, dist = this.propDist, t = this.propTarget;
+    let gx = e.x + d.x * dist - t.x, gy = e.y + d.y * dist - t.y, gz = e.z + d.z * dist - t.z;
+    const gl = Math.sqrt(gx * gx + gy * gy + gz * gz), lim = HAND_SPEED * h;
     if (gl > lim) { gx *= lim / gl; gy *= lim / gl; gz *= lim / gl; }
     t.x += gx; t.y += gy; t.z += gz;
-    if (this.propPrevOk && dt > 0) {
-      const a = 1 - Math.exp(-realDt / THROW_TAU), pv = this.propPrev, hv = this.propVel;
-      hv.x += ((t.x - pv.x) / dt - hv.x) * a; hv.y += ((t.y - pv.y) / dt - hv.y) * a; hv.z += ((t.z - pv.z) / dt - hv.z) * a;
+    if (this.propPrevOk) {
+      const a = k === 1 ? THROW_A : 1 - Math.exp(-h / THROW_TAU), pv = this.propPrev, hv = this.propVel;
+      hv.x += ((t.x - pv.x) / h - hv.x) * a; hv.y += ((t.y - pv.y) / h - hv.y) * a; hv.z += ((t.z - pv.z) / h - hv.z) * a;
     }
     this.propPrev.x = t.x; this.propPrev.y = t.y; this.propPrev.z = t.z;
     this.propPrevOk = true;
-    moveGrab(ps, t, dt);
+    moveGrab(ps, t, h);
   }
 
   /** The pilot's body moves with what the ship just did. */
   private stepBody(dt: number, mo: ShipMotionT): void {
     const b = this.body, layout = this.layout;
     if (!b || !layout || b.seat !== '' || this.warpIndex > 0) return;
-    stepCrew(b, layout, mo, this.walk, dt);
-  }
-
-  /** Keep the docking latch armed near a station (and open for a moment after an undock). */
-  private arm(): void {
-    const c = this.ship;
-    if (c.destroyed || c.dockedTo !== null) return;
-    const d = dockingStatus(this.world, PLAYER_ID);
-    if (this.rearmBlock && (d.portId === null || d.portDistance > REARM_DISTANCE)) this.rearmBlock = false;
-    let armed = false;
-    if (!this.rearmBlock && d.stationId !== null) {
-      const st = findCraft(this.world, d.stationId);
-      armed = st !== null && d.distance < st.radius + ARM_RANGE;
-    }
-    c.dockingArmed = armed;
-  }
-
-  /** Pilot input and the attitude hold -> commands on the craft. True while the attitude controller is working. */
-  private command(): boolean {
-    const c = this.ship;
-    if (c.destroyed) return false;
-    // The flight computer reads the physical controls (the direct inputs of setControls are added: tests only).
-    const ds = this.devs, ix = this.ix;
-    let p = this.pitch, y = this.yaw, r = this.roll, thr = this.throttle;
-    let tx = this.translate.x, ty = this.translate.y, tz = this.translate.z;
-    if (ix.rot >= 0) { y += stickAxis(ds[ix.rot].x); p -= stickAxis(ds[ix.rot].y); } // pull back = nose up
-    if (ix.roll >= 0) r += rockerValue(ds[ix.roll]);
-    if (ix.trans >= 0) { tx += stickAxis(ds[ix.trans].x); ty += stickAxis(ds[ix.trans].y); }
-    if (ix.transZ >= 0) tz -= rockerValue(ds[ix.transZ]); // +1 = forward = -Z
-    // The throttle lever opens the main-drive valves only while DRIVE ARM is on.
-    if (ix.arm >= 0 && ix.throttle >= 0 && ds[ix.arm].made) thr = Math.max(thr, leverValue(ds[ix.throttle]));
-    p = clamp(p, -1, 1); y = clamp(y, -1, 1); r = clamp(r, -1, 1);
-    tx = clamp(tx, -1, 1); ty = clamp(ty, -1, 1); tz = clamp(tz, -1, 1);
-    this.faFiring = false;
-    if (this.assist) {
-      // Flight Assist: lever and translation controller command a velocity relative to the reference, in ship
-      // axes (so it turns with the nose); the computer works the same thrusters the hand would.
-      const ref = c.dockedTo === null && c.propellant > 0 ? this.assistRef() : null;
-      thr = 0;
-      if (ref === null) {
-        tx = ty = tz = 0; // no reference (or latched, or dry): the computer fires nothing
-        this.faIdle();
-      } else {
-        const m = c.dryMass + c.propellant, aR = c.rcsThrust / m, aM = c.mainThrust / m;
-        const vl = qRotInv(this.FV, c.q, c.v.x - ref.v.x, c.v.y - ref.v.y, c.v.z - ref.v.z);
-        const ez = tz * FA_NUDGE - this.faLever() * FA_SPEED - vl.z; // forward is -Z
-        tx = this.faAxis(0, tx * FA_NUDGE - vl.x, aR);
-        ty = this.faAxis(1, ty * FA_NUDGE - vl.y, aR);
-        const armed = ix.arm >= 0 && ds[ix.arm].made && aM > 0;
-        if (!armed || -ez < FA_MAIN_OFF) this.faMain = false;
-        else if (-ez > FA_MAIN_ON) this.faMain = true;
-        if (this.faMain) {
-          thr = clamp(-ez / (aM * FA_TAU), 0, 1);
-          tz = 0;
-          this.faOn[2] = false;
-        } else tz = this.faAxis(2, ez, aR);
-        this.faFiring = thr > 0 || tx !== 0 || ty !== 0 || tz !== 0;
-      }
-    }
-    if (thr > 0 && this.cmdThrottle === 0) this.settled = false; // point properly before the drive lights
-    this.cmdThrottle = thr;
-    const tq = c.torque;
-    if (c.dockedTo !== null) {
-      // The latch interlocks drive and RCS; the joint carries the attitude.
-      c.throttle = 0;
-      c.rcs.x = c.rcs.y = c.rcs.z = 0;
-      tq.x = tq.y = tq.z = 0;
-      this.holdQValid = false;
-      this.settled = false;
-      return false;
-    }
-    c.throttle = thr;
-    c.rcs.x = tx; c.rcs.y = ty; c.rcs.z = tz;
-    if (c.landedOn !== null) {
-      tq.x = tq.y = tq.z = 0;
-      this.holdQValid = false;
-      this.settled = false;
-      return false;
-    }
-    const stick = Math.abs(p) > STICK_DEADZONE || Math.abs(y) > STICK_DEADZONE || Math.abs(r) > STICK_DEADZONE;
-    if (this.hold === 'off') {
-      // Raw torque demand: pitch about +X (nose up), yaw about -Y (nose right), roll about -Z (clockwise).
-      tq.x = stick ? p : 0; tq.y = stick ? -y : 0; tq.z = stick ? -r : 0;
-      return stick;
-    }
-    const I = craftInertia(c, this.I), ERR = this.ERR, WE = this.WE, w = c.w;
-    if (stick) {
-      // The stick overrides the hold: a rate demand, met with real torque.
-      this.settled = false;
-      this.holdQValid = false;
-      ERR.x = ERR.y = ERR.z = 0;
-      WE.x = w.x - p * STICK_RATE; WE.y = w.y + y * STICK_RATE; WE.z = w.z + r * STICK_RATE;
-      holdTorque(ERR, WE, I, c.maxTorque, tq);
-      return true;
-    }
-    this.holdTarget();
-    const WFF = this.WFF;
-    WE.x = w.x - WFF.x; WE.y = w.y - WFF.y; WE.z = w.z - WFF.z;
-    const th = Math.sqrt(ERR.x * ERR.x + ERR.y * ERR.y + ERR.z * ERR.z);
-    const we = Math.sqrt(WE.x * WE.x + WE.y * WE.y + WE.z * WE.z);
-    if (this.settled) {
-      const warp = this.mult();
-      if (warp < SUSPEND_WARP && (th > (warp >= LOOSE_WARP ? WAKE_ANGLE_LOOSE : WAKE_ANGLE) || we > WAKE_RATE)) this.settled = false;
-    } else if (th < SETTLE_ANGLE && we < SETTLE_RATE) this.settled = true;
-    if (this.settled) {
-      // Deadband: a settled ship commands nothing, so it coasts and time acceleration is free.
-      tq.x = tq.y = tq.z = 0;
-      return false;
-    }
-    holdTorque(ERR, WE, I, c.maxTorque, tq);
-    return true;
-  }
-
-  /** Attitude error (ERR, local rotation vector) and the rate the target itself turns at (WFF, local) for the hold. */
-  private holdTarget(): void {
-    const c = this.ship, ERR = this.ERR, WFF = this.WFF, D = this.D, OM = this.OM;
-    ERR.x = ERR.y = ERR.z = 0;
-    WFF.x = WFF.y = WFF.z = 0;
-    OM.x = OM.y = OM.z = 0;
-    let mode = this.hold;
-    if (mode === 'dock') {
-      const d = dockingStatus(this.world, PLAYER_ID);
-      if (d.portId !== null && c.dockPort) {
-        // Shortest turn that takes the collar axis onto the reversed port axis (roll about it stays free).
-        const a = qRot(this.A, c.q, c.dockPort.dir.x, c.dockPort.dir.y, c.dockPort.dir.z);
-        const bx = -d.portAxis.x, by = -d.portAxis.y, bz = -d.portAxis.z;
-        const cx = a.y * bz - a.z * by, cy = a.z * bx - a.x * bz, cz = a.x * by - a.y * bx;
-        const s = Math.sqrt(cx * cx + cy * cy + cz * cz), co = a.x * bx + a.y * by + a.z * bz;
-        if (s > 1e-9) {
-          const k = Math.atan2(s, co) / s;
-          qRotInv(ERR, c.q, cx * k, cy * k, cz * k);
-        } else if (co < 0) {
-          const dd = c.dockPort.dir;
-          if (Math.abs(dd.x) < 0.9) { ERR.x = Math.PI; } else { ERR.y = Math.PI; }
-        }
-        this.holdQValid = false;
-        return;
-      }
-      mode = 'stability';
-    }
-    if (mode === 'stability') {
-      const w = c.w;
-      if (!this.holdQValid && w.x * w.x + w.y * w.y + w.z * w.z < CAPTURE_RATE * CAPTURE_RATE) {
-        const q = c.q, h = this.holdQ;
-        h.x = q.x; h.y = q.y; h.z = q.z; h.w = q.w;
-        this.holdQValid = true;
-      }
-      if (this.holdQValid) attitudeError(c.q, this.holdQ, ERR);
-      return;
-    }
-    this.holdQValid = false;
-    const r = c.rel, v = c.relV;
-    const hx = r.y * v.z - r.z * v.y, hy = r.z * v.x - r.x * v.z, hz = r.x * v.y - r.y * v.x;
-    const r2 = r.x * r.x + r.y * r.y + r.z * r.z, v2 = v.x * v.x + v.y * v.y + v.z * v.z;
-    const sign = mode === 'retrograde' || mode === 'antinormal' || mode === 'radialIn' || mode === 'antiTarget' ? -1 : 1;
-    D.x = D.y = D.z = 0;
-    switch (mode) {
-      case 'retrograde':
-      case 'prograde':
-        D.x = v.x; D.y = v.y; D.z = v.z;
-        this.progradeRate(hx, hy, hz, r2, v2);
-        break;
-      case 'antinormal':
-      case 'normal':
-        D.x = hx; D.y = hy; D.z = hz;
-        break;
-      case 'radialIn':
-      case 'radialOut':
-        D.x = r.x; D.y = r.y; D.z = r.z;
-        if (r2 > 0) { OM.x = hx / r2; OM.y = hy / r2; OM.z = hz / r2; }
-        break;
-      case 'antiTarget':
-      case 'target': {
-        const t = this.targetState();
-        if (t) {
-          const dx = t.r.x - c.r.x, dy = t.r.y - c.r.y, dz = t.r.z - c.r.z;
-          const ux = t.v.x - c.v.x, uy = t.v.y - c.v.y, uz = t.v.z - c.v.z;
-          const d2 = dx * dx + dy * dy + dz * dz;
-          D.x = dx; D.y = dy; D.z = dz;
-          if (d2 > 0) { OM.x = (dy * uz - dz * uy) / d2; OM.y = (dz * ux - dx * uz) / d2; OM.z = (dx * uy - dy * ux) / d2; }
-        }
-        break;
-      }
-      case 'burn': {
-        const b = this.nextBurn();
-        const vl = Math.sqrt(v2), hl = Math.sqrt(hx * hx + hy * hy + hz * hz);
-        if (b && vl > 0 && hl > 0) {
-          // Same basis the prediction applies the impulse in: prograde, orbit normal, radial-out = prograde × normal.
-          const px = v.x / vl, py = v.y / vl, pz = v.z / vl, nx = hx / hl, ny = hy / hl, nz = hz / hl;
-          const ox = py * nz - pz * ny, oy = pz * nx - px * nz, oz = px * ny - py * nx;
-          D.x = b.prograde * px + b.normal * nx + b.radial * ox;
-          D.y = b.prograde * py + b.normal * ny + b.radial * oy;
-          D.z = b.prograde * pz + b.normal * nz + b.radial * oz;
-          this.progradeRate(hx, hy, hz, r2, v2);
-        }
-        break;
-      }
-      default:
-        break;
-    }
-    const dl = Math.sqrt(D.x * D.x + D.y * D.y + D.z * D.z);
-    if (!(dl > 1e-9)) return; // nothing to point at: damp rotation only
-    D.x *= sign / dl; D.y *= sign / dl; D.z *= sign / dl;
-    pointingError(c.q, D, ERR);
-    qRotInv(WFF, c.q, OM.x, OM.y, OM.z);
-  }
-
-  /** Rate at which the velocity direction turns under the primary's pull: (v × g) / v². */
-  private progradeRate(hx: number, hy: number, hz: number, r2: number, v2: number): void {
-    // v × (−μ r / r³) = μ (r × v) / r³
-    if (!(r2 > 0 && v2 > 0)) return;
-    const k = this.world.bodies[this.ship.primary].mu / (r2 * Math.sqrt(r2) * v2);
-    this.OM.x = hx * k; this.OM.y = hy * k; this.OM.z = hz * k;
+    stepCrew(b, layout, mo, this.walk, dt, this.tk);
   }
 
   private nextBurn(): PlannedBurn | null {
@@ -838,13 +823,13 @@ class WorldSession implements Session {
       if (e.craftId !== PLAYER_ID) continue;
       switch (e.type) {
         case 'docked':
-          this.throttle = 0;
+          this.fc.throttle = 0;
           this.predDirty = true;
           out.emit('docked', { stationId: e.stationId, portId: e.portId });
           break;
         case 'undocked': this.predDirty = true; out.emit('undocked', { stationId: e.stationId }); break;
         case 'impact': this.wake(); this.predDirty = true; out.emit('impact', { speed: e.speed, with: e.with }); break;
-        case 'destroyed': this.wake(); this.throttle = 0; out.emit('destroyed', { cause: e.cause }); break;
+        case 'destroyed': this.wake(); this.fc.throttle = 0; out.emit('destroyed', { cause: e.cause }); break;
         case 'atmosphere': if (e.entered) this.wake(); out.emit('atmosphere', { bodyId: e.bodyId, entered: e.entered }); break;
         case 'primaryChanged': this.predDirty = true; out.emit('primaryChanged', { from: e.from, to: e.to }); break;
         case 'landed': this.predDirty = true; out.emit('landed', { bodyId: e.bodyId }); break;
@@ -879,8 +864,10 @@ class WorldSession implements Session {
     i = clamp(i, 0, WARP_LADDER.length - 1);
     if (this.asleep) { this.wake(); return; }
     if (i === this.warpIndex) return;
+    const m0 = this.mult();
     this.warpIndex = i;
-    this.settled = false; // the hold looks again (and tightens up when time slows down)
+    this.rewarp(m0);
+    this.fc.settled = false; // the hold looks again (and tightens up when time slows down)
     // the read-out answers at once
     this.winN = this.winAt = 0;
     this.limitFrames = 0;
@@ -890,25 +877,22 @@ class WorldSession implements Session {
   // ------------------------------------------------------------------------------------------ input
 
   setControls(c: { pitch?: number; yaw?: number; roll?: number; throttle?: number; translate?: V3 }): void {
-    if (c.pitch !== undefined) this.pitch = clamp(c.pitch, -1, 1) || 0;
-    if (c.yaw !== undefined) this.yaw = clamp(c.yaw, -1, 1) || 0;
-    if (c.roll !== undefined) this.roll = clamp(c.roll, -1, 1) || 0;
+    if (c.pitch !== undefined) this.fc.pitch = clamp(c.pitch, -1, 1) || 0;
+    if (c.yaw !== undefined) this.fc.yaw = clamp(c.yaw, -1, 1) || 0;
+    if (c.roll !== undefined) this.fc.roll = clamp(c.roll, -1, 1) || 0;
     if (c.throttle !== undefined) {
       const t = clamp(c.throttle, 0, 1) || 0;
-      if (t > 0 && this.throttle === 0) this.settled = false; // point properly before the drive lights
-      this.throttle = t;
+      if (t > 0 && this.fc.throttle === 0) this.fc.settled = false; // point properly before the drive lights
+      this.fc.throttle = t;
     }
     if (c.translate) {
-      this.translate.x = clamp(c.translate.x, -1, 1) || 0;
-      this.translate.y = clamp(c.translate.y, -1, 1) || 0;
-      this.translate.z = clamp(c.translate.z, -1, 1) || 0;
+      this.fc.translate.x = clamp(c.translate.x, -1, 1) || 0;
+      this.fc.translate.y = clamp(c.translate.y, -1, 1) || 0;
+      this.fc.translate.z = clamp(c.translate.z, -1, 1) || 0;
     }
   }
   setHold(mode: HoldMode): void {
-    if (mode === this.hold) return;
-    this.hold = mode;
-    this.holdQValid = false;
-    this.settled = false;
+    this.fc.setHold(mode);
   }
 
   // ------------------------------------------------------------------------------------------ views
@@ -936,31 +920,39 @@ class WorldSession implements Session {
       o.heat = c.heatCapacity > 0 ? c.heat / c.heatCapacity : 0;
       o.hull = c.hull;
       o.dockedTo = c.dockedTo;
+      // wave 1: what was applied (W1-B fills the records)
+      o.w.x = c.w.x; o.w.y = c.w.y; o.w.z = c.w.z;
+      const jd = o.jetDuty, cd = c.jetDuty;
+      for (let j = 0; j < jd.length; j++) jd[j] = j < cd.length ? cd[j] : 0;
+      const el = o.engineLevel, ft = c.engineThrust, en = c.engines;
+      for (let j = 0; j < el.length; j++) el[j] = j < ft.length && j < en.length && en[j].maxThrust > 0 ? ft[j] / en[j].maxThrust : 0;
+      o.airVelocity.x = c.airVel.x; o.airVelocity.y = c.airVel.y; o.airVelocity.z = c.airVel.z;
+      o.heatFlux = c.heatFlux;
     }
     return out;
   }
   player(): PlayerView {
     const c = this.ship, o = this.playerView;
-    const m = c.dryMass + c.propellant;
+    const m = craftMass(c);
     o.name = c.name;
     o.mass = m;
     o.propellant = c.propellant;
     o.propellantFraction = c.propellantCapacity > 0 ? c.propellant / c.propellantCapacity : 0;
-    o.deltaV = c.propellant > 0 ? c.exhaustVelocity * Math.log(m / c.dryMass) : 0;
+    o.deltaV = c.propellant > 0 ? c.exhaustVelocity * Math.log(m / (m - c.propellant)) : 0; // the main pool's Δv
     o.maxAccel = c.propellant > 0 ? c.mainThrust / m : 0;
-    o.throttle = this.cmdThrottle > this.throttle ? this.cmdThrottle : this.throttle;
-    o.hold = this.hold;
+    o.throttle = this.fc.cmdThrottle > this.fc.throttle ? this.fc.cmdThrottle : this.fc.throttle;
+    o.hold = this.fc.hold;
     o.heat = c.heatCapacity > 0 ? c.heat / c.heatCapacity : 0;
     o.hull = c.hull;
     o.destroyed = c.destroyed;
     o.destroyedBy = c.destroyedBy;
     o.dockedTo = c.dockedTo;
     o.spin = Math.sqrt(c.w.x * c.w.x + c.w.y * c.w.y + c.w.z * c.w.z);
-    const ref = this.assist ? this.assistRef() : null;
-    o.assist = !this.assist ? 'off' : ref ? 'on' : 'noRef';
+    const ref = this.fc.assist ? this.fc.assistRef() : null;
+    o.assist = !this.fc.assist ? 'off' : ref ? 'on' : 'noRef';
     o.assistRef = ref ? ref.name : '';
     o.assistSpeed = ref ? Math.hypot(c.v.x - ref.v.x, c.v.y - ref.v.y, c.v.z - ref.v.z) : 0;
-    o.assistCmd = this.assist ? this.faLever() * FA_SPEED : 0;
+    o.assistCmd = this.fc.assist ? this.fc.faLever() * FA_SPEED : 0;
     return o;
   }
   flight(): FlightView {
@@ -982,6 +974,12 @@ class WorldSession implements Session {
     o.accel = f.accel;
     o.airDensity = f.airDensity;
     o.dynamicPressure = f.dynamicPressure;
+    // the IMU: f = −felt at its mounting point (SIMULATION.md W1-A 8), from the same ship motion the crew feels
+    const c = this.ship, m = craftMotion(this.world, c, this.motion, this.ledger), im = this.IMU;
+    feltAt0(m, im.x, im.y, im.z, o.specificForce);
+    o.specificForce.x = -o.specificForce.x; o.specificForce.y = -o.specificForce.y; o.specificForce.z = -o.specificForce.z;
+    o.rcsPropellant = c.rcsPropellant;
+    o.rcsPropellantCapacity = c.rcsPropellantCapacity;
     return o;
   }
 
@@ -990,7 +988,7 @@ class WorldSession implements Session {
     this.targetId = id;
     if (id !== null && this.targetState() === null) this.targetId = null;
     this.predDirty = true;
-    if (this.hold === 'target' || this.hold === 'antiTarget') this.settled = false;
+    if (this.fc.hold === 'target' || this.fc.hold === 'antiTarget') this.fc.settled = false;
   }
   target(): TargetView | null {
     const t = this.targetState();
@@ -1013,15 +1011,68 @@ class WorldSession implements Session {
 
   // ------------------------------------------------------------------------------------------ prediction
 
+  /**
+   * The path the ship will fly (SIMULATION.md W1-A 3). Computed in step(), never here: this only hands out the view.
+   * The shown path is extended at its far end and trimmed behind the present (≤ 0.3 ms of steps a frame, usually
+   * one coast step every 20–30 s); a disturbance restarts it in 0.5 ms slices while the old path stays shown.
+   */
   prediction(): PredictionView {
-    const world = this.world, c = this.ship, view = this.pred;
-    const thrust = !c.destroyed && c.dockedTo === null && c.propellant > 0 && (c.throttle > 0 || c.rcs.x !== 0 || c.rcs.y !== 0 || c.rcs.z !== 0);
+    return this.pred;
+  }
+  setPredictionVisible(on: boolean): void {
+    this.predVisible = !!on;
+  }
+
+  /** The predictor's share of a frame (after the world's step): nothing while nobody can see the path. */
+  private runPrediction(): void {
+    if (!this.predVisible || this.asleep) return;
+    const world = this.world, c = this.ship;
+    const thrust = !c.destroyed && c.dockedTo === null && (c.propellant > 0 && c.throttle > 0 || c.rcsPropellant > 0 && (c.rcs.x !== 0 || c.rcs.y !== 0 || c.rcs.z !== 0));
     if (thrust !== this.predThrust) { this.predThrust = thrust; this.predDirty = true; }
-    if (!this.predDirty && (world.t === this.predT || this.clock - this.predClock < PREDICT_INTERVAL)) return view;
+    const t0 = this.clockNow();
+    let steps = 0;
+    const age = this.clock - this.predClock;
+    // held thrust changes the path continuously: a new one every PREDICT_INTERVAL; coasting, a fresh one now and then
+    // all the same (the hold's jets are real and push a little), so the ghost never strays far from the ship
+    if (!this.freshBusy && (thrust ? age >= PREDICT_INTERVAL : age >= PREDICT_REFRESH)) this.predDirty = true;
+    if (this.predDirty && (!this.freshBusy || age >= PREDICT_INTERVAL)) this.startFresh();
+    if (this.freshBusy) {
+      const cap = Math.max(8, Math.floor(PREDICT_RESTART_MS / this.predStepMs));
+      const before = this.freshWork.steps;
+      const done = this.fresh.run(cap);
+      steps += this.freshWork.steps - before;
+      if (done) this.showFresh();
+    } else if (this.liveOk) {
+      // keep the horizon: drop what is behind, extend the far end only as far as it fell short
+      const live = this.live, want = world.t + this.predDuration;
+      if (want - live.end() > PREDICT_SLACK * this.predDuration && live.extend(want)) this.liveRunning = true;
+      if (this.liveRunning) {
+        const cap = Math.max(4, Math.floor(PREDICT_EXTEND_MS / this.predStepMs));
+        const before = this.liveWork.steps;
+        if (this.live.run(cap)) this.liveRunning = false;
+        steps += this.liveWork.steps - before;
+        this.live.dropBefore(world.t);
+        this.publish(this.liveWork);
+      } else if (this.liveWork.count > 1 && this.liveWork.points[7] < world.t) {
+        this.live.dropBefore(world.t);
+        this.publish(this.liveWork);
+      }
+    }
+    if (steps > 0 && !this.unitFixed) {
+      this.predMs += this.clockNow() - t0; this.predSteps += steps;
+      if (this.predSteps >= PREDICT_LEARN_STEPS) {
+        const u = this.predMs / this.predSteps;
+        this.predStepMs = u > UNIT_MS_MIN ? (u < UNIT_MS_MAX ? u : UNIT_MS_MAX) : UNIT_MS_MIN;
+        this.predMs = this.predSteps = 0;
+      }
+    }
+  }
+
+  /** Begin a fresh prediction from the present state into the spare buffer. */
+  private startFresh(): void {
+    const world = this.world, c = this.ship;
     this.predDirty = false;
     this.predClock = this.clock;
-    this.predT = world.t;
-
     // About three orbits of the current path, long enough to show every planned burn, inside the ephemeris ring.
     const b = world.bodies[c.primary];
     const f = flightReadout(world, PLAYER_ID);
@@ -1034,24 +1085,51 @@ class WorldSession implements Session {
     const eph = ephemerisOf(world);
     const cap = 0.8 * eph.capacity * world.h;
     if (duration > cap) duration = cap;
-
-    const o = this.predOpts, work = this.work;
+    this.freshDuration = duration;
+    const o = this.predOpts;
     o.duration = duration;
     o.frameBodyId = this.predFrame;
     o.burns = burns;
     const t = this.targetState();
     o.targetCraftId = t && t.craft ? this.targetId : null;
-    this.predictor.start(world, PLAYER_ID, o, work);
-    this.predictor.run(PREDICT_BUDGET_MS, now);
+    // while the drive burns: the held thrust along the drive axis for min(propellant/ṁ, 30 s), then the coast
+    o.thrust = null;
+    if (this.predThrust && c.throttle > 0 && c.propellant > 0 && c.exhaustVelocity > 0) {
+      const F = c.mainThrust * c.throttle, md = F / c.exhaustVelocity, d = qRot(this.FV, c.q, 0, 0, -1);
+      const th = this.predThrustOpt;
+      th.fx = F * d.x; th.fy = F * d.y; th.fz = F * d.z; th.mdot = md;
+      th.until = world.t + Math.min(c.propellant / md, PREDICT_THRUST_S);
+      o.thrust = th;
+    }
+    this.fresh.start(world, PLAYER_ID, o, this.freshWork);
+    this.freshBusy = true;
+  }
+
+  /** The fresh prediction is done: it becomes the shown (live) one; the old buffer is the next spare. */
+  private showFresh(): void {
+    const p = this.live, w = this.liveWork;
+    this.live = this.fresh; this.liveWork = this.freshWork;
+    this.fresh = p; this.freshWork = w;
+    this.freshBusy = false;
+    this.liveOk = true;
+    this.liveRunning = false;
+    this.predDuration = this.freshDuration;
+    this.publish(this.liveWork);
+  }
+
+  /** Copy the shown prediction's header into the view (the arrays are the buffer's own). */
+  private publish(work: Prediction): void {
+    const view = this.pred, world = this.world;
     view.version++;
+    view.points = work.points;
+    view.targetPoints = work.targetPoints;
     view.frameBodyId = world.bodies[work.frameBody].id;
     view.count = work.count;
     view.targetCount = work.targetCount;
     view.horizon = work.horizon;
-    const ev: PredictionEvent[] = [];
+    const ev = view.events as PredictionEvent[];
+    ev.length = 0;
     for (let i = 0; i < work.eventCount; i++) ev.push(predictionEvent(work, i));
-    view.events = ev;
-    return view;
   }
   setPredictionFrame(bodyId: string | null): void {
     if (bodyId !== null && !this.world.bodies.some((b) => b.id === bodyId)) bodyId = null;
@@ -1090,7 +1168,7 @@ class WorldSession implements Session {
   }
   private burnsChanged(): void {
     this.predDirty = true;
-    if (this.hold === 'burn') this.settled = false;
+    if (this.fc.hold === 'burn') this.fc.settled = false;
   }
 
   // ------------------------------------------------------------------------------------------ docking
@@ -1128,8 +1206,8 @@ class WorldSession implements Session {
   }
   undock(): boolean {
     if (!undock(this.world, PLAYER_ID)) return false;
-    this.rearmBlock = true;
-    this.settled = false;
+    this.fc.rearmBlock = true;
+    this.fc.settled = false;
     this.predDirty = true;
     this.pump();
     return true;
@@ -1148,7 +1226,7 @@ class WorldSession implements Session {
   }
   crew(): CrewView {
     const o = this.crewView, layout = this.layout, b = this.playerMode === 'onFoot' ? this.body : null;
-    const m = craftMotion(this.world, this.ship, this.motion);
+    const m = craftMotion(this.world, this.ship, this.motion, this.ledger);
     o.mode = this.playerMode;
     o.asleep = this.asleep;
     o.prompt = null;
@@ -1174,8 +1252,10 @@ class WorldSession implements Session {
       o.vel.x = o.vel.y = o.vel.z = 0;
       o.yaw = this.headYaw; o.pitch = this.headPitch;
       o.boots = true; o.gripped = false;
-      feltAt0(m, e.x, deck + CREW_COM, e.z, o.felt);
+      feltAt0(m, e.x, e.y - HELM_COM_BELOW_EYE, e.z, o.felt); // the seated body's centre of mass (W1-A 8)
     }
+    const d = this.eyeOffset(o.eyeOffset);
+    o.eye.x += d.x; o.eye.y += d.y; o.eye.z += d.z;
     const room = layout ? roomAt(layout, o.pos.x, o.pos.y + CREW_COM, o.pos.z) : null;
     o.roomId = room ? room.id : '';
     o.roomName = room ? room.name : '';
@@ -1233,9 +1313,9 @@ class WorldSession implements Session {
     const c = this.ship, layout = this.layout, ix = this.ix;
     if (this.playerMode !== 'helm' || !layout || c.destroyed) return false;
     const armed = ix.arm >= 0 && (this.devs[ix.arm].on || this.devs[ix.arm].made);
-    if (armed || this.cmdThrottle > 0 || this.throttle > 0 || c.throttle > 0) return false;
-    this.pitch = this.yaw = this.roll = 0;
-    this.translate.x = this.translate.y = this.translate.z = 0;
+    if (armed || this.fc.cmdThrottle > 0 || this.fc.throttle > 0 || c.throttle > 0) return false;
+    this.fc.pitch = this.fc.yaw = this.fc.roll = 0;
+    this.fc.translate.x = this.fc.translate.y = this.fc.translate.z = 0;
     for (const i of this.hands.values()) devRelease(this.devs[i]); // hands off the controls
     this.hands.clear();
     const boots = this.body ? this.body.boots : true;
@@ -1245,7 +1325,7 @@ class WorldSession implements Session {
     this.setWarpIndex(0);
     this.playerMode = 'onFoot';
     this.restT = 0;
-    this.settled = false;
+    this.fc.settled = false;
     this.events.emit('crewMode', { mode: 'onFoot' });
     return true;
   }
@@ -1280,9 +1360,11 @@ class WorldSession implements Session {
   /** End the sleep (any input, or the ship being knocked about). */
   private wake(): void {
     if (!this.asleep) return;
+    const m0 = this.mult();
     this.asleep = false;
+    this.rewarp(m0);
     this.restT = 0;
-    this.settled = false;
+    this.fc.settled = false;
     this.winN = this.winAt = 0;
     this.events.emit('sleep', { asleep: false, seconds: this.world.t - this.sleptFrom });
   }
@@ -1337,10 +1419,10 @@ class WorldSession implements Session {
   private litOf(i: number): boolean {
     const def = this.devDefs[i], d = this.devs[i], ix = this.ix, role = def.role;
     const hm = HOLD_OF[role];
-    if (hm) return this.hold === hm;
+    if (hm) return this.fc.hold === hm;
     switch (role) {
       case 'driveArm': return d.made;
-      case 'flightAssist': return this.assist && (this.assistRef() !== null || this.clock % 0.7 < 0.35); // blinks with no reference
+      case 'flightAssist': return this.fc.assist && (this.fc.assistRef() !== null || this.clock % 0.7 < 0.35); // blinks with no reference
       case 'throttle': return ix.arm >= 0 && this.devs[ix.arm].made && leverValue(d) > 0;
       case 'cabinLights': return this.lights;
       case 'harness': return this.playerMode === 'helm';
@@ -1480,19 +1562,41 @@ class WorldSession implements Session {
     propHandOff(ps, this.propVel, this.playerMode === 'onFoot' ? this.body : null);
   }
 
+  // ------------------------------------------------------------------------------------------ senses (wave 1)
+
+  drainEvents(cb: (e: SimEvent, seq: number) => void): number {
+    return drain(eventRing(this.world), cb);
+  }
+  dutyTape(): DutyTape {
+    return this.tape;
+  }
+  frameTime(): number {
+    // §1.3: the views hold the latest tick state; at 1× (quantum 1) the frame lies r = owed ticks · Q < Q past it and
+    // the renderer extrapolates by r from each view's own v and w. Under warp the frame shows the tick state itself.
+    const r = this.quantum() === 1 && this.due > 0 ? (this.due < 1 ? this.due : 1 - 1e-9) / TICK_HZ : 0;
+    return this.world.t + r;
+  }
+  setLean(amount: number): void {
+    const a = amount > 0 ? (amount < 1 ? amount : 1) : 0;
+    if (a !== this.leanT) this.restT = 0;
+    this.leanT = a;
+  }
+
   // ------------------------------------------------------------------------------------------ life cycle
 
   reset(): void {
     this.bind(buildWorld(this.system));
     this.startPilot();
+    this.seated = createSeatedBody();
+    this.leanT = 0;
     this.lights = true;
-    this.assist = false;
-    this.faIdle();
-    this.pitch = this.yaw = this.roll = this.throttle = 0;
-    this.translate.x = this.translate.y = this.translate.z = 0;
-    this.hold = 'stability';
-    this.holdQValid = false;
-    this.rearmBlock = false;
+    this.fc.assist = false;
+    this.fc.faIdle();
+    this.fc.pitch = this.fc.yaw = this.fc.roll = this.fc.throttle = 0;
+    this.fc.translate.x = this.fc.translate.y = this.fc.translate.z = 0;
+    this.fc.hold = 'stability';
+    this.fc.holdQValid = false;
+    this.fc.rearmBlock = false;
     this.warpIndex = 0;
     this.warpView.limitedBy = '';
     this.targetId = START_STATION_ID;
@@ -1502,12 +1606,18 @@ class WorldSession implements Session {
     this.events.emit('reset', {});
   }
   save(): string {
+    const fc = this.fc;
     const state: SessionState = {
-      seed: this.seed, hold: this.hold, holdQ: this.holdQValid ? { ...this.holdQ } : null, targetId: this.targetId, predFrame: this.predFrame,
-      burns: this.burnList, burnSeq: this.burnSeq, throttle: this.throttle, rearmBlock: this.rearmBlock, settled: this.settled,
-      mode: this.playerMode, crew: this.playerMode === 'onFoot' ? this.body : null, lights: this.lights, assist: this.assist,
+      seed: this.seed, hold: this.fc.hold, holdQ: this.fc.holdQValid ? { ...this.fc.holdQ } : null, targetId: this.targetId, predFrame: this.predFrame,
+      burns: this.burnList, burnSeq: this.burnSeq, throttle: this.fc.throttle, rearmBlock: this.fc.rearmBlock, settled: this.fc.settled,
+      mode: this.playerMode, crew: this.playerMode === 'onFoot' ? this.body : null, lights: this.lights, assist: this.fc.assist,
       devices: this.devs, pages: this.devPage, head: [this.headYaw, this.headPitch],
       props: this.loose ? savePropsState(this.loose) : null,
+      seated: saveSeatedBody(this.seated), lean: this.leanT,
+      ctl: {
+        in: [fc.pitch, fc.yaw, fc.roll, fc.translate.x, fc.translate.y, fc.translate.z], faOn: fc.faOn.slice(), faMain: fc.faMain, faFiring: fc.faFiring,
+        cmd: fc.cmdThrottle, active: this.ctlActive, restT: this.restT,
+      },
     };
     return JSON.stringify({ tidelock: SAVE_VERSION, session: state, world: saveWorld(this.world) });
   }
@@ -1524,20 +1634,30 @@ export function createSession(opts: SessionOptions = {}): Session {
   return new WorldSession(system, buildWorld(system), opts, seed);
 }
 
+/**
+ * SIMULATION.md Decision 4: a save of ANY version is brought up to this one, never discarded. The envelope keeps its
+ * shape across versions; every field added since is optional in SessionState (the constructor gives each its
+ * default) and every craft field gets its loader default in world.ts migrateCraft (a version-3 save's single 24 t
+ * tank becomes 22.5 t LH2 + 1.5 t N2H4, the same total mass). Null only when the text is not a TIDELOCK save.
+ */
+export function migrate(data: { tidelock?: unknown; session?: unknown; world?: unknown }): { session: SessionState; world: World } | null {
+  if (typeof data.tidelock !== 'number' || typeof data.world !== 'string' || !data.session || typeof data.session !== 'object') return null;
+  return { session: data.session as SessionState, world: loadWorld(data.world) };
+}
+
 /** Null when the text is not a save of this session. */
 export function loadSession(json: string, opts: SessionOptions = {}): Session | null {
   try {
-    const data = JSON.parse(json) as { tidelock?: number; session?: SessionState; world?: string };
-    if (data.tidelock !== SAVE_VERSION || typeof data.world !== 'string' || !data.session) return null;
-    const s = data.session;
-    const world = loadWorld(data.world);
+    const m = migrate(JSON.parse(json) as Record<string, unknown>);
+    if (!m) return null;
+    const s = m.session, world = m.world;
     const system = startSystem(typeof s.seed === 'number' ? s.seed : 1);
     if (world.bodies.length !== system.bodies.length || !findCraft(world, PLAYER_ID)) return null;
     return new WorldSession(system, world, opts, s.seed, {
       seed: s.seed, hold: s.hold ?? 'stability', holdQ: s.holdQ ?? null, targetId: s.targetId ?? null, predFrame: s.predFrame ?? null,
       burns: Array.isArray(s.burns) ? s.burns : [], burnSeq: s.burnSeq ?? 0, throttle: s.throttle ?? 0, rearmBlock: !!s.rearmBlock, settled: !!s.settled,
       mode: s.mode === 'helm' ? 'helm' : 'onFoot', crew: s.crew ?? null, lights: s.lights !== false, assist: s.assist === true, devices: s.devices, pages: s.pages, head: s.head,
-      props: s.props,
+      props: s.props, seated: s.seated, lean: s.lean, ctl: s.ctl,
     });
   } catch {
     return null;

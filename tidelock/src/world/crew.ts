@@ -10,10 +10,13 @@
 // Magnetic boots grip a deck (a room floor) and hold up to BOOT_HOLD; beyond that the body slides and falls
 // like anything loose. Movement stays inside the layout's rooms and doors, minus the solids.
 
-import type { V3 } from '../core/types';
+import type { Quat, V3 } from '../core/types';
 import type { Interactable, InteriorLayout } from '../data/interiors';
 import { clamp1, qRotInv } from './math';
 import { craftMass, type Craft, type World } from './state';
+import type { EventRing } from './events';
+import type { LedgerMean } from './jets';
+import { createHarnessBody, loadHarnessBody, saveHarnessBody, type HarnessBody } from './body';
 
 /**
  * Collision radius of the body about its long axis, m: about half a person's shoulder depth-to-width. The
@@ -99,7 +102,8 @@ export function createCrew(layout: InteriorLayout, shipId: string): CrewState {
  * (while there is propellant), the ground's push when it rests on a surface, torque through Euler's equations.
  * Aerodynamic and contact forces during flight are not included.
  */
-export function craftMotion(world: World, c: Craft, out: ShipMotion): ShipMotion {
+export function craftMotion(world: World, c: Craft, out: ShipMotion, mean?: LedgerMean | null): ShipMotion {
+  void mean; // W1-C fills: the motion from the tick's consumed ledger (body.ts motionFromLedger) replaces the rebuild below
   const a = out.a, al = out.alpha, w = c.w;
   a.x = a.y = a.z = 0;
   al.x = al.y = al.z = 0;
@@ -365,7 +369,8 @@ function sub(s: CrewState, layout: InteriorLayout, c: Compiled, m: ShipMotion, i
  * Advance the body by dt of ship time. Sub-stepped at 120 Hz or finer (and so that no sub-step moves it more
  * than a few centimetres), so the result does not depend on the frame rate and nothing tunnels.
  */
-export function stepCrew(s: CrewState, layout: InteriorLayout, m: ShipMotion, input: CrewInput, dt: number): void {
+export function stepCrew(s: CrewState, layout: InteriorLayout, m: ShipMotion, input: CrewInput, dt: number, tk?: BodyTick): void {
+  void tk; // W1-C fills: the tick context (impulses, events, latched look and lean)
   if (!(dt > 0) || s.seat !== '') return;
   const c = compile(layout);
   const v = s.vel, a = m.a, w = m.w;
@@ -453,4 +458,58 @@ export function findPrompt(s: CrewState, layout: InteriorLayout): Interactable |
     if (score < bestScore) { bestScore = score; best = it; }
   }
   return best;
+}
+
+// ================================================================================================ day-1 contract (W1-A)
+// The session (W1-A) calls these once per tick (once per quantum under warp) with the BodyTick it fills; W1-C owns
+// what happens inside. Each stub keeps today's behaviour (no seated body, no eye offset) until W1-C fills it.
+
+/** What the session hands every body stepper per tick (or per quantum under warp). W1-A fills it; W1-C reads it. */
+export interface BodyTick {
+  /** World tick index at the END of the step (sim time = tick / 120 s). */
+  tick: number;
+  /** Ticks this step covers (1 at 1×; the quantum under warp) and its length, s (= ticks / 120). */
+  ticks: number;
+  h: number;
+  /** The step's consumed ledger (dynamics.ts consumeLedger): mean proper force (N) and torque (N·m), impulses Δv, Δω; craft axes. */
+  ledger: LedgerMean;
+  /** The craft's attitude (local → inertial) at the end of the step. */
+  q: Quat;
+  /** The world's event ring (output only: emit, never read). */
+  events: EventRing;
+  /** Look yaw and pitch latched at the tick boundary, rad (CrewView conventions), and the lean the pinch asks for, 0..1. */
+  yaw: number;
+  pitch: number;
+  lean: number;
+}
+
+export function createBodyTick(ledger: LedgerMean, events: EventRing): BodyTick {
+  return { tick: 0, ticks: 1, h: 1 / 120, ledger, q: { x: 0, y: 0, z: 0, w: 1 }, events, yaw: 0, pitch: 0, lean: 0 };
+}
+
+/** Where a seated body sits: the helm (harness), the bunk (straps) or the lounge table bench. */
+export type SeatKind = 'helm' | 'bunk' | 'table';
+/** The seated body's state (torso, head, lean): body.ts HarnessBody. Saved by the session through save/loadSeatedBody. */
+export type SeatedBody = HarnessBody;
+export const createSeatedBody = (): SeatedBody => createHarnessBody();
+export const saveSeatedBody = (b: SeatedBody): unknown => saveHarnessBody(b);
+export const loadSeatedBody = (data: unknown): SeatedBody => loadHarnessBody(data);
+
+/**
+ * Step a seated body (harness / bunk straps / table) by one tick context. W1-C fills (body.ts stepHarnessBody at
+ * h = Q, harnessEquilibrium for h > QS_DT; the impulse through shipJumpAt). Stub: nothing moves.
+ */
+export function stepSeated(b: SeatedBody, seat: SeatKind, layout: InteriorLayout, m: ShipMotion, tk: BodyTick): void {
+  void b; void seat; void layout; void m; void tk; // W1-C fills
+}
+
+/**
+ * The eye's displacement by the body, ship axes, m (CrewView.eyeOffset; the session adds it to the eye): seated
+ * (`seated` non-null) or on foot (`crew`). W1-C fills (helmEyeOffset / footEyeOffset + neckEyeDelta, clamped so the
+ * head sphere never passes through glass). Stub: zero.
+ */
+export function eyeOffsetOf(crew: CrewState | null, seated: SeatedBody | null, seat: SeatKind | '', layout: InteriorLayout | null, yaw: number, pitch: number, out: V3): V3 {
+  void crew; void seated; void seat; void layout; void yaw; void pitch; // W1-C fills
+  out.x = 0; out.y = 0; out.z = 0;
+  return out;
 }

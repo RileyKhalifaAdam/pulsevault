@@ -12,6 +12,8 @@ import {
   addCraft, advance, circularState, craftInertia, craftMass, createWorld, dockingStatus, DOCK_DISTANCE, drainEvents, flightReadout,
   holdTorque, loadWorld, pointingError, RESTITUTION, saveWorld, shipDef, undock, type Craft, type World, type WorldEvent,
 } from '../src/world';
+import { HOLD_MAX_RATE } from '../src/world/control';
+import { holdCmdToJets, IN_RCS, makeStepIn, torqueAuthority } from '../src/world/jets';
 
 const system = getSystem(generateGalaxy(1), 'tallow')!;
 const stats = computeStats(defaultLoadout('wren'));
@@ -66,7 +68,7 @@ describe('craft translation', () => {
     expect(drainEvents(w).length).toBe(0);
   });
 
-  it('a 60 s burn gives the delta-v of the rocket equation', () => {
+  it('a 60 s burn gives the delta-v of the rocket equation (two engines: ignition delay, spool, canted through the CoM)', () => {
     const w = deepSpace();
     const ship = wren(w, STAR, FAR, v3());
     const m0 = craftMass(ship);
@@ -74,16 +76,22 @@ describe('craft translation', () => {
     const r = advance(w, 60);
     expect(r.simDt).toBe(60);
     const m1 = craftMass(ship);
-    expect(m0 - m1).toBeCloseTo((stats.mainThrust / stats.exhaustVelocity) * 60, 6);
+    // 0.5 s of ignition delay, then F_s = F(1 − e^(−t/0.8)): ∫F dt = F·(59.5 − 0.8·(1 − e^(−59.5/0.8)))
+    const burnT = 59.5 - 0.8 * (1 - Math.exp(-59.5 / 0.8));
+    expect(m0 - m1).toBeCloseTo((stats.mainThrust / stats.exhaustVelocity) * burnT, 6);
+    expect(ship.rcsPropellant).toBe(ship.rcsPropellantCapacity); // no jet fired
     const dv = len(ship.relV), want = stats.exhaustVelocity * Math.log(m0 / m1);
     console.log(`rocket equation: flown ${dv.toFixed(4)} m/s, ideal ${want.toFixed(4)} m/s (${r.steps} steps)`);
     expect(Math.abs(dv / want - 1)).toBeLessThan(1e-3);
-    expect(-ship.relV.z / dv).toBeGreaterThan(0.999999);
+    // both pods sit 0.2 m below the CoM and are canted atan(0.2/15.6) = 0.73° so the thrust passes through it
+    const cant = Math.atan2(0.2, 15.6);
+    expect(-ship.relV.z / dv).toBeCloseTo(Math.cos(cant), 6);
+    expect(len(ship.w)).toBeLessThan(1e-9); // and so it makes no torque
     // Running dry stops the thrust.
     advance(w, 2000);
     expect(ship.propellant).toBe(0);
     const v1 = len(ship.relV);
-    expect(Math.abs(v1 / (stats.exhaustVelocity * Math.log(m0 / stats.dryMass)) - 1)).toBeLessThan(1e-3);
+    expect(Math.abs(v1 / (stats.exhaustVelocity * Math.log(m0 / (stats.dryMass + ship.rcsPropellant))) - 1)).toBeLessThan(1e-3); // W1-A: the RCS pool stays aboard
     advance(w, 100);
     expect(Math.abs(len(ship.relV) - v1)).toBeLessThan(1e-2);
   });
@@ -111,23 +119,33 @@ describe('craft rotation', () => {
     expect(dE).toBeLessThan(1e-5);
   });
 
-  it('the hold controller turns 90° with real torque and settles without overshoot', () => {
+  it('the hold controller turns 90° with real torque (the jets) at 0.1 rad/s and settles without overshoot (D3)', () => {
     const w = deepSpace();
     const ship = wren(w, STAR, FAR, v3());
-    const dir = v3(1, 0, 0), e = v3(), I = v3();
+    const dir = v3(1, 0, 0), e = v3(), I = v3(), cmd = new Float64Array(6), inp = makeStepIn();
+    const p0 = ship.rcsPropellant;
     let reached = -1, rebound = 0, ang = 0, peakRate = 0;
-    for (let k = 0; k < 60 * 15; k++) {
+    for (let k = 0; k < 60 * 30; k++) {
       ang = len(pointingError(ship.q, dir, e));
       if (k === 0) expect(ang).toBeCloseTo(Math.PI / 2, 9);
       if (reached < 0 && ang < 0.02) reached = k / 60;
       if (reached >= 0) rebound = Math.max(rebound, ang);
+      inp[IN_RCS] = ship.rcsPropellant;
+      torqueAuthority(ship.jetAlloc, inp, ship.maxTorque);
       holdTorque(e, ship.w, craftInertia(ship, I), ship.maxTorque, ship.torque);
+      holdCmdToJets(ship.jetAlloc, ship.torque, cmd);
+      ship.torque.x = cmd[3]; ship.torque.y = cmd[4]; ship.torque.z = cmd[5];
       advance(w, 1 / 60);
       peakRate = Math.max(peakRate, len(ship.w));
     }
-    console.log(`hold: 90° reached in ${reached.toFixed(2)} s, peak rate ${peakRate.toFixed(3)} rad/s, final error ${ang.toExponential(2)} rad, rate ${len(ship.w).toExponential(2)} rad/s`);
+    const used = p0 - ship.rcsPropellant;
+    console.log(`hold: 90° reached in ${reached.toFixed(2)} s, peak rate ${peakRate.toFixed(3)} rad/s, final error ${ang.toExponential(2)} rad, rate ${len(ship.w).toExponential(2)} rad/s; ${used.toFixed(1)} kg of hydrazine`);
+    expect(peakRate).toBeLessThan(HOLD_MAX_RATE * 1.02);
+    expect(used).toBeGreaterThan(25); // the plan's "about 40 kg per hold slew"
+    expect(used).toBeLessThan(60);
+    expect(len(ship.relV)).toBeLessThan(3e-3); // a pure torque from the jets: no translation (this is the star's 6e-5 m/s² pull over 30 s)
     expect(reached).toBeGreaterThan(0);
-    expect(reached).toBeLessThan(10);
+    expect(reached).toBeLessThan(20);
     expect(rebound).toBeLessThan(0.03);
     expect(ang).toBeLessThan(0.005);
     expect(len(ship.w)).toBeLessThan(0.002);
@@ -479,11 +497,13 @@ describe('advance, save and load', () => {
     expect(r.simDt).toBeGreaterThan(1000);
     expect(r.simDt).toBeLessThan(1e7);
     expect(r.limitedBy).toBe('cpu');
-    ship.throttle = 0.01;
+    ship.throttle = 0.2; // above the 15% minimum: the engines light
     r = advance(w, 1000, { budgetMs: 3, now });
     expect(r.simDt).toBeLessThan(1000);
     expect(r.limitedBy).toBe('thrust');
     ship.throttle = 0;
+    advance(w, 10); // the shut-down tail ends (F_s = 0 exactly after τ_down·ln(F/ε) ≈ 2.6 s)
+    expect(ship.engineThrust).toEqual([0, 0]);
     ship.torque.x = 0.5;
     r = advance(w, 1000, { budgetMs: 3, now });
     expect(r.limitedBy).toBe('rotation');

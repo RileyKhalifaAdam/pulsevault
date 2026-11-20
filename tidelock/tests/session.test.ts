@@ -11,6 +11,7 @@ import { createSession, loadSession, type Session } from '../src/game';
 import { START_CLEARANCE } from '../src/game/session';
 import { computeStats, defaultLoadout } from '../src/sim/ships';
 import { DOCK_ANGLE, DOCK_DISTANCE, DOCK_SPEED, qRotInv } from '../src/world';
+import { Autosave, AUTOSAVE_SECONDS, BUDGET_30, BUDGET_60, PerfMonitor } from '../src/app/perf';
 
 const STATS = computeStats(defaultLoadout('wren'));
 const WHEEL_RADIUS = STATION_LAYOUTS.ringHabitat.radius;
@@ -261,6 +262,8 @@ describe('session on the physical world', () => {
     expect(p.events.some((e) => e.kind === 'burn')).toBe(true);
     expect(p.frameBodyId).toBe(l!.flight().primaryId);
     l!.removeBurn(id);
+    // the predictor works in step() slices (≤ 0.5 ms a frame), showing the old path until the new one is done
+    run(l!, 2);
     expect(l!.prediction().events.some((e) => e.kind === 'burn')).toBe(false);
 
     let resets = 0;
@@ -892,5 +895,203 @@ describe('loose objects in the hand', () => {
       const s = standAt(x, z, -Math.PI / 2); // facing starboard, toward the sofa
       expect(s.crew().prompt?.label, `${x},${z}`).toBe('Sit on the sofa');
     }
+  });
+});
+
+// ---- wave 1, day 1 (SIMULATION.md §1.4, Decision 4): the contract fields, their views, saves of other versions ----
+describe('wave-1 contract (W1-A)', () => {
+  it('the Wren carries two pools: 22.5 t LH2 and 1.5 t hydrazine, the same 24 t in all', () => {
+    const s = createSession(FREE);
+    const p = s.player(), f = s.flight();
+    expect(p.propellant).toBe(22500);
+    expect(f.rcsPropellant).toBe(1500);
+    expect(f.rcsPropellantCapacity).toBe(1500);
+    expect(p.mass).toBe(STATS.dryMass + STATS.fuelCapacity);
+    const c = me(s);
+    expect(c.jets.length).toBe(SHIP_LAYOUTS.wren.rcs.length);
+    expect(c.engines.length).toBe(SHIP_LAYOUTS.wren.engines.length);
+    expect(c.jetDuty.length).toBe(c.jets.length);
+    expect(c.engineLevel.length).toBe(c.engines.length);
+    expect(Array.from(c.jetDuty).every((d) => d === 0)).toBe(true);
+    expect(s.crew().eyeOffset).toEqual({ x: 0, y: 0, z: 0 });
+    expect(s.drainEvents(() => undefined)).toBe(0);
+    expect(s.frameTime()).toBe(s.time());
+  });
+
+  it('the IMU reads the specific force: zero coasting, the drive along −Z under thrust', () => {
+    const s = createSession(FREE);
+    run(s, 0.5);
+    const f0 = s.flight().specificForce;
+    expect(Math.hypot(f0.x, f0.y, f0.z)).toBeLessThan(1e-6);
+    s.setControls({ throttle: 1 });
+    run(s, 0.5);
+    const f = s.flight().specificForce, m = s.player().mass;
+    expect(f.z / -(STATS.mainThrust / m)).toBeGreaterThan(0.95);
+    expect(f.z / -(STATS.mainThrust / m)).toBeLessThan(1.05);
+  });
+
+  it('a version-3 save (one 24 t tank, no wave-1 fields) loads: split 1.5 t + 22.5 t, same total mass, defaults', () => {
+    const s = createSession(FREE);
+    run(s, 1);
+    const data = JSON.parse(s.save()) as { tidelock: number; world: string };
+    expect(data.tidelock).toBe(4);
+    const w = JSON.parse(data.world) as { craft: Record<string, unknown>[] };
+    for (const k of ['jets', 'engines', 'jetTable', 'jetAlloc', 'jetIn']) expect(k in w.craft[w.craft.length - 1]).toBe(false); // derived: never saved
+    const total = (s.player().mass);
+    for (const c of w.craft) {
+      c.propellant = (c.propellant as number) + (c.rcsPropellant as number);
+      c.propellantCapacity = (c.propellantCapacity as number) + (c.rcsPropellantCapacity as number);
+      for (const k of ['jetDuty', 'engineThrust', 'engineTimer', 'rcsPropellant', 'rcsPropellantCapacity', 'fAcc', 'tauAcc', 'accT', 'dvImpulse', 'dwImpulse', 'airVel', 'heatFlux', 'holdWakeT']) delete c[k];
+    }
+    data.tidelock = 3;
+    data.world = JSON.stringify(w);
+    const l = loadSession(JSON.stringify(data), FREE)!;
+    expect(l).not.toBe(null);
+    const one = s.player().propellant + s.flight().rcsPropellant; // the v3 tank (the hold has used a little)
+    expect(l.flight().rcsPropellant).toBe(Math.min(1500, one / 16));
+    expect(l.player().propellant).toBe(one - Math.min(1500, one / 16));
+    expect(Math.abs(l.player().mass - total)).toBeLessThan(1e-9);
+    expect(Array.from(me(l).jetDuty)).toEqual(Array.from(me(s).jetDuty));
+    expect(l.crew().eyeOffset).toEqual({ x: 0, y: 0, z: 0 });
+    const js = (x: unknown): unknown => JSON.parse(JSON.stringify(x)); // (a save keeps −0 as 0, as it always has)
+    expect(js({ ...snapshot(l), propellant: 0 })).toEqual(js({ ...snapshot(s), propellant: 0 }));
+    run(l, 1);
+    expect(l.player().mass).toBeGreaterThan(total - 1);
+  });
+
+  it('save → load → step stays bit-identical with the wave-1 fields (a hold wake time of +∞ included)', () => {
+    const s = createSession(FREE);
+    s.setControls({ throttle: 0.5 }); // (setControls' translate is a test input the save does not keep)
+    run(s, 1);
+    const l = loadSession(s.save(), FREE)!;
+    expect(l.save()).toBe(s.save());
+    run(s, 2);
+    run(l, 2);
+    expect(l.save()).toBe(s.save());
+    expect(JSON.parse(JSON.parse(l.save()).world).craft.find((c: { id: string }) => c.id === 'player').holdWakeT).toBe(null);
+  });
+});
+
+describe('the spine: budget, prediction slices, perf honesty, autosave (W1-A)', () => {
+  it('the budget counts work units: a smaller budget gets less far per frame, with the reason; setBudget raises it', () => {
+    const units = (budgetMs: number): number => {
+      const s = createSession({ budgetMs, unitMs: 0.002, now: () => 0 });
+      s.setWarp(1e4);
+      s.step(1 / 60);
+      const i = s.step(1 / 60);
+      return i.simDt;
+    };
+    const lo = units(0.02), hi = units(3);
+    expect(lo).toBeLessThan(hi);
+    const s = createSession({ budgetMs: 0.02, unitMs: 0.002, now: () => 0 });
+    s.setWarp(1e4);
+    s.step(1 / 60);
+    expect(s.warp().limitedBy).not.toBe('');
+    s.setBudget(8);
+    const t = s.time();
+    s.step(1 / 60);
+    expect(s.time() - t).toBeGreaterThan(1e4 / 60 * 0.9);
+    expect(s.costPerUnit()).toBe(0.002);
+  });
+
+  it('a hidden page catches up on the time missed (D6): at most one sim day, under the warp budget', () => {
+    const s = createSession({ budgetMs: 1e9 });
+    const t0 = s.time();
+    s.catchUp(600); // ten minutes hidden
+    let frames = 0;
+    while (s.time() - t0 < 600 && frames < 600) { s.step(1 / 60); frames++; }
+    expect(s.time() - t0).toBeGreaterThanOrEqual(600);
+    expect(s.time() - t0).toBeLessThan(600 + 200); // the catch-up ends: back to 1x, plus the quantum it ended in
+    const t1 = s.time();
+    for (let i = 0; i < 60; i++) s.step(1 / 60);
+    expect(s.time() - t1).toBeCloseTo(1, 1);
+    const d = createSession({ budgetMs: 1e9 });
+    d.catchUp(10 * 86400);
+    for (let i = 0; i < 2000; i++) d.step(1 / 60);
+    expect(d.time()).toBeLessThan(86400 + 2000 / 60 + 200);
+  });
+
+  it('no frame spends more than 0.5 ms in the predictor (node); hidden, it does nothing', () => {
+    const s = createSession({ budgetMs: 1e9 });
+    const probe = s as unknown as { runPrediction(): void };
+    const frame = (): number => {
+      s.setPredictionVisible(false);
+      s.step(1 / 60);
+      s.setPredictionVisible(true);
+      const a = performance.now();
+      probe.runPrediction();
+      return performance.now() - a;
+    };
+    // warm every path (JIT) and learn the cost per step: a restart, a burn edit, a hold
+    for (let i = 0; i < 600; i++) { if (i === 100) s.addBurn(s.time() + 600, { radial: 1 }); if (i === 300) s.clearBurns(); frame(); }
+    let worst = 0, sum = 0;
+    for (let i = 0; i < 1200; i++) {
+      if (i === 300) s.addBurn(s.time() + 900, { prograde: 15 }); // a disturbance: restart in slices
+      if (i === 600) s.setHold('prograde');
+      const ms = frame();
+      sum += ms;
+      if (ms > worst) worst = ms;
+    }
+    console.log(`predictor per frame: mean ${(sum / 1200 * 1000).toFixed(1)} µs, worst ${(worst * 1000).toFixed(0)} µs`);
+    expect(worst).toBeLessThan(0.5 * 1.2); // 0.4 ms of steps by the learnt cost + start/hand-over; 20% for vitest jitter
+    expect(sum / 1200).toBeLessThan(0.1);
+    expect(s.prediction().events.some((e) => e.kind === 'burn')).toBe(true);
+    // hidden: the view stays as it was
+    const v = s.prediction().version;
+    s.setPredictionVisible(false);
+    s.addBurn(s.time() + 1200, { normal: 5 });
+    run(s, 2);
+    expect(s.prediction().version).toBe(v);
+  });
+
+  it('perf honesty: idle = frame − sim − render as 2 s means; over target with a large idle is GPU-bound', () => {
+    const p = new PerfMonitor('high');
+    p.budgetMs = BUDGET_30;
+    // a synthetic ring: RT High, 40 ms frames, 2 ms sim, 9 ms render: 29 ms idle → the GPU is the limit
+    for (let i = 0; i < 100; i++) p.record(40, 2, 9, 10, 500);
+    let s = p.snapshot();
+    expect(s.frameMean).toBeCloseTo(40, 9);
+    expect(s.simMean).toBeCloseTo(2, 9);
+    expect(s.renderMean).toBeCloseTo(9, 9);
+    expect(s.idleMean).toBeCloseTo(29, 9);
+    expect(s.msPerUnit).toBeCloseTo(2 / 500, 12);
+    expect(s.gpuBound).toBe(true);
+    // CPU-bound: 40 ms frames, 20 ms sim + 18 ms render: no idle → not the GPU
+    const c = new PerfMonitor('high');
+    c.budgetMs = BUDGET_30;
+    for (let i = 0; i < 100; i++) c.record(40, 20, 18, 10, 500);
+    s = c.snapshot();
+    expect(s.idleMean).toBeCloseTo(2, 9);
+    expect(s.gpuBound).toBe(false);
+    // on target at 60 fps: not GPU-bound however idle
+    expect(PerfMonitor.gpuBound(16.7, 12, BUDGET_60)).toBe(false);
+    // RT High at ≈ 33 ms with a large idle: the auto-quality must not cut it
+    const r = new PerfMonitor('high');
+    r.budgetMs = BUDGET_30;
+    r.clear(0);
+    let cut = false;
+    for (let i = 0; i < 1200; i++) { r.record(i % 10 === 0 ? 34.5 : 33.3, 1.5, 8, 4, 200); if (r.auto(1 / 30)) cut = true; }
+    expect(cut).toBe(false);
+    expect(r.report()).toContain('idle');
+  });
+
+  it('autosave: storage probed once; when it throws nothing is ever serialised; otherwise on an idle frame, written after it', () => {
+    let serialised = 0;
+    const ser = (): string => { serialised++; return '{}'; };
+    const dead = new Autosave(() => { throw new Error('SecurityError'); }, () => true, (fn) => fn());
+    expect(dead.enabled).toBe(false);
+    for (let i = 0; i < 10000; i++) dead.frame(1 / 60, 10, ser);
+    expect(serialised).toBe(0);
+    const later: (() => void)[] = [];
+    const writes: string[] = [];
+    const ok = new Autosave(() => true, (j) => { writes.push(j); return true; }, (fn) => later.push(fn));
+    // a minute of busy frames (idle < 4 ms): it waits for an idle one…
+    for (let i = 0; i < AUTOSAVE_SECONDS * 60 + 30; i++) ok.frame(1 / 60, 1, ser);
+    expect(serialised).toBe(0);
+    ok.frame(1 / 60, 6, ser);
+    expect(serialised).toBe(1);
+    expect(writes.length).toBe(0); // …and writes in a following task, not inside the frame
+    later.shift()!();
+    expect(writes).toEqual(['{}']);
   });
 });

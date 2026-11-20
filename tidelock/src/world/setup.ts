@@ -5,6 +5,8 @@ import type { DockingPortDef, PadSize, Quat, StationCollider, SystemDef, V3, Ves
 import { cross, norm, qFromTo, qFromAxisAngle, qMul, qRotate, Y_AXIS, X_AXIS, dot } from '../core/vec';
 import { elementsToState } from '../sim/orbit';
 import { STATION_LAYOUTS } from '../data/stationLayouts';
+import { SHIP_LAYOUTS } from '../data/shipLayouts';
+import { buildJetTable, engineDef, ENGINE_UNLIT, IN_RCS, jetsFromLayout, makeStepIn, RCS_CAPACITY, torqueAuthority } from './jets';
 import { DEFAULT_MAX_LOAD } from './atmosphere';
 import { compoundGyration, hullCompound } from './compound';
 import { bodyIndex, type Body, type Craft, type CraftKind, type World } from './state';
@@ -25,6 +27,9 @@ export interface CraftDef {
   dryMass: number;
   propellant?: number;
   propellantCapacity?: number;
+  /** RCS (hydrazine) pool and its capacity, kg (default: none). */
+  rcsPropellant?: number;
+  rcsPropellantCapacity?: number;
   /** Bounding radius, m. */
   radius: number;
   /** Box extents (x = width, y = height, z = length), m: principal inertia of a uniform box. Default: a sphere. */
@@ -33,7 +38,10 @@ export interface CraftDef {
   exhaustVelocity?: number;
   rcsThrust?: number;
   rcsExhaustVelocity?: number;
-  /** Peak angular acceleration at dry mass, rad/s² (sets the max torque per axis). */
+  /**
+   * Peak angular acceleration at dry mass, rad/s²: the max torque per axis of a craft WITHOUT a jet layout (stations,
+   * debris). A ship's torque is what its jets can make (buildThrusters: the computed authority).
+   */
   maxAngularAccel?: number;
   dragArea?: number;
   heatShield?: number;
@@ -133,9 +141,81 @@ export function addCraft(world: World, def: CraftDef): Craft {
     dockedTo: null,
     dockPortId: null,
     landedOn: null,
+    // wave 1 (SIMULATION.md §1.4); the arrays are sized by buildThrusters below
+    jetDuty: [],
+    engineThrust: [],
+    engineTimer: [],
+    rcsPropellant: def.rcsPropellant ?? def.rcsPropellantCapacity ?? 0,
+    rcsPropellantCapacity: def.rcsPropellantCapacity ?? def.rcsPropellant ?? 0,
+    fAcc: { x: 0, y: 0, z: 0 },
+    tauAcc: { x: 0, y: 0, z: 0 },
+    accT: 0,
+    dvImpulse: { x: 0, y: 0, z: 0 },
+    dwImpulse: { x: 0, y: 0, z: 0 },
+    airVel: { x: 0, y: 0, z: 0 },
+    heatFlux: 0,
+    holdWakeT: Infinity,
+    jets: [],
+    engines: [],
+    jetTable: EMPTY_TABLE,
+    jetAlloc: null as unknown as Craft['jetAlloc'],
+    jetIn: EMPTY_TABLE,
   };
+  buildThrusters(c);
+  // The torque the attitude system can make: the jets' computed authority (the smaller of ± per axis) at the pool's
+  // pressure, replacing the lumped wheel-pack figure (SIMULATION.md W1-B 1). The flight computer refreshes it every
+  // control tick as the blowdown pool drains (a loaded craft keeps its saved value until then); a craft without jets
+  // keeps its declared maxTorque.
+  if (c.jets.length > 0) {
+    c.jetIn[IN_RCS] = c.rcsPropellant;
+    torqueAuthority(c.jetAlloc, c.jetIn, c.maxTorque);
+  }
   world.craft.push(c);
   return c;
+}
+
+const EMPTY_TABLE = new Float64Array(0);
+/** The centre of mass in craft axes: the layout origin (a moving CoM is W3-A's). */
+const COM0: V3 = { x: 0, y: 0, z: 0 };
+
+/**
+ * The derived thruster data of a craft (§1.4 "rebuilt at load, not saved"), from its hull layout and its own fitted
+ * stats (rcsThrust, rcsExhaustVelocity, mainThrust, exhaustVelocity): the RCS jets, the main engines (canted through
+ * the CoM), the minimum-propellant allocation table and the per-step scratch. A craft without a ship layout
+ * (stations, debris) gets none. Called by addCraft and by loadWorld; deterministic, so a table rebuilt after a load is
+ * the one the save was made with. The saved per-jet / per-engine arrays are resized to the counts (new entries 0 /
+ * unlit). W1-B owns what goes in (layout jets, Z jets, health scaling); W1-A calls it.
+ */
+export function buildThrusters(c: Craft): void {
+  const layout = c.kind === 'ship' && c.shipVisual ? SHIP_LAYOUTS[c.shipVisual as keyof typeof SHIP_LAYOUTS] : undefined;
+  const jets = layout ? jetsFromLayout(layout.rcs, c.rcsThrust, c.rcsExhaustVelocity) : [];
+  const ne = layout ? layout.engines.length : 0;
+  const engines = layout ? layout.engines.map((e) => engineDef(e.pos, COM0, c.mainThrust / ne, c.exhaustVelocity)) : [];
+  c.jets = jets;
+  c.engines = engines;
+  c.jetAlloc = buildJetTable(jets, COM0, { rcsCapacity: c.rcsPropellantCapacity > 0 ? c.rcsPropellantCapacity : RCS_CAPACITY });
+  c.jetTable = c.jetAlloc.table;
+  c.jetIn = makeStepIn();
+  const resize = (a: number[], n: number, d: number): number[] => {
+    if (!Array.isArray(a)) a = [];
+    while (a.length < n) a.push(d);
+    a.length = n;
+    return a;
+  };
+  c.jetDuty = resize(c.jetDuty, jets.length, 0);
+  c.engineThrust = resize(c.engineThrust, ne, 0);
+  c.engineTimer = resize(c.engineTimer, ne, ENGINE_UNLIT);
+}
+
+/**
+ * The RCS pool a fitted ship carries out of its total tankage, kg: the stats' own figure when the fit states one
+ * (W1-B, sim/ships.ts), else min(1.5 t, total/16) — the Wren's 24 t becomes 22.5 t LH2 + 1.5 t N2H4 (SIMULATION.md
+ * W1-B 2, D3), the same rule migrate() applies to a version-3 save.
+ */
+export function rcsShare(stats: Pick<VesselStats, 'fuelCapacity'> & { rcsCapacity?: number }): number {
+  const total = stats.fuelCapacity > 0 ? stats.fuelCapacity : 0;
+  const r = stats.rcsCapacity ?? Math.min(RCS_CAPACITY, total / 16);
+  return r < 0 ? 0 : r > total ? total : r;
 }
 
 /** Physical description of a ship from its derived statistics and (optionally) its hull layout. */
@@ -152,8 +232,10 @@ export function shipDef(
     kind: 'ship',
     shipVisual: layout?.id ?? null,
     dryMass: stats.dryMass,
-    propellant: stats.fuelCapacity,
-    propellantCapacity: stats.fuelCapacity,
+    propellant: stats.fuelCapacity - rcsShare(stats),
+    propellantCapacity: stats.fuelCapacity - rcsShare(stats),
+    rcsPropellant: rcsShare(stats),
+    rcsPropellantCapacity: rcsShare(stats),
     radius: layout?.radius ?? stats.radius,
     size: layout ? { x: layout.width, y: layout.height, z: layout.length } : undefined,
     mainThrust: stats.mainThrust,

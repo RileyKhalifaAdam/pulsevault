@@ -4,9 +4,12 @@
 
 import type { World } from './state';
 
-const CBRT2 = Math.cbrt(2);
-const W1 = 1 / (2 - CBRT2);
-const W0 = -CBRT2 * W1;
+// SIMULATION.md Decision 5: the Yoshida constants as literals (not Math.cbrt(2) at load), so the ephemeris never
+// depends on an engine's cbrt: W1 = 1/(2 − 2^(1/3)), W0 = −2^(1/3)·W1.
+const W1 = 1.3512071919596578;
+const W0 = -1.7024143839193153;
+/** relPositions cache entries: one Yoshida step evaluates three distinct times, per primary; twelve cover a tick of craft about four primaries. */
+const RP_SLOTS = 12;
 /** Yoshida 4th-order coefficients: drifts C1 C2 C2 C1, kicks D1 D2 D1. */
 export const YC1 = W1 / 2;
 export const YC2 = (W0 + W1) / 2;
@@ -97,6 +100,20 @@ export class Ephemeris {
   private kMin: number;
   private kMax: number;
   private pin: number;
+  /**
+   * relPositions cache (SIMULATION.md W1-A 7): within a sync span every craft evaluates the bodies at the same
+   * sub-step times, so the last RP_SLOTS distinct (t, p) results are kept and copied out — the same arithmetic done
+   * once, so the result is bit-identical. An entry is valid while no node was written since (gen).
+   */
+  private gen = 0;
+  private readonly rpT = new Float64Array(RP_SLOTS).fill(NaN);
+  private readonly rpP = new Int32Array(RP_SLOTS);
+  private readonly rpGen = new Float64Array(RP_SLOTS).fill(-1);
+  private readonly rpBuf: Float64Array;
+  private rpNext = 0;
+  /** Cache hits and misses (benchmarks). */
+  rpHits = 0;
+  rpMisses = 0;
 
   constructor(mu: ArrayLike<number>, h: number, step0: number, state0: ArrayLike<number>, capacity = 8192) {
     this.n = mu.length;
@@ -106,6 +123,7 @@ export class Ephemeris {
     this.capacity = capacity;
     this.buf = new Float64Array(capacity * 2 * this.n3);
     this.acc = new Float64Array(this.n3);
+    this.rpBuf = new Float64Array(RP_SLOTS * this.n3);
     this.kMin = this.kMax = this.pin = step0;
     const o = (step0 % capacity) * 2 * this.n3;
     for (let i = 0; i < 2 * this.n3; i++) this.buf[o + i] = state0[i];
@@ -126,11 +144,13 @@ export class Ephemeris {
       if (this.kMax + 1 - this.kMin >= cap) {
         if (this.kMin >= this.pin) return this.kMax * this.h;
         this.kMin++;
+        this.gen++;
       }
       const a = (this.kMax % cap) * stride, b = ((this.kMax + 1) % cap) * stride;
       for (let i = 0; i < stride; i++) buf[b + i] = buf[a + i];
       yoshidaStep(this.n, this.mu, buf, b, this.acc, this.h);
       this.kMax++;
+      this.gen++;
       this.steps++;
     }
     return t;
@@ -147,6 +167,26 @@ export class Ephemeris {
 
   /** Positions of all bodies relative to body `p` at time `t`: out[3j..3j+2] = r_j − r_p. */
   relPositions(t: number, p: number, out: Float64Array): void {
+    const n3 = this.n3, rt = this.rpT, gen = this.gen;
+    for (let j = 0; j < RP_SLOTS; j++) {
+      if (rt[j] === t && this.rpP[j] === p && this.rpGen[j] === gen) {
+        const src = this.rpBuf, o = j * n3;
+        for (let i = 0; i < n3; i++) out[i] = src[o + i];
+        this.rpHits++;
+        return;
+      }
+    }
+    this.rpMisses++;
+    this.relPositionsRaw(t, p, out);
+    const j = this.rpNext;
+    this.rpNext = (j + 1) % RP_SLOTS;
+    rt[j] = t; this.rpP[j] = p; this.rpGen[j] = gen;
+    const dst = this.rpBuf, o = j * n3;
+    for (let i = 0; i < n3; i++) dst[o + i] = out[i];
+  }
+
+  /** relPositions without the cache. */
+  relPositionsRaw(t: number, p: number, out: Float64Array): void {
     const h = this.h, n3 = this.n3, cap = this.capacity, buf = this.buf;
     let k = Math.floor(t / h);
     if (k >= this.kMax) k = this.kMax - 1;

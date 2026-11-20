@@ -5,6 +5,10 @@ import { qRotate } from '../src/core/vec';
 import { elementsToState } from '../src/sim/orbit';
 import { generateGalaxy, getSystem } from '../src/sim/universe';
 import { advance, bodyInvariants, bodyOrientation, createWorld, Ephemeris, ephemerisOf, yoshidaStep } from '../src/world';
+import { addCraft, eventRing, loadWorld, saveWorld, shipDef } from '../src/world';
+import { emitEvent } from '../src/world/events';
+import { SHIP_LAYOUTS } from '../src/data/shipLayouts';
+import { computeStats, defaultLoadout } from '../src/sim/ships';
 
 const system = getSystem(generateGalaxy(1), 'tallow')!;
 
@@ -129,5 +133,29 @@ describe('ephemeris', () => {
     }
     console.log(`ephemeris: mid-step interpolation error ≤ ${err.toFixed(3)} m (H = ${w.h} s)`);
     expect(err).toBeLessThan(20);
+  });
+});
+
+// ---- wave 1 (W1-A day 1): derived thruster data is rebuilt at load, the event ring is output only ----------------
+describe('wave-1 world contract (W1-A)', () => {
+  it('rebuilds jets, engines and the allocation table at load, bit for bit; the ring starts empty', () => {
+    const w = createWorld(system);
+    const b = w.bodies[1];
+    const c = addCraft(w, shipDef('w1a', 'Wren', computeStats(defaultLoadout('wren')), SHIP_LAYOUTS.wren, {
+      primaryId: b.id, r: { x: b.radius + 4e5, y: 0, z: 0 }, v: { x: 0, y: 0, z: Math.sqrt(b.mu / (b.radius + 4e5)) },
+    }));
+    expect(c.rcsPropellant + c.propellant).toBe(computeStats(defaultLoadout('wren')).fuelCapacity);
+    emitEvent(eventRing(w), 'jetOn', 0, 0, 0, 34e3, null, null, 0, 0, 0);
+    const json = saveWorld(w);
+    expect(json).not.toContain('"jetTable"');
+    const l = loadWorld(json);
+    const d = l.craft.find((x) => x.id === c.id)!;
+    expect(Array.from(d.jetTable)).toEqual(Array.from(c.jetTable));
+    expect(d.jets).toEqual(c.jets);
+    expect(d.engines).toEqual(c.engines);
+    expect(d.holdWakeT).toBe(Infinity);
+    expect(d.engineTimer).toEqual(c.engineTimer);
+    expect(eventRing(l).head - eventRing(l).tail).toBe(0);
+    expect(eventRing(w).head - eventRing(w).tail).toBe(1);
   });
 });

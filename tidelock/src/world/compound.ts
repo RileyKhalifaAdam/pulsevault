@@ -603,11 +603,11 @@ export function makeContactBody(): ContactBody {
   return { p: { x: 0, y: 0, z: 0 }, v: { x: 0, y: 0, z: 0 }, q: { x: 0, y: 0, z: 0, w: 1 }, w: { x: 0, y: 0, z: 0 }, invMass: 0, invI: { x: 0, y: 0, z: 0 } };
 }
 
-interface CraftLike { rel: V3; relV: V3; q: Quat; w: V3; dryMass: number; propellant: number; gyration: V3 }
+interface CraftLike { rel: V3; relV: V3; q: Quat; w: V3; dryMass: number; propellant: number; rcsPropellant?: number; gyration: V3 }
 /** Point `out` at a craft's state (by reference: the solver then writes the craft directly) and its mass properties. */
 export function bodyFromCraft(out: ContactBody, c: CraftLike): ContactBody {
   out.p = c.rel; out.v = c.relV; out.q = c.q; out.w = c.w;
-  const m = c.dryMass + c.propellant;
+  const m = c.dryMass + c.propellant + (c.rcsPropellant ?? 0); // W1-A hook: the RCS pool is mass too
   out.invMass = m > 0 ? 1 / m : 0;
   const g = c.gyration;
   out.invI.x = m > 0 && g.x > 0 ? 1 / (m * g.x) : 0;

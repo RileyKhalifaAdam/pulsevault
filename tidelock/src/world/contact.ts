@@ -18,9 +18,10 @@ import {
   bodyFromCraft, collide, collidePlanet, compoundSupport, craftCompound, DEFAULT_CONTACT, makeContactBody, makeContactResult, Manifold,
   manifoldState, planetBody, setManifoldState, solveManifold, type Compound, type ContactParams,
 } from './compound';
-import { WHY_CONTACT, WHY_FREE, WHY_PROXIMITY } from './dynamics';
+import { jointedThrust, ledgerDocked, ledgerJump, ledgerLanded, ledgerToGround, WHY_CONTACT, WHY_FREE, WHY_PROXIMITY } from './dynamics';
+import { emitEvent } from './events';
 import { qAxisTo, qConjMulTo, qMulTo, qRot, qRotInv, rotAxis } from './math';
-import { bodyIndex, destroyCraft, findCraft, pushEvent, type Craft, type World } from './state';
+import { bodyIndex, destroyCraft, eventRing, findCraft, pushEvent, type Craft, type World } from './state';
 
 export const DOCK_DISTANCE = 4;
 export const DOCK_SPEED = 2;
@@ -42,7 +43,7 @@ const Q1: Quat = { x: 0, y: 0, z: 0, w: 1 };
 const ORIGIN: V3 = { x: 0, y: 0, z: 0 };
 let _pDist = 0, _pCos = 0, _pSpeed = 0, _syncWhy = WHY_FREE;
 
-const mass = (c: Craft): number => c.dryMass + c.propellant;
+const mass = (c: Craft): number => c.dryMass + c.propellant + c.rcsPropellant; // W1-A hook: the RCS pool is mass too
 
 /** Solver parameters: the world's restitution and friction on the compound solver's defaults. */
 const PARAMS: ContactParams = { ...DEFAULT_CONTACT, restitution: RESTITUTION, friction: FRICTION };
@@ -62,15 +63,21 @@ const SCRATCH = new Manifold();
  */
 export interface Jolt { dv: V3; dw: V3; n: number }
 const jolts = new WeakMap<Craft, Jolt>();
+/** W1-B hook: when a craft last touched down (sim s), so the landed span after it is counted from there, not twice. */
+const landedAt = new WeakMap<Craft, number>();
 const JV = { x: 0, y: 0, z: 0 }, JW = { x: 0, y: 0, z: 0 }, JV2 = { x: 0, y: 0, z: 0 }, JW2 = { x: 0, y: 0, z: 0 };
 function snap(c: Craft, v: V3, w: V3): void {
   v.x = c.relV.x; v.y = c.relV.y; v.z = c.relV.z;
   w.x = c.w.x; w.y = c.w.y; w.z = c.w.z;
 }
+const JD = { x: 0, y: 0, z: 0 }, JE = { x: 0, y: 0, z: 0 };
 function addJolt(c: Craft, v0: V3, w0: V3): void {
   const dvx = c.relV.x - v0.x, dvy = c.relV.y - v0.y, dvz = c.relV.z - v0.z;
   const dwx = c.w.x - w0.x, dwy = c.w.y - w0.y, dwz = c.w.z - w0.z;
   if (dvx === 0 && dvy === 0 && dvz === 0 && dwx === 0 && dwy === 0 && dwz === 0) return;
+  // W1-B hook: the applied-force ledger's impulses (dvImpulse / dwImpulse, craft axes) see every jolt
+  JD.x = dvx; JD.y = dvy; JD.z = dvz; JE.x = dwx; JE.y = dwy; JE.z = dwz;
+  ledgerJump(c, JD, JE);
   let j = jolts.get(c);
   if (!j) {
     j = { dv: { x: 0, y: 0, z: 0 }, dw: { x: 0, y: 0, z: 0 }, n: 0 };
@@ -191,6 +198,8 @@ export function surfaceContact(world: World, c: Craft, t: number): void {
   world.joints.push({ kind: 'landed', craftId: c.id, otherId: b.id, portId: '', localPos: lp, localQ: lq });
   c.landedOn = b.id;
   c.load = 0;
+  ledgerToGround(c, b); // W1-B hook: the pin to the turning ground is the rest of the touchdown impulse
+  landedAt.set(c, t); // W1-B hook
 }
 
 // ------------------------------------------------------------------------------------------------ joints
@@ -217,16 +226,18 @@ export function updateJoints(world: World, t: number, dt: number): void {
       c.primary = bi;
       qMulTo(c.q, qAxisTo(Q1, n, ang), j.localQ);
       qRotInv(c.w, c.q, wr * n.x, wr * n.y, wr * n.z);
-      if (!c.destroyed && c.propellant > 0 && c.throttle > 0) {
-        const thr = c.throttle > 1 ? 1 : c.throttle;
+      // W1-B hooks: on the ground the jets are off and the engines fire against it (spool, ignition delay, minimum
+      // throttle); the ledger records the ground's hold (c.load = |proper acceleration|, about 1 g).
+      const tl = landedAt.get(c);
+      const dtL = tl !== undefined && t - tl < dt ? (t > tl ? t - tl : 0) : dt;
+      const o = jointedThrust(world, c, t, dtL, true);
+      ledgerLanded(c, b, dtL);
+      if (o.fx !== 0 || o.fy !== 0 || o.fz !== 0) {
         const m = mass(c);
         const r = Math.sqrt(rel.x * rel.x + rel.y * rel.y + rel.z * rel.z);
-        qRot(A, c.q, 0, 0, -1);
-        const aUp = ((c.mainThrust * thr) / m) * ((A.x * rel.x + A.y * rel.y + A.z * rel.z) / r);
+        qRot(A, c.q, o.fx, o.fy, o.fz);
+        const aUp = (A.x * rel.x + A.y * rel.y + A.z * rel.z) / (r * m);
         const sp2 = c.relV.x * c.relV.x + c.relV.y * c.relV.y + c.relV.z * c.relV.z;
-        const burn = ((c.mainThrust * thr) / c.exhaustVelocity) * dt;
-        c.propellant = burn < c.propellant ? c.propellant - burn : 0;
-        c.load = (c.mainThrust * thr) / m;
         if (aUp > b.mu / (r * r) - sp2 / r) {
           joints.splice(i, 1);
           c.landedOn = null;
@@ -246,7 +257,9 @@ export function updateJoints(world: World, t: number, dt: number): void {
       c.primary = st.primary;
       qMulTo(c.q, st.q, j.localQ);
       qRotInv(c.w, j.localQ, w.x, w.y, w.z);
-      c.load = 0;
+      // W1-B hooks: latched, no jet or engine applies anything; the ledger records the ride on the station
+      jointedThrust(world, c, t, dt, false);
+      ledgerDocked(c, st, lp, dt);
     }
   }
 }
@@ -299,6 +312,9 @@ function tryLatch(world: World, s: Craft, st: Craft, pl: V3, t: number): boolean
     addJolt(s, JV, JW);
     addJolt(st, JV2, JW2);
     pushEvent(world, { type: 'docked', t, craftId: s.id, stationId: st.id, portId: port.id });
+    // W1-B hook: the event ring (J = the impulse across the joint, N·s; pos = the port, station axes)
+    const jx = s.relV.x - JV.x, jy = s.relV.y - JV.y, jz = s.relV.z - JV.z;
+    emitEvent(eventRing(world), 'latch', t, world.craft.indexOf(s), world.craft.indexOf(st), m * Math.sqrt(jx * jx + jy * jy + jz * jz), port.pos, port.dir, 0, 0, 0);
     return true;
   }
   return false;
@@ -328,6 +344,8 @@ export function undock(world: World, craftId: string): boolean {
       st.relV.x -= A.x * kt; st.relV.y -= A.y * kt; st.relV.z -= A.z * kt;
       s.v.x += A.x * ks; s.v.y += A.y * ks; s.v.z += A.z * ks;
       addJolt(s, JV, JW);
+      // W1-B hook: the event ring (J = the spring impulse, N·s)
+      emitEvent(eventRing(world), 'undock', world.t, world.craft.indexOf(s), world.craft.indexOf(st), m * ks * l, port ? port.pos : null, port ? port.dir : null, 0, 0, 0);
     }
     pushEvent(world, { type: 'undocked', t: world.t, craftId, stationId: j.otherId });
     return true;

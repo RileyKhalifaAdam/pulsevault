@@ -270,6 +270,7 @@ const sv = newState();
 const bodyViews: BodyView[] = system!.bodies.map((def) => ({ id: def.id, def, r: V(0, 0, 0), v: V(0, 0, 0), spinAxis: V(0, 1, 0), spinAngle: 0 }));
 const mkCraft = (id: string, kind: 'ship' | 'station'): CraftView => ({
   id, name: id, kind, shipVisual: null, stationVisual: null, visualSeed: 0, r: V(0, 0, 0), v: V(0, 0, 0), q: { x: 0, y: 0, z: 0, w: 1 }, throttle: 0, rcs: V(0, 0, 0), heat: 0, hull: 1, isPlayer: false, dockedTo: null, radius: 10,
+  w: V(0, 0, 0), jetDuty: new Float64Array(0), engineLevel: new Float64Array(0), airVelocity: V(0, 0, 0), heatFlux: 0, jets: [], engines: [], // W1-A hook: wave-1 view fields
 });
 const shipCraft = mkCraft('player', 'ship');
 shipCraft.shipVisual = 'wren';
