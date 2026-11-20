@@ -63,8 +63,11 @@ Dependencies point downward only. `world/` knows nothing about the player, the s
    drag and contacts. Attitude hold is a controller commanding real torque — orientation is never set.
 4. **Atmosphere:** exponential density co-rotating with the body; drag `½ρv²·CdA` against the air-relative
    velocity; heating `∝ √ρ·v³` into a heat capacity with radiative loss. Entering too fast destroys the craft.
-5. **Contact:** sphere and capsule colliders. Impacts are resolved with impulses (restitution, friction) and do
-   damage by energy; a slow, aligned arrival at a docking port closes a latch (a joint); undocking releases it
+5. **Contact:** the real hull shapes — compounds of boxes and capsules fitted to each hull
+   (`data/hullColliders.ts`, `tools/fit-hull-colliders.mjs`) and the stations' colliders (`world/compound.ts`),
+   bounding spheres first, then a persistent manifold (saved with the world) and a sequential-impulse solve.
+   Impacts are resolved with impulses (restitution, friction) and do damage by energy; the crew and the loose
+   objects aboard feel the hull's jolt (they keep their own velocity while the hull's changes); a slow, aligned arrival at a docking port closes a latch (a joint); undocking releases it
    with a spring impulse. A slow touchdown on a body's surface becomes resting contact on the rotating ground.
 6. **Nothing else moves anything.** No tug, no teleport, no "on rails" mode. Time acceleration means taking
    more or larger integration steps under the same laws.

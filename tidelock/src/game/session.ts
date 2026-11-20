@@ -15,16 +15,16 @@ import { computeStats, defaultLoadout, SHIPS } from '../sim/ships';
 import { generateGalaxy, getSystem } from '../sim/universe';
 import {
   addCraft, advance, attitudeError, craftInertia, createPrediction, createWorld, dockingStatus, drainEvents, ephemerisOf, findCraft,
-  flightReadout, holdTorque, loadWorld, pointingError, predictionEvent, Predictor, qRot, qRotInv, saveWorld, shipDef, undock,
-  type AdvanceOptions, type Craft, type PredictOptions, type World,
+  flightReadout, holdTorque, loadWorld, pointingError, predictionEvent, Predictor, qRot, qRotInv, saveWorld, shipDef, takeJolt, undock,
+  type AdvanceOptions, type Jolt, type Craft, type PredictOptions, type World,
 } from '../world';
 import {
   craftMotion, createCrew, createDevice, createShipMotion, crewEye, crewFelt, CREW_COM, devGrab, devMove, devRelease, devTap, feltAt, findPrompt, leverValue, lookCrew,
   pushOffCrew, rockerValue, roomAt, sitCrew, standCrew, stepCrew, stepDevice, stickAxis,
-  type CrewState, type DeviceState,
+  type CrewState, type DeviceState, type ShipMotion as ShipMotionT,
 } from '../world';
 import {
-  ARM_REACH as PROP_REACH, createPropsState, propsChunk, grab as propHandOn, loadPropsState, moveGrab, pickProp, propInfo, propViews, release as propHandOff,
+  reachAlong, createPropsState, propsChunk, grab as propHandOn, loadPropsState, moveGrab, pickProp, propInfo, propViews, release as propHandOff,
   savePropsState, stepProps, unstow, type PropsState, type PropView,
 } from '../world/props';
 import type {
@@ -276,6 +276,7 @@ class WorldSession implements Session {
   private cmdThrottle = 0;
   private readonly walk = { moveX: 0, moveZ: 0 };
   private readonly motion = createShipMotion();
+  private readonly jolt: Jolt = { dv: { x: 0, y: 0, z: 0 }, dw: { x: 0, y: 0, z: 0 }, n: 0 };
   private readonly promptView = { id: '', kind: '', label: '' };
   // loose objects and the hand on one
   private loose: PropsState | null = null;
@@ -422,8 +423,9 @@ class WorldSession implements Session {
       info.simDt += res.simDt;
       info.steps += res.steps;
       if (res.simDt > 0) {
-        if (this.playerMode === 'onFoot') this.stepBody(res.simDt);
-        this.stepLoose(res.simDt);
+        const mo = this.chunkMotion(res.simDt);
+        if (this.playerMode === 'onFoot') this.stepBody(res.simDt, mo);
+        this.stepLoose(res.simDt, mo);
         this.stepDevices(res.simDt);
       }
       const limited = res.limitedBy;
@@ -542,10 +544,25 @@ class WorldSession implements Session {
     return false;
   }
   /** The loose objects move with what the ship and the pilot's body just did (after the body, as props.ts asks). */
-  private stepLoose(dt: number): void {
+  private stepLoose(dt: number, mo: ShipMotionT): void {
     const ps = this.loose;
     if (!ps) return;
-    stepProps(ps, craftMotion(this.world, this.ship, this.motion), this.playerMode === 'onFoot' ? this.body : null, dt);
+    stepProps(ps, mo, this.playerMode === 'onFoot' ? this.body : null, dt);
+  }
+  /**
+   * What the ship did over the step just taken, as the crew and the loose objects feel it: its thrust and torque
+   * (craftMotion) plus the jolt of any contact impulse in the step (an impact, a touchdown, a latch closing, the
+   * undock spring) as the mean acceleration over that step — they keep their own velocity while the hull's changes.
+   */
+  private chunkMotion(dt: number): ShipMotionT {
+    const mo = craftMotion(this.world, this.ship, this.motion);
+    const j = this.jolt;
+    if (dt > 0 && takeJolt(this.ship, j)) {
+      const c = this.ship, a = qRotInv(this.FV, c.q, j.dv.x / dt, j.dv.y / dt, j.dv.z / dt);
+      mo.a.x += a.x; mo.a.y += a.y; mo.a.z += a.z;
+      mo.alpha.x += j.dw.x / dt; mo.alpha.y += j.dw.y / dt; mo.alpha.z += j.dw.z / dt;
+    }
+    return mo;
   }
   /** Where the eye is now, ship-local (on foot, or the helm eye when strapped in). */
   private eyeNow(out: V3): V3 {
@@ -578,10 +595,10 @@ class WorldSession implements Session {
   }
 
   /** The pilot's body moves with what the ship just did. */
-  private stepBody(dt: number): void {
+  private stepBody(dt: number, mo: ShipMotionT): void {
     const b = this.body, layout = this.layout;
     if (!b || !layout || b.seat !== '' || this.warpIndex > 0) return;
-    stepCrew(b, layout, craftMotion(this.world, this.ship, this.motion), this.walk, dt);
+    stepCrew(b, layout, mo, this.walk, dt);
   }
 
   /** Keep the docking latch armed near a station (and open for a moment after an undock). */
@@ -1409,13 +1426,14 @@ class WorldSession implements Session {
     const ps = this.loose;
     if (!ps || this.ship.destroyed || this.asleep || !WorldSession.unit(dir, this.propDir)) return '';
     const e = this.eyeNow(this.PEYE), u = this.propDir;
-    const id = pickProp(ps, e, u, PROP_REACH);
+    const reach = reachAlong(u.y);
+    const id = pickProp(ps, e, u, reach);
     if (id === '') return '';
     const bs = ps.bodies;
     for (let i = 0; i < bs.length; i++) {
       if (bs[i].id !== id) continue;
       const p = bs[i].p, t = (p.x - e.x) * u.x + (p.y - e.y) * u.y + (p.z - e.z) * u.z;
-      this.propDist = t < 0 ? 0 : t > PROP_REACH ? PROP_REACH : t;
+      this.propDist = t < 0 ? 0 : t > reach ? reach : t;
       return id;
     }
     return '';

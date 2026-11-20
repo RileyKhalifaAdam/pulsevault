@@ -21,6 +21,8 @@
 //   moving=N            frames of motion at the end (default 2)          settle=0  do not wait for the atlas / photo upgrade
 //   rtdebug=1|2|3|4     forward debug view: traced visibility, bounce, reflections, reflection coverage
 //   fx=SBR              tracer effects on/off: sun, bounce, reflections (e.g. fx=100)
+//   sungain=k           interior sun gain override (scene.ts interiorLight.sunGain)
+//   float=x,y,z         the loose lounge mug lifted off the table to that ship-local point, tumbled (free fall)
 //
 // interior=proxy builds a stand-in from src/data/interiors.ts with MeshStandardMaterial walls, window and
 // door openings, furniture boxes and userData.room tags (the contract of the interior being rebuilt), so the
@@ -28,7 +30,7 @@
 import * as THREE from 'three';
 import type { V3 } from '../../src/core/types';
 import { createPipeline, type Quality } from '../../src/render/pipeline';
-import { createSceneManager } from '../../src/render/scene';
+import { createSceneManager, interiorLight } from '../../src/render/scene';
 import { beginFrame, createSceneFrame } from '../../src/render/frame';
 import { createSession } from '../../src/game';
 import { INTERIORS, type Box, type InteriorLayout } from '../../src/data/interiors';
@@ -36,6 +38,7 @@ import type { CraftView } from '../../src/game/api';
 import type { InteriorOptions, InteriorUpdate, InteriorVisual } from '../../src/render/space/interior';
 import { renderInfoText } from '../../src/app/perf';
 import type { RayTracer, RtQuality } from '../../src/render/rt';
+import type { PropView } from '../../src/world/props';
 
 const params = new URLSearchParams(location.search);
 const has = (k: string): boolean => params.has(k) && params.get(k) !== '';
@@ -349,10 +352,36 @@ function fill(dt: number): void {
   frame.camera.lookPitch = lookPitch;
   frame.camera.lookAtId = null;
   frame.cabinLights = lights;
+  frame.props = propViewsNow();
+}
+
+// loose objects: the session's own (where the ship's data puts them); float=x,y,z (ship-local) lifts the loose
+// lounge mug off the table to that point, tumbled — the pose a mug has in free fall a few seconds after a nudge
+const floatAt = params.get('float');
+let propsOut: PropView[] = [];
+function propViewsNow(): readonly PropView[] {
+  const views = session.props();
+  if (!floatAt) return views;
+  const f = floatAt.split(',').map(Number);
+  if (propsOut.length !== views.length) propsOut = views.map((pv) => ({ ...pv, pos: { ...pv.pos }, quat: { ...pv.quat } }));
+  for (let i = 0; i < views.length; i++) {
+    const a = views[i], b = propsOut[i];
+    b.pos.x = a.pos.x; b.pos.y = a.pos.y; b.pos.z = a.pos.z;
+    b.quat.x = a.quat.x; b.quat.y = a.quat.y; b.quat.z = a.quat.z; b.quat.w = a.quat.w;
+    b.room = a.room;
+    if (a.id !== 'mug-table-2') continue;
+    b.pos.x = f[0]; b.pos.y = f[1]; b.pos.z = f[2];
+    const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(0.7, 0.4, 0.5));
+    b.quat.x = q.x; b.quat.y = q.y; b.quat.z = q.z; b.quat.w = q.w;
+    b.asleep = false;
+    b.stowed = false;
+  }
+  return propsOut;
 }
 
 async function main(): Promise<void> {
   const t0 = performance.now();
+  if (has('sungain')) interiorLight.sunGain = num('sungain', interiorLight.sunGain);
   scene.setRayTracing(rtTier);
   // fx=SBR: per-effect switches of the tracer (sun, bounce, reflections), e.g. fx=100 for the sun alone
   const fxp = params.get('fx');

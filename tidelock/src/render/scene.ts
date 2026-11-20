@@ -61,6 +61,9 @@ import { createCockpitVisual, type CockpitPick, type CockpitUpdate, type Cockpit
 import { InteriorLighting, OutsideEnvironment, textureBytesOf, type InteriorLightingFrame } from './probes';
 import { TIER_SETTINGS, renderInfo } from '../app/perf';
 import { createRayTracer, type RayTracer, type RtFrame, type RtQuality } from './rt';
+import { createPropsVisual, type PropsVisual } from './space/props';
+import { PROP_TYPES, type PropType } from '../data/props';
+import type { PropView } from '../world/props';
 
 /**
  * Cabin light level against the sun (interior lightmaps, probes, emitters and the cockpit glass). Tried at 0.45
@@ -485,9 +488,9 @@ class Manager implements SceneManager {
   private readonly insideScene = new THREE.Scene();
   private readonly insideCam = new THREE.PerspectiveCamera(60, 1, 0.05, 80);
   private layersInside: RenderLayer[] = [];
-  private interior: { shipId: string; visualId: string; visual: InteriorVisual; cockpit: CockpitVisual | null; lighting: InteriorLighting } | null = null;
+  private interior: { shipId: string; visualId: string; visual: InteriorVisual; cockpit: CockpitVisual | null; props: PropsVisual | null; lighting: InteriorLighting } | null = null;
   /** The Wren's interior built (and its programs compiled, probes captured) while loading, adopted by ensureInterior. */
-  private prebuilt: { visualId: string; visual: InteriorVisual; cockpit: CockpitVisual | null; lighting: InteriorLighting } | null = null;
+  private prebuilt: { visualId: string; visual: InteriorVisual; cockpit: CockpitVisual | null; props: PropsVisual | null; lighting: InteriorLighting } | null = null;
   /** Hulls built while loading so their programs exist before the first frame (kept, never drawn). */
   private warmShips: ShipVisual[] = [];
   private outsideEnv: OutsideEnvironment | null = null;
@@ -508,6 +511,15 @@ class Manager implements SceneManager {
   private readonly rtFrame: RtFrame = { camera: new THREE.PerspectiveCamera(), shipMatrixWorld: new THREE.Matrix4(), sun: this.rtSun, envMap: null, envIntensity: 1, lamps: 1, bakedGain: 1, time: 0, frame: 0, width: 1, height: 1, rooms: this.rtRooms };
   private readonly rtInfo: RayTracingInfo = { tier: 'off', active: false, building: false, rays: 0, msEstimate: 0, msGpu: -1, triangles: 0, bytes: 0, disabled: '', buildMs: 0 };
   private readonly rtWarmCam = new THREE.PerspectiveCamera(70, 0.46, 0.05, 80);
+  // loose objects: the rooms in view, and their traced sun visibility (propsSunVisibility)
+  private readonly propRoomList: string[] = [];
+  private readonly propRooms = new Set<string>();
+  private readonly propVis = new Float32Array(PROP_VIS_MAX).fill(1);
+  private readonly propVisPos = new Float32Array(PROP_VIS_MAX * 3).fill(1e9);
+  private readonly propVisAge = new Uint8Array(PROP_VIS_MAX);
+  private readonly propVisSun: V3 = { x: 0, y: 0, z: 0 };
+  private propVisNext = 0;
+  private propVisSeq = 0;
   private texAge = 1e9;
   private texBytesCache = 0;
   private msaaCapped = false;
@@ -1046,6 +1058,7 @@ class Manager implements SceneManager {
     if (this.interior && this.interior.shipId === e.id) {
       this.interior.lighting.dispose();
       this.interior.cockpit?.dispose();
+      this.interior.props?.dispose();
       this.interior.visual.dispose();
       this.interior = null;
       this.pickValid = false;
@@ -1057,7 +1070,7 @@ class Manager implements SceneManager {
   }
 
   /** Build an interior, its cockpit and its lighting (rooms, sun, probes) into the inside scene; compiles and captures. */
-  private buildInterior(visualId: string): { visualId: string; visual: InteriorVisual; cockpit: CockpitVisual | null; lighting: InteriorLighting } | null {
+  private buildInterior(visualId: string): { visualId: string; visual: InteriorVisual; cockpit: CockpitVisual | null; props: PropsVisual | null; lighting: InteriorLighting } | null {
     const layout = (INTERIORS as Record<string, InteriorLayout | undefined>)[visualId];
     if (!layout) return null;
     const visual = this.interiorFactory(layout, { quality: this.quality });
@@ -1075,6 +1088,11 @@ class Manager implements SceneManager {
       if (!tagged && typeof cockpit.object3d.userData.room !== 'string') cockpit.object3d.userData.room = 'cockpit';
       visual.object3d.add(cockpit.object3d);
     }
+    // the loose objects (src/world/props.ts) ride with the interior too: ship-local poses, mounted before the
+    // lighting patches the materials for the probes and the tracer patches them for the traced light, so their
+    // programs (shadow variants included) compile in the warm-up below like every other cabin material
+    const props = createPropsVisual({ quality: this.quality });
+    visual.object3d.add(props.object3d);
     const lighting = new InteriorLighting(this.pipeline.renderer, this.insideScene, visual.object3d, layout, this.quality);
     lighting.attach();
     // every lit material takes the traced light when the tracer runs (uniform-driven: one program, compiled now)
@@ -1099,7 +1117,7 @@ class Manager implements SceneManager {
     ic.position.set(0, 0, 0);
     ic.updateMatrixWorld();
     visual.object3d.visible = false;
-    return { visualId, visual, cockpit, lighting };
+    return { visualId, visual, cockpit, props, lighting };
   }
 
   private prebuildInterior(visualId: string): void {
@@ -1115,6 +1133,7 @@ class Manager implements SceneManager {
     if (cur) {
       cur.lighting.dispose();
       cur.cockpit?.dispose();
+      cur.props?.dispose();
       cur.visual.dispose();
       this.interior = null;
     }
@@ -1123,6 +1142,7 @@ class Manager implements SceneManager {
       // built for another hull: its lights must not stay in the inside scene
       this.prebuilt.lighting.dispose();
       this.prebuilt.cockpit?.dispose();
+      this.prebuilt.props?.dispose();
       this.prebuilt.visual.dispose();
     }
     this.prebuilt = null;
@@ -1154,6 +1174,7 @@ class Manager implements SceneManager {
     if (this.prebuilt) {
       this.prebuilt.lighting.dispose();
       this.prebuilt.cockpit?.dispose();
+      this.prebuilt.props?.dispose();
       this.prebuilt.visual.dispose();
       this.prebuilt = null;
     }
@@ -2117,7 +2138,7 @@ class Manager implements SceneManager {
           lf.eye.z = c.eye.z;
           lf.sunDir.copy(this.sunDirFocus);
           lf.sunColor.copy(this.keyColor);
-          lf.sunIntensity = traced ? 0 : this.key.intensity;
+          lf.sunIntensity = traced ? 0 : this.key.intensity * interiorLight.sunGain;
           lf.shineDir.copy(this.shine.position);
           if (lf.shineDir.lengthSq() > 1e-12) lf.shineDir.normalize();
           lf.shineColor.copy(this.shine.color);
@@ -2135,7 +2156,7 @@ class Manager implements SceneManager {
           const sun = this.rtSun;
           sun.dirShip.set(c.sunDir.x, c.sunDir.y, c.sunDir.z);
           sun.color.copy(this.keyColor);
-          sun.intensity = this.key.intensity;
+          sun.intensity = this.key.intensity * interiorLight.sunGain;
           sun.angularRadius = Math.asin(Math.min(1, star.def.radius / Math.max(star.dist, star.def.radius)));
           f.shipMatrixWorld = obj.matrixWorld;
           f.envMap = this.outsideEnv ? this.outsideEnv.cubeTexture : null;
@@ -2172,6 +2193,18 @@ class Manager implements SceneManager {
           this.pickQ.z = focusShip.q.z;
           this.pickQ.w = focusShip.q.w;
         }
+        const props = this.interior?.props;
+        if (props) {
+          const views = frame.props ?? NO_PROPS;
+          let rooms: ReadonlySet<string> | null = null;
+          if (li) {
+            li.visibleRooms(this.propRoomList);
+            this.propRooms.clear();
+            for (let i = 0; i < this.propRoomList.length; i++) this.propRooms.add(this.propRoomList[i]);
+            rooms = this.propRooms;
+          }
+          props.update(views, rooms, this.rtActive ? this.propsSunVisibility(views, c.sunDir) : null);
+        }
         layers = this.layersInside;
       } else if (this.frameNo % 2 === 0) {
         this.rt.skip();
@@ -2190,6 +2223,73 @@ class Manager implements SceneManager {
     this.texAge += dt;
     pipeline.render(layers, dt);
     this.publishInfo(inside);
+  }
+
+  /**
+   * Traced sun visibility of each loose object (they are not in the static BVH): CPU shadow rays through the
+   * tracer's BVH toward the star, from a point jittered inside the object and a direction jittered over the
+   * star's disc, averaged over frames (about 8 frames to settle; the soft edge of a window's patch comes out of
+   * the jitter). Moving or held objects every frame, resting ones round-robin. No allocation.
+   */
+  private propsSunVisibility(views: readonly PropView[], sunShip: V3): Float32Array {
+    const n = Math.min(views.length, PROP_VIS_MAX);
+    const vis = this.propVis, last = this.propVisPos;
+    const sx = sunShip.x, sy = sunShip.y, sz = sunShip.z;
+    // the star moved in the ship's axes (the ship turned): every estimate restarts from its next ray
+    const turned = sx * this.propVisSun.x + sy * this.propVisSun.y + sz * this.propVisSun.z < 0.99996; // ~0.5 deg
+    if (turned) {
+      this.propVisSun.x = sx; this.propVisSun.y = sy; this.propVisSun.z = sz;
+    }
+    const ar = this.rtSun.angularRadius;
+    // a basis across the star's direction for the disc jitter
+    let ux = Math.abs(sy) < 0.9 ? 0 : 1, uy = Math.abs(sy) < 0.9 ? 1 : 0, uz = 0;
+    let bx = uy * sz - uz * sy, by = uz * sx - ux * sz, bz = ux * sy - uy * sx;
+    let bl = Math.hypot(bx, by, bz) || 1;
+    bx /= bl; by /= bl; bz /= bl;
+    ux = sy * bz - sz * by; uy = sz * bx - sx * bz; uz = sx * by - sy * bx;
+    bl = Math.hypot(ux, uy, uz) || 1;
+    ux /= bl; uy /= bl; uz /= bl;
+    let budget = PROP_VIS_RESTING;
+    for (let k = 0; k < n; k++) {
+      const i = (this.propVisNext + k) % n;
+      const v = views[i];
+      const p = v.pos;
+      const moved = Math.abs(p.x - last[i * 3]) + Math.abs(p.y - last[i * 3 + 1]) + Math.abs(p.z - last[i * 3 + 2]) > 0.002;
+      const fresh = this.propVisAge[i] < 8;
+      if (!turned && !moved && !fresh && !v.grabbed) {
+        if (budget <= 0) continue;
+        budget--;
+      }
+      // a moving object (or a turning ship) keeps a short average: it follows a beam within a few frames without flicker
+      if ((moved || turned) && this.propVisAge[i] > 2) this.propVisAge[i] = 2;
+      last[i * 3] = p.x; last[i * 3 + 1] = p.y; last[i * 3 + 2] = p.z;
+      // low-discrepancy jitter (R2 sequence) inside the object and over the star's disc
+      const s = ++this.propVisSeq;
+      const j1 = (s * 0.7548776662) % 1, j2 = (s * 0.5698402910) % 1, j3 = (s * 0.6180339887) % 1;
+      const rad = this.propRadius(v.type);
+      const ox = p.x + (j1 - 0.5) * rad, oy = p.y + (j2 - 0.5) * rad, oz = p.z + (j3 - 0.5) * rad;
+      const a = j1 * 6.2831853, rr = Math.sqrt(j2) * ar;
+      const ca = Math.cos(a) * rr, sa = Math.sin(a) * rr;
+      let dx = sx + ux * ca + bx * sa, dy = sy + uy * ca + by * sa, dz = sz + uz * ca + bz * sa;
+      const dl = Math.hypot(dx, dy, dz) || 1;
+      dx /= dl; dy /= dl; dz /= dl;
+      const clear = this.rt.rayClear(ox, oy, oz, dx, dy, dz, 60) ? 1 : 0;
+      const age = this.propVisAge[i];
+      const w = age === 0 ? 1 : Math.max(1 / (age + 1), 0.125);
+      vis[i] += (clear - vis[i]) * w;
+      if (age < 255) this.propVisAge[i] = age + 1;
+    }
+    this.propVisNext = n > 0 ? (this.propVisNext + 1) % n : 0;
+    return vis;
+  }
+
+  /** Jitter size of a loose object's shadow-ray origins (about its smallest extent), m. */
+  private propRadius(t: PropType): number {
+    const sh = PROP_TYPES[t]?.shape;
+    if (!sh) return 0.05;
+    if (sh.kind === 'sphere') return sh.r;
+    if (sh.kind === 'capsule') return sh.r * 2;
+    return 2 * Math.min(sh.half.x, sh.half.y, sh.half.z);
   }
 
   /** Numbers for the perf overlay and the performance report (src/app/perf.ts). */
@@ -2367,8 +2467,19 @@ class Manager implements SceneManager {
  * render() before that only clears the canvas.
  */
 const NO_DEVICES: readonly DeviceView[] = [];
+const NO_PROPS: readonly PropView[] = [];
+/** Loose objects with a traced sun visibility; shadow rays per frame for the resting ones (round-robin). */
+const PROP_VIS_MAX = 64;
+const PROP_VIS_RESTING = 4;
 /** Inside the ship: key 0.16 on the mean log luminance, -2.5..+3 stops. */
 const AUTO_EXPOSURE = { key: 0.16, minEv: -2.5, maxEv: 3, compensation: 0 };
+/**
+ * Light inside the ship. The star's light outside is compressed (starIntensityAt) so the outer system stays
+ * readable; inside, the cabin lamps are baked at a few hundred lux while direct starlight through a window is
+ * tens of thousands. sunGain puts the light through the windows back above the lamps (a sun patch reads several
+ * stops brighter than a lamp-lit wall, as a camera sees it; the cabin's auto exposure then meters the mix).
+ */
+export const interiorLight = { sunGain: 1 };
 /** GPU memory budget of the whole page on an iPhone 15 (docs/ARCHITECTURE.md §4), bytes. */
 const MEMORY_BUDGET = 300 * 1048576;
 

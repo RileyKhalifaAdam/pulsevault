@@ -14,7 +14,7 @@
 // and "lights off", stored as RGBM (range 8), row-delta filtered and deflated, base64 in the .ts module.
 
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
-import { existsSync, statSync, promises as fs } from 'node:fs';
+import { existsSync, readFileSync, statSync, promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import zlib from 'node:zlib';
@@ -333,19 +333,27 @@ export function bakeIsStale() {
 }
 
 export async function bakeIfStale() {
-  if (!bakeIsStale()) return false;
-  await bakeInterior();
+  if (bakeIsStale()) {
+    await bakeInterior();
+    return true;
+  }
+  // file times can lie (a checkout, a copy, an edit inside the same second): the geometry key decides
+  let have = '';
+  try {
+    have = (readFileSync(OUT, 'utf8').match(/key: '([0-9a-f]*)'/) || [])[1] || '';
+  } catch {
+    have = '';
+  }
+  const mod = await loadInteriorModule();
+  if (mod.buildInterior(mod.INTERIORS.wren).key === have) return false;
+  console.log(`interior bake: key changed (${have || 'none'}), re-baking`);
+  await bakeInterior(mod);
   return true;
 }
 
-function sharedF32(n) {
-  return new Float32Array(new SharedArrayBuffer(n * 4));
-}
-
-export async function bakeInterior() {
-  const t0 = Date.now();
+async function loadInteriorModule() {
   const { build } = await import('esbuild');
-  const tmp = path.join(os.tmpdir(), `tidelock-bake-${process.pid}.mjs`);
+  const tmp = path.join(os.tmpdir(), `tidelock-bake-${process.pid}-${Date.now()}.mjs`);
   await build({
     stdin: {
       contents: "export { buildInterior } from './src/render/space/interior'; export { INTERIORS } from './src/data/interiors'; export { TILE_ALBEDO, TILE_IDS } from './src/render/space/surfaces';",
@@ -361,6 +369,16 @@ export async function bakeInterior() {
   });
   const mod = await import(pathToFileURL(tmp).href);
   await fs.unlink(tmp).catch(() => {});
+  return mod;
+}
+
+function sharedF32(n) {
+  return new Float32Array(new SharedArrayBuffer(n * 4));
+}
+
+export async function bakeInterior(loaded) {
+  const t0 = Date.now();
+  const mod = loaded ?? (await loadInteriorModule());
   const B = mod.buildInterior(mod.INTERIORS.wren);
   const W = B.lmW;
   const H = B.lmH;

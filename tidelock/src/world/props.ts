@@ -31,8 +31,18 @@ import { CREW_EYE, CREW_FRICTION, CREW_HEIGHT, CREW_RADIUS, CREW_RESTITUTION, fe
 
 /** Mass of the crew body (with clothes and kit), kg. */
 export const CREW_MASS = 80;
-/** Reach of a hand from the eye, m (arm plus a lean: a standing pilot reaches the 0.7 m lounge table). */
+/** Reach of a hand from the eye at eye level, m (arm plus a lean). */
 export const ARM_REACH = 1.0;
+/**
+ * Extra reach toward things below the eye, m: bending at the waist and knees brings the shoulder down and forward
+ * (a standing pilot, eye 1.62 m above the deck and 0.28 m of body from the edge, reaches across the 0.7 m lounge
+ * table: 1.25 m along a ray 44 deg down). Ship-local "down" (-Y): the boots hold the pilot to the deck.
+ */
+export const BEND_REACH = 0.6;
+/** Reach from the eye along a direction whose ship-local vertical component (of the unit vector) is `uy`. */
+export function reachAlong(uy: number): number {
+  return ARM_REACH + (uy < 0 ? BEND_REACH * Math.min(1, -uy) : 0);
+}
 /** Most a hand can pull or push with, N (a heavy crate follows slowly, a mug at once). */
 export const HAND_FORCE = 160;
 /** Natural frequency of the hand's grip (critically damped spring), rad/s; holding torque limit, N·m. */
@@ -1341,7 +1351,7 @@ export function propsChunk(s: PropsState, ship: ShipMotion, crew: CrewState | nu
 // ------------------------------------------------------------------------------------------------ hands
 
 /**
- * Take hold of an object at a hand point (ship axes). Fails (false) when the hand is beyond ARM_REACH of the
+ * Take hold of an object at a hand point (ship axes). Fails (false) when the hand is beyond reach (reachAlong) of the
  * eye, or not on (within a hand's breadth of) the object. A stowed object comes free only when the hand
  * pulls harder than its holder (a strapped crate needs unstow() first). One object at a time.
  */
@@ -1350,8 +1360,9 @@ export function grab(s: PropsState, propId: string, hand: V3, eye: V3): boolean 
     const rt = runtime(s.layoutId);
     const i = rt ? rt.index.get(propId) ?? -1 : -1;
     if (!rt || i < 0 || !isV3(hand) || !isV3(eye)) return false;
-    const ex = hand.x - eye.x, ey = hand.y - eye.y, ez = hand.z - eye.z;
-    if (ex * ex + ey * ey + ez * ez > ARM_REACH * ARM_REACH + 1e-9) return false;
+    const ex = hand.x - eye.x, ey = hand.y - eye.y, ez = hand.z - eye.z, el = Math.sqrt(ex * ex + ey * ey + ez * ez);
+    const reach = reachAlong(el > 0 ? ey / el : 0);
+    if (el * el > reach * reach + 1e-9) return false;
     const b = s.bodies[i], dx = hand.x - b.p.x, dy = hand.y - b.p.y, dz = hand.z - b.p.z;
     const lim = rt.bound[i] + GRAB_SLOP;
     if (dx * dx + dy * dy + dz * dz > lim * lim) return false;
@@ -1380,14 +1391,14 @@ export function grab(s: PropsState, propId: string, hand: V3, eye: V3): boolean 
   }
 }
 
-/** Move the holding hand to a new point (ship axes) over dt; kept within ARM_REACH of the eye. */
+/** Move the holding hand to a new point (ship axes) over dt; kept within reach of the eye (reachAlong). */
 export function moveGrab(s: PropsState, hand: V3, dt: number): void {
   try {
     const g = s.grab;
     if (g.id === '' || !isV3(hand)) return;
     let x = hand.x - g.eye.x, y = hand.y - g.eye.y, z = hand.z - g.eye.z;
-    const l = Math.sqrt(x * x + y * y + z * z);
-    if (l > ARM_REACH) { x *= ARM_REACH / l; y *= ARM_REACH / l; z *= ARM_REACH / l; }
+    const l = Math.sqrt(x * x + y * y + z * z), reach = reachAlong(l > 0 ? y / l : 0);
+    if (l > reach) { x *= reach / l; y *= reach / l; z *= reach / l; }
     x += g.eye.x; y += g.eye.y; z += g.eye.z;
     if (dt > 0) { g.handVel.x = (x - g.hand.x) / dt; g.handVel.y = (y - g.hand.y) / dt; g.handVel.z = (z - g.hand.z) / dt; }
     else g.handVel.x = g.handVel.y = g.handVel.z = 0;

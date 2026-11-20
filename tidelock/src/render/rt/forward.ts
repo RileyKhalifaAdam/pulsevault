@@ -12,6 +12,9 @@
 //   reflections  on surfaces smoother than the trace's cut (their per-vertex roughness, as traced), the traced radiance
 //                replaces the probe / environment radiance; three applies its own split-sum BRDF and specular
 //                occlusion. Rough surfaces keep the box-projected probes.
+//   dynamic      a material with userData.rtDynamic (the loose objects) declares `varying float vRtSunVis` itself:
+//                its sun visibility per instance from a CPU shadow ray through the same BVH (RayTracer.rayClear),
+//                so a mug floating through the sun beam lights up whatever static surface is behind it.
 //
 // Every texel is fetched with a joint-bilateral 2×2 upsample against the tracer's own G-buffer (view-space plane
 // distance and ship-space normal), falling back to the best-matching tap for pixels the static mesh does not
@@ -141,10 +144,17 @@ if ( uRtOn > 0.5 ) {
   float rtRK;
   rtFetch( geometryPosition, nonPerturbedNormal, rtA, rtB, rtRK );
 #if defined( RE_Direct )
-  if ( uRtFx.x > 0.5 && rtA.a > 0.002 ) {
+  float rtVis = rtA.a;
+#ifdef RT_DYNAMIC
+  // a moving object (not in the BVH): its own traced visibility per instance (vRtSunVis, set by its vertex
+  // shader from a CPU shadow ray), never the static surface's behind it; it keeps its probe reflections
+  rtVis = vRtSunVis;
+  rtRK = 0.0;
+#endif
+  if ( uRtFx.x > 0.5 && rtVis > 0.002 ) {
     IncidentLight rtSun;
     rtSun.direction = uRtSunDir;
-    rtSun.color = uRtSunE * rtA.a;
+    rtSun.color = uRtSunE * rtVis;
     rtSun.visible = true;
     RE_Direct( rtSun, geometryPosition, geometryNormal, geometryViewDir, geometryClearcoatNormal, material, reflectedLight );
   }
@@ -194,7 +204,8 @@ export function patchMaterialForRt(m: THREE.Material, u: RtForwardUniforms): boo
     prev.call(m, sh, r);
     if (!sh.fragmentShader.includes('#include <lights_fragment_end>') || !sh.fragmentShader.includes('void main() {')) return;
     Object.assign(sh.uniforms, u);
-    sh.fragmentShader = sh.fragmentShader.replace('void main() {', `${HEAD}\nvoid main() {`).replace('#include <lights_fragment_end>', APPLY);
+    const dyn = m.userData.rtDynamic === true ? '#define RT_DYNAMIC\n' : '';
+    sh.fragmentShader = sh.fragmentShader.replace('void main() {', `${dyn}${HEAD}\nvoid main() {`).replace('#include <lights_fragment_end>', APPLY);
   };
   m.customProgramCacheKey = () => prevKey.call(m) + RT_FORWARD_KEY;
   m.needsUpdate = true;

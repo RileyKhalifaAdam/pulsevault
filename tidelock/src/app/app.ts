@@ -442,6 +442,7 @@ export async function boot(): Promise<void> {
     const p = session.player();
     // the physical controls as they are, and what the console screens show (re-read five times a second)
     frame.devices = session.devices();
+    frame.props = session.props();
     instrumentsAge += dt;
     // a lamp that changes (a button pressed) re-reads the screens at once, so they never lag the lamp
     let sig = 0;

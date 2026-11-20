@@ -18,6 +18,7 @@
 // states, subtracting in doubles before converting to floats. `frame.ships` is filled by the scene itself from
 // the craft of kind 'ship' (a FrameShip's `r`, `v` are barycentric; `soiBodyId` is unused).
 
+import type { PropView } from '../world/props';
 import type { DeviceView } from '../game/api';
 import type { InstrumentData } from './space/instruments';
 import type { Quat, RGB, ShipVisualId, V3 } from '../core/types';
@@ -141,6 +142,8 @@ export interface SceneFrame {
    */
   devices?: readonly DeviceView[] | null;
   instruments?: InstrumentData | null;
+  /** The loose objects aboard the player's ship (Session.props(), not copied; ship-local). Null / omitted: none drawn. */
+  props?: readonly PropView[] | null;
   environment: FrameEnvironment;
   fx: FrameFx[];
   /** @internal pools behind the lists (see beginFrame / add*) */
@@ -177,6 +180,7 @@ export function createSceneFrame(): SceneFrame {
     cabinLights: true,
     devices: null,
     instruments: null,
+    props: null,
     environment: { reentry: 0, dockingGuide: null },
     fx: [],
     _pool: { ships: [], extras: [], fx: [], guide: { stationId: '', portId: '' } },

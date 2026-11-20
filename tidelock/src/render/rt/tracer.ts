@@ -9,7 +9,7 @@
 // variance-steered). composite() then draws the same mesh at full resolution over the rasterised interior and
 // adds sun direct (GGX + Lambert × traced visibility), sun bounce and reflections, in linear HDR.
 import * as THREE from 'three';
-import { buildPacked, measureWork, mergeStatic, TEX_W, type MergeOptions, type MergedScene, type TraceCounters } from './bvh';
+import { buildPacked, measureWork, mergeStatic, trace, TEX_W, type MergeOptions, type MergedScene, type TraceCounters } from './bvh';
 import { createForwardUniforms, patchTreeForRt, type RtForwardUniforms } from './forward';
 import { ATROUS_FRAG, COMPOSITE_FRAG, COMPOSITE_VERT, COPY_FRAG, DEPTH_FRAG, FULLSCREEN_VERT, GBUF_FRAG, GBUF_VERT, TEMPORAL_FRAG, TRACE_FRAG } from './glsl';
 
@@ -121,6 +121,12 @@ export interface RayTracer {
   bytesAt(tier: RtQuality, width: number, height: number): number;
   /** Restart accumulation (teleport, interior rebuilt). */
   resetHistory(): void;
+  /**
+   * CPU shadow ray against the static scene (the same packed BVH the GPU walks), ship space: is the segment from
+   * (ox, oy, oz) along the unit direction (dx, dy, dz) clear for `maxT` metres? For objects that are not in the
+   * BVH (the loose objects): their sun visibility per instance. True when no scene is built.
+   */
+  rayClear(ox: number, oy: number, oz: number, dx: number, dy: number, dz: number, maxT: number): boolean;
   stats(): RtStats;
   /** GPU estimate for a tier at a full-resolution size (default iPhone 15 portrait, DPR 2). */
   estimate(tier: RtQuality, width?: number, height?: number): { rays: number; ms: number };
@@ -161,6 +167,7 @@ const IPHONE_H = 852 * 2;
 const REFL_MAX_ROUGH = 0.5; // the brief: traced reflections replace the probes on everything smoother than 0.5
 
 const tri = new Float32Array([-1, -1, 0, 3, -1, 0, -1, 3, 0]);
+const hitScratch = { t: 0, tri: 0, u: 0, v: 0 };
 
 export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?: RtQuality } = {}): RayTracer {
   const gl = renderer.getContext();
@@ -862,6 +869,11 @@ export function createRayTracer(renderer: THREE.WebGLRenderer, opts: { quality?:
 
     resetHistory() {
       resetPending = true;
+    },
+
+    rayClear(ox, oy, oz, dx, dy, dz, maxT) {
+      if (!packed) return true;
+      return trace(packed, ox, oy, oz, dx, dy, dz, maxT, true, undefined, hitScratch) === null;
     },
 
     estimate,

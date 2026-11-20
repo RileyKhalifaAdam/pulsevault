@@ -52,6 +52,45 @@ const CA = makeContactBody(), CB = makeContactBody();
 const RES = makeContactResult();
 const SCRATCH = new Manifold();
 
+// ------------------------------------------------------------------------------------------------ jolts
+
+/**
+ * Velocity changes contacts gave a craft (impacts, touchdown, a latch closing, the undock spring) since the last
+ * takeJolt: dv in the inertial axes of its primary, dw in its body axes. The crew and the loose objects inside do
+ * not take part in the impulse — they keep their own velocity — so in the ship's frame they feel it as a jolt
+ * (src/game/session.ts spreads it over the step it happened in). Not state: read and cleared every step.
+ */
+export interface Jolt { dv: V3; dw: V3; n: number }
+const jolts = new WeakMap<Craft, Jolt>();
+const JV = { x: 0, y: 0, z: 0 }, JW = { x: 0, y: 0, z: 0 }, JV2 = { x: 0, y: 0, z: 0 }, JW2 = { x: 0, y: 0, z: 0 };
+function snap(c: Craft, v: V3, w: V3): void {
+  v.x = c.relV.x; v.y = c.relV.y; v.z = c.relV.z;
+  w.x = c.w.x; w.y = c.w.y; w.z = c.w.z;
+}
+function addJolt(c: Craft, v0: V3, w0: V3): void {
+  const dvx = c.relV.x - v0.x, dvy = c.relV.y - v0.y, dvz = c.relV.z - v0.z;
+  const dwx = c.w.x - w0.x, dwy = c.w.y - w0.y, dwz = c.w.z - w0.z;
+  if (dvx === 0 && dvy === 0 && dvz === 0 && dwx === 0 && dwy === 0 && dwz === 0) return;
+  let j = jolts.get(c);
+  if (!j) {
+    j = { dv: { x: 0, y: 0, z: 0 }, dw: { x: 0, y: 0, z: 0 }, n: 0 };
+    jolts.set(c, j);
+  }
+  j.dv.x += dvx; j.dv.y += dvy; j.dv.z += dvz;
+  j.dw.x += dwx; j.dw.y += dwy; j.dw.z += dwz;
+  j.n++;
+}
+/** Copy the craft's accumulated contact jolt into `out` and clear it; false when there was none. */
+export function takeJolt(c: Craft, out: Jolt): boolean {
+  const j = jolts.get(c);
+  if (!j || j.n === 0) return false;
+  out.dv.x = j.dv.x; out.dv.y = j.dv.y; out.dv.z = j.dv.z;
+  out.dw.x = j.dw.x; out.dw.y = j.dw.y; out.dw.z = j.dw.z;
+  out.n = j.n;
+  j.dv.x = j.dv.y = j.dv.z = 0; j.dw.x = j.dw.y = j.dw.z = 0; j.n = 0;
+  return true;
+}
+
 // ------------------------------------------------------------------------------------------------ manifolds
 
 /** Persistent manifolds of one world, per ordered pair of craft ids; pairs not looked at in a pass are dropped. */
@@ -132,7 +171,9 @@ export function surfaceContact(world: World, c: Craft, t: number): void {
     planetBody(CB, ORIGIN, n, wr, ang);
     SCRATCH.clear();
     if (collidePlanet(k, CA, CB, b.radius, SCRATCH) > 0) {
+      snap(c, JV, JW);
       solveManifold(SCRATCH, CA, CB, 0, TOUCHDOWN, RES);
+      addJolt(c, JV, JW);
       c.hull -= RES.energy / c.hullStrength;
     }
     if (!b.solid || speed > LAND_MAX_SPEED || c.hull <= 0) {
@@ -244,6 +285,8 @@ function tryLatch(world: World, s: Craft, st: Craft, pl: V3, t: number): boolean
     if (!portFree(world, st.id, port.id)) continue;
     // Perfectly inelastic capture: the pair moves on with its common centre-of-mass velocity.
     const m = mass(s), M = mass(st), k = m / (M + m);
+    snap(s, JV, JW);
+    snap(st, JV2, JW2);
     st.relV.x += (s.relV.x - st.relV.x) * k; st.relV.y += (s.relV.y - st.relV.y) * k; st.relV.z += (s.relV.z - st.relV.z) * k;
     world.joints.push({
       kind: 'dock', craftId: s.id, otherId: st.id, portId: port.id,
@@ -253,6 +296,8 @@ function tryLatch(world: World, s: Craft, st: Craft, pl: V3, t: number): boolean
     s.dockedTo = st.id;
     s.dockPortId = port.id;
     s.relV.x = st.relV.x; s.relV.y = st.relV.y; s.relV.z = st.relV.z;
+    addJolt(s, JV, JW);
+    addJolt(st, JV2, JW2);
     pushEvent(world, { type: 'docked', t, craftId: s.id, stationId: st.id, portId: port.id });
     return true;
   }
@@ -278,9 +323,11 @@ export function undock(world: World, craftId: string): boolean {
       const l = Math.sqrt(A.x * A.x + A.y * A.y + A.z * A.z) || 1;
       const m = mass(s), M = mass(st);
       const ks = (UNDOCK_SPEED * M) / (M + m) / l, kt = (UNDOCK_SPEED * m) / (M + m) / l;
+      snap(s, JV, JW);
       s.relV.x += A.x * ks; s.relV.y += A.y * ks; s.relV.z += A.z * ks;
       st.relV.x -= A.x * kt; st.relV.y -= A.y * kt; st.relV.z -= A.z * kt;
       s.v.x += A.x * ks; s.v.y += A.y * ks; s.v.z += A.z * ks;
+      addJolt(s, JV, JW);
     }
     pushEvent(world, { type: 'undocked', t: world.t, craftId, stationId: j.otherId });
     return true;
@@ -361,7 +408,11 @@ function contactPair(world: World, cache: PairCache, s: Craft, ks: Compound, o: 
   bodyFromCraft(CA, s);
   bodyFromCraft(CB, o);
   if (collide(ks, CA, ko, CB, m) === 0) return;
+  snap(s, JV, JW);
+  snap(o, JV2, JW2);
   solveManifold(m, CA, CB, dtNext, PARAMS, RES);
+  addJolt(s, JV, JW);
+  addJolt(o, JV2, JW2);
   if (RES.points === 0) return;
   if (RES.approachSpeed > IMPACT_EVENT_SPEED) pushEvent(world, { type: 'impact', t, craftId: s.id, with: o.id, speed: RES.approachSpeed });
   if (RES.energy > 0) {
