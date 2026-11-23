@@ -17,6 +17,8 @@ const L = INTERIORS.wren!;
 const STILL: CrewInput = { moveX: 0, moveZ: 0 };
 const v3 = (x = 0, y = 0, z = 0): V3 => ({ x, y, z });
 const len = (a: V3): number => Math.hypot(a.x, a.y, a.z);
+/** A consumed ledger mean (dynamics.ts consumeLedger): mean proper force f (N) and torque tau (N·m) over T s, no impulses. */
+const mean = (f: V3, tau: V3 = v3(), T = 1 / 120) => ({ f, tau, dv: v3(), dw: v3(), T });
 
 function orbit() {
   const w = createWorld(system, { stations: false });
@@ -82,9 +84,8 @@ describe('the pilot as a body in the ship', () => {
 
   it('full throttle: the felt acceleration is the ship\'s, toward the stern, and a loose body ends against the aft bulkhead', () => {
     const { w, ship } = orbit();
-    ship.throttle = 1;
-    advance(w, 1 / 60);
-    const m = craftMotion(w, ship, createShipMotion());
+    // the drive at full thrust, as the ledger reports what was applied (not the throttle command)
+    const m = craftMotion(w, ship, createShipMotion(), mean(v3(0, 0, -ship.mainThrust)));
     const a = ship.mainThrust / craftMass(ship);
     expect(a).toBeGreaterThan(8);
     const f = feltAt(m, 0, 0, 0, 0, 0, 0, v3());
@@ -106,10 +107,9 @@ describe('the pilot as a body in the ship', () => {
   it('boots hold under a gentle RCS push and fail under main thrust', () => {
     const { w, ship } = orbit();
     const m = createShipMotion();
-    ship.rcs.x = 1;
     const rcs = ship.rcsThrust / craftMass(ship);
     expect(rcs).toBeLessThan(BOOT_HOLD);
-    craftMotion(w, ship, m);
+    craftMotion(w, ship, m, mean(v3(ship.rcsThrust, 0, 0)));
     const s = createCrew(L, ship.id);
     expect(crewFelt(s, m, v3()).x).toBeCloseTo(-rcs, 9);
     run(s, m, STILL, 3, 60);
@@ -121,15 +121,12 @@ describe('the pilot as a body in the ship', () => {
     run(loose, m, STILL, 6, 60);
     expect(loose.pos.x).toBeCloseTo(-1.25 + CREW_RADIUS, 2);
     // main drive: the boots let go and the body goes aft
-    ship.rcs.x = 0;
-    ship.throttle = 1;
-    craftMotion(w, ship, m);
+    craftMotion(w, ship, m, mean(v3(0, 0, -ship.mainThrust)));
     run(s, m, STILL, 2, 60);
     expect(s.gripped).toBe(false);
     expect(s.pos.z).toBeGreaterThan(L.spawn.pos.z + 0.5);
     // drive off: the boots take hold again where the body lies
-    ship.throttle = 0;
-    craftMotion(w, ship, m);
+    craftMotion(w, ship, m, mean(v3()));
     run(s, m, STILL, 2, 60);
     expect(s.gripped).toBe(true);
   });
@@ -187,8 +184,7 @@ describe('the pilot as a body in the ship', () => {
     expect(e.x).toBeCloseTo(0.8, 12);
     // from a real craft: yaw torque gives α = τ / I about +Y
     const { w, ship } = orbit();
-    ship.torque.y = 1;
-    const cm = craftMotion(w, ship, createShipMotion());
+    const cm = craftMotion(w, ship, createShipMotion(), mean(v3(), v3(0, ship.maxTorque.y, 0)));
     expect(cm.alpha.y).toBeCloseTo(ship.maxTorque.y / (craftMass(ship) * ship.gyration.y), 9);
     // a tumbling ship throws a loose body outward, and it still stays aboard
     const spin = createShipMotion();

@@ -7,15 +7,26 @@
 //   felt = -(ship's proper acceleration) - ω × (ω × r) - 2 ω × v - α × r
 //
 // (thrust presses everything toward the stern; a turning ship adds centrifugal, Coriolis and Euler terms).
-// Magnetic boots grip a deck (a room floor) and hold up to BOOT_HOLD; beyond that the body slides and falls
-// like anything loose. Movement stays inside the layout's rooms and doors, minus the solids.
+// Magnetic boots (SIMULATION.md W1-C 4, body.ts): each sole pulls F(g) = F₀/(1 + g/g₀)² toward a deck; they catch
+// only when the soles touch (gap < 2 mm) at ≤ 0.5 m/s, and hold while the felt load along the deck stays inside the
+// friction cone μ_s·(ΣF_mag + m·max(0, −f_n)). Beyond it they slip and the body slides and falls like anything
+// loose; a ship impulse passes through the soles only up to the shear impulse they can carry (bootImpulse). The
+// legs push with F = m(a_cmd − f_t), limited by that traction. Movement stays inside the rooms and doors, minus the
+// solids. The eye moves with the body (eyeOffsetOf: knee, head lag, gait bob, lean; harness and head when seated)
+// as a translation only.
 
 import type { Quat, V3 } from '../core/types';
 import type { Interactable, InteriorLayout } from '../data/interiors';
 import { craftMass, type Craft, type World } from './state';
 import type { EventRing } from './events';
 import type { LedgerMean } from './jets';
-import { createHarnessBody, landedProperAccel, loadHarnessBody, localVertical, motionFromLedger, saveHarnessBody, type HarnessBody } from './body';
+import { emitEvent, MAT } from './events';
+import {
+  BOOT_F0, BOOT_HELD, BOOT_MU_S, bootContact, bootImpulse, bootMagnet, BUNK_DEF, clampEyeOffset, createFootBody, createHarnessBody,
+  footEyeOffset, gaitEye, gaitPhase, gaitSpeedCap, HELM_DEF, helmEyeOffset, kneeLand, landedProperAccel, LEAN_MAX_HELM, LEAN_MAX_STAND,
+  leanClearance, leanDir, leanTick, legForce, loadHarnessBody, localVertical, motionFromLedger, neckEyeDelta, saveHarnessBody, settleFoot,
+  shipJumpAt, SOLE_CATCH, stepFoot, stepHarnessBody, TORSO_MASS, type FootBody, type HarnessBody,
+} from './body';
 
 /**
  * Collision radius of the body about its long axis, m: about half a person's shoulder depth-to-width. The
@@ -28,15 +39,21 @@ export const CREW_EYE = 1.62;
 export const CREW_COM = 0.95;
 export const WALK_SPEED = 1.4;
 export const RUN_SPEED = 2.2;
-/** How hard booted feet can change the body's velocity along the deck, m/s². */
+/** The body's mass, kg (body.ts TORSO_MASS: the whole pilot for the boots, the legs and the drag). */
+export const CREW_MASS = TORSO_MASS;
+/** The most acceleration the legs try for along the deck, m/s² (the soles' traction may give less). */
 export const WALK_ACCEL = 8;
-/** Felt acceleration (along the deck, or away from it) beyond which the boots let go, m/s². */
-export const BOOT_HOLD = 4;
-/** Magnets pull the feet toward a deck within this distance, m, with this acceleration, m/s². */
+/**
+ * Felt acceleration along the deck that two booted soles hold with nothing pressing them into it, m/s²:
+ * μ_s·2F₀/m = 3.5 (more under a load into the deck, less under one away from it).
+ */
+export const BOOT_HOLD = (BOOT_MU_S * 2 * BOOT_F0) / CREW_MASS;
+/** The magnets' pull is followed this far from a deck, m (beyond it F(g) is below 0.1 N per boot). */
 export const BOOT_REACH = 0.4;
-export const BOOT_PULL = 2;
+/** A gripped sole follows a step in the deck (a door sill) up to this height, m; the knee takes it. */
 const BOOT_SNAP = 0.03;
-const BOOT_CATCH_SPEED = 0.3;
+/** Sole catch gap, m (body.ts BOOT_CATCH_GAP). */
+const CATCH_GAP = 0.002;
 export const JUMP_SPEED = 1.5;
 export const PUSH_SPEED = 1.2;
 /** A surface this close to the body can be pushed off, m. */
@@ -67,6 +84,10 @@ export interface CrewState {
   seat: '' | 'table' | 'bunk';
   /** Where it stood before it sat or lay down. */
   back: V3;
+  /** Knee, head lag, gait phase and lean on foot (body.ts FootBody); absent in older saves (created at rest). */
+  foot?: FootBody;
+  /** Felt load into the deck at the last tick, m/s² (the gait bob scales with it); absent: 0. */
+  fn?: number;
 }
 
 /** The ship's motion as the body needs it, all in ship-local axes. */
@@ -325,6 +346,40 @@ function surfaceNear(c: Compiled, s: CrewState, reach: number): boolean {
 // ------------------------------------------------------------------------------------------------ stepping
 
 const F: V3 = { x: 0, y: 0, z: 0 };
+const LEG: V3 = { x: 0, y: 0, z: 0 };
+const UP: V3 = { x: 0, y: 1, z: 0 };
+const JMP: V3 = { x: 0, y: 0, z: 0 };
+const DVB: V3 = { x: 0, y: 0, z: 0 };
+const EVP: V3 = { x: 0, y: 0, z: 0 };
+const V0: V3 = { x: 0, y: 0, z: 0 };
+const AB: V3 = { x: 0, y: 0, z: 0 };
+const LD: V3 = { x: 0, y: 0, z: 0 };
+/** Context of the step in progress (events): the ring or null, and the sim time of the tick. */
+let subEv: EventRing | null = null;
+let subT = 0;
+
+/** The soles' events (body.ts: one per boot; a = 0 left, 1 right): 'boot' on a catch, 'bootOff' when they let go. */
+function soleEvent(kind: 'boot' | 'bootOff', s: CrewState, vn: number): void {
+  const ev = subEv;
+  if (!ev) return;
+  EVP.x = s.pos.x; EVP.y = s.pos.y; EVP.z = s.pos.z;
+  emitEvent(ev, kind, subT, 0, 1, 0, EVP, UP, vn, MAT.steel, MAT.aluminium);
+  emitEvent(ev, kind, subT, 1, 1, 0, EVP, UP, vn, MAT.steel, MAT.aluminium);
+}
+
+function letGo(s: CrewState): void {
+  if (!s.gripped) return;
+  s.gripped = false;
+  soleEvent('bootOff', s, s.vel.y);
+}
+
+/** Do two booted soles at gap 0 hold the felt load F (m/s², at the body) in their friction cone? */
+function soleHolds(f: V3): boolean {
+  const N = 2 * BOOT_F0 - CREW_MASS * f.y; // the magnets plus the felt load into the deck (f.y < 0 presses)
+  if (!(N > 0)) return false;
+  const T = BOOT_MU_S * N;
+  return CREW_MASS * CREW_MASS * (f.x * f.x + f.z * f.z) <= T * T;
+}
 
 function sub(s: CrewState, layout: InteriorLayout, c: Compiled, m: ShipMotion, input: CrewInput, h: number): void {
   const p = s.pos, v = s.vel;
@@ -332,35 +387,57 @@ function sub(s: CrewState, layout: InteriorLayout, c: Compiled, m: ShipMotion, i
   feltAt(m, p.x, p.y + CREW_COM, p.z, v.x, v.y, v.z, F);
   const deck = deckUnder(layout, p.x, p.y, p.z);
   const hasDeck = deck === deck;
-  const along = Math.sqrt(F.x * F.x + F.z * F.z);
-  const grip = s.boots && hasDeck && p.y - deck <= BOOT_SNAP && v.y <= BOOT_CATCH_SPEED && along <= BOOT_HOLD && F.y <= BOOT_HOLD;
-  if (grip) {
-    // The boots hold the feet to the deck; the legs steer the body toward the commanded velocity.
+  const M = CREW_MASS;
+  // a gripped sole stays on its deck (it follows a sill or a step the knee can take); off it, or unbooted, it lets go
+  if (s.gripped && !(s.boots && hasDeck && p.y - deck <= BOOT_SNAP && p.y - deck >= -BOOT_SNAP)) letGo(s);
+  if (s.gripped && !soleHolds(F)) letGo(s); // the felt load leaves the friction cone (or pulls the soles off): they slip
+  if (s.gripped) {
+    // the legs steer the body toward the commanded velocity: F_leg = m(a_cmd − f_t), limited by the traction and 1 kN
     p.y = deck;
     v.y = 0;
     let mx = input.moveX, mz = input.moveZ;
     let mag = Math.sqrt(mx * mx + mz * mz);
     if (!(mag > 0.02)) { mx = mz = mag = 0; }
     else if (mag > 1) { mx /= mag; mz /= mag; mag = 1; }
-    const sp = mag === 0 ? 0 : (mag <= 0.85 ? (WALK_SPEED * mag) / 0.85 : WALK_SPEED + ((RUN_SPEED - WALK_SPEED) * (mag - 0.85)) / 0.15) / mag;
+    let sp = mag === 0 ? 0 : mag <= 0.85 ? (WALK_SPEED * mag) / 0.85 : WALK_SPEED + ((RUN_SPEED - WALK_SPEED) * (mag - 0.85)) / 0.15;
+    const cap = gaitSpeedCap(-F.y); // 1.1 m/s below 0.3 g felt into the deck, running only at ≥ 0.6 g
+    if (sp > cap) sp = cap;
+    if (mag > 0) sp /= mag;
     const cy = Math.cos(s.yaw), sy = Math.sin(s.yaw);
     // right = (cos, 0, -sin), forward = (-sin, 0, -cos)
-    const dx = (cy * mx - sy * mz) * sp - v.x, dz = (-sy * mx - cy * mz) * sp - v.z;
-    const d = Math.sqrt(dx * dx + dz * dz), lim = WALK_ACCEL * h;
-    const k = d > lim ? lim / d : 1;
-    v.x += dx * k; v.z += dz * k;
+    let ax = ((cy * mx - sy * mz) * sp - v.x) / h, az = ((-sy * mx - cy * mz) * sp - v.z) / h;
+    const al = Math.sqrt(ax * ax + az * az);
+    if (al > WALK_ACCEL) { ax *= WALK_ACCEL / al; az *= WALK_ACCEL / al; }
+    const T = BOOT_MU_S * (2 * BOOT_F0 - M * F.y);
+    legForce(M, ax, az, F.x, F.z, T, LEG);
+    v.x += (F.x + LEG.x / M) * h; v.z += (F.z + LEG.z / M) * h;
     p.x += v.x * h; p.z += v.z * h;
     collide(c, s, 0, 0, true);
     p.y = deck;
   } else {
     let ay = F.y;
-    if (s.boots && hasDeck && p.y > deck && p.y - deck <= BOOT_REACH) ay -= BOOT_PULL; // the magnets draw the feet down
+    const gap = hasDeck ? p.y - deck : Infinity;
+    // the magnets draw booted soles toward a deck below: 2·F(g)/m
+    if (s.boots && gap > 0 && gap <= BOOT_REACH) ay -= (2 * bootMagnet(gap)) / M;
     v.x += F.x * h; v.y += ay * h; v.z += F.z * h;
     p.x += v.x * h; p.y += v.y * h; p.z += v.z * h;
-    collide(c, s, CREW_RESTITUTION, CREW_FRICTION, false);
+    if (s.boots && hasDeck) {
+      // the soles meet the deck: they catch when slow enough and the felt load is inside their cone; else bounce
+      const g2 = p.y - deck;
+      if (g2 < CATCH_GAP && g2 > -0.25 && bootContact(g2 > 0 ? g2 : 0, v.y, M, 2) === SOLE_CATCH && soleHolds(F)) {
+        const vIn = v.y < 0 ? -v.y : 0;
+        p.y = deck;
+        v.y = 0;
+        s.gripped = true;
+        if (!s.foot) s.foot = createFootBody();
+        kneeLand(s.foot, vIn);
+        soleEvent('boot', s, vIn);
+      }
+    }
+    collide(c, s, CREW_RESTITUTION, CREW_FRICTION, s.gripped);
+    if (s.gripped) p.y = deck;
   }
-  s.gripped = grip;
-  s.posture = grip ? 'walking' : 'floating';
+  s.posture = s.gripped ? 'walking' : 'floating';
   if (!crewInside(layout, s) || !(p.x === p.x && p.y === p.y && p.z === p.z)) {
     // last line of defence: never leave the ship
     p.x = px; p.y = py; p.z = pz;
@@ -369,14 +446,37 @@ function sub(s: CrewState, layout: InteriorLayout, c: Compiled, m: ShipMotion, i
 }
 
 /**
+ * The tick's ship impulse (contact, latch, undock: tk.ledger.dv, dw) reaches the body once. Floating, it keeps its
+ * inertial velocity (v += −Δv − Δω × r). Gripped, the deck carries it along only up to the shear impulse the soles
+ * pass (bootImpulse: J ≤ μ_s·(F_mag + m·max(0, −f_n))·h); beyond that they slip, or lift when the deck drops away.
+ */
+function shipImpulse(s: CrewState, m: ShipMotion, tk: BodyTick): void {
+  const dv = tk.ledger.dv, dw = tk.ledger.dw;
+  if (dv.x === 0 && dv.y === 0 && dv.z === 0 && dw.x === 0 && dw.y === 0 && dw.z === 0) return;
+  const p = s.pos, v = s.vel;
+  EVP.x = p.x; EVP.y = p.y + CREW_COM; EVP.z = p.z;
+  shipJumpAt(EVP, dv, dw, JMP);
+  if (!s.gripped) { v.x += JMP.x; v.y += JMP.y; v.z += JMP.z; return; }
+  feltAt(m, EVP.x, EVP.y, EVP.z, v.x, v.y, v.z, F);
+  const r = bootImpulse(CREW_MASS, JMP, UP, 2 * BOOT_F0, F.y, tk.h, DVB);
+  v.x += DVB.x; v.y += DVB.y; v.z += DVB.z;
+  if (r !== BOOT_HELD) letGo(s);
+}
+
+/**
  * Advance the body by dt of ship time. Sub-stepped at 120 Hz or finer (and so that no sub-step moves it more
- * than a few centimetres), so the result does not depend on the frame rate and nothing tunnels.
+ * than a few centimetres), so the result does not depend on the frame rate and nothing tunnels. With the session's
+ * tick context `tk`: the tick's ship impulse first (shipImpulse), events to tk.events, and once per tick the knee,
+ * the head lag, the gait phase and the lean (FootBody; quasi-static — settled — under warp).
  */
 export function stepCrew(s: CrewState, layout: InteriorLayout, m: ShipMotion, input: CrewInput, dt: number, tk?: BodyTick): void {
-  void tk; // W1-C fills: the tick context (impulses, events, latched look and lean)
   if (!(dt > 0) || s.seat !== '') return;
   const c = compile(layout);
+  subEv = tk ? tk.events : null;
+  subT = tk ? tk.tick / 120 : 0;
+  if (tk) shipImpulse(s, m, tk);
   const v = s.vel, a = m.a, w = m.w;
+  V0.x = v.x; V0.y = v.y; V0.z = v.z;
   const speed = Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z) + RUN_SPEED
     + (Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z) + (w.x * w.x + w.y * w.y + w.z * w.z) * 12) * dt;
   let n = Math.max(Math.ceil(dt / SUB_DT - 1e-9), Math.ceil((speed * dt) / MAX_MOVE));
@@ -384,6 +484,36 @@ export function stepCrew(s: CrewState, layout: InteriorLayout, m: ShipMotion, in
   else if (n > 2000) n = 2000;
   const h = dt / n;
   for (let i = 0; i < n; i++) sub(s, layout, c, m, input, h);
+  subEv = null;
+  if (tk) footTick(s, layout, c, m, tk, dt);
+}
+
+/** Once per tick on foot: knee and head lag (the body's own acceleration), the gait phase, the lean, the felt load. */
+function footTick(s: CrewState, layout: InteriorLayout, c: Compiled, m: ShipMotion, tk: BodyTick, dt: number): void {
+  const fb = s.foot ?? (s.foot = createFootBody());
+  const p = s.pos, v = s.vel;
+  feltAt(m, p.x, p.y + CREW_COM, p.z, v.x, v.y, v.z, F);
+  s.fn = s.gripped ? -F.y : 0;
+  fb.leanT = tk.lean * LEAN_MAX_STAND;
+  if (tk.ticks !== 1) {
+    // under warp the body is quasi-static: the springs have settled, the lean is at its equilibrium
+    settleFoot(fb);
+    leanDir(tk.yaw, false, LD);
+    leanTick(fb, F, LD, fb.leanT > 0 || fb.lean > 0 ? footLeanMax(s, layout, c) : LEAN_MAX_STAND, tk.h);
+    return;
+  }
+  AB.x = (v.x - V0.x) / dt; AB.y = (v.y - V0.y) / dt; AB.z = (v.z - V0.z) / dt;
+  if (!s.gripped) { AB.x = AB.y = AB.z = 0; } // floating, the head moves with the body (nothing pushes the hips)
+  stepFoot(fb, AB);
+  fb.phase = s.gripped ? gaitPhase(fb.phase, Math.sqrt(v.x * v.x + v.z * v.z), dt) : fb.phase;
+  leanDir(tk.yaw, false, LD);
+  leanTick(fb, F, LD, fb.leanT > 0 || fb.lean > 0 ? footLeanMax(s, layout, c) : LEAN_MAX_STAND, dt);
+}
+
+/** How far the standing head can lean along the look before its sphere meets something, m (≤ LEAN_MAX_STAND). */
+function footLeanMax(s: CrewState, layout: InteriorLayout, c: Compiled): number {
+  crewEye(s, layout, EVP);
+  return leanClearance(c.b, c.n, EVP, LD, LEAN_MAX_STAND);
 }
 
 /** Jump from the deck (boots gripped), or push off a surface within reach along the look direction. */
@@ -391,7 +521,7 @@ export function pushOffCrew(s: CrewState, layout: InteriorLayout): boolean {
   if (s.seat !== '') return false;
   if (s.gripped) {
     s.vel.y = JUMP_SPEED;
-    s.gripped = false;
+    s.gripped = false; // the legs pull the soles out of the magnets' well (body.ts bootWell: ≈ 2 J)
     s.posture = 'floating';
     return true;
   }
@@ -498,21 +628,96 @@ export const createSeatedBody = (): SeatedBody => createHarnessBody();
 export const saveSeatedBody = (b: SeatedBody): unknown => saveHarnessBody(b);
 export const loadSeatedBody = (data: unknown): SeatedBody => loadHarnessBody(data);
 
-/**
- * Step a seated body (harness / bunk straps / table) by one tick context. W1-C fills (body.ts stepHarnessBody at
- * h = Q, harnessEquilibrium for h > QS_DT; the impulse through shipJumpAt). Stub: nothing moves.
- */
-export function stepSeated(b: SeatedBody, seat: SeatKind, layout: InteriorLayout, m: ShipMotion, tk: BodyTick): void {
-  void b; void seat; void layout; void m; void tk; // W1-C fills
+/** Height of the seated torso's centre below the eye, m (where the seat and harness hold it). */
+export const SEAT_DROP = 0.45;
+
+/** Where the seated body's torso sits (its neutral point), ship-local: below the helm or table eye, at the bunk eye. */
+export function seatPoint(seat: SeatKind, layout: InteriorLayout, out: V3): V3 {
+  const e = seat === 'helm' ? layout.helmEye : seat === 'bunk' ? layout.bunkEye : layout.tableEye;
+  out.x = e.x; out.y = e.y - (seat === 'bunk' ? 0 : SEAT_DROP); out.z = e.z;
+  return out;
+}
+/** The neutral (straight-ahead) eye of a seat. */
+const seatEye = (seat: SeatKind, layout: InteriorLayout): V3 => (seat === 'helm' ? layout.helmEye : seat === 'bunk' ? layout.bunkEye : layout.tableEye);
+
+const SP: V3 = { x: 0, y: 0, z: 0 };
+const SF: V3 = { x: 0, y: 0, z: 0 };
+const SJ: V3 = { x: 0, y: 0, z: 0 };
+const SD: V3 = { x: 0, y: 0, z: 0 };
+const EO: V3 = { x: 0, y: 0, z: 0 };
+const GE: V3 = { x: 0, y: 0, z: 0 };
+const NK: V3 = { x: 0, y: 0, z: 0 };
+// one-entry cache of the seated head's lean clearance (it depends only on the seat, the twist and the layout)
+let clrLayout: InteriorLayout | null = null, clrSeat = '', clrYaw = NaN, clrVal = 0;
+
+function seatLeanMax(layout: InteriorLayout, seat: SeatKind, yaw: number, dir: V3, want: number): number {
+  if (clrLayout === layout && clrSeat === seat && clrYaw === yaw) return clrVal;
+  const c = compile(layout);
+  clrVal = leanClearance(c.b, c.n, seatEye(seat, layout), dir, want);
+  clrLayout = layout; clrSeat = seat; clrYaw = yaw;
+  return clrVal;
 }
 
 /**
- * The eye's displacement by the body, ship axes, m (CrewView.eyeOffset; the session adds it to the eye): seated
- * (`seated` non-null) or on foot (`crew`). W1-C fills (helmEyeOffset / footEyeOffset + neckEyeDelta, clamped so the
- * head sphere never passes through glass). Stub: zero.
+ * Step a seated body (harness / bunk straps / table) by one tick context (SIMULATION.md W1-C 2, 3): the tick's ship
+ * impulse reaches the torso through the seat point (v += −Δv − Δω × r: a latch or a bump throws it into the straps),
+ * then the torso on its unilateral seat / harness springs and the head lag on the torso (body.ts stepHarnessBody: 4
+ * exact sub-steps at h = Q; the closed-form equilibrium for h > QS_DT, so a sleeping body under warp never runs a
+ * spring at 83 ms) under the felt load at the seat (the tick's ledger mean), and the lean the pinch asks for along
+ * the look (harnessed: the torso twists ±40° at most), stopped where the head sphere would meet glass.
+ */
+export function stepSeated(b: SeatedBody, seat: SeatKind, layout: InteriorLayout, m: ShipMotion, tk: BodyTick): void {
+  const def = seat === 'bunk' ? BUNK_DEF : HELM_DEF;
+  seatPoint(seat, layout, SP);
+  const dv = tk.ledger.dv, dw = tk.ledger.dw;
+  if (dv.x !== 0 || dv.y !== 0 || dv.z !== 0 || dw.x !== 0 || dw.y !== 0 || dw.z !== 0) {
+    shipJumpAt(SP, dv, dw, SJ);
+    b.v.x += SJ.x; b.v.y += SJ.y; b.v.z += SJ.z;
+  }
+  feltAt(m, SP.x, SP.y, SP.z, 0, 0, 0, SF);
+  let dir: V3 | null = null, lmax = 0;
+  if (seat !== 'bunk') {
+    leanDir(tk.yaw, seat === 'helm', SD);
+    dir = SD;
+    b.leanT = tk.lean * LEAN_MAX_HELM;
+    lmax = b.leanT > 0 || b.lean > 0 ? seatLeanMax(layout, seat, tk.yaw, SD, LEAN_MAX_HELM) : LEAN_MAX_HELM;
+  } else b.leanT = 0;
+  stepHarnessBody(b, def, SF, dir, lmax, tk.h);
+}
+
+/**
+ * The eye's displacement by the body, ship axes, m (CrewView.eyeOffset; the session adds it to the neutral eye):
+ * seated (`seated` non-null: torso in its harness, head lag, lean; body.ts helmEyeOffset) or on foot (`crew`: knee,
+ * head lag, gait bob, lean; footEyeOffset), plus the turn of the head about its neck pivot (neckEyeDelta: on foot the
+ * body turns with the yaw, so only the pitch moves the eye about the neck). A translation only: the VOR holds the gaze,
+ * the view never tilts. Clamped so the head sphere (r 0.10 m) never passes through glass or a bulkhead.
  */
 export function eyeOffsetOf(crew: CrewState | null, seated: SeatedBody | null, seat: SeatKind | '', layout: InteriorLayout | null, yaw: number, pitch: number, out: V3): V3 {
-  void crew; void seated; void seat; void layout; void yaw; void pitch; // W1-C fills
   out.x = 0; out.y = 0; out.z = 0;
-  return out;
+  if (!layout) return out;
+  const c = compile(layout);
+  if (seated && seat !== '') {
+    const dir = seat === 'bunk' ? null : leanDir(yaw, seat === 'helm', SD);
+    helmEyeOffset(seated, dir, out);
+    if (seat !== 'bunk') {
+      neckEyeDelta(yaw, pitch, NK);
+      out.x += NK.x; out.y += NK.y; out.z += NK.z;
+    }
+    const e = seatEye(seat, layout);
+    EO.x = e.x; EO.y = e.y; EO.z = e.z;
+    return clampEyeOffset(c.b, c.n, EO, out);
+  }
+  if (!crew || crew.seat !== '') return out;
+  const fb = crew.foot;
+  const v = crew.vel, speed = crew.gripped ? Math.sqrt(v.x * v.x + v.z * v.z) : 0;
+  if (fb) {
+    leanDir(yaw, false, SD);
+    footEyeOffset(fb, SD, gaitEye(fb.phase, crew.fn ?? 0, speed, GE), out);
+  }
+  // pitch about the neck, turned with the body's yaw
+  neckEyeDelta(0, pitch, NK);
+  const sy = Math.sin(yaw), cy = Math.cos(yaw);
+  out.x += NK.z * sy; out.y += NK.y; out.z += NK.z * cy;
+  crewEye(crew, layout, EO);
+  return clampEyeOffset(c.b, c.n, EO, out);
 }

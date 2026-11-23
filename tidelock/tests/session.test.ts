@@ -663,36 +663,50 @@ describe('the pilot, hands on the physical controls', () => {
     const s = createSession(FREE);
     strapIn(s);
     tap(s, 'flightAssist');
-    // lever at 20 %: 10 m/s along the nose, drive safe -> RCS does it
-    setLever(s, 0.2);
-    expect(s.player().assistCmd).toBeCloseTo(10, 1);
+    // W1-B hook: 5 m/s, not 10. The Wren's 1.5 t of hydrazine is about 49 m/s of RCS Δv and the blowdown pool pushes at
+    // a third of full thrust when empty; this run (go, a 90° turn whose old velocity the RCS must null, stop, nudge)
+    // at 10 m/s needs ~45 m/s and the stop would crawl. The honest jet authority (0.78 MN·m in yaw, D3) also turns the
+    // ship at about half the old lumped rate, so the pilot leads the stop: lets go when ω²/2α reaches the target.
+    const yawBy = (target: number): number => {
+      const n0 = nose(me(s).q);
+      expect(s.grabDevice(idOf(s, 'rotation'), 3)).toBe(true);
+      s.moveDevice(3, 1, 0);
+      let alpha = 0, w0 = 0;
+      const t = until(s, () => {
+        const w = me(s).w, wl = Math.hypot(w.x, w.y, w.z);
+        alpha = Math.max(alpha, (wl - w0) / 0.1); w0 = wl;
+        return alpha > 0 && angle(nose(me(s).q), n0) + (wl * wl) / (2 * alpha) >= target;
+      }, 120);
+      s.releaseDevice(3);
+      return t;
+    };
+    // lever at 10 %: 5 m/s along the nose, drive safe -> RCS does it
+    setLever(s, 0.1);
+    expect(s.player().assistCmd).toBeCloseTo(5, 1);
     expect(me(s).throttle).toBe(0);
-    const tGo = until(s, () => Math.abs(along(relWheel(s), nose(me(s).q)) - 10) < 0.1, 40);
+    const tGo = until(s, () => Math.abs(along(relWheel(s), nose(me(s).q)) - 5) < 0.1, 40);
     expect(tGo).toBeLessThan(16);
     run(s, 4);
     let n = nose(me(s).q);
-    expect(along(relWheel(s), n)).toBeGreaterThan(9.9);
-    expect(along(relWheel(s), n)).toBeLessThan(10.1);
-    expect(Math.abs(speedRel(s) - 10)).toBeLessThan(0.1);
+    expect(along(relWheel(s), n)).toBeGreaterThan(4.9);
+    expect(along(relWheel(s), n)).toBeLessThan(5.1);
+    expect(Math.abs(speedRel(s) - 5)).toBeLessThan(0.1);
     expect(s.player().assistSpeed).toBeCloseTo(speedRel(s), 6);
     // armed, the main drive takes the forward part: yaw the nose 90 degrees with the rotation controller
     tap(s, 'driveArm');
     const n0 = n;
-    expect(s.grabDevice(idOf(s, 'rotation'), 3)).toBe(true);
-    s.moveDevice(3, 1, 0);
-    const tTurn = until(s, () => angle(nose(me(s).q), n0) >= Math.PI / 2, 120);
-    s.releaseDevice(3);
+    const tTurn = yawBy(Math.PI / 2);
     expect(tTurn).toBeLessThan(120);
     run(s, 40);
     n = nose(me(s).q);
     expect(angle(n, n0)).toBeGreaterThan(1.4);
-    expect(Math.abs(along(relWheel(s), n) - 10)).toBeLessThan(0.15); // the velocity is along the new nose
+    expect(Math.abs(along(relWheel(s), n) - 5)).toBeLessThan(0.15); // the velocity is along the new nose
     expect(angle(relWheel(s), n)).toBeLessThan(0.02);
-    expect(Math.abs(speedRel(s) - 10)).toBeLessThan(0.15);
-    // lever back to zero: the ship comes to rest relative to the station (RCS braking, 1 m/s²)
+    expect(Math.abs(speedRel(s) - 5)).toBeLessThan(0.15);
+    // lever back to zero: the ship comes to rest relative to the station (RCS braking, ≤ 1 m/s² by the pool's pressure)
     setLever(s, 0);
     const tStop = 1.2 + until(s, () => speedRel(s) < 0.1, 60);
-    console.log(`flight assist: 10 m/s forward stopped in ${tStop.toFixed(1)} s after the lever went to zero`);
+    console.log(`flight assist: 5 m/s forward stopped in ${tStop.toFixed(1)} s after the lever went to zero`);
     expect(tStop).toBeLessThan(16);
     run(s, 6);
     expect(speedRel(s)).toBeLessThan(0.06);
@@ -821,8 +835,10 @@ describe('loose objects in the hand', () => {
     const loose0 = { ...prop(a, 'crate-S3').pos };
     a.setControls({ throttle: 1 });
     b.setControls({ throttle: 1 });
-    run(a, 0.25);
-    run(b, 0.25);
+    // W1-B hook: the drive lights after a 0.5 s ignition delay and spools up with τ 0.8 s; 1.25 s of it delivers about the
+    // impulse of the old 0.25 s at full thrust
+    run(a, 1.25);
+    run(b, 1.25);
     const slid = prop(a, 'crate-S3').pos.z - loose0.z;
     const va = a.crew().vel.z, vb = b.crew().vel.z;
     console.log(`full thrust 0.25 s: loose crate slid ${slid.toFixed(3)} m aft; body aft speed ${va.toFixed(3)} m/s holding the strapped crate, ${vb.toFixed(3)} m/s not`);
@@ -838,7 +854,7 @@ describe('loose objects in the hand', () => {
     for (let i = 0; i < 60; i++) { c.propMove(6, flat(-0.3)); c.step(1 / 60); }
     const book0 = { ...prop(c, 'book-lounge').pos };
     c.setControls({ throttle: 1 });
-    for (let i = 0; i < 18; i++) { c.propMove(6, flat(-0.3)); c.step(1 / 60); }
+    for (let i = 0; i < 78; i++) { c.propMove(6, flat(-0.3)); c.step(1 / 60); } // W1-B hook: + the 0.5 s ignition delay and the spool
     const e = c.crew().eye, m = prop(c, 'mug-galley-1');
     expect(m.grabbed).toBe(true);
     expect(Math.hypot(m.pos.x - e.x, m.pos.y - e.y, m.pos.z - e.z)).toBeLessThan(1.1);
@@ -933,7 +949,7 @@ describe('wave-1 contract (W1-A)', () => {
     const f0 = s.flight().specificForce;
     expect(Math.hypot(f0.x, f0.y, f0.z)).toBeLessThan(1e-6);
     s.setControls({ throttle: 1 });
-    run(s, 0.5);
+    run(s, 3.5); // W1-B hook: 0.5 s ignition delay, then the spool (τ 0.8 s): 97.6 % after 3 s lit
     const f = s.flight().specificForce, m = s.player().mass;
     expect(f.z / -(STATS.mainThrust / m)).toBeGreaterThan(0.95);
     expect(f.z / -(STATS.mainThrust / m)).toBeLessThan(1.05);

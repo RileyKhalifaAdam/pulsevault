@@ -537,15 +537,20 @@ export function torqueToCmd(T: JetTable, inp: Float64Array, tau: V3, cmd: Float6
 // =============================================================================================== per step: RCS
 
 /**
- * Duties for a 6-axis command (each −1..1, clamped): duty = Σ_k |cmd_k|·table[k±]. Saturation: when a duty would
- * exceed 1 the whole duty vector is scaled down by its largest duty (not clipped per jet), so the applied force and
- * torque keep the commanded DIRECTION and only lose magnitude. Per-jet clipping (the plan's first wording) turns a
- * saturated three-axis torque command into 11.3 kN of spurious translation (measured in tests/jets.test.ts).
+ * Duties for a 6-axis command (each −1..1, clamped): duty = Σ_k |cmd_k|·table[k±], with ROTATION PRIORITY under
+ * saturation (as a real jet-select does: Shuttle DAP, Apollo CSM). The torque part d_τ is allocated first; if alone it
+ * exceeds a duty of 1 it is scaled down by its largest duty (direction kept, magnitude lost). The translation part
+ * d_F then gets the largest scale s ∈ [0, 1] with d_τ + s·d_F ≤ 1 on every jet, so it keeps its DIRECTION and only
+ * yields magnitude. Without the priority, a full sideways Flight Assist demand halves the hold's braking torque on the
+ * shared X jets and a stick-released turn overshoots by ~100° (measured in the FA 90° test). Per-jet clipping (the
+ * plan's first wording) would turn a saturated three-axis torque command into 11.3 kN of spurious translation
+ * (measured in tests/jets.test.ts).
  */
 export function allocateJets(T: JetTable, cmd: ArrayLike<number>, duty: Float64Array): Float64Array {
   const n = T.n, tab = T.table;
   for (let j = 0; j < n; j++) duty[j] = 0;
-  for (let a = 0; a < N_AXES; a++) {
+  // torque first (axes 3..5)
+  for (let a = 3; a < N_AXES; a++) {
     let c = cmd[a];
     if (c === 0 || c !== c) continue;
     let o = 2 * a * n;
@@ -556,6 +561,29 @@ export function allocateJets(T: JetTable, cmd: ArrayLike<number>, duty: Float64A
   let um = 0;
   for (let j = 0; j < n; j++) if (duty[j] > um) um = duty[j];
   if (um > 1) { const k = 1 / um; for (let j = 0; j < n; j++) duty[j] = duty[j] === um ? 1 : duty[j] * k; }
+  // translation (axes 0..2) into the headroom: s = min over jets of (1 − d_τ)/d_F
+  let c0 = cmd[0], c1 = cmd[1], c2 = cmd[2];
+  if (c0 !== c0) c0 = 0;
+  if (c1 !== c1) c1 = 0;
+  if (c2 !== c2) c2 = 0;
+  if (c0 === 0 && c1 === 0 && c2 === 0) return duty;
+  const o0 = c0 < 0 ? n : 0, o1 = 2 * n + (c1 < 0 ? n : 0), o2 = 4 * n + (c2 < 0 ? n : 0);
+  if (c0 < 0) c0 = -c0;
+  if (c1 < 0) c1 = -c1;
+  if (c2 < 0) c2 = -c2;
+  if (c0 > 1) c0 = 1;
+  if (c1 > 1) c1 = 1;
+  if (c2 > 1) c2 = 1;
+  let s = 1;
+  for (let j = 0; j < n; j++) {
+    const f = c0 * tab[o0 + j] + c1 * tab[o1 + j] + c2 * tab[o2 + j];
+    if (f > 0 && duty[j] + s * f > 1) s = (1 - duty[j]) / f;
+  }
+  if (s < 0) s = 0;
+  for (let j = 0; j < n; j++) {
+    const f = c0 * tab[o0 + j] + c1 * tab[o1 + j] + c2 * tab[o2 + j];
+    if (f > 0) { const u = duty[j] + s * f; duty[j] = u > 1 ? 1 : u; }
+  }
   return duty;
 }
 

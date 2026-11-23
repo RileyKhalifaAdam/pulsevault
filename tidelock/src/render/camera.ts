@@ -499,9 +499,10 @@ export function createCameraRig(): CameraRig {
     }
     if (env.collide && !hide) env.collide(pose.offset);
 
-    // leaning in (pinch) narrows the interior view: frame.camera.zoom scales the picture, 1..3
-    const lean = clamp(typeof req.zoom === 'number' && Number.isFinite(req.zoom) ? req.zoom : 1, 1, 3);
-    const fovWant = mode === 'interior' ? 2 * Math.atan(Math.tan(interiorFov(aspect) / 2) / lean) : clamp(fovForAspect(aspect) * fovScale + fovAdd, 20 * DEG, 85 * DEG);
+    // the interior field of view is the eye's and never changes (SIMULATION.md W1-C 5): a pinch leans the body, and
+    // the eye it moves (CrewView.eyeOffset: torso, harness, head lag, lean, gait — a translation only, the VOR holds
+    // the gaze) is already in req.eye. frame.camera.zoom is ignored here.
+    const fovWant = mode === 'interior' ? interiorFov(aspect) : clamp(fovForAspect(aspect) * fovScale + fovAdd, 20 * DEG, 85 * DEG);
     if (first || fov === 0 || mode === 'interior') fov = fovWant;
     else fov += (fovWant - fov) * (1 - Math.exp(-dt / 0.3));
     pose.fovY = fov;

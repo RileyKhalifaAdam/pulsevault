@@ -5,16 +5,20 @@
 //     of the glass — is the walk stick. The stick appears where the thumb landed. That finger never turns the
 //     head, never zooms and never flicks, even if it wanders out of the zone. One walk finger at a time; a second
 //     touch that begins in the zone does nothing. (A quick still tap there still presses the control under it,
-//     so a buckle or a switch low on the glass is never out of reach.)
+//     so a buckle or a switch low on the glass is never out of reach; a still press of any length there does too,
+//     since a thumb that never moved never walked.)
 //   - HAND: it began on a physical control the pilot can reach (outside the walk zone, or anywhere while
 //     seated). Dragging moves a hand controller, a lever or a rocker; a short tap presses a button, flips a
-//     switch, pages a screen, works the harness buckle. A hand on a control never moves the head.
+//     switch, pages a screen. The harness buckle is pressed like a button (it goes down under the finger) and
+//     latches or releases when the finger lifts after a still press of any length. A hand on a control never moves
+//     the head.
 //     It began on a loose object within arm's reach (the touch ray from the eye meets it before any control):
 //     the hand takes hold of it, dragging carries it (a spring in the world pulls it toward the hand, it is never
 //     set), lifting the finger lets go with the hand's velocity (a throw); a quick still tap on a clipped,
 //     magnetted or strapped object undoes its stowage (and one on a bunk or a bench uses the bunk or bench too).
 //   - HEAD: everything else. One head finger: drag = look, a quick upward flick = jump / push off. Two head
-//     fingers: pinch to lean in (narrow the view); look is suspended while they pinch. A walk or hand finger is
+//     fingers: pinch to lean the body in (spread) or back (pinch): the eye moves with the torso, the field of view
+//     never changes (SIMULATION.md W1-C 5); look is suspended while they pinch. A walk or hand finger is
 //     never half of a pinch. (A bunk or a bench is a place for the body, not a hand control: a touch on one is a
 //     head touch, and a still tap uses it.)
 // Three fingers down together and up again opens the system menu. Any touch wakes a sleeping pilot (and does
@@ -24,6 +28,7 @@ import type { V3 } from '../core/types';
 import type { DeviceDef } from '../data/cockpit';
 import type { Session } from '../game';
 import { interiorFov } from '../render/camera';
+import { pinchLean } from '../world/body';
 
 /** What the scene reports under a finger: the device id (x, y: where on it, unused here). */
 export interface DevicePick { id: string; x: number; y: number }
@@ -44,7 +49,12 @@ export interface PlayInputOptions {
 }
 
 export interface PlayInput {
-  /** Lean-in / narrow-view factor, 1..3 (frame.camera.zoom). */
+  /** The lean the pinch asks the body for, 0 (upright) .. 1 (the posture's limit); Session.setLean. */
+  lean: number;
+  /**
+   * Legacy read-out for the e2e scripts written for the old zoom: 1 + 2·lean (1..3). The view never zooms: the field
+   * of view is fixed and leaning moves the eye. Setting it sets the lean.
+   */
   zoom: number;
   setActive(on: boolean): void;
   update(dt: number): void;
@@ -60,7 +70,7 @@ const WALK_PX = 60;
 /** Walk zone, as fractions of the surface: left edge to X, Y to the bottom edge. Portrait, then landscape. */
 const ZONE_PORTRAIT = { x: 0.5, y: 0.55 };
 const ZONE_LANDSCAPE = { x: 0.4, y: 0.35 };
-/** Head turn per pixel of drag at zoom 1, rad. */
+/** Head turn per pixel of drag, rad. */
 const LOOK_RATE = 0.0042;
 /** A tap: shorter than this and moved less than this. */
 const TAP_MS = 400;
@@ -101,11 +111,17 @@ export function createPlayInput(opts: PlayInputOptions): PlayInput {
   const gestures = new Map<number, Gesture>();
   let active = false;
   let triple = 0;
-  /** The pinch in progress: its two HEAD fingers, their span and the zoom when it began. */
+  /** The pinch in progress: its two HEAD fingers, their span and the lean when it began. */
   let pinchA: Gesture | null = null;
   let pinchB: Gesture | null = null;
   let pinch0 = 0;
-  let zoom0 = 1;
+  let lean0 = 0;
+  let lean = 0;
+  const setLean = (l: number): void => {
+    const a = l > 0 ? (l < 1 ? l : 1) : 0;
+    lean = a;
+    session.setLean(a);
+  };
   const keys = { x: 0, z: 0, on: false };
 
   // the walk stick: a ring and a nub, only while on foot and awake; it rests lower left and jumps under the thumb
@@ -128,7 +144,13 @@ export function createPlayInput(opts: PlayInputOptions): PlayInput {
   };
   ringRest();
 
-  const api: PlayInput = { zoom: 1, setActive, update, dispose };
+  const api: PlayInput = {
+    get lean(): number { return lean; },
+    set lean(l: number) { setLean(Number.isFinite(l) ? l : 0); },
+    get zoom(): number { return 1 + 2 * lean; },
+    set zoom(z: number) { setLean(Number.isFinite(z) ? (z - 1) / 2 : 0); },
+    setActive, update, dispose,
+  };
 
   const defOf = (id: string): DeviceDef | null => session.cockpit()?.devices.find((d) => d.id === id) ?? null;
   const reachable = (id: string): boolean => {
@@ -144,13 +166,13 @@ export function createPlayInput(opts: PlayInputOptions): PlayInput {
   const onFoot = (): boolean => session.mode() === 'onFoot';
   /**
    * The touch ray: ship-local unit direction from the eye through a point of the glass (CSS px), the same first-person
-   * camera the renderer draws (interior field of view narrowed by the lean, head yaw then pitch). Reused object.
+   * camera the renderer draws (the fixed interior field of view, head yaw then pitch). Reused object.
    */
   const RAY: V3 = { x: 0, y: 0, z: -1 };
   const rayAt = (x: number, y: number): V3 => {
     const r = surface.getBoundingClientRect();
     const w = r.width || window.innerWidth, h = r.height || window.innerHeight, aspect = w / Math.max(1, h);
-    const t = Math.tan(interiorFov(aspect) / 2) / api.zoom;
+    const t = Math.tan(interiorFov(aspect) / 2);
     const nx = ((x - r.left) / w) * 2 - 1, ny = 1 - ((y - r.top) / h) * 2;
     const c = session.crew(), cp = Math.cos(c.pitch), sp = Math.sin(c.pitch), cy = Math.cos(c.yaw), sy = Math.sin(c.yaw);
     const dx = nx * t * aspect, dy0 = ny * t;
@@ -188,7 +210,7 @@ export function createPlayInput(opts: PlayInputOptions): PlayInput {
     pinchA = a; pinchB = b;
     a.pinched = b.pinched = true;
     pinch0 = Math.hypot(a.x - b.x, a.y - b.y);
-    zoom0 = api.zoom;
+    lean0 = lean;
   };
 
   /** Take the finger out of play (hand off the control, feet still); it keeps its place but does nothing more. */
@@ -247,7 +269,7 @@ export function createPlayInput(opts: PlayInputOptions): PlayInput {
     if (def && def.kind !== 'rest') {
       const k = def.kind;
       g.def = def;
-      if (k === 'stick2' || k === 'lever' || k === 'rocker' || k === 'button' || k === 'handle') {
+      if (k === 'stick2' || k === 'lever' || k === 'rocker' || k === 'button' || k === 'handle' || k === 'buckle') {
         if (k === 'lever') g.base = leverAt(def.id);
         if (!session.grabDevice(def.id, e.pointerId)) return; // another hand already has it
         g.grab = true;
@@ -295,21 +317,12 @@ export function createPlayInput(opts: PlayInputOptions): PlayInput {
         if (pinchA && pinchB) {
           if (g !== pinchA && g !== pinchB) break;
           const span = Math.hypot(pinchA.x - pinchB.x, pinchA.y - pinchB.y);
-          if (pinch0 > 10 && span > 10) {
-            const z1 = clamp(zoom0 * (span / pinch0), 1, 3);
-            if (z1 !== api.zoom) {
-              // lean toward what is between the fingers: the head turns so that it stays under them
-              const r = surface.getBoundingClientRect();
-              const w = r.width || window.innerWidth, h = r.height || window.innerHeight;
-              const f0 = h / 2 / Math.tan(interiorFov(w / Math.max(1, h)) / 2);
-              const ox = (pinchA.x + pinchB.x) / 2 - r.left - w / 2, oy = (pinchA.y + pinchB.y) / 2 - r.top - h / 2;
-              session.addLook(Math.atan(ox / (f0 * z1)) - Math.atan(ox / (f0 * api.zoom)), Math.atan(oy / (f0 * z1)) - Math.atan(oy / (f0 * api.zoom)));
-              api.zoom = z1;
-            }
-          }
+          // spread = lean in, pinch = sit back: one doubling of the span covers the posture's whole range (a target
+          // for the body's force-limited lean; the head sphere stops at glass, the session clamps the reach)
+          if (pinch0 > 10 && span > 10) setLean(pinchLean(lean0, span / pinch0, 1));
         } else {
           // one head finger: the look follows its own travel since its last event, so nothing jumps after a pinch
-          const k = (LOOK_RATE * sens) / api.zoom;
+          const k = LOOK_RATE * sens;
           const a = -(g.x - px) * k, p = -(g.y - py) * k;
           g.ay += a; g.ap += p;
           session.addLook(a, p);
@@ -339,13 +352,17 @@ export function createPlayInput(opts: PlayInputOptions): PlayInput {
           session.propRelease(e.pointerId, tapped);
           if (tapped && g.def) session.tapDevice(g.def.id);
         }
-        else if (g.grab) session.releaseDevice(e.pointerId);
-        else if (tapped && g.def) session.tapDevice(g.def.id);
+        else if (g.grab) {
+          session.releaseDevice(e.pointerId);
+          // the buckle latches or lets go when the finger comes off it after a still press, however long it was held
+          if (g.def && g.def.kind === 'buckle' && !cancelled && g.moved <= TAP_PX) session.tapDevice(g.def.id);
+        } else if (tapped && g.def) session.tapDevice(g.def.id);
         break;
       case 'walk':
         session.setWalk({ moveX: 0, moveZ: 0 });
         ringRest();
-        if (tapped && g.def) session.tapDevice(g.def.id); // a still tap low on the glass still presses what is there
+        // a still press low on the glass still presses what is there (a thumb that never moved never walked)
+        if (!cancelled && g.moved <= TAP_PX && g.def) session.tapDevice(g.def.id);
         break;
       case 'head': {
         if (g === pinchA || g === pinchB) stopPinch(); // the finger that stays goes back to looking, from where it is
@@ -379,7 +396,7 @@ export function createPlayInput(opts: PlayInputOptions): PlayInput {
   const onWheel = (e: WheelEvent): void => {
     if (!active) return;
     e.preventDefault();
-    api.zoom = clamp(api.zoom * Math.exp(-e.deltaY * 0.0015), 1, 3);
+    setLean(lean - e.deltaY * 0.0015); // a mouse wheel leans like a pinch (desktop testing)
   };
   // a keyboard, when there is one (desktop testing): WASD / arrows walk, space jumps, Escape opens the menu
   const KEY: Record<string, [number, number]> = { KeyW: [0, 1], ArrowUp: [0, 1], KeyS: [0, -1], ArrowDown: [0, -1], KeyA: [-1, 0], ArrowLeft: [-1, 0], KeyD: [1, 0], ArrowRight: [1, 0] };
