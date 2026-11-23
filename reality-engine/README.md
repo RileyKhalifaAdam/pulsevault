@@ -7,5 +7,4 @@ Saved mid-session so nothing is lost. No engine code exists yet.
 - `raw-results.json` — the same material as structured data.
 - `workflow-script.js` — the script that produced it.
 
-Still to do: the final synthesized plan (one recommended architecture and roadmap), and one review
-(physics lens on the layered-multiscale design) that had not finished when this was saved.
+Still to do: the final synthesized plan (one recommended architecture and roadmap). All six reviews are now included.
