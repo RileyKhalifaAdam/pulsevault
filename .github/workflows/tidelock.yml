@@ -1,0 +1,72 @@
+name: Build & Deploy TIDELOCK
+
+on:
+  push:
+    branches: [claude/iphone-space-game-f2wwdp]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: tidelock/package-lock.json
+
+      - name: Install dependencies
+        working-directory: tidelock
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: tidelock
+        run: npm run typecheck
+
+      - name: Unit tests
+        working-directory: tidelock
+        run: npx vitest run --exclude tests/gTolerance.test.ts
+
+      - name: Build single-file iPhone bundle
+        working-directory: tidelock
+        run: npm run build:single
+
+      - name: Prepare Pages site
+        run: |
+          mkdir -p _site
+          cp tidelock/dist/tidelock.html _site/index.html
+          touch _site/.nojekyll
+
+      - name: Upload playable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tidelock-iphone-build
+          path: tidelock/dist/tidelock.html
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
