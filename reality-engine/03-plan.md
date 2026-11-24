@@ -112,14 +112,17 @@ The test suite is written before each feature, and each phase ends with a 20-min
 
 ## Decisions that are yours
 
-1. **3D or 2D.** 3D at workshop scale is assumed. 2D carries about 6-7 times more bodies in the same budget.
+1. **3D.** Decided: the engine is 3D. The 2D option is dropped.
 2. **What to build first.** Machines, robots and vehicles (assumed, and the order above), or liquids, sand and destruction first (phases 3-4 move ahead of 2).
 3. **Where it lives.** A new public repository is recommended; GitHub Pages on a free account needs a public repo, and it keeps PulseVault untouched. This session cannot create repositories, so you would create it. The alternative is a subfolder of this repo.
 4. **Apple Developer Program.** Only needed for phase 5, so it can wait.
 5. **Device lab.** Your phone must run iOS 26 or later, and each phase needs you to run a soak test and paste back a block of text.
 
+Decided since this plan was written: the engine is 3D; it must scale to a whole solar system or more;
+and multiplayer is required. This document predates the last two and is being rewritten around them.
+
 Defaults chosen unless you say otherwise: strict mode on; when the phone runs hot, drop to 30 frames per
-second before reducing matter; no multiplayer requirement.
+second before reducing matter.
 
 ## Caveats on the evidence
 
