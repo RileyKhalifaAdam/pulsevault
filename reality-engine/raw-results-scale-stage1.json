@@ -1,0 +1,1043 @@
+{
+ "research:dynamics": {
+  "area": "Numerics of gravity, orbits, frames and time from tabletop to solar system and beyond (integrators, precision, non-inertial frames, time warp, planet-scale environment models, Newtonian limits, open ephemeris data, and a 0.5 ms A16 budget)",
+  "summary": "A solar system fits the phone easily; the hard parts are precision, frames and time warp, not force count. No A16 measurement of any of this exists, so every phone figure below is scaled from desktop measurements.\n\nDefensible budget for 0.5 ms of one A16 performance core per 60 Hz frame (ESTIMATE, assuming an A16 P-core is 1-2x the single-thread speed of the desktop CPUs measured):\n- **Sun + 8 planets, Wisdom-Holman at a 5-day step:** about 300-600 steps per frame, so time warp up to about 8e9x (roughly 250-500 simulated years per wall second), with relative energy error bounded near 1e-8 and no secular drift.\n- **34 bodies (Sun, planets, major moons, dwarf planets), Principia-class 12th-order at a 10-minute step:** about 16 force evaluations per frame, so warp up to about 6e5x, with errors of metres per year against its own model.\n- **On-rails Kepler bodies:** at least 2,500 per frame at any warp factor, exact for two bodies.\n- **Direct-sum leapfrog:** about 300-450 mutually gravitating bodies at one force evaluation per frame.\n- **At 1x to 1e4x warp:** the 34-body system costs under 10 microseconds per frame amortised.\n\nOther points the architects need:\n- Float32 is unusable beyond a few km (0.5 m steps at Earth radius, 16 km at 1 AU). Float64 covers a star system (31 micrometres at 1 AU, 1 mm at 30 AU) but not a galaxy (33 km at 26,000 ly). The A16 GPU is fp32-only.\n- The workshop design therefore has to live in a local, co-moving, re-based frame inside a float64 hierarchical frame tree.\n- Plain leapfrog is wrong for planetary orbits: about 155,000 km of along-track error per year at 100 steps per orbit.\n- Newtonian scope can be declared with numbers: Mercury 42.98 arcsec per century, 499 s light-time per AU, speeds below 0.01c.\n\nNetwork limits: the fetch tool could not resolve any host, so pages were pulled with curl. arxiv.org, en.wikipedia.org and raw.githubusercontent.com were opened; JPL, NASA, Epic, the KSP wiki, readthedocs and NVIDIA were blocked, and those items are marked unverified. Pure arithmetic I ran this session is tagged DERIVED and marked verified only where its inputs are definitional or came from opened sources. I wrote helper scripts and downloads to the session scratchpad only; no project files were touched.",
+  "findings": [
+   {
+    "claim": "MEASURED: REBOUND WHFast integrates the Sun + 8 planets for 5 Gyr at a 5-day step in 6.82 days on one Xeon Gold 6148 core (WHFast512/AVX-512: 1.40 days; MERCURY: 46.5 days). DERIVED: 3.65e11 steps, so 1.61 microseconds per step (0.20 per planet), 0.33 for AVX-512 and 11 for MERCURY.",
+    "source": "https://arxiv.org/abs/2307.05683 (PDF opened; Table 1 and section 4)",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "Principia's real-solar-system configuration integrates 34 massive bodies with a 12th-order Quinlan-Tremaine symmetric linear multistep method at a fixed 10-minute step (vessel histories: 8th order at 10 s; predictions: adaptive RKN at 1 mm and 1 mm/s tolerance). Its FAQ puts one force evaluation of all massive bodies plus one vessel at 30 microseconds (MEASURED by the authors, CPU unstated); DERIVED ceiling 600 s / 30 us = 2e7x real time on a full core, consistent with their 'very smooth at 6,000,000x with no vessels'.",
+    "source": "https://raw.githubusercontent.com/mockingbirdnest/Principia/master/astronomy/sol_numerics_blueprint.proto.txt ; .../astronomy/sol_gravity_model.proto.txt ; https://raw.githubusercontent.com/wiki/mockingbirdnest/Principia/Installing,-reporting-bugs,-and-frequently-asked-questions.md (all opened)",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "ESTIMATE for 0.5 ms of one A16 P-core per frame (A16 taken as 1-2x the desktop cores above; unmeasured): 310-620 WHFast steps of Sun + 8 planets, i.e. warp of 8e9x to 1.6e10x at a 5-day step; or about 16 force evaluations of the 34-body system, i.e. warp of about 6e5x (range 3e5x to 1.2e6x) at a 10-minute step. Direct-sum leapfrog at an ESTIMATED 5-10 ns per pair gives 50,000-100,000 pair interactions, i.e. about 320-450 mutually gravitating bodies at one evaluation per frame.",
+    "source": "DERIVED this session from the two measured anchors above; A16-versus-desktop ratio and ns-per-pair are estimates (Geekbench figures in 01-research.md are themselves unverified)",
+    "verified": false,
+    "confidence": "medium"
+   },
+   {
+    "claim": "Wisdom-Holman energy error is bounded and scales as O(mass-ratio x dt^2); WHFast removes the linear secular drift, leaving only a random walk from round-off (Brouwer's law). MEASURED: outer Solar System at a 1.5-day step holds about 1e-14 relative energy error with symplectic correctors and about 1e-10.5 without; Mercury needs more than 20 steps per 88-day orbit (dt about 4 days); a 5-day step kept the median relative energy error below 1e-8 over 40 Gyr.",
+    "source": "https://arxiv.org/abs/1506.01084 (PDF opened, sections 4.2-4.4) ; https://arxiv.org/abs/2307.05683 (section 5)",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "IAS15 is a 15th-order adaptive Gauss-Radau integrator that holds machine precision (about 1e-16) over 1e9 orbits at about 100 steps per orbit and handles close encounters and velocity-dependent forces. DERIVED cost: 7 substages x about 2 predictor-corrector iterations = about 14 force evaluations per step, about 1,400 per orbit; a 10x larger step raises the error by 1e15, so it suits a reference oracle, not a real-time integrator.",
+    "source": "https://arxiv.org/abs/1409.4779 (PDF opened) ; https://raw.githubusercontent.com/hannorein/rebound/4.4.1/docs/integrators.md (opened)",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "Close encounters are handled by hybrid schemes: MERCURIUS and TRACE run Wisdom-Holman normally and switch to IAS15 or Bulirsch-Stoer inside a critical radius (documentation example: 4 Hill radii). MEASURED: TRACE matches MERCURIUS accuracy with a 12x speed-up for planet-planet encounters and is 15x to 41x faster than IAS15 in scattering and lunar-accretion tests.",
+    "source": "https://arxiv.org/abs/2405.03800 ; https://arxiv.org/abs/1903.04972 ; REBOUND 4.4.1 docs/integrators.md (all opened)",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "DERIVED: plain leapfrog/Verlet on a circular orbit has relative frequency error (omega*dt)^2/24 although its energy error stays bounded. For Earth's orbit that is about 155,000 km of along-track error per year at 100 steps per orbit, 1,546 km at 1,000 steps and 5.6 m at 60-second steps. Leapfrog is second-order, symplectic, time-reversible and stable only for dt < 2/omega.",
+    "source": "Derivation this session from the Verlet relation 4*sin^2(theta/2) = (omega*dt)^2; order and stability limit from https://en.wikipedia.org/wiki/Leapfrog_integration (opened)",
+    "verified": false,
+    "confidence": "high"
+   },
+   {
+    "claim": "DERIVED position step (ULP) for float32 / float64: Earth radius 0.5 m / 0.93 nm; Moon distance 32 m / 60 nm; 1 AU 16.4 km / 31 micrometres; 30 AU 524 km / 0.98 mm; 1 light-year 1.07e9 m / 2 m; 26,000 ly 1.76e13 m (118 AU) / 32.8 km; 100,000 ly 7.0e13 m / 131 km. Velocity step: float32 is 0.49 mm/s at 7.67 km/s (LEO) and 1.95 mm/s at 29.78 km/s; float64 is 9e-13 and 3.6e-12 m/s.",
+    "source": "Direct IEEE-754 computation this session (python struct and math.ulp); float32 step sizes cross-checked against the table in https://raw.githubusercontent.com/godotengine/godot-docs/master/tutorials/physics/large_world_coordinates.rst (opened)",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "Godot's documentation recommends single precision only out to 4-8 km for first- and third-person 3D games (steps of 0.2-0.5 mm) and 64 km for any 3D game. Beyond that it offers an all-double build with a stated performance and memory penalty that 'may not perform well on low-end mobile devices', emulates doubles in shaders with pairs of floats, and names origin shifting as the low-end alternative.",
+    "source": "https://raw.githubusercontent.com/godotengine/godot-docs/master/tutorials/physics/large_world_coordinates.rst (opened)",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "Unreal Engine 5 Large World Coordinates moved world positions to doubles with a default world limit of 88 million km (0.59 AU); DERIVED float64 step there is 15 micrometres, so one UE5 frame does not span a solar system. KSP's API documents a FloatingOrigin class and a Krakensbane class 'used to overcome the floating point precision errors' by re-basing position and velocity around the active vessel; the specific thresholds I recall (6 km, 750 m/s) could not be confirmed.",
+    "source": "Search excerpts only; could not open https://dev.epicgames.com/documentation/en-us/unreal-engine/large-world-coordinates-in-unreal-engine-5 or https://www.kerbalspaceprogram.com/ksp/api/class_krakensbane.html (hosts blocked)",
+    "verified": false,
+    "confidence": "medium"
+   },
+   {
+    "claim": "Stock KSP uses patched conics with planets on fixed rails and no n-body gravity. To replace that, Principia had to alter the stock Jool moon system (unstable under n-body: orbits enlarged, Bop made retrograde), use a different integrator (Blanes-Moan) for that system, add double-double summation, and add geopotentials (Earth to degree 10, Moon to degree and order 30). It rejected Kepler rails for planets because solving Kepler's equation costs more than the N^2 forces at about 20 bodies, and rejected multithreading for a 30-microsecond task.",
+    "source": "https://en.wikipedia.org/wiki/Kerbal_Space_Program ; Principia FAQ and Change-Log wiki pages via raw.githubusercontent.com/wiki/mockingbirdnest/Principia/ (all opened)",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "The IAS15 paper states that floating point destroys Galilean invariance: translating a Solar System held in AU units by 1e16 loses all relative-position information, and force accuracy can be no better than relative-position accuracy. This is the primary-source argument for storing each body relative to its parent (hierarchical frames) and never in one global frame.",
+    "source": "https://arxiv.org/abs/1409.4779 (PDF opened, section 3)",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "DERIVED integer ranges: int64 at 1 mm resolution spans +/-9.22e15 m (61,650 AU, 0.975 ly), enough for a star system out to the Oort cloud; int64 at 1 micrometre spans only +/-61.6 AU; int128 at 1 micrometre spans +/-1.8e16 ly. A galaxy therefore needs either 128-bit positions or a two-level address (star-system index plus an int64 or float64 offset).",
+    "source": "Integer-range arithmetic computed this session (definitional inputs)",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "Surface gravity derived, not asserted: GM/R^2 = 9.820 m/s^2 at Earth's mean radius; centrifugal omega^2*R = 0.0339 m/s^2 at the equator (DERIVED); MEASURED sea-level g is 9.780 at the equator and 9.832 at the poles. The MEASURED vertical gradient is 0.3086 mGal/m (3.086e-6 per s^2), so uniform g across a 10 m workshop is wrong by about 3 ppm, while Coriolis 2*omega*v = 1.46e-3 m/s^2 at 10 m/s (1.5e-4 g) is the largest term neglected at workshop scale.",
+    "source": "https://en.wikipedia.org/wiki/Gravity_of_Earth ; https://en.wikipedia.org/wiki/Free-air_gravity_anomaly (opened); derived values computed this session",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "DERIVED tidal gradient at 400 km altitude: n^2 = 1.28e-6 per s^2; in the orbiting frame a vehicle is stretched radially by 3n^2 = 3.85e-6 m/s^2 per metre (0.39 micro-g per metre) and compressed by n^2 across the orbit plane. Gravity-gradient torque is 3n^2 * r x (I r), at most 1.5 n^2 * (Imax - Imin): 0.016 N*m for a 1-tonne, 10 m rod, with a libration period of orbit period / sqrt(3) = 53 min.",
+    "source": "memory (standard astrodynamics formulas); numbers computed this session from GM = 3.986e14 m^3/s^2",
+    "verified": false,
+    "confidence": "high"
+   },
+   {
+    "claim": "Earth's J2 is 1.0826e-3 and drives node regression of -1.5*J2*(R/p)^2*n*cos(i): -3.68 degrees/day for an 800 km, 56-degree orbit (source example). DERIVED: -5.0 degrees/day for the ISS, about 590 km/day of cross-track error if J2 is omitted; the perturbing acceleration is about 1.5*J2*g = 0.016 m/s^2 at the surface. Principia found Mars's C22/S22 terms necessary for Phobos.",
+    "source": "https://en.wikipedia.org/wiki/Nodal_precession ; https://en.wikipedia.org/wiki/Geopotential_spherical_harmonic_model ; Principia Change-Log (all opened)",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "A two-body orbit can be advanced exactly over any time span by a universal-variable Kepler solve (one equation covering elliptic, parabolic and hyperbolic cases via Stumpff functions). WHFast512 uses a fixed 2 Halley + 2 Newton iterations with truncated series to reach 1e-13 relative error, with no library trig calls. DERIVED: at most 0.2 microseconds per body, so at least 2,500 on-rails bodies per 0.5 ms regardless of warp factor.",
+    "source": "https://en.wikipedia.org/wiki/Universal_variable_formulation ; https://arxiv.org/abs/2307.05683 Appendix A (opened); per-body bound derived from the measured 1.61 us step for 8 planets",
+    "verified": true,
+    "confidence": "medium"
+   },
+   {
+    "claim": "Time-warp precedent: stock KSP's maximum warp is 100,000x. Principia keeps full n-body integration under warp and reports it smooth at 100,000x with 20 vessels, 'janky but usable' at 1,000,000x and smooth at 6,000,000x with no vessels (desktop); its eclipse predictions lose 'a few minutes of accuracy after a century or so'.",
+    "source": "Principia FAQ and Change-Log wiki pages via raw.githubusercontent.com (opened)",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "State that can be advanced analytically without breaking conservation: two-body orbits; torque-free rigid rotation (closed form in Jacobi elliptic functions, conserving angular momentum and kinetic energy); lumped thermal relaxation (exponential for linear exchange, closed form for pure radiation); constant-load battery discharge. KSP freezes vessels under on-rails warp into Kepler points with no forces, torques or part physics. Contact, atmospheric flight and close encounters cannot be put on rails.",
+    "source": "memory (KSP on-rails behaviour and the closed-form solutions); conservation properties of torque-free rotation checked at https://en.wikipedia.org/wiki/Poinsot%27s_ellipsoid",
+    "verified": false,
+    "confidence": "medium"
+   },
+   {
+    "claim": "Hierarchical (block) timesteps place bodies on power-of-two rungs dt_n = dt_0/2^n and let them change rung only at synchronisation points. Variable steps break the symplectic property of leapfrog, but time-symmetric variants recover good long-term energy behaviour; the 4th-order Hermite scheme is the standard for collisional n-body work.",
+    "source": "https://arxiv.org/abs/1105.1082 (Dehnen & Read review, PDF opened, section 2.3)",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "Barnes-Hut trees give O(N log N) but do not pay at solar-system counts: for N = 100 at opening angle 1 the tree needs 902 cell-particle plus 306 particle-particle interactions against 4,950 direct pairs, about 4x fewer at reduced accuracy. Few-body steps cost microseconds, so the WHFast512 authors and Principia both conclude that parallelising them across threads is counter-productive.",
+    "source": "https://arxiv.org/abs/1105.1082 (Fig. 5) ; https://arxiv.org/abs/2307.05683 (introduction) ; Principia FAQ ; https://raw.githubusercontent.com/hannorein/rebound/main/docs/gravity.md (all opened)",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "No published n-body throughput for any mobile or integrated GPU was found. The only anchor is GPU Gems 3: about 1e10 pair interactions per second on a GeForce 8800 GTX at N = 16,384 (38 steps/s). ESTIMATE for the fp32-only A16 GPU from its 1.7 TFLOPS theoretical figure: 5e9 to 1.2e10 interactions/s sustained, i.e. about 2,000-3,500 all-pairs bodies per 1 ms, usable only in a local frame because float32 has 16 km steps at 1 AU.",
+    "source": "Search excerpt of https://developer.nvidia.com/gpugems/GPUGems3/gpugems3_ch31.html (host blocked); A16 GPU figures from 01-research.md (unverified there)",
+    "verified": false,
+    "confidence": "low"
+   },
+   {
+    "claim": "Hydrostatic atmosphere: the barometric formula's scale height R*T/(M*g) is about 8.4 km in the troposphere (DERIVED 8.43 km at 288.15 K). The U.S. Standard Atmosphere 1976 starts at 101,325 Pa and 288.15 K with a -6.5 K/km lapse rate and is tabulated in 7 layers to 86 km; measured density falls by a factor of 9,600 by 70 km (mean scale height 7.64 km).",
+    "source": "https://en.wikipedia.org/wiki/Barometric_formula ; https://en.wikipedia.org/wiki/U.S._Standard_Atmosphere ; https://en.wikipedia.org/wiki/Scale_height (opened)",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "Re-entry heating correlation: Sutton-Graves stagnation heat flux q = k*sqrt(rho/Rn)*v^3 with k = 1.7415e-4 kg^0.5/m for Earth air. On the Hayabusa2 capsule it gave a 9.0 MW/m^2 peak, 15-18% below the Detra-Kemp-Riddell correlation, so it is an empirical law good to roughly +/-20%. DERIVED example: 7.8 km/s, rho 3.1e-4 kg/m^3, 1 m nose radius gives 1.46 MW/m^2 and a 2,340 K radiative-equilibrium wall at emissivity 0.85.",
+    "source": "https://arxiv.org/abs/2611.16291 (PDF opened, Appendix I)",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "Stellar flux: the solar constant is MEASURED at 1.361 kW/m^2 at 1 AU (0.1% higher at solar maximum). DERIVED by inverse square: 9,088 W/m^2 at Mercury, 586 at Mars, 50.3 at Jupiter, 1.51 at Neptune. DERIVED radiative-equilibrium temperature of Earth at Bond albedo 0.3 is 254-255 K, about 33 K below the observed mean surface temperature (288 K, from memory), which is the error of a no-greenhouse model.",
+    "source": "https://en.wikipedia.org/wiki/Solar_constant ; https://en.wikipedia.org/wiki/Planetary_equilibrium_temperature (opened); derived values computed this session",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "Tides and limits: lunar tidal acceleration at Earth's surface is 1.1e-7 g and solar 0.52e-7 g. The fluid Roche limit is 2.44*R*(rho_primary/rho_satellite)^(1/3) (rigid-body coefficient 1.26, from memory); DERIVED for Earth-Moon: 18,370 km fluid, 9,480 km rigid. Sphere of influence is a*(m/M)^(2/5): 0.929 million km for Earth.",
+    "source": "https://en.wikipedia.org/wiki/Tidal_force ; https://en.wikipedia.org/wiki/Roche_limit ; https://en.wikipedia.org/wiki/Sphere_of_influence_(astrodynamics) (opened)",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "What Newton gets wrong: general relativity adds 42.980 arcsec/century to Mercury's perihelion out of 574.10 observed (DERIVED: 23 km per orbit, about 9,600 km per century at perihelion). GPS clocks gain 38.6 microseconds/day (DERIVED 11.6 km/day of range). DERIVED light-time is 499.0 s per AU (Earth moves 14,860 km meanwhile) and 4.16 h at 30 AU; gamma-1 is 3.3e-10 in LEO, 4.9e-9 at Earth's orbital speed, 5e-5 at 0.01c and 0.5% at 0.1c.",
+    "source": "https://en.wikipedia.org/wiki/Tests_of_general_relativity ; https://en.wikipedia.org/wiki/Error_analysis_for_the_Global_Positioning_System ; https://en.wikipedia.org/wiki/Astronomical_unit (opened); derived values computed this session",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "The Solar System is chaotic with a Lyapunov time of 2-230 million years depending on the study. A 15 m error in Earth's position makes its position unpredictable over about 100 Myr (Laskar), and a 0.38 mm error in Mercury's position makes its eccentricity unpredictable after about 200 Myr (Brown & Rein). At the highest warp factors only bit-exact replay, not positional accuracy, can be guaranteed.",
+    "source": "https://en.wikipedia.org/wiki/Stability_of_the_Solar_System (opened)",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "Open data: JPL DE440 is 114 MB (years 1550-2650), de440s 32 MB (1849-2150), de421 17 MB (1900-2050) and DE441 3.1 GB (-13200 to 17191), stored as Chebyshev coefficients in 32-day segments, with inner-planet orbits known to sub-kilometre accuracy. VSOP87 analytic series are good to 1 arcsec (DERIVED 725 km at 1 AU) over 4,000 years. Principia seeds from JPL Horizons state vectors (1950-01-01) and integrates itself. NASA policy: material is 'not protected by copyright unless noted'; JPL/Caltech-specific terms and the NASA fact sheets could not be opened.",
+    "source": "https://raw.githubusercontent.com/skyfielders/python-skyfield/master/documentation/planets.rst ; https://en.wikipedia.org/wiki/Jet_Propulsion_Laboratory_Development_Ephemeris ; https://en.wikipedia.org/wiki/VSOP_model ; https://en.wikipedia.org/wiki/Template:PD-USGov-NASA (opened); ssd.jpl.nasa.gov and nssdc.gsfc.nasa.gov blocked",
+    "verified": true,
+    "confidence": "medium"
+   }
+  ],
+  "implications": [
+   "Add a celestial tier above the mechanism tier: CPU, float64, single-threaded, with every body stored relative to its parent in a frame tree (galaxy, star system, planet, moon, local workshop). The existing workshop design becomes the leaf frame and never sees absolute coordinates.",
+   "The mechanism and matter tiers must run in a local frame that is re-based in both position and velocity (floating origin plus velocity re-basing). Float32 is acceptable only within about 4-8 km of the local origin; the fp32-only GPU can receive gravity only as a uniform vector plus an optional 3x3 tidal-gradient matrix computed on the CPU in float64.",
+   "Uniform g stops being a constant and becomes a derived, declared approximation: g_eff = GM/R^2 minus the centrifugal term, with Coriolis, Euler and tidal terms reported as neglected or enabled. Their sizes are known (Coriolis 1.5e-4 g at 10 m/s, gradient 3 ppm per 10 m, lunar tide 1.1e-7 g), so the Reality Report can list them, and fictitious-force work needs its own ledger account distinct from numerical loss.",
+   "Give each gravitating body one of three declared propagation modes: on-rails Kepler (exact two-body, cost independent of warp), symplectic n-body (Wisdom-Holman or a high-order multistep; bounded energy error, cost linear in warp), and a high-order adaptive reference (IAS15 class) used for close encounters and as the test oracle.",
+   "Do not use plain leapfrog for planetary or moon orbits: its along-track error is about 155,000 km per year at 100 steps per orbit. Use Kepler-splitting or rails there and keep leapfrog-type stepping for the local 480 Hz physics.",
+   "Time warp should be a ladder with a declared fidelity at each rung: full physics at low warp; mechanisms frozen into rigid composites with point-mass orbit and analytic attitude at medium warp; 34-body n-body up to about 6e5x; planets-only Wisdom-Holman up to about 8e9x; pure rails beyond. The gravity budget is 3% of one core, so the thermal governor is unaffected.",
+   "Bit-exact replay extends to the celestial tier only if the Kepler solver avoids library sin/cos/pow and uses fixed iteration counts with its own series (as WHFast512 does), and fused multiply-add contraction is pinned identically on phone, browser and build server.",
+   "Tree codes, GPU n-body and multithreading are unnecessary for a solar system (up to about 400 direct-sum bodies fit the budget). Rings, asteroid belts and debris should be massless on-rails particles, optionally evaluated on the GPU from orbital elements relative to their parent.",
+   "Planet-scale environment should be analytic fields evaluated on demand, each registered as a declared model with a stated error: layered hydrostatic atmosphere, inverse-square stellar flux, radiative equilibrium (no greenhouse: -33 K for Earth), Sutton-Graves heating (about +/-20%), J2-only gravity (omitting it costs about 590 km/day cross-track in low Earth orbit).",
+   "The charter's out-of-scope list can gain numeric entries: relativity (Mercury 43 arcsec/century; valid for speeds below 0.01c and GM/(r c^2) below 1e-8), finite light-time (499 s per AU), and long-term predictability beyond about 10 Myr.",
+   "Ship only initial state vectors and GM values for about 34 bodies (a few kB) and integrate on device; keep the 32 MB de440s file off the device as a CI oracle for tests such as position error against DE440 after 1, 10 and 100 years.",
+   "'Or even more' means more hierarchy levels, not a bigger solver: int64 millimetres covers one star system to 0.97 ly, a galaxy needs a star index plus offset or 128-bit positions, stars stay on rails, and only one star system needs to be awake for n-body at a time (the same sleeping idea the plan already uses)."
+  ],
+  "open_questions": [
+   "What do a Wisdom-Holman step, a pair interaction and a Kepler solve actually cost in float64 on an A16 P-core, natively and in Safari WebAssembly (including 2-wide f64 SIMD)? Every phone figure here is scaled from Xeon and unspecified desktop measurements; the Phase 0a probe should add these three micro-benchmarks.",
+   "Does a float64 Kepler solver and n-body step replay bit-exactly across Safari WebAssembly, native arm64 and the x86 build server once fused multiply-add and transcendental functions are controlled?",
+   "How large are the energy and momentum ledger discontinuities at hand-offs (rails to n-body, n-body to local rigid-body frame, sphere-of-influence or frame-tree boundaries, inertial to rotating surface frame at 465 m/s), and what tolerance is acceptable?",
+   "What are the rules for freezing a live mechanism or matter region into a rigid composite for warp and thawing it again without violating the ledger (stored elastic energy, sloshing liquid, spinning parts, hot parts)?",
+   "Which step size and integrator keep the chosen body set (including fast moons such as Phobos at 7.65 h and Io at 1.77 days) within a stated error against DE440 over 1-100 years, and is that body set stable over game timescales under our integrator?",
+   "Should Coriolis and tidal-gradient terms be on by default in the workshop frame? The solver cost is negligible, but it needs validation tests (Foucault pendulum, free-fall deflection, gravity-gradient libration at 53 min).",
+   "How should vessels be integrated at high warp within budget: fixed 10 s steps cost about 167 steps per vessel per frame at 1e5x, so an adaptive or Kepler-plus-perturbation (Encke-type) scheme needs prototyping and an accuracy test.",
+   "Can correlation-level entry heating and drag be coupled to the mechanism and matter tiers in a way that passes a published case (for example the Hayabusa2 capsule's 9-12 MW/m^2 peak), given that the matter tier cannot resolve hypersonic flow?",
+   "If debris or ring swarms are wanted, what all-pairs or on-rails particle throughput does the A16 GPU actually sustain? No published mobile figure exists."
+  ]
+ },
+ "research:worlds": {
+  "area": "Multi-scale representation, level of detail, persistence and precedent: how an engine that can afford litres of detailed matter can contain a planet, solar system or galaxy",
+  "summary": "Every shipped precedent and the numerical literature point to the same architecture: a tree of reference frames (galaxy integer grid or fixed point, star-system f64, body-fixed f64, small f32 region co-moving with the player), closed-form or pre-integrated motion for everything unobserved, a deterministic generator plus a journal of deltas for content, and conservative hand-offs between levels. The existing workshop design becomes the innermost region; what must be added is an orbital/aggregate tier, a frame tree, a generator-plus-journal world store and a hand-off contract that restricts to the same conserved quantities at every level. The documented failures in shipped games are almost all at hand-offs (orbit shifts when entering time warp, docking that does not conserve momentum, mined mass restored on reload, terrain edits silently reverting), which is exactly where a first-principles engine has to be stricter than its precedents.\n\nEvidence quality: en.wikipedia.org, arxiv.org and www.gdcvault.com were NOT reachable from this session (DNS failure), nor were developer blogs, university or journalism sites. Only raw.githubusercontent.com fetches succeeded, so verified=true items are source code and documentation hosted on GitHub (KSP API docs, KSPCommunityFixes, Principia, Space Engineers source, Luanti, godot_voxel, AMReX, Orbiter, REBOUND, Jolt, Godot, big_space, Celestia, BurnMan PREM table, MDN). All statements about Outer Wilds, Star Citizen, KSP2, Noita, Universe Sandbox, Elite, No Man's Sky, SpaceEngine, Dual Universe, Children of a Dead Earth, Carlson-Hodgins and Chenney rest on search-result excerpts and are marked verified=false. No measurement exists for generation or streaming cost on an iPhone 15; those are open questions.\n\nOut of reach on a phone (declare, do not fake): particle-resolution matter beyond the awake region (Earth is 3.6e22 times the 30 L budget, DERIVED); global oceans, atmospheres, weather and climate as fluid dynamics; planetary collisions and hypervelocity impacts (closing speeds above material sound speed break the rigid/incompressible assumptions); continuous simulation of unobserved regions; exact retroactive evaluation of chaotic unobserved matter (piles, splashes); mutual N-body dynamics of a galaxy or feedback of vessels on planets; time warp with workshop-tier matter awake; two full-budget detail regions at once under about 4 W; storing rather than generating a galaxy (4e11 systems at 1 byte each is 400 GB, DERIVED); relativity and light-time; first-principles formation of star systems at run time.",
+  "findings": [
+   {
+    "claim": "DERIVED (IEEE-754 spacing 2^(floor(log2 x)-23) for f32, -52 for f64; computed this session): f32 resolves 6.25 cm at 600 km, 0.5 m at Earth's radius and 16.4 km at 1 AU; f64 resolves 0.93 nm at Earth's radius, 30 micrometres at 1 AU, about 1 mm at 30 AU, 2 m at 1 light-year and 65 km at 5e20 m. MEASURED (Godot docs table): f32 step is about 0.03 mm at 256-512 m, 0.5 mm at 4-8 km, 3.9 mm at 32-65 km.",
+    "source": "https://raw.githubusercontent.com/godotengine/godot-docs/master/tutorials/physics/large_world_coordinates.rst (table) plus own derivation",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "MEASURED (docs): the Rust crate big_space uses nestable integer grids (i8 to i128) with an f32 transform relative to each cell centre, giving 0.5 mm worst-case precision; an i64 grid spans 19.5 million light-years, children of a grid inherit a planet's motion in high precision, and it claims 'absolute coordinates without drift, unlike camera-relative or periodic recentering'. Celestia's UniversalCoord is a fixed-point (R128) type for 'millimeters to thousands of light years'.",
+    "source": "https://raw.githubusercontent.com/aevyrie/big_space/main/README.md ; https://raw.githubusercontent.com/aevyrie/big_space/main/src/lib.rs ; https://raw.githubusercontent.com/CelestiaProject/Celestia/master/src/celengine/univcoord.h",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "MEASURED (KSP API docs): vessels are loaded only within about 2.5 km of the active vessel and are packed/unpacked at about 300 m; 'CelestialBodies and on-rails Vessels follow their Orbits exactly'; a vessel goes on rails when it exits loading distance or enters time warp; the Krakensbane velocity frame engages at about 750 m/s; on-rails warp rates were 1 to 100,000x (v0.18.2).",
+    "source": "https://raw.githubusercontent.com/Anatid/XML-Documentation-for-the-KSP-API/master/Assembly-CSharp.xml",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "MEASURED (community bug-fix list for KSP 1.12): shipped hand-off defects include the active vessel's orbit 'moving randomly when engaging timewarp' under CPU load, docking ports that did not conserve momentum (fix: average the acquire force between the two ports), asteroid mass 'restored to 100% when reloading after having mined it down to 0%', and unrecoverable part position drift on robotics and docking ports.",
+    "source": "https://raw.githubusercontent.com/KSPModdingLibs/KSPCommunityFixes/master/README.md",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "MEASURED (Principia docs): stock KSP keeps a vessel 'within the sphere of influence of a single celestial' (two-body conics); under true N-body gravity the stock Jool moon system is unstable and Principia makes Bop retrograde to fix it. Principia integrates the solar system ahead of time, lets only celestials exert gravity (vessels are test particles), and reports time warp smooth at 100,000x and at 6,000,000x with no vessels, with slowdown caused by vessel count and trajectory prediction.",
+    "source": "https://raw.githubusercontent.com/mockingbirdnest/Principia/master/README.md ; https://raw.githubusercontent.com/wiki/mockingbirdnest/Principia/Installing,-reporting-bugs,-and-frequently-asked-questions.md ; https://raw.githubusercontent.com/wiki/mockingbirdnest/Principia/Concepts.md",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "MEASURED (Space Engineers source): physics is split into clusters with IdealClusterSize 20,000 m, a 2,000 m minimum distance from the border and a split threshold of 40,000 m; a cluster is created around each non-static object, overlapping clusters are unioned and re-split along the longest axis, and an object's offset is its cluster's AABB centre. DERIVED from the Godot table: a 10 km half-size gives about 1 mm worst-case f32 resolution.",
+    "source": "https://raw.githubusercontent.com/KeenSoftwareHouse/SpaceEngineers/master/Sources/VRage.Math/Spatial/MyClusterTree.cs",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "MEASURED (source and docs): Space Engineers stores voxels in an octree whose leaves are either read-only procedural 'provider' leaves (only the cell key is saved) or 16x16x16-voxel micro-octree leaves materialised on first write; the save holds the serialized generator plus edited leaves. godot_voxel states 'By default, only modified blocks are saved'.",
+    "source": "https://raw.githubusercontent.com/KeenSoftwareHouse/SpaceEngineers/master/Sources/Sandbox.Game/Engine/Voxels/Storage/MyOctreeStorage.cs ; https://raw.githubusercontent.com/Zylann/godot_voxel/master/doc/source/streams.md",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "MEASURED (Luanti docs): the world is stored as 16x16x16-node map blocks (u16+u8+u8 per node, so 16,384 bytes raw per block, DERIVED) compressed whole with zstd and stamped with a u32 last-saved time; only blocks near players are active, and unattended areas are caught up lazily: ABM catch_up (default true) raises the trigger chance on return, LBMs receive dtime_s (seconds since the block was last active) and node timers receive total elapsed time.",
+    "source": "https://raw.githubusercontent.com/luanti-org/luanti/master/doc/world_format.md ; https://raw.githubusercontent.com/luanti-org/luanti/master/doc/lua_api.md",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "MEASURED (AMReX docs): at a coarse-fine interface 'the area-weighted fluxes from the fine grid advance do not in general match the underlying flux from the coarse grid face', so conservation is restored by a reflux correction applied to the adjacent coarse cells; fine levels are subcycled ('advanced r times using a coarse grid time step reduced by a factor of r'), and covered coarse cells are overwritten with the average of the fine cells.",
+    "source": "https://raw.githubusercontent.com/AMReX-Codes/amrex/development/Docs/sphinx_documentation/source/AmrCore.rst",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "DERIVED (Koenig's theorem): replacing N bodies by one rigid aggregate with the same mass, linear momentum, angular momentum and inertia tensor always removes the kinetic energy of internal relative motion, dE = sum of 0.5*m_i*|v_i - v_cm - w x r_i|^2 >= 0. A conservative demotion must therefore book dE into an internal-energy account, and promotion cannot recover the micro-state unless a seed or record is stored.",
+    "source": "own derivation from classical mechanics (no external source opened)",
+    "verified": false,
+    "confidence": "high"
+   },
+   {
+    "claim": "DERIVED (GM_Earth 3.986e14 m^3/s^2, r = 6,771 km): a 400 km orbit has v = 7.67 km/s, n = 1.133e-3 rad/s and a 92.4 min period; in the co-orbiting frame tidal acceleration is 3n^2x = 5.8e-5 m/s^2 at 15 m and Coriolis is 2.3e-3 m/s^2 per m/s. An f32 velocity near 7.7 km/s has a 4.9e-4 m/s step, 2.4% of the 0.0204 m/s that 1 g adds per 480 Hz substep, versus 6.1e-5 m/s below 1 km/s.",
+    "source": "own derivation computed this session (constants from memory); consistent with KSP's 750 m/s Krakensbane threshold in the KSP API docs",
+    "verified": false,
+    "confidence": "high"
+   },
+   {
+    "claim": "DERIVED: an Earth-to-Mars Hohmann transfer takes 259 days (half the period of an a = 1.262 AU ellipse), which is 224 s at KSP's 100,000x warp; a fixed 480 Hz solver cannot be warped, so all awake matter must be demotable to closed-form state first. At 10 km/s closing speed bodies move 20.8 m per 480 Hz substep and 167 m per 60 Hz frame.",
+    "source": "own derivation; warp rates from https://raw.githubusercontent.com/Anatid/XML-Documentation-for-the-KSP-API/master/Assembly-CSharp.xml",
+    "verified": false,
+    "confidence": "high"
+   },
+   {
+    "claim": "MEASURED (Orbiter source defaults): the open-source Orbiter simulator enables Encke orbit stabilisation by default (perturbation limit 0.05, step limit 0.01) and selects the integrator by step size, RK2/RK4/RK6/RK8 at time-step targets of 0.1, 2, 20 and 200-500 s; nonspherical gravity and gravity-gradient torque exist but default to off.",
+    "source": "https://raw.githubusercontent.com/orbitersim/orbiter/main/Src/Orbiter/Config.cpp ; https://raw.githubusercontent.com/orbitersim/orbiter/main/README.md",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "MEASURED (README): the research N-body code REBOUND ships symplectic integrators (WHFast, LEAPFROG, SABA), a 'high accuracy non-symplectic integrator with adaptive time-stepping' (IAS15), hybrid integrators that switch method for close encounters (MERCURIUS, TRACE) and a Simulationarchive 'for exact reproducibility of N-body simulations'.",
+    "source": "https://raw.githubusercontent.com/hannorein/rebound/main/README.md",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "MEASURED (PREM table shipped with BurnMan): Earth's whole radial structure is 94 rows; density is 13,088 kg/m^3 and pressure 363.85 GPa at the centre, density jumps from 5,566 to 9,903 kg/m^3 at the core-mantle boundary (r = 3,480 km) and is 2,600 kg/m^3 at the surface. DERIVED: a uniform-density Earth gives P_c = 3GM^2/(8*pi*R^4) = 172 GPa, 2.1 times too low, so a layered compressible model is required.",
+    "source": "https://raw.githubusercontent.com/geodynamics/burnman/main/burnman/data/input_seismic/prem.txt",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "MEASURED (MDN): WebKit lets one origin store 'up to around 60% of total disk' in browser apps and Home Screen web apps (80% across origins); Safari deletes script-written data after seven days of browser use without interaction; writes beyond quota fail with QuotaExceededError; OPFS falls under the same quota, offers in-place writes, and its synchronous handles work only in Web Workers. DERIVED: 60% of a 128 GB phone (capacity from memory) is 76.8 GB at most, in practice bounded by free space.",
+    "source": "https://raw.githubusercontent.com/mdn/content/main/files/en-us/web/api/storage_api/storage_quotas_and_eviction_criteria/index.md ; https://raw.githubusercontent.com/mdn/content/main/files/en-us/web/api/file_system_api/origin_private_file_system/index.md",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "MEASURED (docs): Jolt Physics says f32 is 'accurate enough' if 'all simulation takes place within roughly 5 km from the origin', its double-precision mode runs '5-10% slower' and cross-platform determinism costs about 8%; Godot recommends f32 limits of 4,096 m (first person) to 8,192 m (third person) and warns double precision 'may perform poorly on low-end mobile devices' while shaders stay single precision.",
+    "source": "https://raw.githubusercontent.com/jrouwe/JoltPhysics/master/Docs/Architecture.md ; https://raw.githubusercontent.com/godotengine/godot-docs/master/tutorials/physics/large_world_coordinates.rst",
+    "verified": true,
+    "confidence": "high"
+   },
+   {
+    "claim": "DERIVED: Earth's volume is 1.08e24 L, 3.6e22 times a 30 L detailed budget; its surface at 5 cm cells is 2.0e17 cells for one layer; a galaxy of 4e11 systems at 1 byte each is 400 GB, more than the phone's total storage. An i64 tick counter at 480 Hz spans 6.1e8 years, while f64 seconds degrade to 0.48 microseconds at 100 years and 4 s at 1e9 years.",
+    "source": "own derivation computed this session (Earth radius 6,371 km; galaxy count from the Elite Dangerous search excerpt)",
+    "verified": false,
+    "confidence": "high"
+   },
+   {
+    "claim": "MEASURED by the cited paper, seen only as search excerpts: Chen and Kipping (2017) fit radius to mass as R ~ M^0.28 below about 2.0 Earth masses, M^0.59 up to about 130 Earth masses, M^-0.04 for Jovian worlds and M^0.88 for stars. DERIVED: surface gravity then scales as M^0.44 for rocky planets.",
+    "source": "https://arxiv.org/abs/1603.08614 (not reachable; search excerpt only)",
+    "verified": false,
+    "confidence": "medium"
+   },
+   {
+    "claim": "DERIVED (textbook formulas, constants from memory): from mass, radius, temperature, composition and orbit alone, Earth's atmospheric scale height H = kT/(mu*m_u*g) comes out at 8.4 km, its equilibrium temperature T_sun*sqrt(R_sun/2a)*(1-A)^0.25 at 254 K, its sphere of influence at 925,000 km and its Hill radius at 1.50e6 km.",
+    "source": "own derivation computed this session (memory for constants)",
+    "verified": false,
+    "confidence": "high"
+   },
+   {
+    "claim": "Search excerpts only: Elite Dangerous models about 400 billion systems, generated by 'Stellar Forge' in the client from a seeded generator so the same coordinates give the same result, with real catalogue stars (Hipparcos, Gliese) where data exist; Frontier says each system 'is formed from first principles' but no reachable source documents the physics. The open StarGen lineage (Dole, Fogg 1985, Burdick 1988) is likewise seeded and reproducible.",
+    "source": "https://80.lv/articles/generating-the-universe-in-elite-dangerous/ and https://eldacur.com/~brons/NerdCorner/StarGen/StarGen.html (neither reachable; search excerpts)",
+    "verified": false,
+    "confidence": "medium"
+   },
+   {
+    "claim": "Search excerpts only: Star Citizen moved physics and positioning to 64-bit world coordinates while rendering stays 32-bit, and its zone system gives each ship interior its own physics grid so the ship moves as one master item ('You just update the master, not the children').",
+    "source": "https://gamersnexus.net/gg/2622-star-citizen-sean-tracy-64bit-engine-tech-edge-blending and https://gamersnexus.net/gg/2119-chris-roberts-star-citizen-network-and-render-pipelines (not reachable; search excerpts)",
+    "verified": false,
+    "confidence": "medium"
+   },
+   {
+    "claim": "Search excerpts only: KSP2's physics engineer wrote that on Kerbin (600,000 m radius) f32 positions are accurate to about 10 cm (DERIVED here: 6.25 cm), so KSP2 combined a floating origin with hierarchical positioning (a tree of offsets relative to nearby objects) and targeted collisions at 10 km/s or more; the creative director said applying N-body physics made the system 'fire moons at planets'.",
+    "source": "https://kerbalspaceprogram.com/news/dev-diaries-developer-insights-10-collisions and https://www.pcgamesn.com/kerbal-space-program-2/n-body-physics (not reachable; search excerpts)",
+    "verified": false,
+    "confidence": "medium"
+   },
+   {
+    "claim": "Search excerpts only: Outer Wilds runs its whole solar system as a continuous Unity physics simulation ('things are changing and happening whether you're there or not') but at miniature scale, with planets tens of kilometres apart and orbiting 'way faster because everything is smaller-scale'; community sources (not developers) say it keeps the player at the origin.",
+    "source": "https://www.vice.com/en/article/how-outer-wilds-developers-mobius-digital-made-space-physics-fun and https://www.pcgamer.com/how-to-build-a-black-hole/ (not reachable; search excerpts)",
+    "verified": false,
+    "confidence": "low"
+   },
+   {
+    "claim": "Search excerpts only: Noita divides its simulated world into 64x64-cell chunks, each with a dirty rectangle so only changed cells update, and (secondary source) streams 512x512 world chunks, saving old ones to disk and keeping about 12 alive.",
+    "source": "https://80.lv/articles/noita-a-game-based-on-falling-sand-simulation/ and GDC 2019 talk https://gdcvault.com/play/1025695/Exploring-the-Tech-and-Design (not reachable; search excerpts)",
+    "verified": false,
+    "confidence": "medium"
+   },
+   {
+    "claim": "Search excerpts only: Universe Sandbox integrates gravity as an N-body problem in small steps and automatically limits how fast simulated time may run 'while still maintaining relatively accurate orbits'; its planet surfaces are coarse 'Surface Grids' in which water volume moves cell to cell each step.",
+    "source": "https://universesandbox.com/faq and https://universesandbox.com/blog/?p=1704 (not reachable; search excerpts)",
+    "verified": false,
+    "confidence": "medium"
+   },
+   {
+    "claim": "Search excerpts only (player reports, not Hello Games): No Man's Sky caps stored terrain edits per save at roughly 20,000-30,000, and beyond the cap the oldest edits revert so dug terrain reappears.",
+    "source": "https://steamcommunity.com/app/275850/discussions/0/3092275748074322669 and https://gamepretty.com/no-mans-sky-how-to-clear-all-terrain-edits-using-the-save-editor/ (not opened; search excerpts)",
+    "verified": false,
+    "confidence": "low"
+   },
+   {
+    "claim": "Search excerpts only: Carlson and Hodgins (Graphics Interface 1997, pp. 1-8) simulated less important creatures with cheaper models (fewer degrees of freedom, hybrid kinematic/dynamic, or purely kinematic) and switched between levels, with the acceptance test that the outcome of the game is essentially unchanged and the viewer's perception of motion is the same.",
+    "source": "https://graphicsinterface.org/proceedings/gi1997/gi1997-1 (not reachable; search excerpt)",
+    "verified": false,
+    "confidence": "medium"
+   },
+   {
+    "claim": "Search excerpts only: Chenney and Forsyth (SI3D 1997, pp. 55-58) named the consistency problem of simulation culling (what state a culled system should be in when the view returns); re-simulating the whole unseen interval causes lag, so later work (Chenney, Arikan, Forsyth, Eurographics 2001) replaces out-of-view dynamics with cheaper discrete-event proxy models.",
+    "source": "https://www.cs.princeton.edu/courses/archive/spr01/cs598b/papers/chenney97.pdf and https://pages.cs.wisc.edu/~schenney/research/culling/index.html (not reachable; search excerpts)",
+    "verified": false,
+    "confidence": "medium"
+   },
+   {
+    "claim": "Search excerpts only, weak: Space Engineers' 2014 'super-large worlds' update is reported to have raised the safe world radius from about 10 km (f32 Havok) to about 1e9 km using cluster-relative coordinates; SpaceEngine ships over 130,000 catalogued real objects and generates the rest; Dual Universe advertises 25 cm voxels on procedurally generated planets; Children of a Dead Earth advertises an N-body simulator at 1:1 solar-system scale.",
+    "source": "https://blog.marekrosa.org/2014/12/space-engineers-super-large-worlds_17/ ; https://spaceengine.org ; https://www.mobygames.com/game/139593 (none reachable; search excerpts)",
+    "verified": false,
+    "confidence": "low"
+   }
+  ],
+  "implications": [
+   "Frame tree instead of one world space: galaxy level as integer grid or fixed point; each star system in barycentric f64 metres (about 1 mm resolution out to 30 AU, DERIVED); each body in a body-fixed f64 frame; each awake region in a local f32 frame. A single f64 frame must not span more than one star system (2 m resolution at 1 light-year, DERIVED). No absolute position is ever stored in f32.",
+   "Keep an awake region small: within about 500 m of its origin f32 resolves about 0.03 mm (MEASURED, Godot table), which suits a 480 Hz mechanism solver; treat a few kilometres as the hard cap (Jolt's 5 km guidance, Space Engineers' 10 km cluster half-size gives about 1 mm).",
+   "The region frame is itself a physical object with f64 position and velocity (and rotation on a planet surface). The solvers see only velocities relative to it (KSP re-bases velocity at about 750 m/s), and the frame's tidal, Coriolis and centrifugal terms are applied as explicit body forces and entered in the ledger. This is how a vehicle interior or a region at orbital speed stays inside the existing workshop tiers.",
+   "Add an orbital/aggregate tier beneath the mechanism tier: a whole vehicle or settled body is one record (mass by material, centre of mass, momentum, angular momentum, inertia tensor, internal energy, inventory) propagated in closed form or with a symplectic/high-order integrator. Massive bodies follow a deterministic ephemeris computed as a function of time (analytic or integrated ahead of time, as Principia does); vessels are test particles under summed gravity. Both are declared approximations on the fidelity ladder.",
+   "Prefer summed gravity from an ephemeris over patched-conic sphere-of-influence switching: it removes a discontinuous hand-off, costs little (ESTIMATE: 30 bodies x 1,000 vessels x 60 Hz = 1.8 million force evaluations per second) and supports time warp because ephemeris state is a pure function of time.",
+   "One hand-off contract for every level: each representation must restrict to the same conserved record (mass per material, linear and angular momentum, kinetic and internal energy, volume), and promotion must satisfy restrict(promote(c)) == c bit-exactly on the CPU. Kinetic energy lost when coarsening is booked to internal energy in a new ledger account (it is always >= 0, DERIVED), never dropped.",
+   "Hand off only at quiescent states (asleep, in equilibrium, no contact with still-awake matter) and use hysteresis between promote and demote radii, as KSP does with separate load/unload and pack/unpack distances. Where a boundary must cut live matter, treat it like an AMR coarse-fine interface and account for the flux mismatch explicitly.",
+   "World = versioned deterministic generator (CPU, bit-exact, seeded) + journal of deltas. Store only what the player changed (edited voxel leaves, moved bodies, inventories); compact old deltas into coarser conservative summaries instead of evicting them. Silent reversion (No Man's Sky reports) or reset on reload (KSP asteroid mass bug) would break the mass ledger and must be impossible by construction; on quota exhaustion, refuse or coarsen and report it.",
+   "No background simulation of unobserved regions. Classify every process as (a) closed form in elapsed time (orbits, conduction toward equilibrium, battery self-discharge), evaluated lazily from a stored tick as Luanti does with dtime_s; (b) relaxing to an equilibrium that needs no history (liquid to hydrostatic level), jumped to with the dissipated energy booked as heat; or (c) chaotic and history-dependent, frozen and declared as such.",
+   "Time warp is legal only when no workshop-tier matter is awake; requesting warp demotes everything through the conservative hand-off first, and the warp factor is part of the replay log. Use integer ticks (i64 at 480 Hz spans 6.1e8 years, DERIVED) rather than f64 seconds as the master clock.",
+   "The thermal budget is global, not per region: two vehicles far apart share the same roughly 4 W envelope from the existing plan, so the governor's 'amount of awake matter' becomes an allocation across regions, with non-controlled regions pushed to the aggregate tier first.",
+   "Planets are data derived from laws: a radial table from integrating hydrostatic equilibrium with material equations of state (Earth's reference model is 94 rows, well under 10 kB), giving g(r), P(r), density and moment of inertia; terrain and regolith as layered columns of database materials sampled deterministically on demand; atmosphere from scale height. Each generated parameter is labelled catalogue (measured), derived from law, or sampled from a distribution (artistic or statistical).",
+   "Region merge and docking: before contact, move both regions into one frame at their common centre of mass (Space Engineers unions overlapping clusters and re-splits), and test momentum conservation across docking in CI because the reference game shipped without it. Swept collision tests are needed whenever relative motion exceeds a cell per substep (20.8 m per substep at 10 km/s, DERIVED); impacts faster than the material sound speed need a separate declared coarse model.",
+   "Storage design for iOS: append-only journal in OPFS through a synchronous access handle in a worker, navigator.storage.persist() requested, tab-kill-safe, with periodic compaction; assume Safari may evict after seven days without interaction when not installed to the Home Screen, and treat QuotaExceededError as a normal, reported state.",
+   "The lesson from Outer Wilds versus KSP: simulating a whole system continuously works only at miniature scale; at real scale every precedent uses rails plus a small physics region plus time warp. The engine should say which of the two a game has chosen rather than promise both."
+  ],
+  "open_questions": [
+   "What does deterministic generation cost on an iPhone 15 in single-threaded WebAssembly (for example one 32^3 block of layered terrain materials from a seed), and therefore how fast can the awake region move over a surface inside a 1-2 ms per-frame budget? No measurement was found; any figure today is an ESTIMATE.",
+   "How large are the conservation errors and visible pops on a demote-then-promote round trip of a pile, a liquid volume and a jointed machine, and how much kinetic energy lands in the 'unresolved to internal' account each time?",
+   "Does a Home Screen web app on iOS 26 actually get multi-gigabyte OPFS writes and a granted persist(), and what is the sustained write throughput of a synchronous access handle in a worker? The 60% figure is a documented ceiling, not a measurement on this phone.",
+   "How fast does the delta journal grow in real play (bytes per minute of digging, building and moving objects), and what compaction ratio do conservative summaries achieve?",
+   "Can the mechanism tier at 480 Hz in f32 resolve the fictitious forces of its own frame (Earth-surface Coriolis is about 1.5e-4 m/s^2 per m/s, orbital tidal terms about 6e-5 m/s^2 at 15 m, DERIVED), or do they vanish in rounding and need accumulation in f64?",
+   "Is a bit-exact generator achievable across the phone, the browser and the build server when it needs square roots, logarithms and trigonometry in f64, or must it be written in integer or fixed-point arithmetic with its own math library?",
+   "How should the thermal budget be split when two regions are awake at once, and what is the smallest useful region (bodies and particles) that still feels alive?",
+   "Which ephemeris form is best on the phone: analytic Kepler elements, or a pre-integrated N-body table (size, accuracy over decades, evaluation cost), and do players need effects only N-body gives, such as Lagrange points?",
+   "What happens during atmospheric entry or a landing approach, when the region moves about 128 m per frame at orbital speed (DERIVED from 7.67 km/s at 60 Hz) and terrain must be generated ahead of it?",
+   "Can a second WebAssembly thread be used for background generation on the chosen host (cross-origin isolation was flagged as unavailable on GitHub Pages in the earlier research), or must generation be time-sliced on the physics thread?",
+   "The developer accounts for Outer Wilds, Star Citizen, KSP2, Noita, Universe Sandbox, Elite Dangerous and the Carlson-Hodgins and Chenney papers could not be opened in this session; their details (chunk sizes, zone mechanics, switching criteria, reported speedups) should be re-checked against the primary sources before any design decision leans on them."
+  ]
+ },
+ "redteam:physics": {
+  "lens": "Physics, first-principles integrity and completeness of 03-plan.md, on its own terms and as the innermost region of a solar-system-scale engine",
+  "verdict": "The synthesized plan does fix the solver-level fatal flaws of the candidates (pairwise velocity-level impulses plus reduced-coordinate articulations at one global 480 steps per second; softened FEM and the single energy-minimising solver removed; probe first; mechanisms first). But it is a summary that keeps the names of the honesty machinery while dropping about 55 concrete review fixes, and three fatal-class physics defects survive in weaker form: break/yield loads that the rigid tier does not determine, explicit softening of granular and soft matter, and an unspecified lagged CPU-GPU coupling. Its charter is also internally inconsistent (uniform gravity is unlisted hard-coded physics; 'one sanctioned departure' is at least three; the governor changes outcomes; switching was 'dropped' yet melting and breaking need it). Against the new requirement the decisive problem is that Layer 1, declared permanent, describes a closed, flat, airless, single-frame, constant-g, one-clock world: it has no reference frames, no field laws, no open ledgered boundary and no hand-off contract, so it cannot be embedded in a larger engine without changing the permanent layer. No code exists, so all of this is cheap to correct now; none of it requires abandoning the laws-and-materials-over-replaceable-solvers idea. All numbers below are tagged; I re-derived them in a scratch calculation and fetched Box2D defaults and three constants from source, but did not re-verify the research's device figures.",
+  "issues": [
+   {
+    "id": "P01",
+    "area": "scale",
+    "severity": "fatal",
+    "issue": "Layer 1, declared permanent, has no reference-frame concept: state is implicitly absolute position and velocity from one origin in one inertial frame, at a precision the plan never states. That cannot be embedded on a rotating planet, in orbit, or anywhere far from the origin, and every solver kernel will be written against it.",
+    "evidence": "DERIVED: the per-substep gravity increment is g*dt^2 = 9.81/480^2 = 42.6 um, while f32 spacing 2^(e-23) is 61 um from 512 m, 0.5 m at Earth's radius (MEASURED 6371 km, Wikipedia 'Earth radius') and 16.4 km at 1 AU (MEASURED 149,597,870,700 m, Wikipedia); even f64 at 1 AU is 2^(37-52) = 30.5 um, above the 17 um static contact sag the STRATA physics review derived. DERIVED: low-orbit speed sqrt(GM/r) = sqrt(3.986e14/6.771e6) = 7.67 km/s is 16 m per substep. MEASURED: the Box2D lineage rescales any body faster than 400 m/s by default (box2d src/types.c maximumLinearSpeed and src/solver.c, fetched 2026-11-24).",
+    "fix": "Make the frame a first-class Layer 1 object before Phase 0b: every simulated region owns a frame (f64 or fixed-point origin, velocity, angular velocity, parent) and all solver state is frame-local deltas, with integer tick time. Add translation, rotation and Galilean-boost invariance gates plus a far-from-origin resting test to the Phase 0b suite."
+   },
+   {
+    "id": "P02",
+    "area": "scale",
+    "severity": "fatal",
+    "issue": "The plan models a closed world: it deleted representation switching, forbids creating matter or setting velocities, and describes everything outside the awake set only as 'sleeping or simplified matter'. The innermost region of a larger engine must continuously import and export bodies and matter across its boundary, which is exactly the creation, teleport and hand-off the plan has no conserving contract for.",
+    "evidence": "Plan lines 45-46, 72 and 110. The STRATA physics review's fix for 'bodies leaving the awake bubble have no stated representation, so their momentum can simply vanish' and for the particle-window flux boundary was not carried over. Without it the ladder's 'exact by construction: mass, momentum' holds only while nothing crosses the region edge.",
+    "fix": "Add to Layer 1 a boundary port with per-step flux accounts for mass, linear momentum, angular momentum and total energy, and a hand-off contract: aggregate mass, centre of mass, inertia tensor, momenta and energy must match across a representation change to a stated tolerance, with the residual booked. Reserve worst-case promotion cost at admission, and treat engine-internal hand-offs as an audited class separate from game escape hatches."
+   },
+   {
+    "id": "P03",
+    "area": "foundations",
+    "severity": "major",
+    "issue": "Charter rule 1 claims conservation laws are the only hard-coded physics, yet uniform constant gravity is a hard-coded force law the charter never names, and the ledger's potential energy is implicitly m*g*h in one frame. There is no place for a gravitational field, fictitious-force work, frame-transfer terms or radiative flux.",
+    "evidence": "DERIVED: g scales as (R/(R+h))^2, so -3.1% at 100 km and -11.5% at 400 km, and its direction tilts L/R = 1.6e-4 rad per km; Earth-surface Coriolis 2*7.292e-5*v is 1.5e-3 m/s^2 at 10 m/s, but in a 100 m radius habitat spun to 1 g (omega = sqrt(9.81/100) = 0.313 rad/s) it is 0.63 m/s^2 per m/s, 6.4% of g. DERIVED: Earth's orbital kinetic energy 0.5*5.97e24*29780^2 = 2.6e33 J (mass and speed from memory) has f64 spacing 2^59 = 5.8e17 J, so one global ledger cannot hold a planet and a robot.",
+    "fix": "Add a 'fields and interactions' class to the charter: Newtonian gravitation is the law, uniform g is its declared local approximation with the error reported per region. Define the ledger per frame with explicit gravitational-potential, fictitious-force, frame-transfer and radiative terms, and make ledgers hierarchical so each closes at its own magnitude."
+   },
+   {
+    "id": "P04",
+    "area": "mechanism",
+    "severity": "major",
+    "issue": "Bend, yield and break are decided from joint and contact loads that the rigid tier does not determine physically, and quasi-static linear modal elasticity can neither vibrate nor buckle. Phase 2's gates (vibration frequency and buckling load within 3-5%, 'a bridge fails where the analysis says') cannot pass as designed for redundant structures, impacts or slender members; this is STRATA physics fatal flaw 2, inherited.",
+    "evidence": "DERIVED: at a 120 Hz contact clamp peak impact force is m*v*omega = 754 N per kg*m/s, while Hertz for a 1 kg steel sphere (R = 31 mm, E* = 110 GPa) at 1 m/s gives F = k*d^1.5 = 16.7 kN with k = (4/3)*E*sqrt(R) and d = (5*m*v^2/(4k))^0.4 = 75 um, a 22x gap. The STRATA physics review's numerical check (its DERIVED figures) gave tip-deflection errors of 23/13/7% for 4/8/16 free-free modes loaded through a weld, showed redundant load sharing follows soft-constraint compliance and sweep order, and that members with slenderness above 199 buckle below the 0.2-yield screen.",
+    "fix": "Solve each bonded or jointed assembly as an elastic network with real stiffness ratios (direct factorisation per island), bake Craig-Bampton attachment modes and geometric-stiffness buckling factors, and use impulse or energy criteria for impact damage. Make modes below the resolvable frequency dynamic state (DERIVED: a 1 m x 1 cm steel cantilever's first mode is 0.56*5048*0.00289/1^2 = 8.2 Hz), and gate with a redundant truss against the stiffness method through the runtime weld port."
+   },
+   {
+    "id": "P05",
+    "area": "matter",
+    "severity": "major",
+    "issue": "Two-way coupling between the bit-exact CPU tier and the f32 GPU tier is one sentence with no scheme. A lagged partitioned exchange is where momentum stops being 'exact by construction' and where floating bodies go unstable, so Phase 3's boat gate either fails or is passed by an undeclared stabiliser.",
+    "evidence": "DERIVED: a hull with 5 cm draft heaves at T = 2*pi*sqrt(0.05/9.81) = 0.45 s (omega = 14 rad/s); a lag tau on the restoring force gives negative damping omega*tau/2 = 12% at one frame and 23-35% at the 2-3 frame readback delay two reviews assumed (ESTIMATE, unmeasured on iOS). Three reviews cite the added-mass instability of loosely coupled incompressible schemes when added mass exceeds body mass (from memory, unverified); a floating body displaces its own mass, so every boat sits near that limit.",
+    "fix": "Put rigid-body degrees of freedom inside the pressure projection (or integrate coupled bodies' free motion on the GPU), use a fixed N-tick delay line, and record the quantised wrench stream as a replay input. Gate with a bobbing float at density ratios 0.1-0.5, heave period and decay, and a 60 s at-rest drift test; measure readback latency in Phase 0a."
+   },
+   {
+    "id": "P06",
+    "area": "matter",
+    "severity": "major",
+    "issue": "The 'one sanctioned departure' (rigid solids, incompressible liquids) does not cover sand, mud or soft solids, which the matter tier still promises. Explicit elasticity at 2-8 substeps forces their moduli down by orders of magnitude, the reviews' softening-admissibility rule was dropped rather than met, and materials between gel and rigid (rubber, foam) have no honest representation in either tier.",
+    "evidence": "DERIVED: c_max = dx*60*n at CFL 1, so at dx 2 cm and n = 2/4/8 the cap is 2.4/4.8/9.6 m/s, a modulus rho*c^2 of 5.8/23/92 kPa at 1000 kg/m^3. DERIVED: tyre rubber at 5 MPa and 1100 kg/m^3 (review's figures, ESTIMATE) has c = 67 m/s, 56 substeps per frame; 'a few litres of sand' (3 L, a 14.4 cm cube) strains g*h/c^2 = 6.1% at its base at 4 substeps and 2 cm cells, or 24.5% at 1 cm cells. Column collapse and angle of repose depend mainly on friction angle, so the Phase 4 gates would not detect it.",
+    "fix": "Treat the volumetric response of all dense matter with a unilateral implicit pressure projection and cap only the deviatoric modulus, or use an implicit or rigid-plastic granular solve. Add static-bed settlement and bearing-capacity gates at the shipped tier, restore the admissibility rule, and print 'unsupported' on the fidelity record for the gel-to-rigid gap until a representation exists."
+   },
+   {
+    "id": "P07",
+    "area": "scale",
+    "severity": "major",
+    "issue": "Liquid, ground and (absent) air exist only as awake particles or rigid bodies inside a fixed window; there is no analytic or field far-field. So the boat floats in litres, the digger has litres of soil, and a planet's ocean, terrain and atmosphere have no representation the window could be embedded in.",
+    "evidence": "DERIVED: 10-30 thousand particles (plan estimate) at 8 per 2 cm cell is 1 mL each, i.e. 10-30 L. The Hamilton physics fix (Tier 1 analytic hydrostatic reservoir with the particle window embedded) and STRATA's kept idea (integrated-pressure buoyancy on analytic and heightfield liquids) are both absent from the plan.",
+    "fix": "Add field representations for bulk media to Layer 1 (hydrostatic or heightfield liquid, terrain as heightfield or SDF with a material, ambient gas), with Archimedes buoyancy integrated over the wetted hull as a convergent-tier result. Embed the particle window through a two-way flux boundary with mass and wave-reflection gates, and let the window move and re-orient with the local frame and gravity."
+   },
+   {
+    "id": "P08",
+    "area": "mechanism",
+    "severity": "major",
+    "issue": "'Contact stiffness and friction are derived from material data, then clamped' presents a clamp as a material law: above the clamp every solid has the same contact stiffness, so the derivation is vacuous. The Soft Step lineage also brings tuned constants and silent clamps the plan does not list among its declared approximations (charter rule 3), and 'the one sanctioned departure' is false by at least three (contact clamp, softened granular/soft matter, solver constants).",
+    "evidence": "DERIVED: at a 120 Hz clamp k = m*(2*pi*120)^2 = 5.7e5 N/m per kg for any material (STRATA physics review). MEASURED (box2d src/types.c and src/solver.c, fetched 2026-11-24): contactHertz 30, contactDampingRatio 10, contactSpeed (push-out) 3 m/s, restitutionThreshold 1 m/s, maximumLinearSpeed 400 m/s enforced by rescaling velocity, sleepThreshold 0.05 m/s, and a source comment that time-of-impact 'timeloss means there is a lost gravity contribution'.",
+    "fix": "State contact stiffness as a numerical regularisation, not a material property, and compute Hertz quantities (patch radius, peak-force estimates) analytically from the real moduli. List every solver constant, clamp and sleep rule in the Reality Report with a sensitivity test, and book any momentum or energy they remove."
+   },
+   {
+    "id": "P09",
+    "area": "verification",
+    "severity": "major",
+    "issue": "The ledger's 'numerical loss' account is undefined; if it is the residual, closure is automatic and the audit proves nothing. In a soft-constraint solver most contact energy leaves through numerical damping, so the physical/numerical split is undefined exactly where most energy is dissipated.",
+    "evidence": "DERIVED: an implicit soft constraint keeps 1/(1+(h*omega)^2) of modal energy per substep, 29% at h*omega = pi/2. Two reviews (Hamilton physics, Materia physics) asked for independently computed channels and a cap; the plan kept only the phrase 'a separate numerical loss account'.",
+    "fix": "Compute every physical channel independently (friction work, restitution loss defined as (1-e^2) of normal relative kinetic energy, viscous and plastic dissipation, Joule heat) and define numerical loss as what remains. Gate numerical loss as a maximum fraction of physical dissipation on named scenes (ring-down, rebound height, slosh decay)."
+   },
+   {
+    "id": "P10",
+    "area": "mechanism",
+    "severity": "major",
+    "issue": "Stored elastic energy has no faithful home. In quasi-static modal elasticity strain energy is not a state variable (deflection is either cosmetic or moves geometry with no energy account), and springs integrated as implicit soft constraints lose energy at first order in the step, so bows, catapults, suspensions and springboards are wrong by tens of percent and depend on the step rate.",
+    "evidence": "DERIVED: energy kept over a quarter period is (1+(omega*h)^2)^(-pi/(2*omega*h)), about exp(-(pi/2)*omega*h), so at 480 steps per second a 5/10/20 Hz spring delivers about 90/81/66% of its stored energy. The Hamilton physics review's numeric check for a backward-Euler update gave 90/79/60%.",
+    "fix": "Integrate resolvable conservative elements (springs, modes below the clamp) with a second-order energy-consistent rule and carry their strain energy in the ledger as state. Add spring-launch efficiency tests at 5-50 Hz and a ring-down test with zero physical damping."
+   },
+   {
+    "id": "P11",
+    "area": "mechanism",
+    "severity": "major",
+    "issue": "There is no tunnelling policy: no continuous collision detection, no stated speed envelope and no test.",
+    "evidence": "DERIVED: at 480 steps per second a body moves v/480 per substep, 10.4 cm at 50 m/s, so any dynamic pair thinner than that can pass through each other; at an orbital relative speed of 7.67 km/s it is 16 m. The research notes dynamic-versus-dynamic CCD is off by default in Box2D v3 and Box3D.",
+    "fix": "Always-on speculative plus time-of-impact CCD against statics, opt-in dynamic CCD, a declared envelope (minimum thickness times step rate) on the fidelity record, bullet and grazing tests, and frame-relative velocities so bulk orbital speed never reaches the contact solver. Declare hypervelocity impact out of scope."
+   },
+   {
+    "id": "P12",
+    "area": "matter",
+    "severity": "major",
+    "issue": "The matter tier's boundary physics is unspecified: grid-based colliders cannot separate matter across walls thinner than about two cells, separate matter bodies fuse through the shared velocity field, and 'coupled with friction' is not a physical boundary condition for a viscous liquid. Viscosity itself is unresolved for thin liquids, which the plan does not declare.",
+    "evidence": "DERIVED: two cells at dx 2 cm is a 4 cm minimum wall, thicker than any cup, pipe or model hull (two-cell limit from the Materia physics review). DERIVED: the cell Reynolds number U*dx/nu = 1*0.02/1e-6 = 2e4 for water at 1 m/s, so molecular viscosity is far below grid-scale numerical dissipation and water and light oil behave identically.",
+    "fix": "Use a per-particle side-of-surface test (CPIC style) or particle-level SDF projection, per-owner two-field nodal contact, and no-slip or Navier-slip for liquids with Coulomb only for granular matter. Print minimum wall thickness and the viscosity floor on the fidelity record, and add a zero-leak thin-container test."
+   },
+   {
+    "id": "P13",
+    "area": "foundations",
+    "severity": "major",
+    "issue": "Phase 4 adds conduction and melting with no heat sink: no ambient reservoir, convection or radiation, and no temperature state for rigid bodies. Fire, combustion and a gas phase are neither scheduled nor listed as out of scope.",
+    "evidence": "DERIVED: 20 W of motor loss into a 0.5 kg steel housing (c = 490 J/kg/K, ESTIMATE from memory) heats it 20/(0.5*490) = 0.082 K/s, +98 K over a 20-minute session with nowhere to go. DERIVED: a 300 K black surface radiates sigma*T^4 = 5.67e-8*300^4 = 459 W/m^2, the only sink in vacuum; the Materia physics review derived that the Stefan gate can pass while in-game melting is grid-controlled (boundary layer sqrt(alpha*t) = 2.9 mm after 60 s against 2 cm cells).",
+    "fix": "Give each rigid body a lumped or coarse enthalpy, add an ambient reservoir with a declared film coefficient and grey-body radiation with measured emissivity, and book both in the ledger. State plainly whether fire is in or out."
+   },
+   {
+    "id": "P14",
+    "area": "foundations",
+    "severity": "major",
+    "issue": "There is no ambient medium: no drag, no buoyancy in air, no ambient pressure, no wind. This is an undeclared approximation (the out-of-scope list names turbulence, not air), it is visibly wrong at workshop scale, and at system scale the same vehicle must behave correctly in air, thin air and vacuum.",
+    "evidence": "DERIVED: drag 0.5*rho*v^2*Cd*A on a 6 cm ball at 20 m/s is 0.5*1.225*400*0.47*2.83e-3 = 0.33 N (Cd 0.47 for a sphere, ESTIMATE), 58% of the weight of a 57 g ball. DERIVED: sea-level pressure of 101 kPa (standard value) puts 10 kN on a 0.1 m^2 panel, which matters for any sealed or evacuated part.",
+    "fix": "Add an ambient-medium field to Layer 1 (density, pressure, temperature and velocity as functions of position, supplied by the outer tier; vacuum is a value, not the absence of the feature). Use a declared quasi-steady surface-element drag and lift closure in the empirical tier, air buoyancy, and ambient pressure as the matter tier's free-surface boundary condition."
+   },
+   {
+    "id": "P15",
+    "area": "foundations",
+    "severity": "major",
+    "issue": "The thermal governor contradicts its own rule: reducing awake matter freezes matter the laws say should move, so outcomes depend on device temperature. Governor actions are not listed as replay inputs, time dilation is never mentioned, the web has no thermal-state signal, and the default 'drop to 30 frames per second' makes the '60 Hz for 20 minutes' exits ambiguous.",
+    "evidence": "Plan lines 76-77 and 121-122 against the bit-exact replay claim at lines 87-89. Three reviews (Materia feasibility, Materia physics, STRATA physics) asked for refusal or shedding to be replaced by declared time dilation with worst-case certification at authoring time; one (Hamilton feasibility) asked for logged shedding, and the plan adopted the shedding without the logging.",
+    "fix": "Order the rungs: render scale, 30 Hz presentation with physics unchanged, declared time dilation, and only then logged matter reduction booked in the ledger. Record every governor decision in the replay stream, certify scenes on worst-case awake matter, and write exits as sim-time ratio plus dropped-frame fraction."
+   },
+   {
+    "id": "P16",
+    "area": "mechanism",
+    "severity": "major",
+    "issue": "Rolling contact is unaddressed although the first mechanism milestone is a rover: no wheel or cylinder primitive, no per-substep contact refresh, no rolling-resistance property, no tyre model and no rolling test.",
+    "evidence": "DERIVED: with contact anchors fixed for a frame (confirmed in Box2D source by the STRATA physics review) a wheel unloads within the frame once v^2/r exceeds g, i.e. above sqrt(9.81*0.05) = 0.70 m/s for a 5 cm wheel and 1.7 m/s for a 0.3 m wheel, giving 60 Hz traction ripple. Hertz patch radius scales as E^(-1/3), so a patch computed from a clamped modulus is 27-126x too large (Hamilton physics review, DERIVED there).",
+    "fix": "Add analytic wheel and cylinder contact refreshed every substep, a declared rolling-resistance closure computed from real moduli, and for vehicles a brush-tyre or enclosed-gas tyre model. Gate Phase 1 with rolling acceleration ((5/7)*g*sin(theta) for a sphere) and traction at speed."
+   },
+   {
+    "id": "P17",
+    "area": "verification",
+    "severity": "major",
+    "issue": "No gate is bound to the shipped configuration, so tests can pass on the f64 reference at fine resolution while the phone runs something never validated. Some stated tolerances are unreachable at the stated particle budget, and tests for the artifacts that break real mechanisms are absent.",
+    "evidence": "ESTIMATE: the free surface is located to about +/-0.5 cell; DERIVED from that: hydrostatic error is 0.5/N for an N-cell column, so 3% needs N >= 17, and a 17-cell cube at 8 particles per cell is 39 thousand particles, above the plan's 10-30 thousand. The STRATA physics review derived that a 5% waterline needs a hull 30-60 cells wide because grid contact acts 0.25-0.5 cell off the surface.",
+    "fix": "Run every gate on production precision at shipped dx, dt, particle count and iteration budget and publish those numbers beside the reference. Add step-rate invariance (240/480/960 per second), long-run liquid volume drift, resting jitter, four-bar closure drift, loaded transmission ratio, gyroscopic precession, spinning-assembly angular momentum and static-friction creep tests."
+   },
+   {
+    "id": "P18",
+    "area": "roadmap",
+    "severity": "major",
+    "issue": "The plan says automatic rigid-to-deformable switching was dropped, yet melting (Phase 4), breaking (Phase 2) and digging all move matter between a rigid body and particles or create new bodies at runtime. None of that transfer is specified, so mass, momentum and energy at those events are unaccounted and runtime re-baking is unbudgeted.",
+    "evidence": "Plan lines 61-63, 100 and 110 contradict each other. The reviews' fixes (surface-layer promotion with remainder mass properties and reserved slots; pre-fractured or lattice fragments that stay plain rigid; fracture energy per crack area at two resolutions) are absent, and strain energy released at fracture is not a state in a quasi-static model.",
+    "fix": "Specify one audited conversion primitive (rigid volume to particles and back) that preserves mass, momentum, angular momentum and enthalpy, with reserved slots and the remainder's mass properties updated. Pre-bake fracture patterns offline, keep fragments plain rigid, and book fracture energy as toughness times crack area."
+   },
+   {
+    "id": "P19",
+    "area": "scale",
+    "severity": "major",
+    "issue": "Activity management assumes gravity pins things to a ground frame and one clock runs everything at 480 steps per second forever. In free fall nothing comes to rest, coasting lasts hours to years, and 'never change the timestep' plus bit-exact replay leave no way to skip time.",
+    "evidence": "DERIVED: one year is 3.156e7 s x 480 = 1.5e10 steps; a signed 32-bit step counter overflows after 2^31/480 s = 51.8 days; f32 seconds cannot resolve one substep after 16,384 s (4.6 h), where spacing reaches 2^-9 s. MEASURED: the lineage's sleep test is a speed threshold, 0.05 m/s by default (box2d src/types.c), which presumes a rest frame.",
+    "fix": "Define a dormant representation: an assembly frozen into one aggregate rigid body (or point mass) on an analytic or coarse-step trajectory with its internal state stored, plus explicit wake conditions. Use an i64 tick clock with a declared multi-rate mapping, allow time acceleration only when every active region is dormant, and record rate changes in the replay stream."
+   },
+   {
+    "id": "P20",
+    "area": "api",
+    "severity": "major",
+    "issue": "The builder API is a list of nouns and becomes a usable kit only in Phase 6. Strict mode forbids spawning, teleporting and velocity setting, which a streamed large world needs constantly, and the plan does not say what language games are written in, at what rate controllers run, or how a game learns that something happened.",
+    "evidence": "Plan lines 70-74 and the Phase 6 row. Reviews asked for an event stream, a controller library with step-rate servo blocks, an authoring binding, implicit joint-housing collision exclusion, measured mass properties with provenance and an SDK slice from Phase 2; none appear.",
+    "fix": "Specify the API contract early: authoring binding, deterministic controller runtime and rate, events (contact, yield, break, sleep, hand-off), scene queries, snapshots and a stock controller library. Separate engine-internal streaming and hand-offs (audited, conserving) from game escape hatches, and end each phase with a small playable slice."
+   },
+   {
+    "id": "P21",
+    "area": "mechanism",
+    "severity": "minor",
+    "issue": "'Motor tests within 1-2%' is unreachable for transients of small motors under first-order integration at 480 steps per second, and the electrical time constant is below one step.",
+    "evidence": "DERIVED: backward Euler turns a time constant tau into h/ln(1+h/tau), about tau + h/2, an error of h/(2*tau) = 5.2% at tau = 20 ms and 10% at 10 ms (typical small-motor mechanical time constants, ESTIMATE). ESTIMATE: small DC motors have L/R near 0.5 ms against a 2.08 ms step, so inductance must be dropped.",
+    "fix": "Integrate the linear motor-circuit-rotor subsystem with its exact exponential update, declare the zero-inductance approximation on the fidelity record, and name the motor tests (stall, no-load, step response, efficiency)."
+   },
+   {
+    "id": "P22",
+    "area": "verification",
+    "severity": "minor",
+    "issue": "The determinism claims are broader than the design supports: a phone replay reproduces on the build server only for scenes that never touch GPU matter, the governor or timing-dependent input, and 'twice the bodies natively with identical hashes' conflicts with how the lineage obtains determinism.",
+    "evidence": "The research (lines 193 and 251, citing Rapier's documentation; not re-checked by me) says Rapier's enhanced-determinism feature cannot be combined with its SIMD feature. ESTIMATE (Hamilton feasibility review): two performance cores shared with rendering give about 1.3-1.6x, not 2x.",
+    "fix": "Define a replay as snapshot plus inputs plus governor decisions plus quantised GPU wrenches, and state the determinism scope in the fidelity ladder. Set the Phase 5 body-count gate from a measurement."
+   },
+   {
+    "id": "P23",
+    "area": "roadmap",
+    "severity": "minor",
+    "issue": "Several headline numbers are stated more firmly or more favourably than the research supports.",
+    "evidence": "DERIVED from the research's MEASURED Box3D and Box2D M2 benchmarks: '2D carries 6-7x more bodies' is the box-pyramid ratio 9.1 ms/1.36 ms = 6.7, but for jointed bodies it is 11.0/3.28 = 3.4. The research's own scaling gives 15-28 thousand particles cool and 10-17 thousand after derate for a lighter native kernel (low confidence), and reviewers corrected to 3-8 thousand liquid particles and 1-3 thousand honest sand (ESTIMATES) against the plan's 10-30 thousand; '4.3 W sustained' is one unverified excerpt of a 30-minute run on an A16 phone that is not the iPhone 15.",
+    "fix": "Quote ranges with basis and confidence, give the jointed-body ratio beside the box ratio in the 2D/3D decision, and lower the pre-probe planning figure for matter to the reviewers' range."
+   },
+   {
+    "id": "P24",
+    "area": "delivery",
+    "severity": "minor",
+    "issue": "Delivery statements skip review findings: a new repository's Pages site under the same account shares the github.io origin, so 'keeps PulseVault untouched' is not true for client storage, and 'the whole loop runs from this Linux environment' omits that GPU kernels cannot be executed or Safari-compiled here.",
+    "evidence": "Hamilton and STRATA feasibility reviews: origin-wide OPFS, IndexedDB and quota; no GPU device or Vulkan driver in the container; WebKit's shader compiler not runnable on Linux. The plan also has no soak protocol, time boxes or kill criteria.",
+    "fix": "Namespace all storage or use a separate origin, add a software-WebGPU path in the container and a macOS-runner Safari compile smoke test, write the soak protocol, and give each phase a time box and descope trigger."
+   },
+   {
+    "id": "P25",
+    "area": "foundations",
+    "severity": "minor",
+    "issue": "Charter rule 2 says everything object-specific enters through geometry and material, but restitution, friction, rolling resistance and emissivity are properties of pairs, surfaces, geometry and speed, and restitution is missing from the material property list. Material data are also implicitly at room temperature and one atmosphere.",
+    "evidence": "Plan lines 19-21 list density, stiffness, yield strength, friction pairs, viscosity and thermal properties only, while Phase 0b's first demo distinguishes steel, oak and rubber by bounce. The STRATA feasibility review noted that measured data do not exist for most material pairs.",
+    "fix": "Add surface and pair records (static and kinetic friction, restitution as a function of speed, rolling resistance, emissivity) with source, uncertainty and validity range (temperature, pressure, speed), and label mixing-rule defaults as such on the fidelity record."
+   }
+  ],
+  "dropped_review_fixes": [
+   "[Hamilton physics, Materia physics] Compute the ledger's numerical-loss account independently of the residual and cap it as a fraction of physical dissipation per reference scene; the plan keeps only the phrase 'a separate numerical loss account'.",
+   "[Hamilton physics] Torque-free spinning-assembly, spring-launch-efficiency, head-on-impact and Newton's-cradle conservation tests at the shipped step budget with sleeping disabled are absent ('Conservation tests pass' is unspecified).",
+   "[Hamilton physics, Materia physics, STRATA physics] A step-rate invariance gate (different substep counts must agree on penetration, peak force, restitution and break outcome) is absent.",
+   "[Hamilton physics] The requirement to declare every tuned solver constant with a sensitivity test was written for AVBD and was not carried over to Soft Step's contact frequency, damping ratio, push-out speed, slop and restitution threshold.",
+   "[Hamilton physics] Stick-slip and friction-limit-under-transient-load tests, and refreshing the normal force inside the sweep, are absent.",
+   "[Hamilton physics, Materia physics, STRATA physics] Dynamic CCD, a declared speed envelope and thin-plate bullet tests are absent.",
+   "[Hamilton physics, STRATA physics] Loaded gear-train tests (ratio, backlash, efficiency over many revolutions) and loaded-joint separation limits are absent.",
+   "[Hamilton physics, Materia physics] Deciding rigidity by structural mode frequency and giving members lumped compliance with a direct solve per bonded island, validated against truss member forces from the stiffness method, is absent.",
+   "[STRATA physics] Craig-Bampton attachment modes with a residual-flexibility term, with cantilever and first-mode gates run through the runtime weld and contact port, are absent.",
+   "[STRATA physics] Baked linear-buckling factors (geometric stiffness) and impulse- or energy-based impact damage criteria are absent although buckling load is a Phase 2 gate.",
+   "[Hamilton physics] An enclosed-gas pressure-volume primitive, a brush-tyre closure for rigid wheels, co-rotating-frame tyre deformation and three-shaft (differential) gear constraints are absent.",
+   "[STRATA physics] Cylinder and wheel primitives with analytic contact refreshed every substep, and rolling-acceleration and traction-at-speed gates, are absent.",
+   "[Hamilton physics] Computing the contact-patch radius for rolling and torsional resistance from the real moduli instead of the clamp is absent (rolling resistance is not mentioned at all).",
+   "[Hamilton physics; STRATA physics 'keep'] A Tier 1 analytic hydrostatic reservoir or heightfield liquid with integrated-pressure buoyancy and the particle window embedded in it is absent, so the boat floats only in the particle tub.",
+   "[Hamilton physics, Materia physics, STRATA physics] Fire is neither declared out of scope nor scheduled as a one-step pyrolysis and combustion slice.",
+   "[Materia physics, STRATA physics] An ambient reservoir with convective film coefficient and grey-body radiation, lumped enthalpy per rigid body, increment-only temperature transfer and a sub-grid heat-transfer closure are absent.",
+   "[Hamilton physics, Materia feasibility, Materia physics, STRATA physics] Strong coupling (rigid-body inverse mass inside the GPU pressure solve, or an over-estimated added-mass tensor) and a rule for which side is authoritative within a frame are absent.",
+   "[Materia feasibility, Materia physics, STRATA feasibility] A fixed N-tick wrench delay line, and measuring buffer readback latency in the probe, are absent.",
+   "[Hamilton physics, Materia feasibility, Materia physics] Coupling gates (bobbing float at density ratios 0.1-0.5, heave period and decay, floating body at rest for 60 s, block resting on sand) are absent.",
+   "[STRATA physics; Hamilton physics 'keep'] Recording the quantised GPU wrench stream and governor decisions as replay inputs, so CPU bit-exactness survives contact with GPU matter, is not stated.",
+   "[STRATA physics] Fixed-point two-limb wrench accumulation, per-frame reconciliation of ledger against state, and applying joint and friction impulses at a shared midpoint are absent.",
+   "[Materia physics] The incompressible label was adopted, but publishing the volume-drift relaxation parameter and gating on divergence residual plus a long-run water-level test were dropped.",
+   "[Materia physics, Materia feasibility, STRATA feasibility] A pressure-solve microbenchmark, per-dispatch overhead and a per-frame dispatch budget in the Phase 0a probe are absent (the probe lists limits, timers, particle and body throughput and a soak).",
+   "[Hamilton feasibility] Budgeting grid cell-passes separately from particle-passes, with an active-block list or tight moving bounds, is absent.",
+   "[Materia physics] A stability cap on wave speed plus material speed with a deterministic velocity-triggered substep rule, and booking any velocity clamp in the ledger, are absent.",
+   "[Materia physics] CPIC-style thin-wall handling, minimum wall thickness on the fidelity record and a zero-leak container test are absent.",
+   "[Materia physics] Two-field per-owner nodal contact with pair friction between free matter-tier bodies is absent.",
+   "[Materia physics] Choosing the boundary condition by phase (no-slip or Navier-slip for liquids, Coulomb for granular) was dropped; the plan couples the tiers 'with friction' for everything.",
+   "[Materia physics] A viscosity cap and a 'viscosity unresolved below the numerical floor' flag on the fidelity record are absent.",
+   "[STRATA physics; Materia feasibility and physics fatal flaws] Implicit unilateral volumetric treatment of all dense matter with static-bed settlement and bearing-capacity gates is absent, and the softening-admissibility rule was dropped rather than satisfied.",
+   "[Hamilton physics, Materia physics, STRATA physics, STRATA feasibility] Running every gate on production precision at shipped resolution, particle count and iteration budget, and comparing observables rather than trajectories, is absent.",
+   "[Materia physics, STRATA physics] Tests for long-run liquid volume drift, resting-jitter RMS, closed-loop four-bar drift, static-friction grasp creep, gyroscopic precession and a 1:1000 chain with maximal-coordinate breakable joints are absent.",
+   "[Materia physics] Printing the fracture characteristic length, labelling authored versus stress-derived break planes and a two-resolution fracture-energy test are absent.",
+   "[STRATA feasibility, STRATA physics, Materia physics] Fragment handling (offline pre-fracture and pre-bake, fragments staying plain rigid or inheriting parent data, a runtime bake cap) and partial promotion for melting (surface layer, remainder mass properties, reserved slots) are absent.",
+   "[STRATA physics] A far-field representation for bodies leaving the awake set (analytic ballistic or low-rate integrator booked in the ledger) and a two-way flux boundary for the particle window are absent.",
+   "[STRATA physics, Hamilton feasibility] An f64 or island-local origin with per-step delta accumulation from Phase 0, plus translation, rotation and Galilean-boost invariance gates and a far-from-origin resting test, are absent; production precision is never stated.",
+   "[Materia feasibility, Materia physics, STRATA physics] Replacing awake-matter refusal or reduction with declared time dilation, and certifying worst-case awake or promotable matter at authoring time, was dropped; the plan sheds awake matter and never mentions dilation.",
+   "[Hamilton feasibility, Materia feasibility, STRATA feasibility] Falsifiable soak exits (sim-time ratio, dropped-frame fraction) under a written protocol (Low Power Mode off, unplugged, no case, fixed brightness, ambient noted, battery percent before and after) are absent.",
+   "[STRATA feasibility] Detecting Safari's 30 Hz cadence and running two fixed steps per presented frame, with budgets sized at half of cool capacity because the web has no thermal-state signal, is absent.",
+   "[Hamilton feasibility, Materia feasibility, STRATA feasibility] Time boxes, numeric floors and kill or descope criteria per phase are absent.",
+   "[Materia feasibility, Materia physics, Hamilton physics] A small playable slice at the end of every phase and a usable SDK from Phase 2 were dropped; the builder kit and first game remain Phase 6.",
+   "[Hamilton physics, Materia physics] A stock controller library (joint servo, wheel speed, inverse kinematics, balance) as strict-mode code, step-rate servo blocks and a stated controller rate are absent.",
+   "[Hamilton physics] Accepting measured mass properties with provenance (hollow shells, imported robot descriptions) is not addressed.",
+   "[Materia physics, STRATA physics] Implicit joint-housing collision exclusion, an event stream, a named authoring binding, gear, rack, screw, belt, cable and pulley constraints, per-surface fluid forces, and air and wind are absent (the plan names only gearboxes).",
+   "[Hamilton feasibility, Materia feasibility, STRATA feasibility] Executing shader kernels in the container on a software GPU path, a macOS-runner Safari compile smoke test, NaN-safe-by-construction kernels and a CPU twin for every kernel are not stated.",
+   "[Materia feasibility, Hamilton feasibility] Crash breadcrumbs persisted on the device, capture of shader-compile and device-lost errors, a build hash in every report, cache-busting and the cross-origin-isolation shim for fine timers are absent.",
+   "[Materia feasibility] Using a thin hand-written WebGPU host on the web, or proving the Rust GPU abstraction on the phone in Phase 0a, is left unspecified.",
+   "[STRATA feasibility] A WebGL2 fallback renderer so CPU-tier phase exits do not depend on WebGPU staying up for 20 minutes is absent.",
+   "[Hamilton feasibility, STRATA feasibility] Serving from a separate origin or namespacing all storage was dropped: a new repository's site under the same account shares the github.io origin with the existing app.",
+   "[Materia feasibility] A stable (non-racy) particle sort for fixed summation order in the GPU tier is unspecified.",
+   "[Materia feasibility, Materia physics] Deciding build-versus-adopt for the rigid core (adopt an existing deterministic engine and write only the material, actuator and coupling layers) is left open by 'of the lineage'.",
+   "[Hamilton feasibility; kept idea in both Hamilton reviews] A budget meter that prices a blueprint's worst case in deterministic counters with admission refusal, and CI performance gates on those counters, is absent.",
+   "[Kept idea in Materia and STRATA feasibility reviews] Snapshot and resume after a tab kill as a core feature is absent from the plan.",
+   "[STRATA feasibility] The native-path preflight checklist and an early empty TestFlight build milestone are absent.",
+   "[STRATA physics] A hand-off energy and force-equilibrium gate normalised by total mechanical energy is moot for the dropped auto-switching but still needed at break and melt events, and is absent.",
+   "[Hamilton feasibility, Hamilton physics] Written A/B pass thresholds (cost per body-substep, stack drift, sliding dissipation, chain stretch, momentum and angular-momentum defect) are not stated; the plan says only 'a written A/B test'."
+  ],
+  "missing_entirely": [
+   "Reference-frame tree with local origins, frame-relative state and declared fictitious-force terms",
+   "Gravity as a field law (central and n-body sources, tidal gradient, gravity-gradient torque) and the interface to an orbit propagator (on-rails or symplectic), including sphere-of-influence or frame hand-offs",
+   "Dormant or on-rails representation of whole assemblies, wake conditions, time acceleration and a multi-rate integer clock",
+   "Open-boundary flux accounting and a conserving hand-off contract between levels of detail (point mass, aggregate rigid body, full mechanism; analytic medium, particle window)",
+   "World streaming and level of detail for static content: planet-scale terrain representation and collision, world partition, asset and memory budget",
+   "Ambient medium: atmosphere model (density, pressure, temperature, wind versus position), aerodynamic lift and drag closures, air buoyancy, vacuum",
+   "Bulk liquid reservoirs (ocean, lake, river as analytic or heightfield liquid) and their coupling to the particle window",
+   "Variable-mass bodies and propulsion: rocket and jet thrust with exhaust mass, momentum and energy leaving through the ledger, propellant tanks and slosh",
+   "Enclosed gas and pressure vessels: pneumatics, tyres, balloons, cabin pressure, hydraulics",
+   "Thermal environment: convection, grey-body radiation, solar input, ambient temperature, lumped temperature state for rigid bodies; an explicit in-or-out decision on fire and combustion",
+   "Surface tension, capillarity and wetting (dominant for liquids in free fall and for anything below about 3 mm), declared in or out",
+   "Slender and thin elements: ropes, cables, chains, belts, cloth, shells; wheel and cylinder primitives; tyre models; three-shaft gear constraints",
+   "Energy-consistent springs and other resolvable elastic storage elements with strain energy carried as ledger state",
+   "Continuous collision detection policy, speed envelope and hypervelocity-impact scope statement",
+   "Fracture model definition: where a part breaks, how fragments are generated, fracture energy accounting; wear and fatigue declared in or out",
+   "Event stream for games (contact, impact impulse, yield, break, sleep and wake, hand-off, ledger anomaly)",
+   "Scene queries (ray cast, shape cast, overlap, closest point) for sensors, AI and touch picking",
+   "Authoring binding and tooling: language for scenes and controllers, deterministic controller runtime and rate, import formats, debug visualisation",
+   "Stock controller library (servo, wheel speed, inverse kinematics, balance) and sensor models with rate, latency and noise",
+   "A path for characters and creatures (actuated ragdolls or muscle-like actuators) as a player avatar",
+   "Save, load and resume: versioned snapshot format, crash and tab-kill recovery",
+   "Budget meter and admission control that prices a blueprint's worst case before it runs",
+   "Failure containment: NaN or divergence detection, quarantine of a failing island or window, defined behaviour when budgets are exceeded",
+   "Electrical systems beyond one DC motor: general lumped circuits, generators, solar panels, power buses",
+   "Rendering and presentation contract: how particles become surfaces, far-field rendering across scales, camera frames; audio and haptics driven by contact events",
+   "Validity ranges on material data (temperature, pressure, strain rate) and surface or pair records separate from bulk materials",
+   "A statement of the gravitational and relativistic model limits (Newtonian, instantaneous, light-time ignored) on the fidelity ladder",
+   "Multiplayer or shared-world model, noted as explicitly waived by the plan but with no statement of what determinism scope would be needed if it returns",
+   "CPU and power budget share for the outer tiers (orbit propagation, frame management, streaming) inside the same sustained power envelope"
+  ],
+  "small_world_assumptions": [
+   "Constant, uniform gravity vector (never named in the plan; the lineage's world default is a fixed vector, MEASURED: box2d src/types.c). DERIVED with R = 6371 km (MEASURED, Wikipedia 'Earth radius'): magnitude scales as (R/(R+h))^2, so -0.31% at 10 km, -3.1% at 100 km, -11.5% at 400 km; direction tilts L/R = 1.6e-4 rad per km and a flat floor departs from the sphere by L^2/(2R) = 7.8 cm at 1 km and 7.8 m at 10 km.",
+   "One inertial frame with no fictitious forces. DERIVED: Earth-fixed Coriolis 2*Omega*v = 1.5e-3 m/s^2 at 10 m/s and equatorial centrifugal Omega^2*R = 0.034 m/s^2 (0.35% of g), with Omega = 7.292e-5 rad/s (from memory); in a 100 m radius habitat spun to 1 g, Coriolis is 6.4% of g per m/s. In orbit the natural frame is free-falling and only the tidal gradient 2GM/r^3 = 2.6e-6 s^-2 remains (DERIVED from GM = 3.986e14 m^3/s^2, MEASURED, Wikipedia 'Standard gravitational parameter', at r = 6771 km), which still separates two parts 10 m apart by 0.5*2.6e-5*100^2 = 0.13 m in 100 s.",
+   "Positions as offsets from one origin at an unstated (presumably single) precision. DERIVED: f32 spacing 2^(e-23) is 7.6 um at 100 m, 61 um from 512 m (already above the 42.6 um per-substep gravity increment 9.81/480^2), 1 mm at 10 km, 0.5 m at Earth's radius and 16.4 km at 1 AU; f64 from a heliocentric origin is 30.5 um at 1 AU and 1 mm at 30 AU, so even double precision needs local frames.",
+   "Absolute velocities inside the solver. DERIVED: low-orbit speed 7.67 km/s and Earth's heliocentric 29.8 km/s (from memory) are 16 m and 62 m per substep; f32 velocity spacing at 29.8 km/s is 2 mm/s against a per-substep gravity increment of 9.81/480 = 20 mm/s. MEASURED: the lineage's default speed clamp is 400 m/s (box2d src/types.c).",
+   "One clock at a fixed 480 steps per second with no time skipping. DERIVED: a year is 1.5e10 steps, a signed 32-bit step counter lasts 51.8 days and f32 seconds lose substep resolution after 4.6 h; the governor rule and the replay format both assume a single rate.",
+   "A fixed, world-axis-aligned window of matter with gravity along one grid axis, closed boundaries and zero ambient pressure; no moving or re-orienting window and no flux boundary to an ocean, soil or atmosphere reservoir. DERIVED: the window holds 10-30 L at 1 mL per particle (8 particles per 2 cm cell).",
+   "No atmosphere, and vacuum is not modelled as such either (no vapour pressure, no radiative cooling). DERIVED: sea-level drag on a 6 cm ball at 20 m/s is 0.33 N, 58% of a 57 g ball's weight (drag coefficient 0.47, ESTIMATE).",
+   "A ledger with only local terms: potential energy as m*g*h, kinetic energy in one frame, a single global sum, and no gravitational-field, orbital, frame-transfer, tidal or radiative terms. DERIVED: Earth's orbital kinetic energy of about 2.6e33 J has f64 spacing 2^59 = 5.8e17 J, so workshop-scale joules vanish in a global total. MEASURED: sunlight delivers 1.361 kW/m^2 at 1 AU (Wikipedia 'Solar constant') and nothing in the ledger can receive it.",
+   "Static ground of infinite mass as an unbooked momentum and energy sink. DERIVED: a 10 m diameter asteroid at 2500 kg/m^3 (density ESTIMATE) is (4/3)*pi*5^3*2500 = 1.3e6 kg with escape speed sqrt(2GM/r) = 5.9 mm/s; a 1 t lander arriving at 1 m/s changes its velocity by 1000/1.3e6 = 0.76 mm/s, 13% of escape speed.",
+   "Sleeping and the awake budget assume gravity presses things to rest against a ground frame; in free fall nothing settles, and a speed threshold (MEASURED: 0.05 m/s default, box2d src/types.c) has no meaning without a chosen frame.",
+   "Liquids assume gravity-dominated free surfaces and have no surface tension. DERIVED: the Bond number rho*g*L^2/sigma for 10 cm of water is 1000*9.81*0.01/0.072 = 1.4e3 at 1 g but 3.6e-3 under a 2.6e-5 m/s^2 tidal acceleration (sigma = 0.072 N/m, from memory), so in orbit capillarity governs and the tier's behaviour is qualitatively wrong.",
+   "Heat with no environment: no ambient temperature, no radiation and no solar input. DERIVED: in vacuum the only sink is radiation, 5.67e-8*300^4 = 459 W/m^2 from a 300 K black surface.",
+   "'Sleeping or simplified matter' as the only far-field: a planet's terrain, ocean and air cannot be sleeping rigid bodies or particles, and celestial bodies sit far outside the 1 cm to 10 m, 1 g to 10 t range the mechanism tier's parent design declared (STRATA's supported range).",
+   "Material data implicitly at room temperature and one atmosphere with no validity range; friction, restitution, modulus, lubrication and battery behaviour all change in vacuum and across the roughly 100-400 K range of space hardware (ESTIMATE).",
+   "The whole sustained power envelope (about 4.3 W, the plan's figure from an unverified excerpt) is spent on one awake workshop, with no share reserved for outer-tier work such as orbit propagation, frame management and streaming.",
+   "The player's finger is an actuator anchored to a ground-fixed view, and strict mode treats any spawn or velocity set as an escape hatch, both of which presume the camera and the world share one frame and that nothing streams in or out.",
+   "Gravity is implicitly Newtonian, instantaneous and single-source; n-body perturbations, light-time (DERIVED: 1.496e11 m / 2.998e8 m/s = 499 s at 1 AU) and relativistic effects are neither declared out of scope nor placed on the fidelity ladder.",
+   "Validation gates (hydrostatic pressure, dam break, angle of repose, waterline, pendulum) are all defined for uniform 1 g and a flat free surface, so none of them exercises the engine in a rotating, free-falling or low-gravity region."
+  ],
+  "keep": [
+   "The laws-and-materials layer as the permanent asset with replaceable solver tiers beneath it (extend it with frames, fields and boundary ports; do not replace it)",
+   "Charter rules 3 to 5: every numerical shortcut declared and measured, every fidelity claim backed by an automated toleranced test, units enforced by types",
+   "The fidelity ladder's honesty: friction, restitution and viscosity labelled empirical; atoms, electromagnetic fields and turbulence out of scope; 'rigid plus incompressible' named as the stiff limit and reported per material",
+   "Per-step ledger of mass, momentum and energy with a separate numerical account, per-object fidelity record (authored versus achieved) and the live Reality Report",
+   "CPU mechanism tier built on pairwise velocity-level impulses with reduced-coordinate articulations at one global step rate; this is what resolves the candidates' angular-momentum and action-reaction fatal flaws",
+   "Solver choice settled by a written A/B test on the build server before anything is built on it",
+   "Physical actuator models: DC motor with back-EMF and current limit, gearbox reflected inertia, battery internal resistance; the finger as a force-limited actuator",
+   "Quasi-static modal elasticity at the real modulus as the stress estimator for stiff parts (extend it with attachment modes, geometric stiffness and plasticity; do not go back to softened FEM)",
+   "Implicit incompressible pressure solve for liquids; liquids are the one medium whose real stiffness limit is affordable on this phone",
+   "Strict mode by default with logged escape hatches whose injected mass, momentum and energy are booked as external",
+   "Bit-exact CPU tier with the WASM build as cross-platform reference, and a double-precision reference solver as oracle",
+   "Phase 0a probe on the actual phone before any budget is frozen; sustained power, not peak speed, as the binding budget; a 20-minute soak at the end of every phase; tests written before features",
+   "Mechanisms-first ordering and web-first delivery with native optional",
+   "The rejections recorded under 'What the reviews changed': no continuum-only engine, no single energy-minimising solver, no hand-off into a softened deformable solver",
+   "Presenting body and particle counts as unmeasured estimates to be replaced by the probe"
+  ]
+ },
+ "redteam:feasibility": {
+  "lens": "Feasibility, delivery, scope and roadmap (adversarial review of /home/user/pulsevault/reality-engine/03-plan.md as a plan and as the future innermost region of a multi-scale engine)",
+  "verdict": "The workshop plan is a sound innermost region but not yet a deliverable plan: its headline scales are the pre-review research ranges (my re-derivation for the sustained web build is roughly 100-300 awake boxes and 3-8k liquid particles, ESTIMATE), most phase exits either cannot fail or cannot pass on the phone, and about two dozen feasibility fixes from the six reviews were silently dropped. With the solar-system requirement the roadmap order itself must change: the layer declared permanent has no frames, gravity model or time-scale policy, and no phase ever shows a second scale. The combined scope is finishable only with a hard v1 cut: probe, then a CPU-only two-scale release (f64 point-mass system tier plus one adopted-solver rigid workshop in a local frame whose gravity comes from the outer tier), then mechanisms; liquids become v2 behind a measured go/no-go, and sand, melting, yield/fracture, the native app and planetary surface detail are deferred. From this container WASM builds and WGSL on software Vulkan are workable (llvmpipe enumerates), but Safari's shader compiler and the deployed site are unreachable, so a macOS-runner Safari job, a post-deploy CI smoke test and on-page diagnostics are prerequisites.",
+  "issues": [
+   {
+    "id": "F01",
+    "area": "roadmap",
+    "severity": "fatal",
+    "issue": "No phase of the roadmap produces a second scale, and Layer 1 (declared permanent) has no reference frames, no gravity-source model and no time-scale policy. Phases 0b-6 would therefore build units, ledger, solver, replay and snapshot on single-origin, uniform-g, 1x-real-time assumptions that the new requirement invalidates.",
+    "evidence": "The only statement on scale in 03-plan.md is one sentence ('A larger world can exist around that as sleeping or simplified matter'); roadmap rows 0a-6 contain no frame, far-field or hand-off deliverable. DERIVED: an f64 heliocentric position at 1 AU (1.496e11 m, between 2^37 and 2^38) has ulp 2^-15 m = 30.5 micrometres, against a 480 Hz gravity step g*dt^2 = 9.81/480^2 = 42.6 micrometres, so the workshop cannot simply be dropped into a large f64 world.",
+    "fix": "Reorder: 0a probe, then a CPU-only two-scale release (f64 system tier of point-mass bodies plus one rigid workshop in a local frame whose gravity vector is supplied by the system tier), then mechanisms, then matter. Gate it with frame-invariance tests: identical workshop state hashes with the frame anchored at the origin and at 1 AU, and block fall time within 1% of sqrt(2h/g_local) on two different bodies."
+   },
+   {
+    "id": "F02",
+    "area": "roadmap",
+    "severity": "major",
+    "issue": "The combined scope is not finishable as written: about 20 substantial subsystems (DERIVED by enumerating the plan's architecture and roadmap: units, materials, ledger, rigid solver, articulations, actuators, modal elasticity with yield and fracture, MPM with implicit pressure, two-way coupling, granular, plasticity, heat, renderer, governor, replay, native host, builder kit, game), each doubled by an f64 oracle, plus the new scale architecture. There are no durations, cut lines or kill criteria.",
+    "evidence": "The STRATA feasibility review judged a smaller version of this scope would 'stall after Phase 1 unless cut to about three representations', and every feasibility review asked for time boxes, which 03-plan.md omits. The only developer is a cloud agent in an ephemeral container and the only device is one phone operated by the user.",
+    "fix": "Define v1 as probe + two-scale rigid slice + mechanisms (joints, motors) + Reality Report + a toy built on the public API. Put liquids in v2 behind a measured go/no-go and remove from v1: Phase 4 (sand, mud, soft solids, melting), yield and fracture, the native app, more than one simultaneously awake detail region, atmospheres and terrain streaming. Give every phase a time box, a numeric floor and a named cut list."
+   },
+   {
+    "id": "F03",
+    "area": "foundations",
+    "severity": "major",
+    "issue": "The plan states scales but no frame or power budget, and its headline numbers are the research's pre-review ranges rather than the reviews' corrected ones.",
+    "evidence": "DERIVED from MEASURED Box3D M2 data in 01-research.md (5,050 boxes / 9.1 ms = 555 boxes/ms at 4 substeps; 555/1.7 = 326 at 8 substeps if the solver is 70% of cost, ESTIMATE) with ESTIMATE penalties (WASM 1.4-2.5x; immature or non-SIMD code 1-3.5x, bounded by the MEASURED Box2D float-versus-NEON ratio 4.64/1.36 = 3.4): 37-233 boxes/ms on one WASM thread, so 110-700 stacked boxes in 3 ms (central about 300) and about 35-210 convex hulls (hulls cost 3.3x, MEASURED). For liquids the reviews' corrected figure is 3-8k particles at 4 substeps (ESTIMATE; 3-8 L at 2 cm cells, DERIVED from 8 mL per cell at 8 particles per cell) and 1-3k for sand, against the plan's 10-30k.",
+    "fix": "Before the probe, publish a budget table derived from watts: about 5-6 ms of GPU in total and about 5 P-core-ms per frame sustained (the reviews' ESTIMATE from the 4.3 W anchor), split per tier, each line with a range and the probe measurement that will replace it. State web v1 targets as about 100-300 awake boxes (30-100 hulls) and 3-8k liquid particles until measured."
+   },
+   {
+    "id": "F04",
+    "area": "roadmap",
+    "severity": "major",
+    "issue": "Phase 0a is not a days-sized milestone as written and its exit cannot fail. 'Real particle and rigid-body throughput' presupposes a solver and an MPM kernel chain, and 'every budget is replaced by a measurement' has no protocol, thresholds or decision table.",
+    "evidence": "All three feasibility reviews asked for a days-long probe with a written protocol, breadcrumb logs and a go/no-go ladder; the plan kept only the split into 0a and 0b. MEASURED this session: registry.npmjs.org returns 200 for @dimforge/rapier3d-compat (a prebuilt WASM rigid-body engine), so a real rigid benchmark needs no Rust build.",
+    "fix": "0a-1 (ESTIMATE 1-2 days): plain JS page with adapter limits and features, timer resolution, memory growth, one compute dispatch, a 1,000-dispatch overhead batch, readback latency, a Worker WebGPU check, build hash and staged breadcrumbs. 0a-2 (ESTIMATE under a week): prebuilt Rapier box stacks at 100-2,000 bodies and 8 substeps, a minimal real MLS-MPM chain with sort and pressure sweeps at 4k/8k/16k particles, and a 20-minute soak at the planned duty cycle. Write the decision table first (which measured value selects which branch, e.g. under 4k sustained particles means the matter tier is deferred)."
+   },
+   {
+    "id": "F05",
+    "area": "roadmap",
+    "severity": "major",
+    "issue": "'60 Hz for 20 minutes' and 'the heat soak holds' are not falsifiable: no body or particle count and no metric. They also collide with the plan's own default (drop to 30 frames per second when hot) and with Safari halving requestAnimationFrame under thermal mitigation or Low Power Mode.",
+    "evidence": "MEASURED in 01-research.md from WebKit source: performance.now() resolution is 1 ms without cross-origin isolation, and requestAnimationFrame falls to 30 fps under thermal mitigation; the web has no thermal-state API. DERIVED: a hand-read battery percentage over a 20-minute soak at 4.3 W (4.3/3 = 1.43 Wh = 11% of the 12.98 Wh pack) has about +/-1 point of quantisation, i.e. about +/-9%, before battery-health scaling.",
+    "fix": "Define each exit as a stated scene size, simulation-time ratio 1.0 with zero dilation events, under 2% of frame intervals above 25 ms, and step time measured over batches of N ticks, under a written protocol (iOS build, tab or Home Screen, Low Power Mode off, unplugged, no case, fixed brightness, ambient, battery percent before and after). Declare 30 Hz presentation with two fixed steps per presented frame a certified pass state, and size sustained budgets at 0.5 of cool capacity."
+   },
+   {
+    "id": "F06",
+    "area": "mechanism",
+    "severity": "major",
+    "issue": "The plan neither adopts a rigid-body library nor commits to writing one, and the 0b 'written A/B test' names no candidates, metrics or thresholds, so it cannot settle anything. A from-scratch deterministic 3D solver with reduced-coordinate articulations is far larger than one phase.",
+    "evidence": "Two reviews said to adopt Rapier. MEASURED this session from its Cargo.toml: version 0.36.1, Apache-2.0, minimum Rust 1.86 (the container has rustc 1.97), with rapier3d-f64 and rapier3d-mjcf crates and a 4-lane SIMD path; index.crates.io and static.crates.io return 200 while github.com clone URLs for third-party repositories return 403. Box3D is alpha v0.1 with six joint types and no articulations (MEASURED in 01-research.md).",
+    "fix": "Adopt Rapier, pinned and vendored from crates.io, behind the engine's own solver trait, and write only material-derived contact parameters with clamp reporting, actuators, ledger taps and frames. Turn the A/B into a pre-registered acceptance test of the adopted solver (cost per body-substep, 10-box stack drift, 1:1000 chain stretch, momentum defect, substep invariance) with a written fallback if it fails."
+   },
+   {
+    "id": "F07",
+    "area": "verification",
+    "severity": "major",
+    "issue": "'The whole loop runs from this Linux environment' is false in two places: nothing here can run WebKit's WGSL-to-Metal compiler, and the container cannot load the deployed site.",
+    "evidence": "MEASURED read-only in this container: rustc and cargo 1.97, Node 22.23, Chrome for Testing 153 (Playwright Chromium 1243), 4 vCPUs, 15 GB RAM, and a Vulkan loader 1.3.275 that enumerates 'llvmpipe (LLVM 20.1.2)' at API 1.4.335 when VK_ICD_FILENAMES=/opt/lavapipe/lvp_icd.json (no ICD is registered by default, there is no /dev/dri), plus a SwiftShader library. Missing: the wasm32-unknown-unknown target, wasm-bindgen-cli, wasm-opt, emscripten and any WebKit build; requests to rileykhalifaadam.github.io, webkit.org and the Playwright CDN got no HTTP response (curl code 000) and GitHub release downloads returned 403.",
+    "fix": "Gate every kernel through three compilers: naga via wgpu on lavapipe here, Tint via headless Chrome WebGPU here (not executed in this review because launching Chrome writes files, so verify it first), and Safari on a GitHub macOS runner (free for public repositories; whether the runner exposes WebGPU is unverified). Add a post-deploy smoke job in GitHub Actions, keep a CPU twin for every kernel, and treat an on-device subset as the real gate."
+   },
+   {
+    "id": "F08",
+    "area": "matter",
+    "severity": "major",
+    "issue": "Phase 3's exit cannot pass on the phone as written: the particle tier is too small for the boat and hydrostatic gates, the coupling scheme is unspecified, and the implicit pressure solve is first costed inside Phase 3.",
+    "evidence": "DERIVED: a free-surface position error of 0.25-0.5 cell gives 3% hydrostatic error only below 8-17 cells of depth (0.25/0.03 to 0.5/0.03). The physics review's 5% waterline condition (hull 30-60 cells wide) means a half-submerged 30-cell hull displaces 30 x 30 x 15 = 13,500 cells = 108,000 particles at 8 per cell, against 3-8k (reviews) or 10-30k (plan). Reviews also showed that 16 Jacobi sweeps remove only about 37% of the smooth residual at 13 cells of depth (DERIVED there) and that lagged coupling is unstable when added mass exceeds body mass (ESTIMATE from memory in the review).",
+    "fix": "Restore the analytic or heightfield hydrostatic reservoir that two physics reviews recommended as the home for boats (it is also the mid-scale water representation a larger engine needs) and embed the particle window in it. Size each on-device gate to at most half the measured budget at shipped resolution, benchmark the pressure-solve chain in the probe, and put body inverse mass inside the pressure solve or use a fixed-delay over-estimated added mass with a bobbing-float gate."
+   },
+   {
+    "id": "F09",
+    "area": "matter",
+    "severity": "major",
+    "issue": "On the web build the two tiers are not independent: encoding the GPU tier's compute dispatches, render submission and the mechanism solve share one thread, so 'one tier on the CPU, the other on the GPU' overstates what a combined scene can hold.",
+    "evidence": "Reviews counted 150-260 compute dispatches per frame for MPM with an implicit pressure solve at 4 substeps (DERIVED there by enumeration). At an ESTIMATE of 11-20 microseconds each that is 1.7-5.2 ms of CPU per frame (DERIVED), most of the roughly 5 P-core-ms sustained envelope (ESTIMATE), leaving 0-3 ms for mechanisms: about 0-300 boxes at the central 100 boxes/ms.",
+    "fix": "Budget dispatches as a first-class quantity (cap near 100 per frame, several block-local sweeps per dispatch) and measure per-dispatch cost and readback latency in the probe. Also test in the probe whether WebGPU works from a dedicated Worker (unverified), so the mechanism solve can leave the encoding thread without SharedArrayBuffer or nightly Rust."
+   },
+   {
+    "id": "F10",
+    "area": "scale",
+    "severity": "major",
+    "issue": "The plan states no precision or coordinate policy. The design it was synthesized from used f32 positions about one origin limited to +/-128 m, and the GPU is fp32-only, which cannot serve as the innermost region of a moving frame.",
+    "evidence": "DERIVED: in an inertial frame at low-orbit speed 7.8 km/s (between 2^12 and 2^13) the f32 velocity ulp is 2^-11 = 4.9e-4 m/s, while one 480 Hz gravity increment is 9.81/480 = 0.0204 m/s, only 42 ulp. Two reviews already required island-local or f64-anchored positions 'from Phase 0' at workshop scale, and 03-plan.md dropped that.",
+    "fix": "Make co-moving local frames with f64 anchors and frame-relative f32 state part of Layer 1 in the first release, with frame acceleration and rotation as explicit ledgered terms. Add translation, Galilean-boost and rotating-frame invariance gates to the 0b suite."
+   },
+   {
+    "id": "F11",
+    "area": "foundations",
+    "severity": "major",
+    "issue": "Charter item 1 lists only the conservation laws and the second law as hard-coded physics, and the fixed-rate rule ('never changes the timestep') assumes 1x real time. A solar-system engine needs gravitation as a law and a time-acceleration policy, so the charter breaks the day the outer tier is added.",
+    "evidence": "03-plan.md lines 17-18 and 76-77. DERIVED: an Earth-Mars transfer of about 259 days (ESTIMATE, the standard Hohmann figure from memory) compressed into 5 minutes needs 259 x 86,400 / 300 = about 74,600x time acceleration, while the workshop tier is already at its power limit at 1x.",
+    "fix": "Amend the charter now: add gravitation with a declared model per tier, make uniform g a derived local approximation with a reported error, and make time acceleration legal only for tiers whose integrators are certified at that step, with every detailed region asleep or on declared analytic rails."
+   },
+   {
+    "id": "F12",
+    "area": "scale",
+    "severity": "major",
+    "issue": "The plan removed the intermediate representations its source design had (heightfield and analytic liquids, far-field ballistic bodies, an awake-bubble boundary), yet the middle scales, not the outermost one, are where a multi-scale engine's cost and content sit. No render budget exists anywhere in the plan.",
+    "evidence": "DERIVED: a 30-body gravitational system is 30 x 29 / 2 = 435 pair evaluations per step, microseconds per frame on one core (ESTIMATE of about 20 ns per pair), so the outer tier is nearly free. Planet terrain, oceans, atmosphere and their rendering must share the same roughly 5-6 ms sustained GPU envelope (ESTIMATE) as the matter tier, and the STRATA physics review warned that bodies leaving the awake bubble have no representation, so their momentum vanishes.",
+    "fix": "In v1 keep planets as gravity sources with one simple collision surface per landing site, give out-of-bubble bodies a ledgered ballistic or Kepler propagator, and state a render budget. Add heightfield terrain and reservoir water as the first mid-scale representations in v2, each with a ledgered hand-off."
+   },
+   {
+    "id": "F13",
+    "area": "mechanism",
+    "severity": "major",
+    "issue": "Phase 2 rests on a method with no research backing and on gates the reviews' own checks contradict: 'quasi-static' modes have no vibration to measure, linear modes cannot buckle, and 'a bridge fails where the analysis says' names no structure, load or tolerance.",
+    "evidence": "MEASURED by search of 01-research.md: modal methods appear only in connection with sound. The STRATA physics reviewer's 200-element beam check (DERIVED there) gave tip deflection low by 23%, 13%, 7% and 3.6% with 4, 8, 16 and 32 free-free modes loaded through a weld, against the plan's 3-5% gate; re-baking modes for fragments on one WASM thread is unbudgeted.",
+    "fix": "Before Phase 2 is scheduled, pass a desktop prototype gate: Craig-Bampton attachment modes at joint anchors, exact oscillator integration for resolvable modes, baked linear-buckling factors and an elastic-network solve for bolted assemblies. Specify the bridge test as a named truss with member forces within a stated percentage of the stiffness method, and ship only elastic deflection and stress reporting first, with offline pre-fractured bakes later."
+   },
+   {
+    "id": "F14",
+    "area": "verification",
+    "severity": "major",
+    "issue": "The determinism gates lack a transport and a compatible solver design. No path exists for a phone replay to reach the build server, GPU-coupled scenes need a recorded wrench stream, and Phase 5's 'identical replay hashes' between a one-thread WASM build and a two-thread NEON build requires a solver whose results do not depend on thread count or SIMD width.",
+    "evidence": "DERIVED: 20 minutes of 60 Hz touch samples is 72,000 x 16 B = 1.15 MB (about 1.5 MB as base64), and wrenches for 20 coupled bodies at 24 B and 60 Hz are 20 x 24 x 60 x 1,200 = 34.6 MB per 20 minutes; neither can be pasted. MEASURED: Rapier's determinism guide on master (possibly stale, it names features absent from the current Cargo.toml) says enhanced-determinism cannot be combined with SIMD or parallel features, which conflicts with the research note citing the changelog; only Box2D/Box3D claim invariance across thread counts by default.",
+    "fix": "Gate determinism on scripted-input scenarios that print a hash checkpoint every N seconds (a few hundred bytes to paste), with the build server running the same .wasm under Node, which is bit-exact by the WASM specification apart from NaN payloads. Keep full replay export as a file for bug reports, restate bit-exactness as holding for matter-free scenes or with recorded wrenches, and keep Phase 5's hash-equality gate only if the chosen solver is ordering-invariant by design."
+   },
+   {
+    "id": "F15",
+    "area": "delivery",
+    "severity": "major",
+    "issue": "A new public repository does not 'keep PulseVault untouched': a project site under the same account shares the origin rileykhalifaadam.github.io, so localStorage, OPFS and IndexedDB quota, the persistence grant and any 'clear website data' step are shared with the existing app. The subfolder alternative is worse, and GitHub Pages cannot send the cross-origin-isolation headers that threads and fine timers need.",
+    "evidence": "MEASURED in this repository: /home/user/pulsevault/README.md gives the live URL on that origin and says all PulseVault state lives in localStorage; /home/user/pulsevault/sw.js is network-first and caches every GET inside its /pulsevault/ scope, so a subfolder deploy would be intercepted, and .github/workflows/pages.yml copies a fixed file list that excludes reality-engine/. MEASURED from GitHub's docs source: published Pages sites are limited to 1 GB with a soft 100 GB per month bandwidth limit; Safari's localStorage quota of about 5 MB per origin is an ESTIMATE from memory.",
+    "fix": "Use a new repository, keep engine data in IndexedDB or OPFS under an engine-named database and directory, never write engine logs to localStorage, never instruct origin-wide clearing, and give any engine service worker its own path scope. Start single-threaded without isolation and add the coi-serviceworker shim only when threads or 20-microsecond timers are needed; a clean origin with real headers needs a different static host and a user account."
+   },
+   {
+    "id": "F16",
+    "area": "api",
+    "severity": "major",
+    "issue": "Buildability is proven last (Phase 6), and the plan never states what a game is written in (a Rust crate, or JavaScript/TypeScript over WASM) or ships a controller library. 'Driven only by voltages' makes each milestone demo a bespoke controls project, and API mistakes surface after six phases.",
+    "evidence": "Reviews asked for a usable SDK from Phase 2, a controller library and a playable toy at the end of every phase; 03-plan.md keeps the builder kit and first game as the final roadmap row. With the scale requirement the API must also expose frames, sites and time acceleration, none of which appear in the strict-mode description.",
+    "fix": "State the authoring binding now and end every release with a small toy built only on the public strict-mode API (first: throw blocks on two worlds and in orbit). Ship joint-servo, wheel-speed and inverse-kinematics controllers as ordinary strict-mode library code in the mechanisms phase."
+   },
+   {
+    "id": "F17",
+    "area": "delivery",
+    "severity": "minor",
+    "issue": "The plan does not choose between wgpu and a hand-written WebGPU layer for Safari, and the inherited default (wgpu on the web) is the untested path.",
+    "evidence": "MEASURED in 01-research.md: wgpu's README and CI do not cover Safari, Bevy 0.20's wgpu shaders failed in Safari 26.6, and WebKit's WGSL compiler rejects constructs that naga and Tint accept (constant arrays above 2,047 elements, textures bound to let).",
+    "fix": "On the web use a thin hand-written JavaScript WebGPU host that binds WASM memory and loads plain .wgsl files; use wgpu natively for lavapipe tests here and for the later iOS host, both driven by one shared kernel manifest (bind layouts, buffer sizes). Prove one compute pass through the web path on the phone in 0a-1."
+   },
+   {
+    "id": "F18",
+    "area": "verification",
+    "severity": "minor",
+    "issue": "'A double-precision reference solver ... for every production solver' roughly doubles the implementation work of each tier.",
+    "evidence": "The STRATA feasibility review flagged this as a scope multiplier. MEASURED this session: a rapier3d-f64 crate exists in Rapier's workspace and pypi.org's index page for mujoco returns 200 (download not attempted).",
+    "fix": "Write solvers generic over the float type and use the f64 instantiation with converged iterations as the reference. Use independent engines (Rapier f64, MuJoCo) offline in the container as cross-checks, and run every gate at shipped f32 resolution as well."
+   },
+   {
+    "id": "F19",
+    "area": "foundations",
+    "severity": "minor",
+    "issue": "The governor's 'reduce the amount of awake matter' makes physical outcomes depend on phone temperature and is not listed as a replay input, which conflicts with 'never changes the laws' and with bit-exact replay.",
+    "evidence": "All three physics reviews flagged refusing or shedding awake matter as outcome-changing (a refused pile becomes an immovable momentum sink) and required governor decisions to be recorded as replay inputs. 03-plan.md lines 76-77 keep the shedding and say nothing about recording it.",
+    "fix": "Admit scenes against a worst-case awake budget at load time, record every governor decision in the replay stream, and order the rungs as render scale, 30 Hz presentation, then declared time dilation. Shed simulated matter only as a logged, ledgered demotion that uses the same rules as a scale hand-off."
+   },
+   {
+    "id": "F20",
+    "area": "foundations",
+    "severity": "minor",
+    "issue": "The plan states 'an A16 phone sustains about 4.3 W' as fact, but it is a single unverified search excerpt, apparently about a different and larger phone, at unstated brightness.",
+    "evidence": "01-research.md cites an article whose URL names the iPhone 15 Pro Max and marks it unverified; that host gave no HTTP response from this container. MEASURED on Wikipedia this session: the base iPhone 15 panel reaches 1,000 nits typical and 2,000 nits peak outdoors, far above the 150 nits at which the research's 0.94 W idle figure was taken.",
+    "fix": "Label 4.3 W an ESTIMATE, expect a lower envelope for the smaller chassis and for bright screens, fix brightness in the soak protocol, and let the probe's battery-percent measurement set the real figure."
+   },
+   {
+    "id": "F21",
+    "area": "roadmap",
+    "severity": "minor",
+    "issue": "The jump from 'hundreds' of bodies on the web to 'low thousands' natively, and Phase 5's 'at least twice the awake bodies' gate, contradict the plan's own statement that heat, not speed, is binding. Phase 5 also hides manual Apple steps.",
+    "evidence": "DERIVED from ESTIMATE factors: a second P-core gives 1.3-1.6x and removing WASM 1.4-2.5x, so 1.8-4x on a cool phone, but at a fixed power envelope only the efficiency part (1.4-2.5x) survives a 20-minute soak. Reviews found that fastlane cannot create the app record with an API key and that each native fix costs a 10-15 minute runner cycle (ESTIMATE in the review).",
+    "fix": "State the native target as body-steps per joule over a soak, about 1.5-2.5x the web build (ESTIMATE), and schedule an empty TestFlight build with a user preflight checklist before any porting. Keep Phase 5 deferred until the web ceiling is the measured blocker."
+   },
+   {
+    "id": "F22",
+    "area": "delivery",
+    "severity": "minor",
+    "issue": "A CPU-only milestone can be blocked by a browser GPU bug, because the first playable scene has no renderer fallback and the plan no longer mentions snapshot and resume.",
+    "evidence": "01-research.md lists WebKit bug 302711, a Metal-backend crash on iOS 26.0/26.1 that builds over about 70 seconds and scales with mesh count (unverified excerpt), and notes that iOS kills the tab instead of signalling device loss.",
+    "fix": "Draw all bodies in one instanced call, provide a WebGL2 or Canvas fallback for CPU-tier scenes, and make physics exits independent of the renderer. Persist snapshots and breadcrumbs so a tab kill is recoverable and diagnosable."
+   },
+   {
+    "id": "F23",
+    "area": "delivery",
+    "severity": "minor",
+    "issue": "Toolchain set-up is not a deliverable, although the container is ephemeral and several download routes are blocked.",
+    "evidence": "MEASURED: no wasm32 target, no ~/.cargo/registry cache, no wasm-bindgen-cli or wasm-opt; static.rust-lang.org, index.crates.io, static.crates.io and registry.npmjs.org return 200, while github.com release and clone URLs return 403 (so the npm wasm-pack installer and cargo git dependencies will fail). The cold-start cost per session is an ESTIMATE of 10-20 minutes of installs and first builds on 4 vCPUs.",
+    "fix": "Make the first deliverable a pinned tool list and an in-repository bootstrap script (rustup target add, cargo-built wasm-bindgen-cli, binaryen from npm, Node as the WASM test runner), with a committed lockfile and crates.io-only dependencies. Do release builds in GitHub Actions with caching."
+   },
+   {
+    "id": "F24",
+    "area": "delivery",
+    "severity": "minor",
+    "issue": "The plan lists five decisions but not the user's hands-on steps, and one stated constraint is unverified.",
+    "evidence": "Reviews found that a new repository's Pages source cannot be enabled with the workflow's own token. MEASURED: this checkout's only git remote is RileyKhalifaAdam/pulsevault, and this session's tool catalogue lists a GitHub repository-creation tool and an add-repository tool, so 'this session cannot create repositories' should be tested, not assumed (authorisation was not tested here).",
+    "fix": "Give one checklist: create or approve the public repository and choose a licence, set the Pages source to GitHub Actions, attach the repository to the session, confirm iOS 26 or later, then per phase run the written soak protocol and return results through a prefilled GitHub issue link instead of pasting. For Phase 5 add enrolment, agreements, app record, bundle ID and a Team API key placed directly in repository secrets."
+   },
+   {
+    "id": "F25",
+    "area": "matter",
+    "severity": "minor",
+    "issue": "Phase 4's gates have no tolerances ('match experiment') and bundle four research-grade features (granular flow, plasticity, conduction, melting) whose honest budget on the phone is tiny.",
+    "evidence": "Reviews derived that explicit sand holding self-weight strain near 1% needs 13-27 substeps at 2 cm cells, leaving about 1-3k particles (ESTIMATE; 1-3 L, DERIVED at 8 particles per 8 mL cell). The Materia physics review derived a thermal boundary layer of sqrt(1.43e-7 x 60) = 2.9 mm after 60 s against 2 cm cells, so the melting test can pass while in-game melting is grid-limited.",
+    "fix": "Remove Phase 4 from v1. When it is scheduled, give each feature its own gate with a numeric tolerance at shipped resolution, and treat dense granular volume with the same pressure projection as liquids."
+   }
+  ],
+  "dropped_review_fixes": [
+   "Budget from watts instead of from a throttled frame: about 5-6 ms GPU total and about 5 P-core-ms per frame at the 4.3 W anchor, sustained budgets at 0.5 of cool capacity (reviewers' ESTIMATEs); 03-plan.md has no millisecond or watt table at all. [Hamilton, Materia, STRATA feasibility]",
+   "Corrected planning numbers: 3-8k liquid particles at 4 substeps, 1-3k for honest sand, 110-330 web boxes in 3 ms, 64-128 certified awake primitives for web v1 (all reviewers' ESTIMATEs); the plan reverted to the research's 10-30k particles and 'hundreds' of bodies. [STRATA, Materia feasibility]",
+   "Written soak protocol and falsifiable exits: simulation-time ratio 1.0, dropped-interval fraction, Low Power Mode off, stated brightness, no case, unplugged, ambient noted, battery percent as the power proxy. [all three feasibility reviews]",
+   "Numeric floors, time boxes, named cut lists and kill criteria per phase, with tolerances frozen in the phase that ships each feature. [all three feasibility reviews]",
+   "Diagnostics for a lab with no remote inspector: staged breadcrumb log, getCompilationInfo, uncapturederror and device.lost capture, build hash in the HUD and every report, cache-busted assets, one-tap result return instead of copy-paste. [Hamilton, Materia, STRATA feasibility]",
+   "Safari shader-compile job on a GitHub macOS runner and WGSL execution in the container as Phase 0 exit items; NaN-safe kernels because Safari compiles in relaxed-maths mode; a CPU twin for every kernel. [all three feasibility reviews]",
+   "Thin hand-written WebGPU host on the web, or proof of wgpu on the phone in the probe, before committing to wgpu for Safari. [Materia feasibility]",
+   "Adopt an existing deterministic rigid-body engine (Rapier) and write only the material, actuator and coupling layers; use Rapier, Box3D and MuJoCo as offline oracles. [Materia feasibility and physics, STRATA feasibility]",
+   "Solver A/B with thresholds fixed in advance: cost per body-substep, stack drift, chain stretch, momentum defect. [Hamilton feasibility and physics]",
+   "Probe content beyond throughput: per-dispatch overhead, readback latency in frames, timestamp-query availability, pressure-solve chain convergence, Safari tab versus Home Screen, Lockdown and Low Power Mode. [Materia physics, STRATA feasibility]",
+   "Budget cell-passes and dispatches separately from particle-passes; active-block or tight moving grid window; a cap near 100 dispatches per frame (reviewer's ESTIMATE). [Hamilton, Materia feasibility]",
+   "Strong rigid-liquid coupling (body inverse mass inside the pressure solve, or an over-estimated added mass), a fixed N-tick wrench delay, the wrench stream recorded as a replay input, and a bobbing-float gate. [Materia feasibility, STRATA physics]",
+   "Analytic or heightfield hydrostatic reservoir as the home for boats, with the particle window embedded in it. [Hamilton and STRATA physics]",
+   "Every gate run and published at shipped resolution, particle count and f32, not only on the f64 reference; on-device tests sized to half the certified budget or less. [Materia feasibility; Materia and STRATA physics]",
+   "Positions as per-step deltas relative to an f64 or island-local origin from Phase 0, with translation, rotation and Galilean-boost invariance gates. [STRATA physics, Hamilton feasibility]",
+   "Bodies that leave the awake bubble get an analytic ballistic or low-rate integrator booked in the ledger; a two-way flux boundary for the particle window. [STRATA physics]",
+   "Governor that never alters outcomes: worst-case admission at load, time dilation before any refusal, 30 Hz presentation with full-speed simulation as a certified mode, governor decisions recorded as replay inputs. [Materia and STRATA, both lenses]",
+   "Snapshot to OPFS and resume after a tab kill as a core engine feature; it is in the keep list of several reviews and absent from 03-plan.md.",
+   "Shared-origin storage policy: namespaced OPFS and IndexedDB, no origin-wide clearing, or a separate origin. [Hamilton, STRATA feasibility]",
+   "Toolchain bootstrap script and pinned tool list as the first deliverable; an explicit statement that the web tier stays single-threaded unless nightly Rust is accepted; a one-time user checklist including Pages enablement. [Hamilton, Materia feasibility]",
+   "Renderer risk controls: one instanced draw call, a WebGL2 fallback for CPU-tier scenes, physics exits independent of the renderer. [STRATA feasibility]",
+   "A vertical slice and a playable toy at the end of every phase; a usable SDK and controller library from the mechanisms phase; the authoring binding (Rust crate or JS/TS over WASM) stated. [Materia feasibility; Hamilton and Materia physics]",
+   "Repairs the modal tier needs for the Phase 2 gates: Craig-Bampton attachment modes, baked linear-buckling factors, elastic-network load sharing, offline pre-fracture bakes with runtime bakes capped. [STRATA physics and feasibility]",
+   "Native preflight: user checklist (enrol, accept agreements, create app record and bundle ID, Team API key into repository secrets) and an empty TestFlight build as its own early milestone. [STRATA, Hamilton feasibility]",
+   "Reference solver as the same generic code instantiated in f64 with converged iterations, instead of a second implementation per solver. [STRATA feasibility]"
+  ],
+  "missing_entirely": [
+   "Any milestone, test or deliverable at more than one scale; any frame tree, re-anchoring rule, gravity-source model or time-acceleration policy in Layer 1.",
+   "A numeric frame and power budget (milliseconds and watts per tier, cool versus sustained), including a render budget; rendering is not mentioned anywhere in the plan although it shares the GPU envelope.",
+   "Time boxes, effort estimates, cut lines and kill criteria for every phase; a risk register.",
+   "A written device test protocol and a pre-registered decision table mapping probe results to design branches.",
+   "Decisions on adopt-versus-write for the rigid solver, on the GPU abstraction for Safari, and on the language a game is authored in.",
+   "Toolchain bootstrap, pinned versions, CI design (build in Actions, post-deploy smoke test, Safari-on-macOS shader job) and a statement of what cannot be tested from the container.",
+   "On-page diagnostics, build stamping, cache busting, and a result-return channel that does not depend on pasting large text.",
+   "The user's manual-steps checklist, the licence choice forced by a public repository, and third-party notices if a library is adopted.",
+   "Origin and storage policy for sharing rileykhalifaadam.github.io with PulseVault; snapshot and resume after a tab kill; Safari storage-eviction handling.",
+   "Precision and coordinate policy (f32 versus f64, local frames) and invariance tests.",
+   "Intermediate-scale representations (heightfield terrain and water, analytic reservoirs, far-field ballistic bodies) and ledgered hand-off rules between representations.",
+   "Transport and size limits for replays and for recorded GPU wrench streams; which scenes the bit-exact claim covers.",
+   "A controller library, input and camera design, and any definition of what 'a rover and an arm run' means as a measurable task.",
+   "Provenance route for planetary constants: JPL hosts gave no HTTP response from this container (MEASURED, curl code 000) while en.wikipedia.org is reachable."
+  ],
+  "small_world_assumptions": [
+   "One awake detail bubble: every body and particle budget is for a single region around one observer; two simultaneously awake regions (for example a base and a ship) would each get half.",
+   "A single world origin with f32 state (the source design's +/-128 m limit) and an fp32-only GPU; no frame tree and no re-anchoring.",
+   "Uniform constant gravity of fixed direction is implicit in every Phase 0b-4 gate (hydrostatic rho*g*h, dam break, angle of repose, waterline, block stacking).",
+   "1x real time everywhere: the fixed 480 Hz step and 'the governor never changes the timestep' assume no time acceleration (DERIVED: an Earth-Mars transfer in 5 minutes needs about 74,600x).",
+   "'Sleeping' means at rest in the world frame; on a rotating planet or in orbit a sleeping body is moving and needs rails propagation with ledger entries.",
+   "One global ledger of mass, momentum and energy: DERIVED, Earth's orbital kinetic energy 0.5 x 5.97e24 kg x (2.978e4 m/s)^2 = 2.6e33 J has an f64 ulp of 2^59 = 5.8e17 J, so workshop-scale joules vanish in a shared account; the source design's integer-microgram mass ledger overflows 64 bits for any planet (5.97e33 micrograms versus 2^64 = 1.8e19).",
+   "Snapshot equals the whole world and replay equals initial snapshot plus inputs from time zero; both assume the world fits in memory and sessions last about 20 minutes.",
+   "Replay logs small enough to paste, with no stream of promotion, demotion, re-anchoring or GPU-wrench events.",
+   "The 20-minute soak of one fixed scene as the phase exit; no test of transition spikes such as landing, where far-field matter is promoted into the detailed tier.",
+   "The governor sheds 'awake matter' inside one scene; admission control across regions and worst-case promotion volume are not budgeted.",
+   "A render load of one room-scale view; no terrain level of detail, atmosphere, far bodies or depth-range handling from metres to 1e11 m, all of which would draw on the same sustained GPU envelope as the matter tier.",
+   "A material database of workshop solids and liquids (steel, oak, rubber, water, sand); no regolith, rock, ice, gases or vacuum behaviour.",
+   "A charter law list without gravitation, and 'electromagnetic fields out of scope', which also excludes sunlight and radiative cooling, the only heat sink in vacuum.",
+   "Validation oracles that are lab-scale closed forms and bench experiments (dam break, column collapse, cube toss, beam deflection).",
+   "'Memory is not the binding limit' holds because the world is at most about 20,000 sleeping bodies and one 64-cubed grid (source design's ESTIMATE); streamed planetary data changes that, and a GitHub Pages site is limited to 1 GB (MEASURED from GitHub docs) while a 30-arc-second global elevation grid is 43,200 x 21,600 x 2 B = 1.87 GB (DERIVED).",
+   "Collision broadphase, islands and sleeping over one flat body list in one coordinate system.",
+   "Strict mode forbids teleporting and setting velocities, but frame re-anchoring and rails-to-dynamic hand-offs are engine-internal versions of both and need a sanctioned, ledgered path.",
+   "Phase 5's 'twice the awake bodies' and every 'done when' measure one scene at one site.",
+   "Origin-shared, evictable browser storage is acceptable for a demo scene but not for a persistent multi-session world (Safari deletes script-written data after seven days without interaction unless persistence is granted, MEASURED in 01-research.md).",
+   "The device-lab loop of one pasted result block per phase assumes one scenario per phase; a multi-scale engine needs a scenario matrix (surface, orbit, transit, hand-off).",
+   "The player's finger as the only force-limited actuator assumes human-scale objects within reach at one zoom level.",
+   "Web budgets assume a single thread shared by the mechanism solve, GPU dispatch encoding and rendering; any outer-tier work (propagation, streaming, generation) joins that same thread unless Workers are proven on the phone."
+  ],
+  "keep": [
+   "The laws-and-materials layer as the permanent asset with replaceable solver tiers beneath it; extend it with frames, gravitation and a time policy, do not replace it.",
+   "The probe on the user's own phone as a separate first step before any budget is frozen.",
+   "Web-first delivery (Rust core to WebAssembly, kernels in WGSL, static site, no Mac and no Apple account), with the native app optional and later.",
+   "A CPU-authoritative deterministic mechanism tier with the WASM binary as the cross-platform reference, and the GPU tier held to tolerances only.",
+   "Heat as the binding constraint, a soak as an exit for every phase, and a governor that never changes the timestep, the materials or the laws.",
+   "The ledger with a separate numerical-loss account, the per-object fidelity record of authored versus achieved parameters, and the live Reality Report.",
+   "The strict-mode API with logged, ledgered escape hatches, actuators as physical models (motor, gearbox, battery) and the finger as a force-limited actuator.",
+   "The stiffness stance: stiff things rigid with a real-modulus stress estimate, liquids incompressible, the departure declared per material; friction, restitution and viscosity labelled empirical.",
+   "The rejections of a continuum-only engine, a single energy-minimising solver and automatic rigid-to-deformable switching.",
+   "Tests written before each feature against closed forms or published experiments with tolerances.",
+   "The honest statement that the detailed region is a workshop; it becomes the certified budget of the innermost region of the larger engine.",
+   "A separate public repository from PulseVault, and Phase 0b limited to rigid blocks in three materials.",
+   "The substepped soft-constraint solver family with reduced-coordinate articulations as the mechanism approach, obtained by adoption instead of a rewrite."
+  ]
+ }
+}
