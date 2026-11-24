@@ -6,8 +6,6 @@ Tags: **[M]** measured, **[D]** derived, **[E]** estimate until the Phase 0a pro
 
 ## 1. Frame tree and number formats
 
-Every position is a frame plus a local coordinate.
-
 | Level | Frame | Format |
 |---|---|---|
 | G | Star-system origins | Three 64-bit integers, km: +/-975,000 light-years [D: 2^63 km / 9.461e12]; error 0.5 km |
@@ -28,10 +26,9 @@ The worst-case position or velocity error is half a spacing per operation. Doubl
 
 ## 2. The region frame
 
-| | Surface region | Free-fall region (orbit, cruise) |
+| | Surface region (axes body-fixed) | Free-fall region (orbit, cruise; axes never rotate) |
 |---|---|---|
 | Anchor | A point fixed in the body's rotating frame; the ground is static | A point falling under the summed gravity of all heavy bodies plus the primary's J2, stepped every tick |
-| Axes | Parallel to the body-fixed axes | Parallel to system axes; never rotate |
 | Re-centre when the focus object is | Over 256 m away [E]: shift positions | Over 256 m or 32 m/s away [E]: shift positions and velocities |
 
 Re-centring is decided from sequenced state at a frame boundary, so every peer does it at the same tick, and is journalled. Shifts are multiples of 2^-16 m and m/s: the anchor absorbs them exactly, each body rounds by at most 4.5e-13 m and 5.7e-14 m/s [D: half a spacing], and that residual plus the energy change -P.dV + 0.5 M dV^2 is booked as frame transfer.
@@ -44,11 +41,11 @@ Leaving: an island past the demote radius is demoted into the parent body's fram
 
 ## 3. Orbit integrator
 
-**Decision (VP01).** Heavy bodies (10 in release 1, 34 in Phase 2) attract each other and everything else pairwise. Objects (vessels, debris, anchors) attract nothing. Two-body rails survive only as mode K for dormant objects and as the fallback for an uncertified authored system.
+**Decision (VP01).** Heavy bodies (10 in release 1, 34 in Phase 2) attract each other and everything else pairwise; objects (vessels, debris, anchors) attract nothing. Two-body rails survive only as mode K for dormant objects and as the fallback for an uncertified authored system.
 
 **Interface.** heavy_state(tick) is bit-exact and equals F(initial-record hash, arithmetic version, integrator id and step, journal of kicks and mass changes, tick), whatever the warp history or observer (VP02). Changing the method is a journalled event continuing from a checkpoint.
 
-**Method.** Release 1 uses "PEFRL-60": a fourth-order symplectic composition (energy error stays bounded) of five drifts and four kicks, coefficients 0.1786178958448091, -0.2123418310626054, -0.06626458266981849 (Omelyan et al., from memory; order confirmed by a run this session). Step H = 28,800 ticks = 60 s [D], on tick multiples of H. It follows VF05, not VP01's baseline (ORRERY's 12th-order multistep at 600 s): it is self-starting, checkpoints as positions and velocities, takes kicks without a restart, and needs only add, subtract, multiply, divide and square root. The multistep and nested Wisdom-Holman methods can replace it only through the oracle test.
+**Method.** Release 1 uses "PEFRL-60": a fourth-order symplectic composition (energy error stays bounded) of five drifts and four kicks, coefficients 0.1786178958448091, -0.2123418310626054, -0.06626458266981849 (Omelyan et al., from memory; order confirmed by a run this session). Step H = 28,800 ticks = 60 s [D], on tick multiples of H. It follows VF05, not VP01's baseline (ORRERY's 12th-order multistep at 600 s): it is self-starting, checkpoints as positions and velocities, takes kicks without a restart, and needs only the five basic operations. The multistep and nested Wisdom-Holman methods can replace it only through the oracle test.
 
 1. Bodies in ascending id, state relative to the parent. Drift: position gains coefficient x H x velocity.
 2. Kick: for each pair once, form the separation through the tree, compute 1/(r^2 sqrt(r^2)), apply equal and opposite accelerations; velocity gains coefficient x H x (own acceleration minus parent's).
@@ -68,7 +65,7 @@ Published references: leapfrog at 60 s gives Earth 5.6 m per year [D, 06]; Wisdo
 
 **Cost.** One pair costs 5.4-6.9 ns in wasm on a 2.1 GHz Xeon [M, this round]; the A16 is 1-2.5x slower [E]. A step of four evaluations is 1.0-1.2 us for 10 bodies (45 pairs) and 12-15.5 us for 34 (561 pairs), so 0.5 ms per frame allows warp of 1.4e6-1.9e6x and 1.2e5-1.5e5x [D]. Body-count ceiling: pairs <= 6.5e7 / warp [D: 0.5 ms x 3,600 / (4 x 6.9 ns)], so 360 bodies at 1,000x and 36 at 100,000x.
 
-**Cache (VF10).** A checkpoint is 1,632 B for 34 bodies [D: 34 x 6 x 8] plus accounts. The last 64 are kept; older ones thin to every 65,536 nodes, so any tick costs at most 1.0 s of re-stepping [D: 65,536 x 15.5 us].
+**Cache (VF10).** A checkpoint is 1,632 B for 34 bodies [D: 34 x 6 x 8] plus accounts. Old ones thin to every 65,536 nodes, so any tick costs at most 1.0 s of re-stepping [D: 65,536 x 15.5 us].
 
 ## 4. Bit-exactness
 
@@ -78,11 +75,11 @@ The shipped .wasm binary is the canonical arithmetic; a server or native app run
 |---|---|
 | Allowed | f64 add, subtract, multiply, divide, square root; integers. Such a kernel hashed identically on native x86-64 and wasm under Node [M, this round]; Safari unverified |
 | Forbidden | Host maths, fused multiply-add, relaxed SIMD, threads, reassociation. A non-finite result halts the step; no NaN is hashed |
-| Own functions | Sine, cosine: exact octant from the integer phase, then a fixed polynomial. Stumpff series for the Kepler solver: fixed degree and reduction. Kepler solve: exactly 2 Halley and 2 Newton iterations, 1e-13 relative [M, same paper]. Jacobi elliptic functions (Phase 1): fixed Landen steps |
+| Own functions | Sine, cosine: exact octant from the integer phase, then a fixed polynomial. Stumpff series for the Kepler solver: fixed degree and reduction. Kepler solve: exactly 2 Halley and 2 Newton iterations, 1e-13 relative [M, arXiv:2307.05683 via 06] |
 | Order | Ascending stable id; explicit parentheses; constants as bit patterns in an arithmetic-version table |
 | Versioning | Binary hash, arithmetic version and integrator id in the world record and handshake; mismatch refused |
 
-Tests: the first two rows of section 10, in CI and on the phone.
+Tests: section 10, rows 1-2.
 
 ## 5. Gravity supplied to a region
 
@@ -92,14 +89,14 @@ Sizes at L = 250 m from the anchor (the plan's "250 m" read as radius), [D], m/s
 
 | Term | Formula | Earth's equator | Low orbit, 400 km |
 |---|---|---|---|
-| Uniform gravity | GM/r^2 (1 + 1.5 J2) | 9.8142 | 8.676, cancelled exactly by the anchor's fall |
+| Uniform gravity | GM/r^2; on the equator x (1 + 1.5 J2) | 9.8142 | 8.676, cancelled exactly by the anchor's fall |
 | Centrifugal | spin^2 R | 0.0339, leaving 9.7803 ([M] 9.780) | None |
 | Tidal gradient | 2 GM L/r^3 vertical; GM L/r^3 across | 7.7e-4; 3.8e-4 | 6.4e-4; 3.2e-4 |
 | Second; third order | 3 g (L/r)^2; 4 g (L/r)^3 | 4.5e-8; 2.4e-12 | 3.5e-8; 1.7e-12 |
 | Moon; Sun tide | 2 GM_b R/d^3 | 1.1e-6; 5.1e-7 | In the anchor's path; across the region 4.3e-11; 2.0e-11 |
 | Coriolis | 2 spin v | 1.5e-3 at 10 m/s | None |
 
-Earth's own fall (5.9e-3 toward the Sun) cancels the Sun's uniform pull, leaving the tide; the Euler term is zero because spin is prescribed. Drop rule: a term may be dropped only if its bound over the region is under 1e-9 m/s^2 (6.5 mm for a free body in an hour [D: 0.5 a t^2; threshold E]); the decision uses sequenced state, so peers agree, and is listed in the Reality Report. Only the third-order term and the cross-region tide variation drop. Coriolis is applied as a velocity rotation (Boris scheme), which cannot do work.
+Earth's fall toward the Sun (5.9e-3) cancels the Sun's uniform pull, leaving the tide; the Euler term is zero because spin is prescribed. Drop rule: a term may be dropped only if its bound over the region is under 1e-9 m/s^2 (6.5 mm for a free body in an hour [D: 0.5 a t^2; threshold E]); the decision uses sequenced state, so peers agree, and is listed in the Reality Report. Only the third-order term and cross-region tide variation drop. Coriolis is applied as a velocity rotation (Boris scheme), which cannot do work.
 
 ## 6. Time and warp
 
@@ -108,7 +105,7 @@ The clock is a 64-bit tick count at 1/480 s, range 6.09e8 years [D: 2^63 / 480 /
 | Rate | Rule |
 |---|---|
 | Below 1 | Always legal: the governor's time dilation, sequenced (P15) |
-| 1 to 4 [E] | Legal when awake regions hold mechanisms only and fit the budget; more 480 Hz ticks per frame |
+| 1 to 4 [E] | Legal when awake regions hold mechanisms only and fit the budget |
 | Above 4 | Legal when every region is demoted, else refused naming the blocking object; only heavy bodies and mode-S objects step |
 | Above the ceiling | Refused; the model never changes, and the ceiling comes from measured step cost |
 
@@ -150,7 +147,7 @@ Authored systems: the builder gives a star's mass, radius and temperature, and p
 | Property | Formula | Earth check [D] |
 |---|---|---|
 | Radius | (3M / 4 pi density)^(1/3) | 6,371 km at 5,514 kg/m^3 |
-| Surface gravity | GM/R^2 - spin^2 R | 9.76 m/s^2 before J2 |
+| Surface gravity | GM/R^2 - spin^2 R | 9.79 m/s^2 on that sphere, before J2 |
 | Escape speed | sqrt(2GM/R) | 11.19 km/s |
 | Equilibrium temperature | (L(1-A) / 16 pi sigma d^2)^(1/4) | 254.6 K at A = 0.3; real mean 288 K |
 
@@ -158,7 +155,7 @@ An authored system must survive a 10,000-year build-server integration [E]; othe
 
 ## 9. Environment fields (interface only)
 
-environment(body, position, tick) returns density, pressure, temperature and medium velocity; vacuum is a value, returned everywhere in release 1 (P14). starlight(position, tick) returns direction and flux L/(4 pi d^2), 1,361 W/m^2 at 1 AU [M, 06], with an eclipse factor. Atmosphere, drag and heating arrive in phase 4.
+environment(body, position, tick) returns density, pressure, temperature and medium velocity; vacuum is a value, returned everywhere in release 1 (P14). starlight(position, tick) returns direction and flux L/(4 pi d^2), 1,361 W/m^2 at 1 AU [M, 06], with an eclipse factor.
 
 ## 10. Validation tests
 
@@ -167,7 +164,7 @@ Tolerances are [E] until the first run; every gate runs on the shipped binary an
 | Test | Reference | Tolerance | Runs |
 |---|---|---|---|
 | Bit-exactness | Stored bit patterns, 10,000 inputs per own function; hash of 1e6 heavy steps against the build server | 0 bits | P (0a), B |
-| Warp invariance | Hash at one tick under three schedules, one through a checkpoint restore | 0 bits | P (0s), B |
+| Warp invariance | Hash at one tick under three schedules, one through a checkpoint restore; an object's orbital elements across demote, warp, promote | 0 bits; 1e-12 | P (0s), B |
 | Two-body closure | Kepler closed form: integrator on a lunar orbit, 1 year; mode-K solver at eccentricity 0.6, 10,000 periods | 0.1 m; 1e-9 relative; energy 1e-12 | B, P |
 | Oracle, 1 year | IAS15-class run of the same model (1e-16 [M, 06]) | Planets 5 m, Moon 1 m; with 34 bodies 100 m, 5 km, Phobos 50 km | B |
 | DE440, 10 years | Kernel; Mercury off by 960 km for lack of relativity [D, 06] | Within 15%; others reported | B |
@@ -190,7 +187,7 @@ Tolerances are [E] until the first run; every gate runs on the shipped binary an
 
 **Assumed from 03-first-builds.** Phase 0a times the pair kick, one step, sine/cosine and the Kepler solve on the phone and returns the 1e6-step hash (F04, F14). Phase 0s uses this tier's reference sphere and a tangent plane at a site as ground.
 
-**Needed from later specs.** Mechanism tier: f64 state relative to the anchor; gravity, gradient torque and Coriolis rotation as per-body inputs; a re-base operation; no absolute speed clamp; rest judged in the frame (P08). Matter tier: one vector, the gradient and the spin per substep, f32 relative to its own window. Regions: focus, promote and demote radii, aggregate record. Multiplayer: sequencing of warp, tracking and promotion; the heavy checkpoint in the join package and its hash in the fingerprint. Re-centring is a state-derived journalled event, not a sequenced input.
+**Needed from later specs.** Mechanism tier: f64 state relative to the anchor; gravity, gradient torque and Coriolis rotation as per-body inputs; a re-base operation; no absolute speed clamp; rest judged in the frame (P08). Matter tier: one vector, the gradient and the spin per substep, f32 relative to its own window. Regions: the focus object, promote and demote radii. Multiplayer: sequencing of warp, tracking and promotion; the heavy checkpoint in the join package and its hash in the fingerprint. Re-centring is a state-derived journalled event, not a sequenced input.
 
 **Provided.** Every function named above, plus frame transforms, warp admission, prediction, derived body properties and the heavy checkpoint and hash. API nouns: Site, Orbit, Clock.requestWarp, Predict, Environment.
 
@@ -210,5 +207,4 @@ Tolerances are [E] until the first run; every gate runs on the shipped binary an
 - The oracle run: n-body error of PEFRL-60 for 10 and 34 bodies, whether compensated sums are needed, and the bake-off with the multistep and nested methods.
 - Whether WebAssembly requires a correctly rounded square root (recalled, not checked).
 - Every [E] threshold, set from the first runs.
-- A cheaper mode-S step for low orbits (Wisdom-Holman for objects).
 - JPL's licence terms, the IAU pole table, and the recalled catalogue values.
