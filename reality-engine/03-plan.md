@@ -1,130 +1,137 @@
-# Reality engine — the plan
+# Reality engine — the plan (version 2)
 
-Synthesized from five research sweeps, three independent candidate architectures and six adversarial
-reviews (see `01-research.md` and `02-designs-and-reviews.md`). No code exists yet.
+Settled by the user: **3D**, **a whole solar system or more**, **multiplayer**. No code exists yet.
 
-## The verdict in one paragraph
+Version 1 of this plan was workshop-scale and single-player (it is in the git history). Its two
+solver tiers survive as the innermost layer of this one.
 
-No single solver can be "reality" on an iPhone 15, and each of the three candidate designs that bet on
-one was rejected by its reviewers. What survives is a design where the permanent part of the engine is
-not a solver at all: it is a **laws-and-materials layer** (conservation laws, real material data in SI
-units, and an audit of every approximation), with two replaceable solver tiers underneath it. One tier
-runs machines on the CPU; the other runs flowing matter on the GPU. It ships first as a web page your
-iPhone opens in Safari, so it needs no Mac and no Apple account.
+**Status of the evidence.** Two of three scale designs finished (`08-scale-designs.md`). The third
+design and the comparative review were stopped to save usage, so the choice between designs below is
+the lead's judgement and has not been reviewed.
 
-## What "first principles" will mean here (the charter)
+## The verdict
 
-1. The only hard-coded physics is conservation of mass, momentum, angular momentum and energy, plus the
-   second law of thermodynamics as an admissibility test on every material model.
-2. Everything specific to an object enters only through its geometry and its material. Materials carry
-   measured SI properties (density, stiffness, yield strength, friction pairs, viscosity, thermal
-   properties), each with a recorded source. No per-object scripted behaviour.
-3. Every numerical shortcut is declared and measured, never hidden.
-4. Every fidelity claim is backed by an automated test against a closed-form answer or a published
-   experiment, with a tolerance.
-5. Units are enforced by the type system.
+The engine holds a star system as a tree of reference frames and simulates almost none of it in
+detail at any moment. Gravity and orbits run for every body all the time, which is cheap. Machines
+and flowing matter are simulated only inside small **regions of detail** around players. Everything
+else is stored as exact totals and advanced by formula. Players share a region by exchanging inputs,
+not states.
 
-Fidelity ladder:
+## Charter
 
-- **Exact by construction**: mass, momentum exchanged between two interacting bodies, units, replay on the same build.
-- **Convergent and tested**: free rigid motion, joints and mechanisms, bending and buckling of stiff parts, hydrostatics, heat conduction.
-- **Empirical, labelled as such**: friction, bounce (restitution), viscosity. These are empirical in real engineering too.
-- **Out of scope**: atoms, sound waves travelling through steel, turbulence, electromagnetic fields.
+The five points of version 1 stand: conservation laws are the only hard-coded physics; behaviour
+comes only from geometry and measured material data; every shortcut is declared; every claim has a
+test; units are enforced by types. Four are added:
 
-## The limits that shaped the design
+6. **No global coordinates.** Every position is a frame plus a local coordinate. Time is an integer
+   count of ticks of 1/480 s.
+7. **Every hand-off is a double-entry transaction** in mass, momentum, angular momentum and energy,
+   whether between levels of detail, regions or owners, with exactly one owner at all times.
+8. **Nothing is silently frozen.** Whatever is not being simulated either advances by an exact
+   formula or is reported as paused.
+9. **A step is a pure function of state and tick-stamped inputs**, with no wall clock and no
+   unseeded randomness. Save, replay and multiplayer all rest on this.
 
-- **Real stiffness cannot be time-stepped.** Simulating steel explicitly at 1 cm resolution needs about
-  9,800 steps per frame and water about 2,500; the phone affords 2 to 8. So stiff things are treated as
-  rigid (with bending computed separately at the real stiffness) and liquids as incompressible. This is
-  the one sanctioned departure from real parameters, and the engine reports it per material.
-- **Heat is the binding constraint, not speed or memory.** An A16 phone sustains about 4.3 W over a
-  30-minute game session, and its GPU holds 50-85% of peak output once warm. Every budget is sized to
-  what the phone can hold for 20 minutes.
-- **Scale is a workshop, not a world.** Estimates, all unmeasured on an iPhone 15: hundreds of awake
-  rigid bodies in the browser and low thousands in a native app; 10-30 thousand matter particles, which
-  is litres to low tens of litres of liquid, or a few litres of sand. A larger world can exist around
-  that as sleeping or simplified matter.
-- **Contact is the main fidelity risk.** Even simulators fitted to data miss real cube tosses by 13-25%
-  of the cube's size.
+## What "a solar system or more" honestly means
+
+- Every body in a star system moves under Newtonian gravity: about 34 heavy bodies attracting each
+  other (ESTIMATE: up to 300-450), plus thousands of small bodies and vessels.
+- "Or more" means more levels in the tree. A galaxy is a catalogue plus a generator; only the star
+  system you are in is integrated.
+- Planets are bodies with tables (interior structure, an atmosphere column, a seeded surface
+  generator), not simulated matter. There is no global ocean, weather or geology.
+- Nothing mechanical happens where no region is awake. A machine left running pauses unless it has
+  an exact formula.
+- Newtonian only: Mercury's orbit is off by 43 arcseconds per century, and results hold below about
+  1% of light speed.
+- Full detail exists only inside a region. The feasibility review re-derived the sustained browser
+  budget as roughly 100-300 awake boxes and 3-8 thousand liquid particles (ESTIMATE), lower than
+  version 1 claimed.
 
 ## Architecture
 
-**Layer 1 — Laws and materials (permanent).** Typed SI units; a material database with provenance; a
-per-step ledger of mass, momentum and energy with a separate "numerical loss" account; a fidelity
-record per object showing authored versus achieved parameters.
+**Laws, materials and the world record (permanent).** As version 1, plus frames, integer time,
+ports through which matter and energy cross a region's boundary, and a world record kept in memory
+with a journal. The record is separate from the solvers that temporarily check out a region. That
+separation gives save, recovery after the browser kills the page, and hand-off between players.
 
-**Layer 2 — Mechanism tier (CPU, bit-exact).** Rigid bodies and jointed mechanisms
-(reduced-coordinate articulations, the formulation robotics simulators use), solved with a substepped
-soft-constraint solver of the Box2D v3 / Rapier lineage at 480 steps per second. Contact stiffness and
-friction are derived from material data, then clamped to what the step rate can resolve, with the clamp
-reported. Actuators are physical models: DC motors with back-EMF and current limits, gearboxes with
-reflected inertia, batteries with internal resistance. Stiff parts bend, yield and break through
-quasi-static modal elasticity at the real modulus, the one method reviewed that keeps real steel
-stiffness on a phone.
+**Frames and precision.** Star systems are placed with 64-bit integers (1 km resolution, about a
+million light-years of range). Bodies inside a system use 64-bit floats relative to their parent
+body. A region has its own moving origin, and the GPU works in 32-bit relative to it.
 
-**Layer 3 — Matter tier (GPU).** A particle-grid continuum solver (MLS-MPM: matter as particles that
-exchange momentum through a grid) for liquids, sand, mud and soft solids, with an implicit pressure
-solve so liquids do not compress. It is coupled both ways to the mechanism tier with friction, so a
-boat floats and a digger digs.
+**System tier (CPU, bit-exact).** A structure-preserving orbit integrator (the Wisdom-Holman
+family) moves the heavy bodies. Gravity inside a region is supplied by this tier, including tides
+and the effects of a rotating planet, so "g" is derived from mass and radius. Vessels do not perturb
+planets, an error below what 64-bit numbers can represent (DERIVED). *Lead's choice:* integrate the
+heavy bodies with mutual attraction instead of fixed two-body rails, because 34 bodies are cheap and
+rails drop the perturbations; keep closed-form advance for dormant small objects.
 
-**Game-builder API ("a robot on reality").** A game supplies geometry, material names, joints,
-actuators, sensors and controllers. In strict mode, the default, a game cannot teleport objects, set
-velocities or conjure matter. The player's finger is a force-limited actuator. Escape hatches exist but
-are logged, and the energy they inject is booked as external. A live "Reality Report" shows the ledger
-and every active approximation.
+**Matter across scales.** An unobserved object is an aggregate record (mass by material, centre of
+mass, momentum, angular momentum, inertia, internal energy) plus a lossless snapshot of its
+mechanism, about 4 kB for a 30-part rover (ESTIMATE). Terrain is a deterministic generator plus a
+journal of what players changed. Entering a region promotes a record to full simulation; leaving
+demotes it; both are double-entry.
 
-**Thermal governor.** When the phone warms, it reduces render quality, frame rate or the amount of
-awake matter. It never changes the timestep, the materials or the laws.
+**Regions of detail.** Roughly 250 m across (ESTIMATE). Inside, version 1's two tiers run
+unchanged: the mechanism tier (CPU, bit-exact rigid bodies, joints, motors) and the matter tier
+(GPU particles for liquids and sand).
 
-## Delivery
+**Time.** Each region has its own "now". Inside a region, time warp is a shared input. Across
+regions you can only sync forward to one that is ahead.
 
-- **First**: a Rust core compiled to WebAssembly with GPU kernels in WGSL (the WebGPU shader language),
-  published as a static site on GitHub Pages. You open the URL in Safari (iOS 26 or later) and add it to
-  the Home Screen. The whole loop runs from this Linux environment.
-- **Later, optional**: the same core as a native iOS app, built on GitHub's macOS machines and delivered
-  through TestFlight. This needs the Apple Developer Program (US$99 per year). It removes the browser's
-  limits: one physics thread, a memory kill near 2 GB, and no haptics.
-- **Testing without the phone**: the CPU tier is bit-exact across the phone, the browser and the build
-  server, so a replay recorded on your phone reproduces here. A double-precision reference solver acts
-  as the oracle for every production solver.
+**Multiplayer.**
+
+- Inside a region, phones run the same bit-exact simulation in lockstep: they exchange inputs with a
+  few frames of delay, compare a fingerprint of the state, and resync from a snapshot on mismatch.
+  No rollback, because re-simulating multiplies CPU cost on a 4 W budget.
+- Heavy bodies need no network at all: they are a pure function of the tick.
+- A region is owned by lease. When a phone overheats, locks or is killed, the lease lapses and
+  another player takes over or the region sleeps at its last checkpoint.
+- Liquids and sand are not bit-exact between devices. One owner simulates them and shares a coarse
+  summary, so rigid bodies agree exactly and splashes differ per viewer. **No shipped game does
+  this; it is an untested design.**
+
+| Step | Players | What you run | Rough cost |
+|---|---|---|---|
+| 1. Phones connect directly, one hosts | 2-4 | A free signalling service | $0-5 a month |
+| 2. One dedicated server | 8-16 per region | One small rented server | €5-10 a month |
+| 3. Several servers dividing space | Hundreds | One server each plus a relay | Scales with servers |
+
+Player counts are the researcher's judgement. A server has no GPU, so matter stays owned by phones.
 
 ## Roadmap
 
-| Phase | Goal | Done when |
-|---|---|---|
-| 0a. Probe | Measure your actual phone | A page reports WebGPU limits, timer precision, real particle and rigid-body throughput at several sizes, and a 20-minute heat soak. You paste the result back. Every budget above is replaced by a measurement. |
-| 0b. Laws, materials, first world | Units, material database, ledger, rigid blocks | You throw and stack steel, oak and rubber blocks at 60 Hz for 20 minutes. Conservation tests pass. The solver choice is settled by a written A/B test on the build server. |
-| 1. Mechanisms | Joints, motors, gearboxes, batteries, sensors | A rover and a six-joint arm run on the phone driven only by voltages. Motor tests are within 1-2%. A phone replay reproduces bit-exactly on the build server. |
-| 2. Bend, yield, break | Stiff parts deform at real stiffness | Beam deflection, vibration frequency and buckling load are within 3-5% of theory. A bridge fails where the analysis says it should. |
-| 3. Liquids | Incompressible liquid on the GPU, coupled to machines | Hydrostatic pressure is within 3%, the dam-break experiment within 10%, and a boat floats at the predicted waterline. The heat soak holds. |
-| 4. Sand, mud, soft solids, heat | Granular matter, plasticity, conduction, melting | Column collapse and angle of repose match experiment. The melting front is within 5% of theory. |
-| 5. Native app (optional) | Remove the browser ceiling | A TestFlight build runs at least twice the awake bodies of the web build, with identical replay hashes. |
-| 6. Builder kit and first game | Prove a game can be built on it | A sample game ships using only the public API in strict mode, with no engine changes made for it. |
+| Phase | Goal |
+|---|---|
+| 0a. Probe | Measure your phone, including the orbit arithmetic |
+| 0s. Two scales (new first build, CPU only) | Sun, eight planets and the Moon, plus one rigid cube resting on a surface in its own frame, with a time-warp slider. The cube's weight comes from the planet's mass and radius |
+| 0b. Laws, frames, ledger, rigid blocks | The permanent layer, with frames and ports from the start |
+| 1. Mechanisms | Joints, motors, batteries, sensors; suspending and resuming objects; warp |
+| 1m. Two phones | Lockstep in one shared region, with lease takeover |
+| 2. Real solar system and transit | Vessels, trajectory prediction, landing at one airless site |
+| 3. Liquids inside a region | The GPU matter tier on a moving frame, with the shared summary |
+| 4. Environment | Atmosphere, drag, entry heating, sunlight and temperature |
+| 5. Bend, yield, break | Stiff parts deform at real stiffness (version 1's phase 2) |
+| 6. Dedicated server, native app | Multiplayer step 2; remove the browser ceiling |
+| 7. Builder kit and first game | Built only through the public API |
 
-The test suite is written before each feature, and each phase ends with a 20-minute soak on the phone.
+Later: several servers dividing space.
 
-## What the reviews changed
+## Not done
 
-- A continuum-only engine was dropped: at real parameters it resolves only water, oil, honey and gelatin, and sand fails its own honesty test.
-- A single energy-minimizing solver for everything was dropped: its time integrator loses angular momentum, and it has never been measured on a phone.
-- Automatic switching of an object from rigid to fully deformable was dropped: the deformable solver cannot be steel-stiff, so the hand-off would join two different materials.
-- The probe was split out as its own first step, because no published measurement of this kind of simulation on an iPhone 15 exists and estimates span a factor of ten.
+- **Review of this version.** The third scale design and the comparison were not completed.
+- **The red-team findings on version 1** (`07-plan-redteam.md`): 3 fatal and 33 major. The three
+  fatal ones (no reference frames, a closed world with no boundary ports, no second scale in the
+  roadmap) are answered by this version's structure. The 33 major ones are not yet addressed one by
+  one. Among them: most of version 1's "done when" tests cannot be measured on the phone and need
+  restating.
+- **Detailed specs.** None written.
 
 ## Decisions that are yours
 
-1. **3D.** Decided: the engine is 3D. The 2D option is dropped.
-2. **What to build first.** Machines, robots and vehicles (assumed, and the order above), or liquids, sand and destruction first (phases 3-4 move ahead of 2).
-3. **Where it lives.** A new public repository is recommended; GitHub Pages on a free account needs a public repo, and it keeps PulseVault untouched. This session cannot create repositories, so you would create it. The alternative is a subfolder of this repo.
-4. **Apple Developer Program.** Only needed for phase 5, so it can wait.
-5. **Device lab.** Your phone must run iOS 26 or later, and each phase needs you to run a soak test and paste back a block of text.
-
-Decided since this plan was written: the engine is 3D; it must scale to a whole solar system or more;
-and multiplayer is required. This document predates the last two and is being rewritten around them.
-
-Defaults chosen unless you say otherwise: strict mode on; when the phone runs hot, drop to 30 frames per
-second before reducing matter.
-
-## Caveats on the evidence
-
-- Network restrictions meant many sources were seen only as search excerpts; `01-research.md` marks each finding as verified or not.
-- The particle and body counts above are estimates scaled from other devices. Phase 0a exists to replace them.
+1. **Where it lives.** A new public repository is recommended; this session cannot create one.
+2. **Real or invented solar system first.** Default: the real Sun, planets and Moon, since their
+   orbits give exact test answers.
+3. **Apple Developer Program** (US$99 a year): only needed for the native app in phase 6.
+4. **Device lab.** Your phone needs iOS 26 or later (26.4 for the dedicated-server step), and each
+   phase needs you to run a test and paste back the result. Multiplayer tests need a second phone.

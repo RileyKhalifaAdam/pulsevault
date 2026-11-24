@@ -1,0 +1,542 @@
+# Reality engine — scale designs
+
+Two independent multi-scale architectures. A third (a ladder of descriptions related by coarse-graining) and the comparative review were stopped before finishing.
+
+---
+
+# ORRERY: a frame tree with rails, wrapping the workshop tiers as its innermost region (stance: frames-and-rails)
+
+## Thesis
+
+Hold the universe as a tree of reference frames and simulate almost none of it. Everything outside a player's reach is either a closed-form function of an integer tick (Kepler arcs, an n-body ephemeris, spin, lumped cooling) or a deterministic generator plus a journal of what players changed. The workshop tiers of /home/user/pulsevault/reality-engine/03-plan.md run inside a co-moving region of detail about 250 m across (ESTIMATE), fed gravity, tides, rotation terms and ambient fields by the frame above. Matter enters and leaves a region only through double-entry hand-offs that keep mass exact and book every joule. This is the lineage that has shipped (KSP, Principia, Space Engineers, Star Citizen's zones). Because the dormant universe is a pure function of time, it costs no CPU, no heat and no bandwidth, which is what lets a solar system fit in about 0.5 ms per frame (ESTIMATE) and lets multiplayer fit on a phone. The price is stated, not hidden: outside a region nothing evolves except along a declared closed form; the middle scales (rivers, weather, landslides) have no dynamics at all; and promoted matter is a plausible micro-state regenerated from conserved totals, not the state that would have evolved.
+
+## Frames and precision
+
+Every position is (frame id, local coordinate); no global float exists. Five levels:
+
+G, galaxy: star-system barycentres as 3 x i64 in units of 1024 m, spanning +/-998,000 ly (DERIVED: 2^63 x 1024 m / 9.461e15 m per ly), on linear rails. Error is 1 km by construction and harmless, because nothing interacts across systems.
+
+S, star system: barycentric inertial, f64 metres, each massive body stored relative to its parent. Step size 31 micrometres at 1 AU, 0.98 mm at 30 AU, 2 m at 1 ly (DERIVED, 2^(e-52); matches the research). Rule: no f64 frame is used beyond 2^43 m = 58.8 AU (DERIVED), where the step passes 1 mm; farther objects get an intermediate cruise frame.
+
+B, body: body-centred inertial plus body-fixed rotating (spin angle linear in tick), f64: 0.93 nm at Earth's radius, 60 nm at lunar distance (DERIVED).
+
+R, region of detail: anchor = f64 position, velocity and orientation relative to B (orbit, surface) or S (cruise). All mechanism-tier state is f64 relative to the anchor, radius capped at 8 km: step 9.1e-13 m, and 1.1e-13 m/s at 1 km/s (DERIVED).
+
+W, matter window: f32, origin an f64 pose in R or on a carrier body. A 1.28 m span (64 cells x 2 cm) gives 1.2e-7 m, and 1.9e-6 m/s at 16 m/s (DERIVED). f32 never holds more than a window offset.
+
+Time: i64 ticks at 480 Hz, range 6.1e8 years (DERIVED: 2^63 / 480 / 3.156e7).
+
+Orbital speed: the anchor carries it; the solvers never see it. An orbital anchor is a free-falling, non-rotating frame integrated in f64 about its primary; a surface anchor is fixed in the rotating frame. Bodies hold only velocity relative to the anchor. When the focus body exceeds 64 m/s or 1 km from the anchor (ESTIMATE thresholds; KSP re-bases at about 750 m/s, MEASURED, KSP API docs), a tick-stamped re-base subtracts a shift and boost quantised to 2^-16 m and 2^-16 m/s. Rounding is at most one step (9e-13 m) per body per re-base, booked as frame-transfer.
+
+Worst case for the anchor itself: heliocentric cruise at 1 AU stepped at 480 Hz random-walks about 1 m per year (DERIVED: sqrt(1.5e10 steps) x 31 um / sqrt(12)); that affects navigation, never contact. Two regions far from the origin are re-parented to a shared rendezvous frame inside 1,000 km, so their relative step falls from 1 mm at 30 AU to 1.2e-10 m (DERIVED) before they meet.
+
+Cost of f64 on the CPU tier: Rapier ships an f64 crate (MEASURED, its Cargo.toml, red-team F06); Jolt reports doubles 5-10% slower (MEASURED, Jolt docs).
+
+## Gravity and orbits
+
+Law: Newtonian point masses plus J2 for oblate primaries; higher harmonics opt-in per body.
+
+Massive bodies never feel vessels (prescribed motion). For planets this is below the number system's resolution: a 1e6 kg ship changing speed by 10 km/s moves Earth 1.7e-15 m/s, under the 3.6e-12 m/s f64 step of Earth's velocity (DERIVED: m x dv / M). For small bodies it is false, so they take ledgered impulsive kicks to their rails: a 1 t lander at 1 m/s moves a 1.3e6 kg asteroid 0.76 mm/s (DERIVED by the red team).
+
+Three declared propagation modes per system:
+- K, hierarchical Kepler rails: universal-variable solver with Stumpff series, fixed 2 Halley + 2 Newton iterations, no library trig (the WHFast512 design, 1e-13 relative; MEASURED, arXiv 2307.05683). Exact for two bodies, cost independent of warp, default for authored systems.
+- N, n-body ephemeris for the awake system: 34 bodies, 12th-order Quinlan-Tremaine symmetric multistep at a 600 s step (Principia's shipped configuration, MEASURED), read out by quintic Hermite (worst case Phobos 1.3 mm; DERIVED: h^6 x n^6 x r / 46080). Above about 5e5x warp: Sun + planets Wisdom-Holman at a 4-5 day step, energy error near 1e-8 with no drift (MEASURED, same paper), moons on K.
+- O, IAS15: offline oracle only.
+Plain leapfrog is banned for orbits (155,000 km per year along-track at 100 steps per orbit; DERIVED in the research).
+
+Dormant vessels: Kepler rails about the dominant body with closed-form J2 secular drift. Up to 64 flagged ones (near a parent change, at Lagrange points, player-tracked; ESTIMATE count) use Encke integration against the summed gravity of all bodies, so they have no sphere-of-influence patch.
+
+Inside a region: anchor acceleration is summed gravity + J2 in f64 each substep. Each body gets gravity relative to the anchor from Encke's f(q) form for the primary, which avoids subtracting nearly equal vectors (Wikipedia 'Perturbation (astronomy)', opened), and a linear tidal tensor for third bodies. Truncating the primary at first order would err by 2.8e-7 m/s^2 at 1 km in low orbit (DERIVED: 1.5 x GM x d^2 / r^4). Gravity-gradient torque is 3(GM/r^3) r x (I r) per rigid body. Surface regions put the centrifugal term inside g_eff(x) and apply Coriolis as a Boris rotation, which does no work by construction (Wikipedia 'Particle-in-cell', opened). The GPU receives a vector, a 3x3 gradient and the rotation rate.
+
+Omitted and declared: relativity (Mercury 42.98 arcsec per century; potential 2.6e-8 at Mercury, DERIVED GM/(r c^2)), light-time (499 s per AU), tidal dissipation, harmonics beyond J2, mutual perturbations in mode K, back-reaction on large bodies. Valid below 0.01c.
+
+## Matter across scales
+
+When nobody is near:
+- Pebble: untouched, it is not an entity but a grain statistic of the terrain generator. Touched, it is a roughly 40-byte record (ESTIMATE: id, material, shape seed, pose in the site chunk, temperature), fixed in the body frame.
+- Rover: an aggregate record (mass per material in i64 micrograms, centre of mass, momentum, angular momentum, inertia tensor, internal energy) plus a lossless mechanism snapshot, about 128 B per body, 4 kB for 30 bodies (ESTIMATE). On Kepler or surface rails; attitude by closed-form torque-free rotation.
+- Mountain: never an object. Generator(seed, version, body parameters) yields layered material columns; only edited 16^3-voxel leaves are stored (8 kB raw, DERIVED 4,096 x 2 B; the Space Engineers scheme, MEASURED from its source).
+- Planet: a catalogue record under 10 kB (ESTIMATE): GM, radius, J2, spin, radial density table (Earth's reference model is 94 rows, MEASURED), atmosphere column, albedo, terrain seed, plus an integer mass-delta account.
+- Star: GM, radius, luminosity, temperature. Never promoted.
+
+Three hand-off classes, each a double-entry transaction at one tick in a stated frame:
+1. Suspend (mechanisms): lossless snapshot. Mass, momentum, angular momentum and energy exact; internal motion is time-frozen and labelled so.
+2. Summarise (GPU matter): mass exact per material, because particles carry integer microgram quanta assigned on the CPU. Momentum and energy are as attested by the owner. The state jumps to equilibrium (hydrostatic pool, repose pile, voxel fill); unresolved kinetic and excess potential energy go to internal energy, always >= 0 (Koenig; DERIVED in the research). Promotion reseeds particles from a CPU-deterministic jittered lattice matching per-cell integer mass.
+3. Convert (terrain to particles and back): mass exact, zero relative momentum, enthalpy carried, fracture energy booked as toughness x area (empirical tier).
+
+A frame crossing books the cross term m x v_anchor . v_rel explicitly as frame-transfer. Ledgers are per frame: i64 micrograms and fixed-point momentum and energy inside regions (exact to 9.2e9 kg, DERIVED 2^63 ug); double-double f64 at body and system level, where only bounded round-off is claimed. Earth's 2.6e33 J (DERIVED by the red team) never shares an account with a robot.
+
+Persistence: generator + append-only journal. ESTIMATE 0.1-1 MB per hour of digging and building. The input log is 3.5 MB per hour (DERIVED: 60 Hz x 16 B x 3,600 s) and is truncated at checkpoints. Old deltas are coarsened conservatively; nothing reverts silently. At quota the engine refuses and reports.
+
+## Regions of detail
+
+A region = frame anchor + local 'now' + ledger + owner lease + budget + awake islands + terrain collision cache + environment sample + at most two matter windows.
+
+Count: the heat envelope (about 4.3 W, an unverified excerpt in 01-research.md) is per phone, not per region. Per phone: one focus region with the full budget, plus up to three mechanism-only satellite regions drawing on the same awake-body pool (ESTIMATE). Across the world: unbounded, one owner each.
+
+Size: full simulation within about 250 m of the focus, promote at 200 m, demote at 300 m (ESTIMATE; KSP uses about 2.5 km load and 300 m pack, MEASURED, KSP API docs). Static terrain collision out to 2 km (ESTIMATE). Frame hard cap 8 km.
+
+Motion: orbital anchors free-fall and are re-based by Galilean boosts; surface anchors ride the rotating body. Fine terrain is realised only below a ground-relative speed set by the measured generation rate (unmeasured today). At orbital speed the region moves 128 m per frame (DERIVED: 7.67 km/s / 60) and sees only a coarse analytic surface. Contact above the declared closing-speed envelope is an out-of-scope hypervelocity event: mass and momentum conserved, the rest booked as heat.
+
+Vehicle interiors: no separate interior solver. Hull and contents share one island in the non-rotating anchor frame, so the coupling is monolithic and has no lag. 'Sleep' is redefined as weld-to-carrier: a body at rest relative to its carrier merges into the carrier's composite inertia (momentum and angular momentum exact, residual kinetic energy to internal). Matter windows ride carrier bodies and receive the carrier's acceleration, Euler, Coriolis and centrifugal terms as a vector plus matrices computed in f64. In a 100 m habitat at 0.313 rad/s the floor moves 6.5 cm with a 21 micrometre sagitta per substep (DERIVED), comparable to gravity's 42.6 micrometres, so no special case is needed. Planets, with prescribed spin, use a truly rotating frame.
+
+Meeting: regions merge before contact is possible, at 2 km separation or 20 s predicted, whichever comes first (ESTIMATE), by re-expressing both in one anchor and closing both ledgers into a new one. With different owners, the lockstep groups merge under the older lease. An interaction island is never split across owners.
+
+On the tiers: the mechanism tier is handed per-body gravity, torque, rotation rate and ambient samples; the matter tier a per-substep uniform block. Neither sees absolute coordinates, the tick-to-date mapping, or other regions.
+
+## Time and warp
+
+Clock: i64 ticks at 480 Hz. The ephemeris and all rails are pure functions of tick given the world record. Each region has its own 'now'; the dormant universe has none.
+
+Ladder. Costs are ESTIMATES scaled from desktop measurements by 0.5-1x for core speed and 1.4-2.5x for WebAssembly; nothing is measured on an A16.
+- Below 1x: governor time dilation, declared.
+- 1x: full physics.
+- 2-4x: more 480 Hz ticks per frame, mechanism-only scenes that fit the budget. The step size never changes.
+- 5x to about 5e5x, rails warp: legal only when every region the requester owns is suspended or summarised. A 34-body step costs 21-75 microseconds (DERIVED from Principia's MEASURED 30), so 0.5 ms buys 2.5e5-8.6e5x. With the tiers asleep 3 ms is available: 1.5e6-5e6x.
+- To about 1e10x: Sun + planets Wisdom-Holman at a 5-day step, 125-450 steps per 0.5 ms (DERIVED from 1.61 microseconds, MEASURED, arXiv 2307.05683), i.e. 3e9-1.2e10x. Moons and vessels drop to Kepler rails, declared.
+- Beyond: a pure Kepler time jump at any factor.
+Reaching a star 4.2 ly away at the 0.01c Newtonian limit takes 420 years, which is 4.4e7x for a five-minute wait (DERIVED).
+
+Advances analytically: two-body orbits, body spin, torque-free attitude (Jacobi elliptic closed form), lumped thermal relaxation toward radiative equilibrium, battery self-discharge, optional orbit-averaged drag decay (empirical tier).
+
+Frozen and labelled: mechanism internal degrees of freedom, matter micro-state, anything chaotic and history-dependent (piles, splashes, combustion). A machine left running does not run while nobody is there.
+
+Conserved across a warp: mass exactly; two-body energy and angular momentum to solver tolerance (1e-13 relative per solve, MEASURED); n-body energy bounded near 1e-8 relative without secular drift (MEASURED for the 5-day configuration); aggregate internal energy exactly, except closed-form heat exchange, which is paired against 'stellar source' and 'radiated to space' accounts.
+
+Entering or leaving warp is a set of hand-off transactions at one tick, and the rate change is a tick-stamped command in the replay stream. Gate: orbital elements identical to 1e-12 across a warp toggle, because KSP shipped with the active vessel's orbit 'moving randomly when engaging timewarp' (MEASURED, KSPCommunityFixes README). Replay becomes checkpoint plus commands since the checkpoint, never from time zero.
+
+## Multiplayer
+
+The stance's advantage: everything outside a region is a pure function of (world record, tick), so the dormant universe costs 0 bytes per second and needs no authority.
+
+Authority. World record and ledger heads: the host phone at rung 1, the server from rung 2, replicated to peers as a hash-chained journal. Region: one owner by lease (epoch number + expiry tick), who sequences inputs. Ephemeris: nobody; hash-checked.
+
+Mechanism tier: sequenced lockstep within a region, inputs sampled at 60 Hz with 2-4 frames of delay (ESTIMATE), state hash each second, snapshot resync on mismatch. No world rollback: a miss k ticks old costs k extra ticks in one frame (MEASURED, GGPO docs).
+
+Matter: one GPU-owning peer simulates a window and puts quantised coupling impulses into the input stream (12 B per coupled body per frame, ESTIMATE), so every peer's mechanism tier stays bit-identical. It publishes the coarse cell field (mass, momentum, energy) at about 4 Hz; viewers steer cosmetic particles to it. Ledger entries are 'attested, not replayable': integer mass cannot change and net momentum is bounded by the field's own balance. No shipped precedent exists (05, 'not established').
+
+Hand-off: at a tick boundary the old lease closes with a state hash and the next epoch opens; a co-simulating peer needs no copy. Entities crossing owners pass through escrow: debited at the sender's tick, credited when the receiver's clock reaches it.
+
+Time: rung 1 has one shared clock and warp by agreement. From rung 2, per-region 'now' with forward-only sync; each object carries a high-water tick and whoever touches it first jumps forward to it.
+
+Hot phone: cut rendering, hand off matter, become a viewer, lastly slow the region for all. Killed or backgrounded: the lease lapses in about 5 s (ESTIMATE); a peer continues from the last sequenced tick, or the region sleeps at its last 10 s checkpoint.
+
+Trust: friends first. A server can re-run the mechanism tier exactly; matter is bounded, not verified; every lockstep peer holds full region state.
+
+Bandwidth, four players and one window (DERIVED; the 80 B datagram overhead is an ESTIMATE): up (80 + 3 x 12 B) x 60 Hz = 56 kbit/s; down (80 + 4 x 3 x 12 B) x 60 = 108 kbit/s, plus impulses 69 kbit/s and coarse field about 50 kbit/s (197 raw, delta-coded): roughly 230 kbit/s. Host uplink about 0.7 Mbit/s.
+
+Ladder: 2-4 players through a host phone over WebRTC with a free signalling worker, US$0-5 a month; one server at about EUR 5-10 a month (unverified prices) for 8-16 players per region; then several servers, each owning frame-tree subtrees.
+
+## Environment fields
+
+Every field is analytic, sampled once per region per frame at the anchor with a linear gradient, and registered as a declared model with its error.
+
+Atmosphere: a one-dimensional hydrostatic column per body, up to 8 layers of piecewise-linear temperature, integrated in closed form with the ideal-gas law and g(h) (the barometric formula). Earth: 101,325 Pa, 288.15 K, -6.5 K/km, 7 layers to 86 km (MEASURED, U.S. Standard Atmosphere 1976); scale height 8.43 km (DERIVED: RT/Mg). The dry adiabat g/c_p gives 9.77 K/km (DERIVED: 9.807/1004), so the measured lapse rate is authored data and is labelled as such. The column co-rotates; wind is zero or an authored profile. About 100 bytes per body (ESTIMATE). Vacuum is a value of the field, not its absence.
+
+Drag and lift: a quasi-steady surface-element sum over at most 32 hull faces per body at 60 Hz. Free-molecular flow (kinetic theory with an accommodation coefficient) and hypersonic flow (Newtonian impact: momentum flux of the intercepted stream) are derived. Subsonic flow uses per-shape coefficients in the empirical tier (sphere 0.47, ESTIMATE). The matter tier cannot resolve this flow and is not asked to.
+
+Heating: Sutton-Graves, q = k x sqrt(rho/R_n) x v^3 with k = 1.7415e-4 for Earth air, good to roughly +/-20% (MEASURED against Hayabusa2, arXiv paper cited in the research). It is capped by drag power so the ledger cannot create energy; the remainder goes to an atmosphere sink account.
+
+Radiation: flux L/(4 pi d^2) per star (1,361 W/m^2 at 1 AU, MEASURED), times an analytic disc-overlap eclipse factor, absorbed through material absorptivity and emitted as emissivity x sigma x T^4 (459 W/m^2 at 300 K, DERIVED). Pressure is flux/c = 4.5 micropascals at 1 AU (DERIVED; Wikipedia 'Radiation pressure', opened).
+
+Temperature: bodies carry lumped enthalpy. Ground temperature on airless bodies is instantaneous radiative balance filtered by a one-harmonic thermal-inertia solution (closed form). With an atmosphere: equilibrium temperature plus a declared greenhouse offset, since the bare model is 33 K cold for Earth (DERIVED: 254-255 K against 288 K).
+
+Day and night: geometry only. Star direction comes from the ephemeris and the spin angle; there is no authored clock.
+
+Cost: about 30 microseconds per frame (ESTIMATE: 100 bodies x 16 faces x 20 ns).
+
+Left out and declared: weather, clouds, convection, oceans as moving fluid, ionisation, ablation.
+
+## Content and authoring
+
+Where a star system comes from:
+1. Real: state vectors and GM for about 34 Solar System bodies at one epoch, a few kilobytes, integrated on the device (Principia's approach, MEASURED). The 32 MB de440s file (MEASURED) stays on the build server as oracle. Real relief at 4 pixels per degree is 2.1 MB per body (DERIVED: 1,440 x 720 x 2 B); finer detail is generated and labelled 'sampled'. A 30-arc-second Earth grid is 1.87 GB (DERIVED by the red team), over the 1 GB Pages limit (MEASURED, GitHub docs), so it is not shipped. JPL's specific terms could not be opened.
+2. Authored by physical parameters: star mass; per planet mass, bulk composition, orbital elements, spin, obliquity, gas inventory.
+3. Generated: a seeded catalogue for 'or even more', never stored (4e11 systems at 1 byte is 400 GB, DERIVED in the research).
+
+Derived, not authored: radius and radial structure by integrating hydrostatic equilibrium with database equations of state (a uniform-density Earth gives a central pressure 2.1x too low, DERIVED from the reference table); surface gravity; J2 from spin and structure; Hill radius, sphere of influence, Roche limit; equilibrium temperature; scale height; whether the planet can hold its authored gas; stellar luminosity from radius and temperature (3.83e26 W for the Sun, DERIVED: 4 pi R^2 sigma T^4). An authoring tool integrates each authored system offline and reports instability, because the stock KSP moon system is unstable under n-body gravity (MEASURED, Principia docs). Authored systems therefore default to Kepler mode.
+
+Every parameter carries one of three labels: catalogue (measured), derived from law, or sampled from a distribution. Terrain shape and mineral layout are always 'sampled': generation is authored statistics, not physics.
+
+Builder workflow: a system file; named sites (body-fixed latitude, longitude and height, or an orbit); blueprints delivered to sites at world creation, which is the one creation event and is booked as initial inventory. Strict mode still forbids teleport and spawn. Promotion, demotion, re-basing and escrow are engine-internal audited hand-offs, a class separate from game escape hatches. New API nouns: Frame, Site, Orbit (elements, prediction, time to periapsis or parent change), Clock (warp request that can refuse with a reason), Environment sample, and events for promote, demote, merge, re-base and hand-off. Sensors report in the vehicle frame; an accelerometer reads zero in free fall. Faster-than-light travel, if a game wants it, is a logged unphysical escape hatch.
+
+## Budget on the A16
+
+All CPU figures are ESTIMATES for single-threaded WebAssembly on one A16 performance core, scaled from desktop measurements by 0.5-1x (core speed) and 1.4-2.5x (WebAssembly). The probe must replace them. The sustained envelope the reviews derived is about 5 performance-core-ms per frame (ESTIMATE), most of it already spent.
+
+Steady state at 1x, one region of 300 bodies:
+- Ephemeris stepping: one 21-75 microsecond step per 36,000 frames (DERIVED: 600 s x 60); negligible.
+- Ephemeris readout, 34 bodies by quintic Hermite: about 1.4 microseconds (34 x 40 ns).
+- Anchor gravity, 34 sources + J2, 8 substeps: 4-8 microseconds.
+- Per-body differential gravity, gradient torque, Coriolis: about 72 microseconds (300 x 8 x 30 ns).
+- Visible rails objects, 256 Kepler solves at 0.14-0.5 microseconds: 36-128 microseconds.
+- Encke vessels, 16 x 4 evaluations x 1 microsecond: 64 microseconds.
+- Environment fields: 30 microseconds.
+- Ledger, hashing, network packing: 20 microseconds.
+Total about 0.23-0.33 ms; hard cap 0.5 ms, 10% of the envelope. The mechanism tier's allowance falls from about 3 ms to about 2.5 ms, roughly one sixth fewer awake bodies (DERIVED: 0.5/3).
+
+Burst: terrain realisation and promotion are time-sliced to 1.0 ms per frame and run only while a region moves or loads; the governor then withholds a further third of the mechanism budget. Uploading a reseeded 30,000-particle window is about 1.4 MB (DERIVED: 30,000 x 48 B) and is allowed one declared hitch.
+
+Warp: the tiers are asleep, so this layer may take 3 ms.
+
+Memory (DERIVED from counts; the counts are ESTIMATES): 10,000 aggregate headers x 256 B = 2.6 MB; 1,000 vessel snapshots x 4 kB = 4 MB; coarse terrain collision, 2 km at 2 m = 4 MB; fine, 256 m at 0.25 m = 4.2 MB; 2,000 resident edited leaves x 8 kB = 16 MB; ephemeris history and prediction 2 MB. About 33 MB, against a web-process kill near 2 GB (unverified excerpt in 01-research.md).
+
+Storage, in the origin-private file system written from a Worker: catalogue and relief 5-20 MB; journal 0.1-1 MB per hour (ESTIMATE); rolling input log capped at 50 MB; default world cap 200 MB (ESTIMATE). The documented ceiling is 60% of disk (MEASURED, MDN), but nothing is measured on this phone, and Safari can evict a site that is not installed after seven days without interaction (MEASURED, MDN).
+
+GPU: this layer adds no compute passes. Rendering planets, sky and far bodies is a real cost that this design does not budget.
+
+## Validation tests
+- Galilean frame invariance — reference: The same scripted region scene run with its anchor at the system origin, at 1 AU moving 29.78 km/s, and at 30 AU; region-local state hashes compared — tolerance: 0 bits difference
+- Two-body closure — reference: Closed-form Kepler orbit, eccentricity 0.6, 10,000 periods (solver tolerance 1e-13 relative, MEASURED, arXiv 2307.05683) — tolerance: Position 1e-9 relative; energy and angular momentum 1e-12 relative
+- Solar System against DE440 — reference: de440s on the build server at 1, 10 and 100 years. Newtonian omission expected for Mercury: about 9,600 km per century at perihelion (DERIVED in research). Principia loses a few minutes of eclipse timing per century (MEASURED) — tolerance: ESTIMATE, to be tightened after the first run: Earth 50 km at 10 years and 1,000 km at 100; Moon 500 km at 100; Mercury 12,000 km at 100 with the relativity term reported separately
+- Orbit integrator drift (leapfrog regression) — reference: Earth's orbit for one year against the Kepler closed form; plain leapfrog at 100 steps per orbit gives 155,000 km (DERIVED in research) — tolerance: Along-track error under 1 km
+- J2 nodal regression — reference: -1.5 x J2 x (R/p)^2 x n x cos(i): -3.68 degrees per day at 800 km, 56 degrees (MEASURED, Wikipedia 'Nodal precession' example) — tolerance: 1% over 30 simulated days
+- Clohessy-Wiltshire tidal drift — reference: Two free bodies 10 m apart radially at 400 km: x = (4 - 3 cos nt) x0, y = 6 (sin nt - nt) x0, giving 10.192 m and -0.0145 m at 100 s (DERIVED; equations from Wikipedia 'Clohessy-Wiltshire equations', opened) — tolerance: 1% of the relative displacement over one orbit
+- Gravity-gradient libration — reference: 1 t, 10 m rod at 400 km: period = orbit period / sqrt(3) = 53.4 min (DERIVED: 92.4 / 1.732); peak torque 0.016 N m (DERIVED in research) — tolerance: 1% on period, 2% on torque
+- Foucault pendulum in a surface region — reference: Precession rate = spin rate x sin(latitude) = 10.64 degrees per hour at 45 degrees (DERIVED: 7.292e-5 x 0.7071 rad/s) — tolerance: 2% over one simulated hour
+- Eastward deflection of a dropped body — reference: (1/3) x spin rate x g x t^3 at the equator: 2.20 cm for a 100 m drop, t = 4.515 s (DERIVED) — tolerance: 2%
+- Derived surface gravity on two bodies — reference: Sea-level g of 9.780 at the equator and 9.832 at the poles (MEASURED, Wikipedia 'Gravity of Earth') from GM, J2 and spin; block fall time sqrt(2h/g_local) on Earth and on the Moon (1.62 m/s^2, DERIVED GM/R^2 with constants from memory) — tolerance: 0.1% on g; 1% on fall time on the phone
+- Suspend and promote round trip — reference: A rover is suspended, rides rails for one orbit, and is promoted; its state in the carrier frame is compared with the pre-suspend snapshot — tolerance: State hash identical (0 bits); mass 0 micrograms; momentum and angular momentum 1e-12 relative
+- Warp toggle leaves the orbit alone — reference: Orbital elements before and after entering and leaving rails warp (regression for the KSP defect, MEASURED in KSPCommunityFixes README) — tolerance: 1e-12 relative
+- Docking conserves momentum — reference: 1 t at 0.1 m/s docks with 10 t at rest: 9.09 mm/s afterwards (DERIVED: m1 v / (m1 + m2)); KSP shipped without this (MEASURED, same README) — tolerance: 1e-9 relative
+- Mined mass persists — reference: Integer ledger: mine an asteroid, save, kill the tab, reload, change owner (regression for KSP's 'mass restored to 100%' defect, MEASURED) — tolerance: 0 micrograms difference
+- Small-body recoil reaches the rails — reference: 1 t lander at 1 m/s onto a 1.3e6 kg asteroid: rails velocity changes by 0.76 mm/s (DERIVED by red team) — tolerance: 1e-6 relative
+- Frame-transfer ledger closure — reference: Kinetic energy in the parent frame = region-frame kinetic energy + m v_anchor . v_rel + 0.5 m v_anchor^2 (identity) — tolerance: 1e-12 relative
+- Hohmann transfer — reference: Earth to Mars in Kepler mode with massless planets: 258.9 days and a first burn of 2.94 km/s (DERIVED from a = 1.262 AU) — tolerance: 0.1%
+- Sun-Earth L1 with summed gravity — reference: Numerical root of the collinear restricted three-body equation, near 1.497e6 km (DERIVED from a x (mu/3)^(1/3)); departure time constant roughly 23 days (MEASURED, Wikipedia 'Lagrange point', opened) — tolerance: 0.1% on distance; 10% on time constant
+- Standard atmosphere column — reference: U.S. Standard Atmosphere 1976 pressure and density at 0, 11, 20, 32 and 47 km (MEASURED table) — tolerance: 1%
+- Entry heating — reference: Hayabusa2 capsule peak stagnation flux of 9.0 MW/m^2 from Sutton-Graves (MEASURED, arXiv paper in the research), fed the same trajectory — tolerance: 10% on peak flux
+- Radiative balance — reference: Black plate facing the Sun at 1 AU: 394 K radiating from one side, 331 K from both (DERIVED: (1361/sigma)^0.25 and (1361/(2 sigma))^0.25); Earth 254-255 K at albedo 0.3 (DERIVED in research) — tolerance: 0.5%
+- Cross-architecture determinism of the outer layer — reference: Kepler solver, ephemeris and hand-offs for 1e6 steps on Safari WebAssembly, Node WebAssembly, native ARM64 and native x86-64 — tolerance: Identical hashes; if native differs, the server runs the WebAssembly binary
+- Two-phone lockstep with owner loss — reference: 10 minutes, 5% injected packet loss, one owner tab killed mid-session — tolerance: Zero hash mismatches; takeover within 5 s (ESTIMATE target); ledger entries across the ownership transfer sum to zero
+- Matter summary round trip and non-1 g hydrostatics — reference: 5 L of water summarised and reseeded; the plan's hydrostatic gate re-run in lunar gravity and in a frame rotating at 0.313 rad/s — tolerance: Mass 0 micrograms; centre of mass within 1 cm (half a cell); booked energy >= 0; hydrostatic pressure within the existing 3%
+
+## Roadmap
+- **0a. Probe (extended)** — Measure the phone, now including the outer layer: f64 Kepler solve, pair interaction and n-body step timings; an f64 hash compared with the build server; storage persistence grant and write rate from a Worker; WebGPU in a Worker; a data channel between two tabs. — Done when: The pasted result block replaces every ESTIMATE in the budget, and a decision table written beforehand selects branches (for example, which warp ceilings are advertised).
+- **0s. Orrery to pebble (first multi-scale step; CPU only, no WebGPU, no solver library)** — Sun, eight planets and the Moon on Kepler rails; the frame tree; one region holding one rigid cube and a ground plane; continuous zoom from 30 AU to 10 cm; time warp. — Done when: On the user's phone: the cube's fall time on Earth and on the Moon is within 1% of sqrt(2h/g_local), with g derived from GM/R^2 minus the centrifugal term; the region's state hash is identical with its anchor at the origin and at Earth's real position and speed; Kepler period closure is 1e-9; 60 Hz holds at 1e6x warp; the page prints the measured precision table.
+- **0b. Laws, frames, ledger, rigid blocks (replaces the old 0b)** — Units, materials, per-frame ledger with frame-transfer and reservoir accounts, the adopted rigid solver in f64 behind the engine's own interface, step as a pure function, snapshot and hash, tick-stamped commands. — Done when: Blocks are thrown and stacked on Earth, on the Moon and in orbit at 60 Hz for 20 minutes. The old conservation gates pass, plus Galilean and rotation invariance, Foucault, and Clohessy-Wiltshire drift. A cross-architecture hash test runs in CI.
+- **1. Mechanisms, suspension and rails warp (old phase 1, widened)** — Joints, motors, batteries, sensors; lossless suspend and promote; warp to 1e5x; docking. — Done when: A rover drives on the Moon, is left, the player warps a month and returns: the rover's state hash equals its pre-suspend hash and the ledger closes. Docking and warp-toggle gates pass. Motor tests stay within 1-2%.
+- **1m. Two phones (multiplayer rung 1)** — Sequenced lockstep for the mechanism tier in one shared region, host as record keeper, lease takeover, journal replica on every peer. — Done when: Two phones share a region for 10 minutes with zero hash mismatches under 5% injected loss; killing the host tab moves the lease without a ledger discontinuity; the world survives a reload.
+- **2. Real Solar System and transit** — 34-body ephemeris, Encke vessels, trajectory prediction, terrain collision cache at one airless site. — Done when: The DE440 gates pass in CI. A vehicle goes from lunar orbit to the surface on the phone, with under 2% of frame intervals above 25 ms during re-basing and terrain realisation.
+- **3. Liquids inside a region (old phase 3, widened)** — The GPU matter window on a carrier frame with non-inertial terms, summaries, reseeding, and the shared coarse field. — Done when: The old phase 3 gates pass at shipped resolution, and also in lunar gravity and a rotating frame. A summary round trip keeps mass exact. A second phone shows the same waterline within the gate's tolerance.
+- **4. Environment fields** — Atmosphere column, drag and lift, entry heating, stellar radiation, lumped thermal with radiative sink. — Done when: Standard-atmosphere, Hayabusa2 and radiative-balance gates pass; a vehicle enters and lands on a body with air, with the ledger closed across the entry.
+- **5. One server and time bubbles (multiplayer rung 2)** — A headless server running the same WebAssembly binary sequences, journals, audits and owns orphaned regions; per-region 'now' with forward-only sync and escrow. — Done when: Eight simulated clients and two phones share a world; the server's re-run of mechanism logs matches every hash; forward-only time-sync property tests pass.
+- **6. Deferred from the old plan, each behind a measured go/no-go** — Old phase 2 (bend, yield, break), old phase 4 (sand, mud, soft solids, melting), old phase 5 (native app). Content unchanged; they no longer block scale or multiplayer. — Done when: As written in 03-plan.md, with every gate also run in a second gravity.
+- **7. Builder kit, first game, wider world** — Old phase 6, plus a second star system and the generated catalogue (cheap: rails and data only), plus rung 3: several servers each owning frame-tree subtrees, split statically. — Done when: A sample game ships on the public strict-mode API with no engine changes. Rung 3 is a stretch goal: an entity crosses between two servers in deep space with a zero-sum ledger transfer.
+
+## Honest limits
+- 'A solar system' means: every body in one star system (tens of massive bodies, thousands of small bodies and vessels) moves correctly under Newtonian gravity at all times, and a player can stand anywhere in it. It does not mean the system is simulated everywhere: workshop-fidelity physics exists only within about 250 m (ESTIMATE) of each player, at the same body and particle counts as before.
+- 'Or even more' means more levels in the tree, not a bigger solver: a galaxy is a catalogue plus a generator; stars move on straight lines; only the star system a region sits in is integrated as an n-body problem. Other stars are reachable only below 0.01c, which is 420 years of game time for 4.2 light-years (DERIVED).
+- Where rails stop being first principles, exactly: (1) Kepler rails are Newton for two bodies only; mutual perturbations are dropped in mode K. (2) The ephemeris is prescribed: large bodies feel nothing from vessels. (3) Suspension stops internal time: conserving, but not evolving. (4) A summary replaces a micro-state by an equilibrium, and promotion invents a plausible micro-state from a seed. (5) Terrain and mineral content are authored statistics. (6) Dormant objects do not interact with each other: no collisions, no mutual gravity. (7) Environment fields are steady states, not dynamics.
+- The middle scales are hollow. Between the 250 m region and the planet there are no dynamics: no rivers, tides in oceans, weather, avalanches or erosion. Water outside a matter window is a hydrostatic reservoir at rest. This is the stance's weakest point and no shipped precedent solves it.
+- Nothing happens where nobody is. A fire, a leak or a running machine left behind is frozen unless it has a declared closed form. This is physically wrong and is reported, not hidden.
+- Quiescence is rare in free fall. Much of what gets put on rails will be suspended mid-motion (time-frozen) rather than settled, and liquids in microgravity are qualitatively wrong without surface tension (Bond number 3.6e-3, DERIVED by the red team), so free liquid in orbit is unsupported for now.
+- Large structures do not fit: a 1 km ship or bridge exceeds the awake-body budget and has no reduced dynamic model here. It can exist only as a rigid aggregate.
+- Planet-scale change (moving 1e15 kg, terraforming) can be booked in the journal at coarse resolution but is never simulated. Collisions between planets, and any impact faster than the declared closing-speed envelope, are out of scope.
+- Many players means many regions. A crowd in one place is capped by one device's mechanism budget (8-16 per region is the research's judgement, not a measurement), and every lockstep peer can read the whole region's state, so hidden information cannot be protected.
+- Shared liquid, sand and mud agree between players only in coarse totals; splashes differ per viewer, and a matter owner's report is bounded by conservation, not verified.
+- Rendering a planet, sky and far bodies is not budgeted by this design and draws on the same sustained GPU envelope as the matter tier.
+- Every phone performance figure here is scaled from desktop measurements; none is measured on an iPhone 15.
+
+## Changes to the existing plan
+- Charter item 1: add Newtonian gravitation and radiative exchange (inverse-square flux, Stefan-Boltzmann) as named laws. Uniform g becomes a derived local approximation whose error is reported per region (-3.1% at 100 km, DERIVED by the red team).
+- Fidelity ladder: 'out of scope' gains numeric entries (relativity at 42.98 arcsec per century for Mercury, light-time 499 s per AU, speeds above 0.01c, hypervelocity impact, fluid dynamics beyond the window). 'Electromagnetic fields' is narrowed so that radiative heat transfer is in scope.
+- Replace 'Scale is a workshop, not a world' and the sentence about 'sleeping or simplified matter': the workshop limits now apply per phone inside a region of detail; the world is rails plus a generator plus a journal.
+- Layer 1 gains, before any solver is written: frames as first-class objects; positions as (frame, local); an i64 tick clock; per-frame hierarchical ledgers with new accounts (gravitational potential, frame-transfer, reservoir momentum, radiative source and sink, atmosphere sink, unresolved-to-internal, escrow); three hand-off classes with a boundary port; an ambient-medium field; stable 64-bit ids; single-writer leases; a world record kept separate from the solvers.
+- Mechanism tier must: hold state in f64 relative to the region anchor; take gravity per body as an input instead of a world constant; accept gravity-gradient torque and a Coriolis rotation; carry no absolute speed clamp (the lineage default is 400 m/s, MEASURED, box2d src/types.c); treat sleep as weld-to-carrier; replace infinite-mass ground with a reservoir body whose momentum is booked; declare a closing-speed envelope.
+- Mechanism tier must also, for multiplayer: make the step a pure function of state and tick-stamped commands; provide complete snapshot, restore and hash; route every mutation (re-base, promote, demote, governor action, coupling impulse) through the command stream.
+- Matter tier must: let the window move and re-orient on a carrier frame; accept a per-substep block of acceleration vector, 3x3 gradient matrix, rotation rate and ambient pressure; stop assuming gravity lies along a grid axis; carry integer mass quanta per particle assigned on the CPU; read back a coarse field of mass, momentum and energy on a fixed delay line; emit quantised coupling impulses as recorded inputs; reseed deterministically from a summary; embed in a hydrostatic reservoir through a flux boundary.
+- Thermal governor becomes an allocator across regions. Order of actions: render quality, 30 Hz presentation, hand off matter or become a viewer (multiplayer), declared time dilation, and only then logged matter reduction. Every action is a sequenced command. The default 'drop to 30 frames per second before reducing matter' stays.
+- Strict mode: promotion, demotion, re-basing and escrow become a sanctioned, audited engine-internal class, distinct from game escape hatches. World creation is the single booked creation event.
+- Replay and snapshot: a snapshot is a region, not the world; a replay is a checkpoint plus commands since it. 'A replay recorded on your phone reproduces here' holds for the mechanism tier and the outer layer; matter is replayed from its recorded impulse stream.
+- Delivery: the world record lives in the origin-private file system, written from a Worker, with persistence requested; Home Screen install becomes required for a persistent world. Multiplayer adds a small signalling worker outside GitHub Pages.
+- Roadmap: a two-scale CPU-only step comes directly after the probe; multiplayer rung 1 follows mechanisms; liquids move after transit; bend/yield/break, sand and the native app are deferred behind go/no-go gates.
+- Validation: every existing gate that assumes uniform 1 g is re-run in a second gravity and in a rotating frame; invariance gates are added to the first solver phase.
+- Budget: the mechanism tier yields about 0.5 ms per frame steadily and up to 1 ms more while a region moves or loads (ESTIMATE).
+
+## Decisions for the user
+- Real Solar System first, or an invented one? Real gives a published reference to test against and familiar places. Invented needs physical parameters you choose and would run in the simpler Kepler mode.
+- What must 'or even more' mean in play? Under real physics other stars take centuries of game time to reach, even with time warp. Either accept that, or allow games a clearly logged, unphysical jump.
+- Is it acceptable that things you leave behind freeze (a running machine, a pouring liquid, a fire) until someone returns? The alternative is keeping them awake, which spends the phone's heat budget on places nobody is looking at.
+- Who plays together first: friends you trust, where one phone can host for free, or strangers, which needs a rented server from the start and still cannot hide information from players in the same place?
+- When players sharing a world want different time-warp rates: one clock changed only by agreement, or separate time bubbles that sync forward when players meet? This is a game-feel choice, and the second is harder and unproven.
+- Accounts and money: a free Cloudflare account for connecting phones at the first multiplayer step (you would create it), and later a server at roughly EUR 5-10 a month plus a domain name. Yes or no, and when.
+- Devices: is your phone on iOS 26.4 or later (needed for the server step), and is there a second phone available for two-player tests?
+- Order: do you accept that liquids move behind the two-scale step, mechanisms and two-phone play, and that bending, sand and the native app wait behind measured go/no-go gates?
+- Real ephemeris data: JPL's specific terms could not be opened from here. Decide whether to rely on NASA's general public-domain policy for the initial state vectors or use lower-accuracy orbital elements from Wikipedia.
+
+## Risks
+- Hand-offs are where every shipped precedent broke (orbit shifts on warp, docking that lost momentum, mined mass restored on reload; MEASURED, KSPCommunityFixes README), and this design has three hand-off classes times several frame boundaries. — Mitigation: Hand-offs are the only way matter changes representation, and each is a double-entry transaction at one tick. Property tests assert restrict(promote(c)) == c; round trips are fuzzed in CI; the named regression gates run on every build.
+- Quiescence is rare in free fall and in sloshing or spinning systems, so warp requests are refused often or force a time-freeze that players notice. — Mitigation: Lossless suspension with an explicit 'frozen' label; closed-form attitude so spin continues; equilibrium jump with booked energy for liquids; the Clock API returns the refusal reason so a game can show it.
+- Bit-exact f64 for the Kepler solver, ephemeris and frame transforms across Safari, other WebAssembly runtimes and native builds is unproven; WebAssembly permits nondeterministic NaN bits and relaxed-SIMD rounding (MEASURED, WebAssembly design docs). — Mitigation: Own series for every transcendental, fixed iteration counts, no relaxed SIMD, no observable NaN payloads; a cross-architecture hash test from the first commit; the server runs the same WebAssembly binary. Fallback: the host distributes ephemeris checkpoints (a few kilobytes per minute, ESTIMATE).
+- Sharing matter adds network transit to the coupling delay: 4-7 frames (ESTIMATE). A lagged restoring force gives negative damping of about 70% for a hull of 5 cm draft at 0.1 s (DERIVED: 14 rad/s x 0.1 s / 2), so floating bodies go unstable. — Mitigation: Depends on the red team's fix P05: rigid-body degrees of freedom inside the GPU pressure solve, so only non-fluid forces are lagged. If that is not done, matter-coupled islands become owner-authoritative with state sync at 3.4 kbit/s per moving body (DERIVED in 05) instead of lockstep.
+- Deterministic terrain generation cost on the phone is unmeasured, so the speed at which a region can move over a surface is unknown. — Mitigation: Probe item. Fine terrain is speed-gated; coarse analytic surface above the gate; pre-generation along the predicted trajectory. Fallback for the first releases: one simple collision surface per landing site (red-team F12).
+- Per-region time ('time bubbles') in a persistent shared world invites paradoxes: one player changes an object that another has already seen later in time. — Mitigation: Rung 1 uses one clock. From rung 2: forward-only sync, a high-water tick on every object, escrow for transfers, and property tests. This rule set is an untested design (05, 'not established').
+- The host is a browser tab that iOS may suspend or kill, reportedly dropping its sockets (unverified forum excerpt in 05); Safari may evict stored data after seven days without interaction (MEASURED, MDN). — Mitigation: Leases expire and peers take over from the last sequenced tick; checkpoints every 10 s (ESTIMATE); every peer holds a journal replica with a deterministic successor order; Home Screen install plus a persistence request; world export and import as a file; a server copy from rung 2.
+- Authored star systems can be unstable under n-body gravity (the stock KSP moon system is; MEASURED, Principia docs), and real-system accuracy against DE440 is unknown until run. — Mitigation: Authored systems default to Kepler mode; the authoring tool integrates offline and reports. DE440 tolerances are provisional and tightened after the first CI run.
+- Dormant objects on Kepler rails ignore perturbations and each other: a derelict in a perturbed orbit never decays, and two rails objects can pass through one another. — Mitigation: Flagged objects (up to 64, ESTIMATE) are integrated against summed gravity; optional orbit-averaged drag decay; conjunction screening promotes a pair only when a player's region is involved. The rest is declared.
+- This layer takes CPU from tiers that are already at the heat limit, and its own cost is an estimate. — Mitigation: A hard 0.5 ms cap with a 1 ms time-sliced burst, measured in the probe; the governor treats the cap as fixed and sheds this layer's optional work (visible rails objects, prediction) first.
+- Scope: the old plan was already judged too large (red-team F02), and this adds a frame tree, rails, a world store and netcode. — Mitigation: Version 1 is the probe, the two-scale step, rigid blocks in frames, mechanisms with suspension, and two phones. Everything else sits behind go/no-go gates with named cut lines. The outer layer itself is small; its test matrix is the real cost.
+- Planet, sky and far-body rendering is unbudgeted and shares the sustained GPU envelope with the matter tier. — Mitigation: Outside this stance's scope; the lead architect should assign a render budget before phase 2. The two-scale first step uses instanced rendering without WebGPU so it cannot be blocked by this.
+
+---
+
+# CASCADE - one multi-rate symplectic integrator over a body tree (no rails, no spheres of influence, no rotating frames) (stance: one-integrator)
+
+## Thesis
+
+One body table, one integer clock, one recursive kick-drift-kick map. Every massive thing is a node in a body tree, stored relative to its parent. Each node has an exact free flow (Kepler flow about its parent, torque-free rotation, or a straight line inside a chart) and pairwise, equal-and-opposite kicks placed on power-of-two rungs dt_k = 2^k/480 s (CHOICE). Rung 0 is the existing mechanism substep; the GPU matter tier is rung 0's partner. A region of detail is a subtree resolved into parts on rung 0 inside a non-rotating chart. There are no rails, no spheres of influence, no rotating frames and no fictitious-force code: weight, Coriolis and centrifugal effects and tides emerge from real gravity sampled at each body plus contact with carriers that really move. Time warp changes only how many ticks elapse per wall frame and the deepest rung the policy admits; no body changes model, so the celestial state at tick T is bit-identical whatever the warp history. For multiplayer this means heavy bodies cost zero bandwidth, dormant bodies are deterministic between logged events, only rung-0 regions need a sequencer and only GPU matter needs an owner. Weakest points, stated up front: the adopted rigid solver lacks carrier-relative sleeping; moon-level accuracy of the nested splitting is unmeasured; warp with live contact is a few times real time at most; authored systems can be dynamically unstable. Tags used throughout: MEASURED (source), DERIVED (derivation), ESTIMATE; design parameters are marked CHOICE. Read for this design: /home/user/pulsevault/reality-engine/03-plan.md, 04-star-citizen-and-partitioning.md and 05-multiplayer-research.md in the same folder.
+
+## Frames and precision
+
+Every coordinate is (node, local value); no global float exists. Four levels:
+(1) Between star systems: system origin as int64 kilometres, range +/-975,000 ly (DERIVED: 2^63 km / 9.4607e12 km per ly), resolution 1 km; velocity f64.
+(2) Body tree inside a system: f64 metres and m/s relative to the parent node (one global frame destroys relative-position information, MEASURED: arXiv:1409.4779 section 3). Worst-case spacing (DERIVED: IEEE-754 ulp computed this session): 0.93 nm at a 6,771 km orbit radius, 60 nm at lunar distance, 31 micrometres at 1 AU, 0.98 mm at 30 AU, 3.1 cm at 1,000 AU, 1 m at 50,000 AU; velocity 9.1e-13 m/s at 7.67 km/s and 3.6e-12 m/s at 29.78 km/s.
+(3) Region chart: mechanism-tier state in f64, chart-local. Within 16 km spacing is 1.8e-12 m; below 300 m/s it is 5.7e-14 m/s (DERIVED). f64 is affordable because the deterministic build is scalar anyway (Rapier's enhanced-determinism forbids SIMD, MEASURED via file 05; Jolt reports 5-10% for doubles, MEASURED docs).
+(4) Matter window: f32 relative to a window origin on an integer cell lattice. Within 0.64 m (CHOICE: 64 cells of 2 cm) spacing is 6.0e-8 m; below 16 m/s it is 9.5e-7 m/s, against a per-substep gravity increment of 0.0204 m/s (DERIVED: 9.81/480).
+Time: i64 ticks of 1/480 s, range 6.09e8 years (DERIVED: 2^63/480/3.156e7). Mass: GM in f64 for heavy bodies; integer micrograms per region, limit 9.2e12 kg (DERIVED: 2^63 micrograms). Rendering is camera-relative f32.
+
+A chart never rotates. Its origin follows an anchor (carrier centre of mass) and is re-based by an exact Galilean shift at a tick boundary, logged, when the anchor's chart-relative speed exceeds 16 m/s or its offset 256 m (CHOICE): every 1.8 s in low orbit (DERIVED: 16 / 8.7 m/s^2), every 123 s at Earth's equator (DERIVED: sqrt(2 x 256 / 0.0339)). Origin and velocity use compensated double-double sums.
+
+A region at orbital speed keeps millimetres because 7.67 km/s lives only in the chart's f64 velocity; no rung-0 state and no GPU buffer ever holds it. The matter window is re-based every frame by whole cells, with the anchor's acceleration folded into one uniform vector.
+
+Errors: rung-0 stepping of a low orbit drifts 5.6 cm per year along-track (DERIVED: (1.133e-3/480)^2/24 = 2.3e-13, times 2.42e11 m travelled). The order-2 field expansion in a chart errs by 4g(L/R)^3 = 1.5e-10 m/s^2 at 1 km on Earth (DERIVED). Re-parenting a body is a logged chart change with hysteresis, not a model switch.
+
+## Gravity and orbits
+
+Law: pairwise Newtonian attraction, with GM products as data. Nothing else supplies gravity.
+
+Integrator: a nested Wisdom-Holman splitting in parent-relative canonical coordinates (democratic-heliocentric at each tree level, after Duncan, Levison and Lee 1998, from memory; hierarchical Jacobi as fallback). Drift is the exact universal-variable Kepler flow with a fixed 2 Halley + 2 Newton iterations and its own series (as WHFast512, MEASURED: arXiv:2307.05683 appendix A), so it is bit-reproducible. Kicks are pairwise, equal and opposite, on power-of-two rungs; this class conserves momentum and angular momentum to machine precision (MEASURED claim: arXiv:1205.5668, abstract opened this session). Rungs (DERIVED: 2^k/480 s; steps per orbit = period/step): planets 27 (3.24 d; Mercury 27 steps, Earth 113), Moon 22 (2.43 h; 270), Io 20 (36 min; 70), Phobos 18 (9.1 min; 50), low-orbit aggregate 16 (136.5 s; 41), contact 0. Close encounters deepen rungs reversibly (SyMBA and TRACE style, arXiv:2405.03800) down to plain kick-drift-kick. Third-body terms are computed as differences (Battin's function, from memory) to avoid cancellation. Extended bodies carry J2 (omitting it costs 590 km/day cross-track in low orbit, DERIVED in research), low-degree harmonics, or up to 16 mascons (CHOICE).
+
+Inside a region: for each source the CPU builds, in f64, a local expansion about the chart origin: g0, the tidal tensor G and the third-derivative tensor T; the parent body's is refreshed every substep, others every frame. Each body receives a = g0 + G x + (1/2) T:xx and torque tau_i = eps_ikj (G I)_kj, which reduces to 3 mu/r^3 r x (I r) (DERIVED). Where region size exceeds 5% of the source radius (asteroids, CHOICE), evaluation is exact per body. Bodies above 1.5 t are local sources (DERIVED: m = a L^2/G for a floor of 1e-9 m/s^2 at 10 m, CHOICE); lighter self-gravity is neglected and reported.
+
+Consequences, not inputs: with GM, J2 and the integrated spin of 7.292e-5 rad/s, a resting mass loads its support by 9.7803 m/s^2 at the equator and 9.8321 at the poles (DERIVED this session; MEASURED 9.780 and 9.832, Wikipedia 'Gravity of Earth'). Axial precession emerges at 50.1 arcsec/yr from torque kicks (DERIVED: rigid-Earth formula).
+
+Accuracy: two-body motion exact to round-off; planets' energy error bounded near 1e-8 relative (MEASURED for WHFast at a 5-day step; ours ESTIMATE); Moon along-track error about 4 km/yr at rung 22 (ESTIMATE: 0.0056 x (2 pi/270)^2/24 x 3.2e10 m), unmeasured, improvable with symplectic correctors (arXiv:1907.11335).
+
+Left out: relativity (Mercury 42.98 arcsec/century, MEASURED Wikipedia; GM/(r c^2) is 1e-8 at 1 AU and 2.1e-6 at the Sun's surface, DERIVED), light-time (499 s per AU, DERIVED in research), tidal dissipation, radiation pressure by default.
+
+## Matter across scales
+
+Everything unobserved is still a body or part of one; nothing is a rail and nothing free-runs.
+- Star, planet: one tree node holding GM, radius, angular-momentum vector and inertia, J2 or low-degree harmonics, a radial structure table (Earth's reference model is 94 rows, MEASURED: BurnMan PREM file), an atmosphere column and a surface generator seed. About 256 bytes plus under 10 kB of tables (ESTIMATE).
+- Mountain: not a body; part of the planet's composite. Stored as generator version plus seed; only edited 16^3-voxel leaves are saved (Space Engineers' scheme, MEASURED source), 8,192 bytes raw each at 2 bytes per voxel (DERIVED; CHOICE of format).
+- Rover, parked: welded to its carrier, which is what static friction physically is; its mass, momentum and angular momentum sit in the carrier's composite. Record: blueprint id, joint coordinates, charge, temperatures; 0.2-2 kB (ESTIMATE). In orbit: a gyrostat aggregate (mass per material, momentum, angular momentum, inertia tensor, rotor momentum, named energy stores), 256 bytes, on its own rung.
+- Pebble: statistically inside the generator's regolith; if a player moved it, a 64-128 byte welded instance (ESTIMATE).
+- Liquid or pile: a reservoir or heightfield record (integer mass per material, enthalpy, container id).
+
+Hand-offs, all at tick boundaries and double-entry:
+1. Weld/sleep: mass, momentum, angular momentum exact; residual relative kinetic energy below 5e-7 J/kg (DERIVED: 0.5 v^2 at a 1 mm/s threshold, CHOICE) booked as heat.
+2. Demote assembly to gyrostat: mass exact in integer micrograms; momentum and angular momentum exact; kinetic energy of internal relative motion, non-negative by Koenig's theorem (DERIVED in research), booked as internal energy; spring and battery energy carried as named stores.
+3. Promote: restores the journalled micro-state, so restrict(promote(c)) == c bit-exactly on the CPU.
+4. Particles to reservoir: mass exact; momentum delivered to the container as an impulse; slosh energy to heat; potential-energy difference to a 'relaxation' account. Reseeding matches per-cell mass exactly; energy mismatch goes to 'reseed'.
+5. Dig/deposit: integer voxel fill to particle mass, exact.
+6. Re-parenting and ownership transfer: identical totals debited and credited in the common ancestor's coordinates.
+Ledgers are hierarchical: integer units per region, double-double per system, so workshop joules are not lost under Earth's 2.6e33 J (DERIVED in red-team notes). Reaction impulses on heavy bodies go to an exact 'deferred reaction' account.
+
+Persistence: world record = checkpoint + append-only journal of tick-stamped commands in OPFS. ESTIMATE: 20,000 placed objects x 128 B = 2.6 MB; 10,000 edited leaves x about 1 kB compressed = 10 MB; inputs 2.6 MB per player-hour (DERIVED: 12 B x 60 Hz x 3,600 s) until the next checkpoint truncates them. Quota exhaustion refuses edits; it never reverts them.
+
+## Regions of detail
+
+A region is a chart plus the set of bodies currently on rung 0. A chart is about 200 bytes (ESTIMATE), so the architecture puts no limit on count. The phone does: every region draws on one awake budget (hundreds of bodies, the plan's ESTIMATE) and one power envelope. CHOICE: at most 4 regions per phone, each at least 32 awake bodies, and one GPU matter window (dispatch encoding for one window already costs 1.7-5.2 ms, DERIVED in red-team F09).
+
+Membership: islands within 150 m of an observer are promoted and those beyond 250 m demoted (CHOICE, hysteresis). Inside a region the hierarchy continues: contacting islands on rung 0; free-flying single bodies on rungs 3 to 6 with exact rotation drift; islands at rest relative to a carrier are welded and cost nothing.
+
+Movement: the chart follows its anchor by Galilean re-base and never rotates. On a surface the planet is a carrier whose patch moves as its integrated rotation dictates. Terrain colliders stream from generator plus journal at 0.5 m spacing (CHOICE): a 100 m/s approach needs about 3,300 height samples per frame (DERIVED: 100/60/0.5 x 1,000 columns).
+
+Vehicle interiors: no interior grid and no special case. The hull is a body in the same chart; contents rest on it by contact. Thrust, tumbling and spin gravity are real hull motion: a 100 m radius ring at 0.313 rad/s gives 9.81 m/s^2, and a 2 m drop lands 0.27 m anti-spinward (DERIVED from the straight inertial path).
+
+Two regions meeting: when swept bounds would touch within 2 s (CHOICE) they merge at a common tick into one chart, one island set and one owner; they split with hysteresis. An interaction island is never divided between charts or owners (file 04 rule 8). Closing speeds beyond the contact envelope (16 m per substep at 7.67 km/s, DERIVED) trigger a declared coarse impact model.
+
+What the lower tiers must provide: (a) carrier-relative sleeping and a per-carrier local broadphase, because nothing is world-static; (b) gravity as per-body field samples; (c) the re-base operation; (d) promote/demote ports; (e) for matter: an arbitrary-direction uniform acceleration plus a 3x3 tidal matrix per substep, moving colliders only, and a coarse-cell summary output.
+
+Weakness: (a) is real engineering that an adopted library does not ship, and bodies resting on a fast-rotating carrier churn the broadphase until they are welded.
+
+## Time and warp
+
+Clock: one i64 tick of 1/480 s. Each region has a 'now'; each dormant body carries its own time and is advanced lazily, which is what individual timesteps mean. The rate r (ticks per wall second / 480) is a sequenced input, never a change of dt.
+
+Warp is policy: the scheduler runs every rung whose step boundary falls inside the frame's tick span, provided the cost fits the budget. Raising r raises the lowest affordable rung. Anything that needs a deeper rung must first become quiescent and be welded or demoted; otherwise warp is refused and the Reality Report names the body that blocks it.
+
+Ladder (cost model: 0.2 microseconds per Kepler drift, DERIVED from 1.61 microseconds per 8-planet step MEASURED on a Xeon, arXiv:2307.05683; 8 ns per pair kick, ESTIMATE; native A16 taken as equal):
+- 1x to about 4x: rung 0 live, matter off above 1x (ESTIMATE; CPU-bound).
+- Up to about 6e6x at 0.5 ms per frame, 4e7x at 3 ms: all 34 bodies with every kick (DERIVED: summed rung costs 4.7e-9 CPU-seconds per simulated second). A 259-day transfer takes 22 s at 1e6x (DERIVED).
+- Up to about 8e9x: planets only (research ESTIMATE); moon kicks suspended, a declared degradation, off by default.
+A followed low-orbit vessel costs 30 microseconds per frame at 1e6x (DERIVED: 0.26 microseconds per 136.5 s step); unobserved ones are caught up later at 60 ms of CPU per simulated year each (DERIVED: 231,000 steps), in time slices.
+
+Advances exactly: Kepler flow, torque-free rotation (Jacobi elliptic functions by fixed-iteration Landen steps), lumped thermal relaxation, battery self-discharge. Frozen and declared: joint coordinates of aggregates, controllers, settled matter, anything chaotic. Nothing mechanical happens where no region is awake.
+
+Conserved across warp: mass exactly; linear and angular momentum to round-off (pairwise kicks); energy oscillates within a bound with no secular drift (about 1e-8 relative for planets at multi-day steps, MEASURED for WHFast, arXiv:2307.05683 section 5; ours ESTIMATE), reported in an 'integrator oscillation' account. Because rung assignment does not depend on r, entering or leaving warp changes no state: the orbit shift on engaging warp that shipped in KSP (MEASURED: KSPCommunityFixes list) cannot occur.
+
+Thermal governor: gains r below 1 (time dilation) as its last sequenced lever.
+
+## Multiplayer
+
+Authority by class.
+Heavy bodies: none needed; a pure function of the tick, hash-checked at checkpoints, zero bandwidth.
+Dormant light bodies: the world record; deterministic between logged events, so any peer advances them; commits go through one journal writer.
+Rung-0 regions: sequenced deterministic lockstep on the bit-exact mechanism tier. One sequencer per region tick-stamps inputs; 2-4 frames of input delay, local actuator predicted visually, no rollback (file 05 rule 2); a 64-bit state hash each second; mismatch means snapshot resync, about 0.6 MB (ESTIMATE: 300 x 400 B + 5,000 x 100 B). Inputs missing at the deadline become 'hold last', so a slow phone stalls nobody.
+GPU matter: one leased owner per window sends quantised coupling wrenches in the input stream and a coarse-cell field (mass, momentum, energy) at 4 Hz (CHOICE); others draw local particles steered to it. The ledger records owner, lease number, coarse totals and each wrench as 'attested, not replayable'; conservation bounds a lie.
+
+Ownership: a region lease (owner, number, expiry 960 ticks = 2 s, CHOICE) in the world record. Transfer is one journal transaction at a tick boundary; release and acquire carry identical state hash and ledger totals; never zero or two owners. Mechanism state needs no copy; matter is reseeded from the coarse field and the difference booked.
+
+Clock: default one world 'now'; warp is a world-level sequenced input requiring all regions quiescent and all players' consent; the slowest governor sets the rate. With servers, each subtree has its own 'now', syncs forward only, and transfers wait in escrow until the receiver reaches the send tick (file 05 rule 5).
+
+Hot phone, as sequenced steps: cut rendering; hand off matter ownership; become a viewer on state sync (3.4 kbit/s per moving body, MEASURED: Fiedler via file 05); last, slow the region. Backgrounded or killed: the lease lapses in 2 s and the next peer in a fixed order sequences from its own state; a solo world resumes from the last journal flush.
+
+Trust: friends first; hashes catch bugs, not cheats. With a server: input deadlines, authoritative re-simulation from the same wasm, sampled audits of attested matter.
+
+Bandwidth per player (DERIVED: 12 B inputs at 60 Hz, 30 packets/s of 4 frames, 90 B overhead ESTIMATE): up 33 kbit/s (30 x 138 B); down 70 kbit/s at 4 players (30 x 290 B), 208 at 16. Matter adds 27 kbit/s for 4 coupled bodies (14 B x 60 Hz) plus 82-328 kbit/s of coarse field (1,024 cells x 10 B x 4 Hz; 4x compression ESTIMATE). Total 31-191 MB per hour.
+
+Ladder: (1) 2-4 players; the host phone sequences over WebRTC data channels; static site plus a free signalling worker, $0-5 per month (file 05, MEASURED pricing). (2) One headless VPS running the same wasm, about EUR 5-10 per month (unverified in file 05); 8-16 players per region (file 05's judgement); it sequences, journals, audits and owns orphaned regions; no GPU, so matter stays client-owned. (3) Several servers, each owning a subtree of the body tree (Earth system, Mars system, transit), one VPS each plus a relay; they exchange only transfer transactions because heavy bodies need no replication.
+
+## Environment fields
+
+All fields are functions evaluated on demand at a body's position; none is a simulated fluid. Each is a registered model with a stated error.
+
+Atmosphere: one column table per planet (64 rows, CHOICE) built at load by integrating hydrostatic balance dP/dr = -rho g(r) with the ideal-gas law and composition from the material database. Temperature profile: catalogue layers where measured (U.S. Standard Atmosphere, 7 layers to 86 km, MEASURED: Wikipedia); otherwise derived: surface from radiative balance, dry adiabat g/cp = 9.8 K/km for Earth air (DERIVED: 9.81/1004), isothermal above at the skin temperature 214 K (DERIVED: 254.6 K / 2^0.25). Derived scale height 8.43 km (DERIVED in research). The air co-rotates with the planet, so in the non-rotating chart still air is a moving medium and a body at rest on the ground feels no wind. No weather: declared.
+
+Drag and lift: per rigid body, Newtonian impact pressure rho v^2 sin^2(theta) on windward faces. This is momentum conservation for an intercepted stream and gives force and torque from geometry alone. It is scaled to tabulated drag coefficients at low speed (empirical tier, labelled; a sphere's 0.47 is an ESTIMATE in the red-team notes) and capped by the free-molecular limit. Momentum and work are booked to the planet's atmosphere reservoir.
+
+Heating: Sutton-Graves q = k sqrt(rho/Rn) v^3 with k = 1.7415e-4 for Earth air, about +/-20% (MEASURED: the arXiv paper cited in research), capped by the incoming kinetic-energy flux 0.5 rho v^3, a conservation bound. Each body has a lumped enthalpy and loses emissivity x sigma T^4, which is 459 W/m^2 for a black surface at 300 K (DERIVED in red-team notes).
+
+Starlight: flux L/(4 pi d^2), 1,361 W/m^2 at 1 AU (MEASURED: Wikipedia 'Solar constant'), with analytic disc-overlap eclipses. A black sphere at 1 AU settles at 278.3 K (DERIVED: (1361/(4 sigma))^0.25); Earth at albedo 0.3 settles at 254.6 K, 33 K below observation (declared no-greenhouse error; an authored optical depth is the labelled fix).
+
+Day, night and seasons are not authored; they follow from the integrated rotation state and the star's direction. Ground temperature away from a region: closed-form periodic conduction into a half-space using the surface material's thermal inertia (linearised radiation, declared).
+
+Oceans (later): a hydrostatic reservoir whose surface is the equipotential derived at load from gravity plus rotation; buoyancy by integrating table pressure over the wetted hull.
+
+Cost: about 80 ns per body per frame (ESTIMATE).
+
+## Content and authoring
+
+Real data: the Solar System ships as state vectors and GM values for 34 bodies at J2000 in a 10,080-byte text file (MEASURED: Principia's sol_initial_state file on raw.githubusercontent.com, opened this session; values from JPL Horizons; licence not verified), plus radii, J2, poles, albedos and compositions labelled 'catalogue'. The phone integrates from there. The 32 MB de440s file (MEASURED size, via research) stays on the build server as an oracle.
+
+Authored by physical parameters: a builder gives a star's mass, each body's mass and composition class, and orbital elements. The tool derives the rest and labels every value catalogue, derived-from-law or sampled:
+- radius and interior by integrating hydrostatic equilibrium with material equations of state (a uniform Earth gives 172 GPa at the centre, 2.1 times too low, so layers are required; DERIVED in research);
+- flattening and J2 from rotation rate and that density profile (Radau-Darwin relation, from memory);
+- surface gravity, day length, seasons, tides, Lagrange points, synchronous altitude, Roche limit, escape speed and eclipse times are never authored, only observed in the running system;
+- luminosity from mass (empirical relation, labelled) or from radius and temperature by the Stefan-Boltzmann law.
+
+Cost of the stance: there are no rails to hold a pretty but impossible system together. Stock KSP's Jool moons are unstable under n-body gravity (MEASURED: Principia docs). Authoring therefore includes a stability certificate: the build server integrates all bodies for 10,000 years and planets only for 10 Myr (CHOICE), roughly 20-25 minutes of CPU each (DERIVED: 6.82 days per 5 Gyr MEASURED, scaled; and 3.156e11 s x 4.7e-9), and reports ejections, collisions and eccentricity growth.
+
+Beyond one system: a catalogue of system origins (int64 km) with real nearby stars where data exist and a versioned seeded generator elsewhere, written with the engine's own deterministic maths kernel so every peer generates identical worlds. Only systems holding a player or a journalled object are instantiated.
+
+Builder API additions: Site (body, latitude, longitude), Vessel, Orbit (elements to state, at t0 only), Clock.requestWarp, Predict (runs the same integrator on a copy; one low orbit ahead is 41 steps, DERIVED) and events: periapsis, encounter, promote, demote, merge, lease change. Strict mode still forbids teleports; initial conditions at t0 are the only un-ledgered creation, and engine hand-offs are an audited class of their own.
+
+## Budget on the A16
+
+CPU per 60 Hz frame at 1x for one region of 300 awake bodies (ESTIMATE unless marked; assumes 0.4 ns per scalar f64 operation in wasm, unmeasured):
+- field refresh: parent source each substep plus 5 others per frame, 13 x 60 ns = 0.8 microseconds;
+- per-body gravity sample: 40 operations = 16 ns, x 300 x 8 substeps = 38 microseconds; gravity-gradient torque once per frame, 3.6 microseconds;
+- ambient medium, drag, radiation: 300 x 80 ns = 24 microseconds;
+- hierarchical ledger roll-up: 300 x 40 ns = 12 microseconds;
+- celestial stepping, amortised: 4.7e-9 x 1/60 s = 0.08 ns, effectively zero (DERIVED from the cost model);
+- state hash once per second: 31 kB at 1 GB/s = 31 microseconds, 0.5 per frame;
+- network and journal: about 3 microseconds.
+Steady total about 0.08 ms. Time-sliced extras, capped: terrain and collider streaming 0.4 ms, lazy catch-up 0.1 ms. Reserve: 0.6 ms per frame, 12% of the roughly 5 P-core-ms sustained envelope (reviews' ESTIMATE). It is not free: taken from the mechanism tier it costs about 60 awake boxes at the red team's central 100 boxes per ms (DERIVED). During warp the solvers idle and stepping may use 3 ms. A wasm penalty of 1.4-2.5x (red-team ESTIMATE) lowers every warp ceiling in proportion.
+
+Demands on the lower tiers' own budgets: f64 state (5-10% slower by Jolt's MEASURED figure; unmeasured in wasm) and carrier-relative sleeping (cost unknown; probe item).
+
+GPU: sky, far bodies as analytic impostors, terrain level of detail and a transmittance lookup: 1-2 ms (ESTIMATE), sharing the 5-6 ms sustained envelope (reviews' ESTIMATE) with matter; scenes in space usually have no matter awake.
+
+Memory (DERIVED from record sizes; counts are CHOICE): 34 heavy bodies x 256 B = 8.7 kB; 10,000 light bodies x 256 B = 2.6 MB; planet tables under 10 kB each; collision heightfield 16 tiles x 128^2 x 4 B = 1.0 MB; 512 voxel leaves x 8 kB = 4.2 MB; journal buffer capped at 64 MB; star catalogue 100,000 x 32 B = 3.2 MB; resync snapshot 0.6 MB. Under 100 MB of the roughly 1 GB web budget (research).
+
+Storage: site bundle under 20 MB (ESTIMATE). No global elevation grid: a 30-arc-second one is 1.87 GB (DERIVED by red team) against a 1 GB Pages limit (MEASURED: GitHub docs); a 1,440 x 720 x 2 B coarse map per body is 2.1 MB (DERIVED). Save: a checkpoint of tens of MB plus 0.1-1 MB per hour of journal (ESTIMATE). Safari may evict unpersisted data after seven days (MEASURED: MDN), so persist() and Home Screen install are required and export is offered.
+
+Every figure here is to be replaced by Phase 0a measurements; three micro-benchmarks (Kepler drift, pair kick, nested step) are added to the probe.
+
+## Validation tests
+- Kepler closure: two bodies at eccentricity 0.0167, 0.2056 and 0.967 for 1e6 orbits — reference: Closed-form two-body solution — tolerance: Energy and angular momentum relative error below 1e-12; position within 1e-9 of the semi-major axis (proposed)
+- Planetary energy bound: Sun and 8 planets for 1 Myr at rung 27 (3.24 d) — reference: Published: WHFast median relative energy error below 1e-8 over 40 Gyr at a 5-day step (arXiv:2307.05683 section 5) — tolerance: Relative energy error bounded below 1e-7 with fitted linear drift consistent with zero
+- Oracle agreement: 34 bodies for 1 year against an IAS15-class f64 reference of the same model — reference: Published: IAS15 holds about 1e-16 (arXiv:1409.4779) — tolerance: Proposed: planets within 100 m, Moon within 5 km, Io and Phobos within 50 km; the rung table is tightened until this holds
+- Mercury perihelion advance from n-body gravity alone, 100 years — reference: 531.1 arcsec/century, DERIVED as observed 574.10 minus the relativistic 42.98 (both MEASURED, Wikipedia 'Tests of general relativity') — tolerance: +/-1.5 arcsec/century; the 42.98 must be absent and declared
+- DE440 residual after 10 years (build server only) — reference: Published ephemeris de440s; expected Newtonian deficit for Mercury about 960 km per decade at perihelion (DERIVED: 9,600 km per century from research) — tolerance: Mercury residual equals the declared deficit within 15%; other planets below 400 km along-track (proposed)
+- Emergent surface gravity: load under a resting mass at Earth's equator and pole, no gravity constant in code — reference: MEASURED 9.780 and 9.832 m/s^2 (Wikipedia 'Gravity of Earth') — tolerance: 0.02% (2e-3 m/s^2)
+- Foucault pendulum at 48.85 degrees north, one simulated hour at rung 0, no Coriolis term in code — reference: Closed form: plane turns at Omega sin(latitude) = 11.33 degrees per hour (DERIVED) — tolerance: 2%
+- Eastward deflection of a 100 m vacuum drop at the equator — reference: Closed form omega g t^3/3 = 2.20 cm (DERIVED) — tolerance: 5%
+- Tidal separation: two free bodies 10 m apart radially, at rest in the orbit-fixed sense, 400 km orbit, 100 s — reference: Clohessy-Wiltshire closed form: +0.192 m radial, -0.0145 m along-track (DERIVED) — tolerance: 1%
+- Gravity-gradient libration of a 1 t, 10 m rod in a 400 km circular orbit — reference: Closed form: orbit period / sqrt(3) = 53.4 min (DERIVED) — tolerance: 1%
+- Spun habitat: 100 m radius at 0.3132 rad/s; floor load and a 2 m drop — reference: Closed form: 9.81 m/s^2; fall time 0.648 s; landing 0.272 m anti-spinward (DERIVED from the straight inertial path) — tolerance: 0.5% on load, 1% on time and offset
+- J2 nodal regression of a station-like orbit as a rung-16 aggregate, 10 days — reference: Closed form -1.5 J2 (R/p)^2 n cos i = -5.02 degrees per day (DERIVED) — tolerance: 1%
+- Axial precession of Earth from gravity-gradient torque kicks, 1,000 years at warp — reference: Rigid-Earth formula with (C-A)/C = 0.0032738: 50.1 arcsec/yr (DERIVED; observed about 50.3, from memory) — tolerance: 3%
+- L1 equilibrium in a synthetic circular Sun-Earth system — reference: Restricted three-body quintic: 1.4976e6 km from Earth (DERIVED this session) — tolerance: 0.1%
+- Chart invariance: same workshop scene with charts anchored at 6 origins from 0 to 30 AU and 0 to 30 km/s — reference: Exact property: chart-local state is independent of the anchor; re-base identity KE' = KE - P.dV + 0.5 M dV^2 — tolerance: Bit-identical local hashes; identity closes within 1 integer ledger unit per body
+- Warp and platform invariance of heavy bodies — reference: Exact property: state at a fixed tick is independent of warp schedule and CPU — tolerance: Identical hashes for 1x, 1e3x, 1e6x and mixed schedules on Safari wasm (A16), Node x86-64 and arm64
+- Demote/promote round trip: rover to aggregate to rover; flywheel assembly to gyrostat — reference: Exact property restrict(promote(c)) == c; Koenig's theorem — tolerance: Bit-identical state; angular momentum relative error below 1e-12; unresolved kinetic energy non-negative and booked
+- Asteroid landing: 1 t at 1 m/s onto a 1.309e6 kg body — reference: Momentum conservation: body gains 0.7634 mm/s (DERIVED) — tolerance: 0.1% on velocity; 0 ledger units of momentum residual
+- Docking through a region merge — reference: Conservation of momentum and angular momentum (KSP shipped a violation, MEASURED: KSPCommunityFixes) — tolerance: 0 ledger units change in both; kinetic energy lost equals booked dissipation within 1%
+- Atmosphere column for Earth — reference: Closed form scale height RT/(Mg) = 8.43 km at 288.15 K; U.S. Standard Atmosphere density ratio 9,600 at 70 km (MEASURED: Wikipedia) — tolerance: Scale height 0.5%; density at 70 km within 15% using catalogue layers
+- Radiative equilibrium and cooling of a lumped black sphere at 1 AU, then in shadow — reference: Closed form (F/(4 sigma))^0.25 = 278.3 K; cooling t = (m c/(3 sigma A))(1/T^3 - 1/T0^3) — tolerance: 0.1% on temperature; 1% on cooling time
+- Entry heating — reference: Sutton-Graves: 1.46 MW/m^2 at 7.8 km/s, 3.1e-4 kg/m^3, 1 m nose (DERIVED in research); Hayabusa2 capsule peak 9.0 MW/m^2 (published, source in research) — tolerance: 0.5% on the formula; 25% on the trajectory-coupled peak
+- Lease and lockstep fault injection: 2-4 simulated peers, 1,000 random owner kills — reference: Exact invariants: single writer; double-entry transfer — tolerance: Never zero or two owners at any tick; ledger sums change by 0 units across every transfer; hashes equal after takeover
+
+## Roadmap
+- **0a. Probe (extended)** — Measure the phone, now including this layer's kernels — Done when: The page reports the existing probe items plus f64 Kepler-drift, pair-kick and nested-step timings, the OPFS persist() result and write rate, and a hash of 1e6 heavy-body steps that equals the build server's. The user pastes the block back and every ESTIMATE in the budget is replaced.
+- **0s. Two scales (new; first build; CPU only; small)** — Sun, 8 planets and the Moon in the cascade integrator plus one rigid cube in a chart, with a warp slider — Done when: On the phone: continuous zoom from 30 AU to 1 m without jitter; the cube's fall time is within 0.1% of sqrt(2h/g) with g derived on Earth and on the Moon; released in low orbit it stays in orbit; the heavy-body hash at a fixed tick is identical on phone and build server and under three warp schedules; the layer costs under 0.1 ms per frame at 1x.
+- **0b. Laws, materials, first world, inside a chart** — Layer 1 with charts, ticks, hierarchical ledger and ports; rigid blocks with carrier-relative sleeping — Done when: Steel, oak and rubber blocks stack and sleep on rotating Earth, on the Moon and in a spun habitat for 20 minutes; chart-invariance hashes are identical at 6 anchors; the Foucault and eastward-deflection gates pass; the solver A/B is settled with carrier-relative sleeping as a criterion.
+- **1. Mechanisms and aggregates** — Joints, motors, batteries, sensors; demote and promote — Done when: The same rover drives on two worlds from voltages only; a parked rover survives a one-year warp with the ledger closed and a bit-exact restore; a phone replay reproduces on the build server.
+- **1m. Multiplayer, step 1** — 2-4 phones in sequenced lockstep on the mechanism tier, with lease takeover — Done when: Two phones share a block-stacking region for 20 minutes with zero hash mismatches; killing the host tab moves sequencing within 3 s; the fault-injection test passes on the build server.
+- **1v. Vessels** — Gyrostat aggregates, thrust, docking by region merge, re-parenting — Done when: A low-orbit-to-Moon transfer is flown at warp; docking changes momentum by 0 ledger units; the libration, tidal-separation and J2 gates pass.
+- **2. Bend, yield, break** — Unchanged content — Done when: The existing gates pass at an Earth site, a low-gravity site and in free fall.
+- **E. Environment fields** — Atmosphere column, drag, radiation, eclipses, entry heating — Done when: Scale-height, radiative-equilibrium and Sutton-Graves gates pass; a capsule entry closes the ledger with drag work booked to the atmosphere reservoir.
+- **3-4. Liquids, sand, heat (GPU)** — Existing content, driven by an apparent-acceleration vector and tidal matrix; reservoirs; dig journal; matter ownership over the network — Done when: The existing gates pass on two worlds; a non-owner phone reaches bit-equal mechanism hashes while watching another phone's liquid; coarse-field totals conserve.
+- **S. Server, then meshing** — Headless wasm sequencer on one VPS; later a static partition of the body tree — Done when: 8 players share one region for an hour; a ship crosses between two servers with ledgers differing by 0 units.
+- **5-6. Native app (optional), builder kit, first game, second system** — Prove a game can be built on it across scales — Done when: A strict-mode sample game spans two worlds and orbit with no engine changes; a second star system is instantiated from catalogue or generator and passes the stability certificate.
+
+## Honest limits
+- 'A solar system' means about 34 heavy bodies (roughly 300-450 by direct sum, research ESTIMATE) under mutual Newtonian gravity at full model from 1x to about 6e6x (ESTIMATE), thousands of dormant light bodies, and workshop-scale detail in at most a few regions sharing one power budget. It does not mean matter everywhere: Earth is 3.6e22 times the 30 L budget (DERIVED in research).
+- Nothing mechanical happens where no region is awake: machines pause, controllers suspend, piles do not creep. A game may spend budget on an unobserved region; otherwise the state is declared frozen.
+- Planets are bodies with tables and generators, not simulated matter: no global ocean, weather, climate, geology or tidal deformation; no planetary collisions; no hypervelocity impacts (16 m per substep at 7.67 km/s, DERIVED).
+- Newtonian only: Mercury is wrong by 42.98 arcsec per century (MEASURED: Wikipedia); light-time of 499 s per AU is ignored; valid below 0.01c.
+- Predictive truth is limited by chaos (Lyapunov time 2-230 Myr, MEASURED: Wikipedia); beyond that only bit-exact replay is guaranteed.
+- Warp with live contact is about 4x at most (ESTIMATE). Warp above the full-model ceiling suspends moon perturbations and is off by default.
+- 'Or even more': other systems are separately addressed cells; only systems holding a player or a journalled object are instantiated; the galaxy is a declared field plus point stars, not an n-body simulation. Below 0.01c the nearest star is over 420 years away (DERIVED: 4.2 ly / 0.01c), so interstellar play needs long warp or a declared non-physical drive. 4e11 systems cannot be stored (400 GB at 1 byte each, DERIVED in research), only generated.
+- Stance weakness: momentum exchange with heavy bodies is exact in the ledger but deferred in the trajectory. A 1,000 t ship changing velocity by 10 km/s moves Earth by 1.7e-15 m/s, below the 3.6e-12 m/s f64 spacing (DERIVED).
+- Stance weakness: the GPU window receives one uniform apparent-acceleration vector. That is an inertial term supplied as an input, the single exception to 'consequences only'; it carries no rotation.
+- Stance weakness: without rails, unobserved light bodies are not screened against each other, so two dormant vessels can pass through one another. Impacts with heavy bodies are detected during catch-up.
+- Stance weakness: an authored system that is dynamically unstable flies apart, by design.
+- Stance weakness: everything on a rotating world is a moving collider, which forces carrier-relative sleeping and broadphase into the mechanism tier. A rails-plus-rotating-frame design would not need that for surface scenes.
+- Multiplayer at scale has no free time warp: with many players, warp needs consent or per-subtree clocks that only sync forward.
+- Shared matter is attested, not verified: rigid outcomes agree bit-exactly, splashes differ per viewer.
+- Every A16 figure is scaled from desktop measurements; none has been measured on the phone.
+
+## Changes to the existing plan
+- Charter in /home/user/pulsevault/reality-engine/03-plan.md: add Newtonian gravitation as a hard-coded law; remove uniform g as a concept (no gravity constant anywhere); admit radiative exchange as flux bookkeeping, narrowing 'electromagnetic fields out of scope'; add a numeric Newtonian scope (below 0.01c; 42.98 arcsec/century; 499 s per AU).
+- Layer 1: add the body tree with stable 64-bit ids, non-rotating charts with logged Galilean re-base, an i64 tick clock with rungs, hand-off ports, an ambient-medium field, single-writer leases, and a deterministic maths kernel (no platform maths library, no fused multiply-add contraction).
+- Layer 1 ledger: becomes hierarchical (integer units per region, double-double per system) with new accounts: chart change, deferred reaction, reservoirs (atmosphere, exhaust, radiation), relaxation, reseed, integrator oscillation.
+- Mechanism tier: state becomes f64 and chart-local (the plan never stated precision; its source design used f32 about one origin).
+- Mechanism tier: no world-static bodies. 'Static' becomes welded to a carrier; sleeping is carrier-relative; the broadphase is per carrier. This is the largest change and may rule out using an adopted solver unmodified.
+- Mechanism tier: gravity arrives as per-body field samples with gravity-gradient torque each substep; speed clamps become chart-relative; huge-mass carriers get reaction accumulators.
+- Mechanism tier: the 1/480 s substep is fixed as rung 0 of the cascade; free-flying islands may sit on rungs 3 to 6.
+- Matter tier: gravity becomes a per-substep f32 vector of arbitrary direction plus a 3x3 tidal matrix; all colliders move; the window is re-based by whole cells each frame; flux ports connect to reservoir and terrain records; the coarse-cell summary is its authoritative output; liquids at Bond number below 1 are flagged outside validity (no surface tension).
+- Thermal governor: gains time dilation (region rate below 1) as a sequenced, logged last resort; every governor action is a tick-stamped input.
+- Replay and snapshot: replaced by world record = checkpoint + journal. The replay stream includes re-base, weld, promote/demote, lease, governor and coupling-wrench events; a snapshot is a region, not the world.
+- Strict mode: engine hand-offs become an audited class separate from game escape hatches; initial conditions at t0 are the only un-ledgered creation.
+- Roadmap: insert '0s Two scales' before 0b, '1m' and '1v' after Phase 1 and an environment phase before liquids; every gate runs at an Earth site, a low-gravity site and in free fall.
+- Budgets: reserve 0.6 ms of CPU per frame and 1-2 ms of GPU for this layer (ESTIMATE); storage moves to OPFS with persist(); 'scale is a workshop, not a world' becomes 'detail is a workshop, the world is a system'.
+- API: add Site, Vessel, Orbit, Clock, Predict and hand-off events.
+
+## Decisions for the user
+- First world: the real Solar System at true scale, or an invented system? An invented one must pass the stability certificate, which may force changes to its design.
+- How players cross interplanetary distances in multiplayer: one shared clock where warp needs everyone's consent; per-ship clocks where someone who warps ahead cannot interact with those behind until they catch up; or a labelled non-physical fast drive. Each has a physics price.
+- Do you accept that nothing runs where no player is (machines pause and are reported as frozen), or should part of the phone's budget go to unattended sites?
+- Where the persistent world lives: on whichever friend's phone is hosting (free, available only when a holder is online), or on an always-on server you rent (about EUR 5-10 per month, unverified price) with a domain name.
+- Who may join: friends only, or strangers? Strangers require the server step, and shared liquids still cannot be verified.
+- What 'or even more' should mean first: a second star system reached by long warp, continuous interstellar flight, or a faster-than-physics drive accepted as a labelled escape hatch.
+- Order of work after mechanisms: multiplayer for a few phones first, or vessels and orbital flight first?
+- Minimum iOS for everyone who will play: the server step uses WebTransport, which needs iOS 26.4 or later (MEASURED: Safari release notes via file 05).
+
+## Risks
+- Carrier-relative sleeping and per-carrier broadphase are not in the adopted rigid solver; building them may amount to writing a solver. — Mitigation: Make it a criterion of the 0b A/B and prototype it on the build server first. Fallback, a concession of the stance: let a planet-surface chart co-rotate with declared fictitious terms (Coriolis 1.5e-4 g at 10 m/s, DERIVED in research) for surface scenes only, keeping inertial charts for vehicles.
+- Nested Wisdom-Holman accuracy for moons is unmeasured (Moon about 4 km/yr, ESTIMATE) and the method has step-size resonances. — Mitigation: Run the oracle comparison in phase 0s on the build server before phone work; keep at least 20 steps per shortest period; add symplectic correctors or a higher-order kernel; last resort, give a moon subsystem a uniform high-order step inside the same tree.
+- f64 results may not be bit-identical across Safari wasm, arm64 and x86-64 once our own Kepler, trigonometric and elliptic functions are involved. — Mitigation: Forbid contraction, relaxed SIMD and platform maths; cross-architecture hash in CI from the first commit and in the probe. Fallback: fixed-point heavy bodies, or a pre-integrated table for heavy bodies only.
+- Rung changes break exact symplecticity; energy errors appear at close encounters and re-parenting. — Mitigation: Reversible switching, changes only at synchronisation ticks, an 'integrator oscillation' ledger account with a gate, and oracle comparisons on flyby scenarios.
+- Lazy catch-up causes a hitch when approaching long-dormant objects (60 ms of CPU per simulated year per low-orbit vessel, DERIVED). — Mitigation: Background slices of 0.1 ms per frame prioritised by proximity; catch-up horizons; a visible 'catching up' state.
+- Authored star systems turn out unstable under real gravity. — Mitigation: Stability certificate in the authoring tool; ship the real Solar System first.
+- Sharing GPU matter between phones has no shipped precedent (file 05, section 5). — Mitigation: First multiplayer release covers the mechanism tier only; matter stays single-owner and attested, audited by conservation bounds, and gated on bit-equal rigid outcomes.
+- The host phone is killed and two phones each believe they hold the world. — Mitigation: A single-writer world lease in the signalling service's small store; a hash-chained journal replicated to peers; forked journals are refused, never merged.
+- Terrain generation and streaming cost on the phone is unmeasured. — Mitigation: Version 1 uses analytic spheres plus one authored heightfield site per body; streaming only after a probe measurement, capped at 0.4 ms per frame.
+- Scope: this layer adds about eight subsystems to a plan the red team already judged unfinishable (F02). — Mitigation: Cut line for version 1: heavy bodies, one region, aggregates and lockstep for mechanisms. No atmosphere, terrain streaming, second system, servers or shared matter until their own phases; each phase time-boxed.
+- Consensus warp is socially fragile beyond a few players. — Mitigation: Per-region 'now' exists in the data model from day one so per-subtree clocks can ship with servers; the choice of travel model is put to the user.
+- Scalar f64 in wasm is slower than assumed (1.4-2.5x, red-team ESTIMATE). — Mitigation: Warp ceilings and region counts are policies computed at run time from measured cost, not constants.
