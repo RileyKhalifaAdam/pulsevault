@@ -74,7 +74,7 @@ The shipped .wasm binary is the canonical arithmetic; a server or native app run
 
 ## 5. Gravity supplied to a region
 
-Each tick a region receives a *gravity packet*: per-body acceleration at the body's own position (free-fall: the primary's pull with J2 at the body minus at the anchor, in Encke's cancellation-free form; surface: gravity with J2 plus centrifugal); third-body tide at the anchor; the gradient for the torque 3(GM/r^3) u x (I u), u the unit vector to the primary; the spin vector; and potential differences of exactly the field applied, for the ledger.
+Each tick a region receives a *gravity packet*: per-body acceleration at the body's own position (free-fall: the primary's pull with J2 at the body minus at the anchor, in Encke's form, which avoids subtracting nearly equal numbers; surface: gravity with J2 plus centrifugal); third-body tide at the anchor; the gradient for the torque 3(GM/r^3) u x (I u), u the unit vector to the primary; the spin vector; and potential differences of exactly the field applied, for the ledger.
 
 Sizes at L = 250 m from the anchor, [D], m/s^2:
 
@@ -108,7 +108,7 @@ A wake trigger caps a frame's ticks, so every peer stops on the same tick. Advan
 
 **Mode S.** Summed gravity of all heavy bodies plus J2, same method and grid. For occupied, tracked or near-expiry objects, at most 64 [E]; more are refused, never downgraded.
 
-Mode K must run on *mean* elements. J2 makes the semi-major axis wobble by 6 km in low orbit; an arc started from the instantaneous value drifts 880 km a day along-track, ahead or behind depending on where it was demoted. A first-order correction leaves under 10 km [D: review run, 400 km, 51.6 degrees].
+Mode K must run on *mean* elements. J2 makes the semi-major axis wobble by 6 km in low orbit; an arc started from the instantaneous value drifts 880 km a day along-track, ahead or behind depending on where it was demoted. A first-order correction leaves about 10 km [D: review run, 400 km, 51.6 degrees].
 
 Mode S is lazy but invisible: a fixed number of steps per frame set by a sequenced input [E: about 0.1 ms], and any read forces catch-up first. Modes change only at grid ticks by journalled events; prediction is cosmetic, uses the mode the object will fly, and the Reality Report lists it (VP17).
 
@@ -170,7 +170,7 @@ Tolerances are [E]; every gate runs on the shipped binary and step (P17). B = bu
 ## 11. Honest limits
 
 - Newtonian only: no relativity (Mercury 42.98 arcseconds per century [M, 06]) or light-time (499 s per AU [D, 06]); valid below 0.01c.
-- Point masses plus J2; no higher harmonics, raised tides, precession or body collisions; spin and pole are constant.
+- Point masses plus J2; no higher harmonics, raised tides, precession or body collisions.
 - Objects exert no gravity: 6.7e-8 m/s^2 at 1 m from a tonne [D: Gm/L^2] exceeds the drop threshold; omitted, declared.
 - Dormant objects do not interact; mode K has no third-body gravity; dormant attitude ignores gradient torque.
 
