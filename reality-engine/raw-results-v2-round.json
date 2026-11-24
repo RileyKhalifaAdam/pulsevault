@@ -986,5 +986,318 @@
    "Strict mode blocks a release while any material or pair value lacks a cited source. Confirm the policy and the starter set: steel, aluminium, copper, oak, rubber, glass, concrete, ice, water, sand, lunar regolith, air",
    "At multiplayer step 2, should phones co-simulate the region or become viewers of a server simulation? Decide after the Phase 0a measurement"
   ]
+ },
+ "spec:firstbuilds": {
+  "file": "/home/user/pulsevault/reality-engine/spec/03-first-builds-and-verification.md",
+  "summary": "Spec 03 is written (about 3,470 words not counting table separators, so roughly 8% over the 3,200 ceiling; the required command, probe and test tables account for it, and the sibling specs are at 3,230 and 3,508 by the same count). It defines release 1 as six phases (0 bootstrap, 0a probe, 0s two scales, 0b blocks, 1 mechanisms, 1m-a two phones in one room) with one planned device session each, a cut list and a kill rule; everything else is unscheduled behind go/no-go. The probe is one table of 10 stages giving method, result fields, decision and the budget each stage re-derives, plus the user protocol, kill-surviving breadcrumbs and a one-line result of at most 900 bytes. 0s and 0b have scope, what the user sees and can do, what is left out, and done-when lists that point into a 28-row test catalogue (A1-A7, S1-S9, B1-B11). The fingerprint test (transcripts T0-T4, platform matrix, failure definition) exists from the first commit.\n\nEnvironment checks were actually run in the scratchpad (/tmp/claude-0/-home-user-pulsevault/a416cf0e-c7c2-56a3-935d-f4967a8e2aae/scratchpad/spec3). Findings: rustc/cargo 1.97.0 present, no wasm32 target, but the rust-std wasm32 component downloads (digest verified) and builds work through a scratch sysroot; the raw .wasm is reproducible (same SHA-256 from two folders); wasm-bindgen-cli 0.2.130 installs from crates.io in 87 s but the spec decides not to use a bindings tool; Node 22 and 24 and Bun 1.4.4 are installed, and Bun runs JavaScriptCore, so Safari's engine family can be exercised here; one f64 kernel gave one hash on native x86-64, Node 22, Node 24, Bun and a Chromium page; headless Chromium runs a WGSL compute shader on SwiftShader only with --enable-unsafe-webgpu (default flags give no adapter), and a Worker can create a device and pipeline; rapier3d-f64 0.36.1 with enhanced-determinism compiles to wasm32 in 46 s with no imports. No github.io page, Playwright download host or JPL host is reachable, there is no WebKit and no ARM emulator, so CI needs a Linux x86-64 runner, a Linux ARM64 runner, a macOS runner for a Safari smoke test, and an oracle job.\n\nI read the two sibling specs already on disk to align interfaces. One disagreement: spec 02 places the Foucault test in 0b, but 0b has no joints, so this spec moves it to Phase 1 and uses eastward deflection plus tidal separation in 0b.",
+  "key_numbers": [
+   "MEASURED (today, rustc -vV): rustc and cargo 1.97.0, LLVM 22.1.6, host x86_64-unknown-linux-gnu; only the host target installed; no wasm-bindgen, wasm-opt, wasm-pack or qemu-aarch64",
+   "MEASURED (today, curl + sha256sum): rust-std-1.97.0-wasm32-unknown-unknown.tar.xz returns 200, 21,926,156 bytes in 1.3 s, SHA-256 474f926f... equal to the published .sha256",
+   "MEASURED (today): throwaway f64 kernel compiled to wasm32 is 18,320 bytes with no imports; two builds in different folders have identical SHA-256 a3ae0f5a...",
+   "MEASURED (today): wasm-bindgen-cli 0.2.130 builds from crates.io into a scratch folder in 87 s (cargo install --locked --root)",
+   "MEASURED (today): Node v22.23.5 (V8 12.4) and v24.22.3 (V8 13.6) at /opt/node22 and /opt/node24; Bun 1.4.4 (JavaScriptCore) at /root/.bun/bin",
+   "MEASURED (today): one hash on native x86-64, Node 22, Node 24, Bun and a Chromium page: 7b9a6899fec2896e (10 bodies, 1e6 kick-drift steps) and dee4618cf376e6c5 (34 bodies, 1e5 steps); 5.1-8.4 ns per pair on a 2.1 GHz Xeon",
+   "MEASURED (today, Playwright 1.63.0, HeadlessChrome 157.0.8103.78): default flags give navigator.gpu but a null adapter; with --enable-unsafe-webgpu a SwiftShader fallback adapter compiles a WGSL compute shader with 0 messages, 4,096 values read back correct, 1,000 dispatches encode in 0.8-6.4 ms and complete in 116-124 ms; a Worker can create adapter, device and pipeline",
+   "MEASURED (today): Chromium performance.now() step 0.1 ms without isolation headers, 0.005 ms with COOP/COEP from a local server; origin-private file system available, persisted() false",
+   "MEASURED (today): rapier3d-f64 0.36.1 with enhanced-determinism and serde-serialize compiles for wasm32-unknown-unknown in 46 s (28 crates), the wasm has no imports; enhanced-determinism = simba/libm_force + parry3d-f64/enhanced-determinism",
+   "MEASURED (today, curl -sI): 200 for static.rust-lang.org, index.crates.io, registry.npmjs.org, pypi.org; no response for octocat.github.io, pages.github.com, cdn.playwright.dev, ssd.jpl.nasa.gov; 403 for api.github.com and GitHub release downloads; /opt/pw-browsers holds Chromium only",
+   "DERIVED: batch timing of at least 200 ms with Safari's 1 ms timer (MEASURED, WebKit source via 01-research.md) gives at most 0.5% error (1/200)",
+   "DERIVED: warp ceiling = 1.8 s / step time, from (warp/3,600) steps per frame x step time <= 0.5 ms",
+   "DERIVED: battery reading gives mean power = points dropped x 0.389 W over 20 minutes, +/- 0.39 W (12.98 Wh MEASURED in 01-research.md x 1% x 3 per hour)",
+   "DERIVED: T1 is 1e6 steps of 60 s = 6e7 s = 1.90 years; warp-invariance node 16,384 = 983,040 s = 11.4 days; 10 years = 5.26e6 steps",
+   "DERIVED: steel cube 0.1 m = 7.85 kg; weight 76.78 N at Earth's equator (x 9.7803) and 12.75 N on the Moon (x 1.6242); fall from 21.2 m and 3.52 m takes 999.4 and 999.3 ticks, tolerance 1 tick = 0.1%",
+   "ESTIMATE: result line at most 900 bytes for 0a (70 fields x 12 B), 300 bytes for later phases",
+   "ESTIMATE: user minutes per phase 5, 45, 10, 35, 35, 40; builder effort 1, 2, 3, 6, 8, 4 working sessions",
+   "ESTIMATE: soak pass rule: no 30 Hz stretch, under 2% of frame intervals above 25 ms, step-cost growth under 15%, tick ratio 1.000 at 5.0 ms per frame; fallback levels 3.0 and 2.0 ms",
+   "ESTIMATE: solver adoption floor N1 >= 60 boxes (two 30-part rovers); snapshot-plus-hash over 4 ms means sliced checkpoints; readback median over 2 frames means owner-authoritative coupling only; under 4,000 sustained particles defers the matter tier",
+   "ESTIMATE: test tolerances other than 0 bits (Earth period 365.256 d within 0.01 d, 13-month lunar mean 27.322 d within 0.05 d, ten-body energy 1e-10 over 10 years, stack drift 1 mm, rebound 5%, slope 1.5 degrees)",
+   "ESTIMATE (from memory, unverified): Linux ARM64 GitHub runners are free for public repositories; Home Screen web apps keep storage apart from Safari tabs"
+  ],
+  "interfaces_to_other_specs": [
+   "Assumes from 01: the 64-bit fingerprint function and canonical serialisation must be defined before the first commit (01 leaves the hash as an unnamed CHOICE); record and snapshot formats; ledger closure tolerances; the closed input set; pair table and restitution law; the budget table whose lines the probe replaces",
+   "Assumes from 02: the fixed-step integrator and its checkpoint nodes every 1,024 steps; the DE440-derived body table at tick 0; site and gravity-packet definitions (9.7803 and 1.6242 m/s^2); warp admission rule",
+   "Disagreement with 02: 02 lists the Foucault test under 0b; 0b has no joints, so it moves to Phase 1 and test B5 (eastward deflection, tidal separation) stands in. 02's mode-K closure test (eccentricity 0.6, 10,000 periods) is not in this catalogue and should run when 0b builds mode-K leaver records",
+   "0s in this spec offers only 1x or demoted warp; 02 allows 1-4x with awake mechanisms, which is deferred to 0b or later",
+   "Provides to 01 and 02: pinned toolchain; the canonical .wasm and its SHA-256 build id; transcripts T0-T4; the probe result fields that replace 01's budget lines and 02's cost and warp-ceiling estimates; the oracle job; all gates they name (anchor invariance, frame-transfer identity, ledger closure, snapshot-restore-continue, heavy hash under three warp schedules, weight and fall)",
+   "Needs from the mechanism spec: a solver interface with a complete snapshot (warm-start and contact caches included), the list of solver constants for the Reality Report, weld sleep, no absolute speed clamp; the adopt-or-write decision is made by tests A2-A4 in Phase 0a",
+   "Needs from the matter spec: a kernel manifest with a CPU twin per WGSL kernel, so the probe's compile checks and particle chain use real kernels",
+   "Needs from the multiplayer spec: handshake fields (build id), join package, QR offer format for 1m-a, arbiter rules for the 1,000-kill test in 1m-b",
+   "Needs from the API spec: confirmation that games are written in JavaScript or TypeScript against the host's public module, plus controller rate and event stream; each phase page from 0s is a toy using only that module",
+   "Spin-wheel rover round trip and lease fault injection, which 01 lists as gates owed by this spec, are placed in Phase 1 and 1m-b"
+  ],
+  "review_issues_addressed": [
+   {
+    "id": "VP06",
+    "how": "Every phase now has numbered tests: three-anchor hash equality (S7, B4), frame-transfer identity to 1 ledger unit (S8, B4), heavy hash under three warp schedules on phone and build server (S1), snapshot-restore-continue (A3, S1, B2), fall time with stated heights of 21.2 m and 3.52 m (S6). The 10,000-period closure belongs to 02's mode-K solver and stays in 02's table"
+   },
+   {
+    "id": "VF02",
+    "how": "Each of 0a-1m is written as scene size, fixed-tick hash against the build server, tick ratio 1.000, under 2% of intervals above 25 ms, still 60 Hz after 20 minutes, battery before and after, costs timed over batches of at least 1,000 ticks; oracles stay on the build server; one device session per phase with a result line of 300-900 bytes"
+   },
+   {
+    "id": "VF14",
+    "how": "Probe prints T0 and T1 (1e6 heavy steps) and a scripted mechanism scene hash for comparison; build id is in the file name, handshake and world record with mismatch refused; a non-finite value reaching the hasher is a failure. Bun gives JavaScriptCore coverage here and in CI, so the half-tested gap is narrowed before the phone"
+   },
+   {
+    "id": "VF01",
+    "how": "Release 1 cut line defined (bootstrap, 0a, 0s, 0b, reduced Phase 1, 1m-a, toy); everything else unscheduled behind go/no-go; time box as device sessions plus builder sessions, a cut list per phase and a kill rule"
+   },
+   {
+    "id": "VF06",
+    "how": "Phase 0 bootstrap added; 0s fixed as 10 bodies, Canvas 2D, one hand-written cube on a plane, warp that demotes the region with the cube welded and reported; exits are weight within 0.1% on Earth and Moon and heavy hash under three schedules"
+   },
+   {
+    "id": "VF07",
+    "how": "Inner loop uses Node, Bun and headless Chromium (all verified today); build, deploy and a live-URL check run in Actions and are read through logs; the CI table states what only the phone can show"
+   },
+   {
+    "id": "VF11",
+    "how": "Namespaced origin-private files written from a Worker, persist() measured in 0a and shown in 0b, export from the first build that saves anything (snapshot string in 0s, file in 0b), journal truncated at checkpoints (B2), Home Screen install from 0b, write rate measured in stage 4"
+   },
+   {
+    "id": "VF19",
+    "how": "Repository creation is marked untested and to be tried only with the user's approval; one checklist of manual steps with minutes; licence, Pages source, Cloudflare account and second phone's iOS version added to decisions"
+   },
+   {
+    "id": "VF03",
+    "how": "1m-a is host-authoritative with no takeover; a guest that loses the host pauses and reports; takeover moved to 1m-b"
+   },
+   {
+    "id": "VF08",
+    "how": "1m split into 1m-a (QR-exchanged offers, no server) and 1m-b (worker, behind go/no-go, needs a Cloudflare account)"
+   },
+   {
+    "id": "VF04",
+    "how": "Shared-region budget is half the measured solo budget (stage 5); the three peer states are left to the multiplayer spec"
+   },
+   {
+    "id": "VF05",
+    "how": "Followed through spec 02's fixed 60 s fourth-order method; T1 runs on a stub kernel until it lands; oracle comparison is a build-server job"
+   },
+   {
+    "id": "VF09",
+    "how": "Probe adds a CPU-only soak with GPU idle, snapshot-plus-hash for 300 bodies, and a loopback channel at 60 packets per second; real radio drain needs the second phone and is in 1m-a"
+   },
+   {
+    "id": "VF12",
+    "how": "Two-phone lock matrix is an exit item of 1m-a and sets the lease expiry for 1m-b"
+   },
+   {
+    "id": "VF13",
+    "how": "Solver adoption decided in 0a by A2 (equal transcript on every engine), A3 (snapshot-restore-continue), A4 (join after 10,000 ticks) and stage 4 timing; failure triggers the written fallback"
+   },
+   {
+    "id": "VF15",
+    "how": "DE440 and the high-order reference run only in the oracle job; phone checks are two-body closed forms, periods and energy"
+   },
+   {
+    "id": "VF17",
+    "how": "A toy on the public API ends every phase from 0s; Phase 6 split into 6a and 6b; authoring binding stated as JavaScript or TypeScript over the host module"
+   },
+   {
+    "id": "VF18",
+    "how": "Liquids are outside release 1, single-player first, shared summary decided afterwards"
+   },
+   {
+    "id": "VP07",
+    "how": "The unmodified compiler output is the canonical binary; a differing native build is not a failure but obliges servers and native apps to run the .wasm; heavy-body hash comparison is stage 3 of the probe"
+   },
+   {
+    "id": "VP09",
+    "how": "Readback latency measured in stage 7 with a rule that sends matter-coupled bodies to owner-authoritative sync"
+   },
+   {
+    "id": "VP10",
+    "how": "1m-b gate: three simulated peers, 1,000 random owner kills, never zero or two owners, ledger change 0 units"
+   },
+   {
+    "id": "VP11",
+    "how": "Snapshot-restore-continue gates in 0a and 0b; late joiner equal after 10,000 ticks in 1m-a"
+   },
+   {
+    "id": "VP12",
+    "how": "0b builds the closed input set including governor actions; B9 replays the phone's journal on the build server"
+   },
+   {
+    "id": "VP13",
+    "how": "Players per region re-derived as shared budget / 30 parts from stage 5"
+   },
+   {
+    "id": "VP14",
+    "how": "Phase 1 exit: rover with spinning wheels and flywheel, identical hash and angular momentum within 1e-12"
+   },
+   {
+    "id": "VP19",
+    "how": "Warp demotes through the weld transaction and reports the pause in 0s and 0b; Phase 1 lists paused processes"
+   },
+   {
+    "id": "VP03",
+    "how": "0s and 0b refuse warp above 1x while anything moves, naming the object"
+   },
+   {
+    "id": "VP05",
+    "how": "0b requires f64 anchor-relative state, weld sleep and no absolute speed clamp from the solver interface; three sites exercise rotating and free-fall frames"
+   },
+   {
+    "id": "F02",
+    "how": "Same as VF01"
+   },
+   {
+    "id": "F03",
+    "how": "Each probe stage states which budget line it replaces and the formula"
+   },
+   {
+    "id": "F04",
+    "how": "Probe has a written protocol, staged breadcrumbs and a decision per stage; the particle chain is first on the cut list"
+   },
+   {
+    "id": "F05",
+    "how": "Exits are numeric with a written soak protocol. Not adopted: 30 Hz presentation as a certified pass; the newer VF02 asks for 60 Hz after 20 minutes, so a 30 Hz stretch fails the level and the next lower duty is tried"
+   },
+   {
+    "id": "F06",
+    "how": "Decision procedure and fallback written (see VF13); rapier3d-f64 verified today to compile for wasm32"
+   },
+   {
+    "id": "F07",
+    "how": "CI machines defined. Changed: kernels go through Tint (Chromium on SwiftShader) and WebKit only; naga is dropped because the web path does not use wgpu"
+   },
+   {
+    "id": "F09",
+    "how": "Stage 6 and 7 measure WebGPU in a Worker and CPU cost per dispatch"
+   },
+   {
+    "id": "F10",
+    "how": "f64 anchor-relative state and invariance gates S7 and B4"
+   },
+   {
+    "id": "F12",
+    "how": "One tangent plane per site; leavers become dormant records (B10)"
+   },
+   {
+    "id": "F14",
+    "how": "Result line carries hashes; a CI job recomputes them for that build id with the same .wasm"
+   },
+   {
+    "id": "F15",
+    "how": "Shared-origin consequences listed; no localStorage, no service worker, no third-party script, never clear site data; no isolation shim in release 1"
+   },
+   {
+    "id": "F16",
+    "how": "Toy per phase from 0s"
+   },
+   {
+    "id": "F17",
+    "how": "Hand-written WebGPU host; one compute pass through it on the phone in stage 6"
+   },
+   {
+    "id": "F20",
+    "how": "4 W replaced by measured battery drain with stated precision of +/- 0.39 W"
+   },
+   {
+    "id": "F22",
+    "how": "0s draws with Canvas 2D only; 0b has a Canvas fallback and tests run with drawing off; snapshots and breadcrumbs persist"
+   },
+   {
+    "id": "F23",
+    "how": "Bootstrap script is the first deliverable. Changed: wasm-bindgen-cli is installable (verified) but not used"
+   },
+   {
+    "id": "F24",
+    "how": "Manual checklist with minutes; pre-filled issue link for results"
+   },
+   {
+    "id": "P17",
+    "how": "Every test runs on the canonical binary at shipped step, precision and body count; the rigid benchmark uses the configuration that would ship"
+   },
+   {
+    "id": "P05",
+    "how": "Stage 7"
+   },
+   {
+    "id": "P08",
+    "how": "0b lists every solver constant and clamp in the Reality Report"
+   },
+   {
+    "id": "P09",
+    "how": "B3: a build with one posting removed must fail closure; numerical loss gated against physical dissipation"
+   },
+   {
+    "id": "P11",
+    "how": "B7 envelope test at 4.8 m/s and above"
+   },
+   {
+    "id": "P14",
+    "how": "Vacuum is the ambient value in 0b"
+   },
+   {
+    "id": "P15",
+    "how": "Governor actions are sequenced inputs and are replayed in B9"
+   },
+   {
+    "id": "P19",
+    "how": "Warp rule in 0s and 0b"
+   },
+   {
+    "id": "P20",
+    "how": "Authoring binding stated; controller rate and event stream requested from the API spec"
+   },
+   {
+    "id": "P22",
+    "how": "B9 defines replay scope for matter-free scenes with governor decisions as inputs"
+   },
+   {
+    "id": "P24",
+    "how": "Namespaced storage; Safari's shader compiler reached through the macOS runner if WebGPU is exposed, else the phone"
+   },
+   {
+    "id": "P25",
+    "how": "0b ships pair records and B8 tests rebound and friction"
+   },
+   {
+    "id": "P02",
+    "how": "B10: mass 0 micrograms and one booked rounding for a block leaving the region"
+   },
+   {
+    "id": "P03",
+    "how": "0s ledger includes gravitational and centrifugal potentials and the ground reservoir; the law list is spec 01's"
+   },
+   {
+    "id": "F11",
+    "how": "Left to 01 and 02; 0s exercises gravitation and the warp policy through S1, S5 and the warp rule"
+   }
+  ],
+  "changes_to_the_plan": [
+   "Roadmap gains Phase 0 (bootstrap), and every Goal becomes a list of numbered tests",
+   "Release 1 ends at 1m-a; all later rows become unscheduled go/no-go items; Phase 6 splits into 6a server and 6b native app",
+   "1m with lease takeover becomes 1m-a without takeover (host-authoritative, QR-exchanged offers); takeover and the rendezvous worker are 1m-b",
+   "0s: any warp above 1x puts the region to sleep; Canvas 2D drawing; no continuous zoom; integrator is spec 02's method, not Wisdom-Holman",
+   "The statement that this session cannot create a repository is treated as untested, to be tried only with the user's approval; licence, Pages source, Cloudflare account and second phone's iOS version join the user's decisions",
+   "100-300 boxes and 4 W are replaced by probe stages 5 and 9",
+   "Paste back the result becomes one line per phase, returned by a pre-filled GitHub issue link or copy",
+   "The shipped binary has no bindings tool; the web host is hand-written JavaScript",
+   "Foucault test moves from 0b to Phase 1"
+  ],
+  "open_items": [
+   "Whether Safari on the A16 reproduces transcripts T0-T4; this gates all phone work on the bit-exact tiers",
+   "Whether the Linux ARM64 runner is free for public repositories, whether the macOS runner's Safari can be driven by WebDriver and exposes WebGPU, and whether builds stay byte-reproducible across hosts once dependencies are added (verified today only for a single-file build on one host)",
+   "Whether origin-private breadcrumbs survive a real iOS page kill; whether a Home Screen app really has storage separate from Safari tabs",
+   "Whether this session's GitHub tools are authorised to create a repository and read issues and Actions logs (listed in the catalogue, never invoked)",
+   "Whether rapier3d-f64 continues bit-identically after snapshot and restore, and its throughput on the phone",
+   "Every ESTIMATE threshold in the probe table and test catalogue",
+   "The spec is about 3,470 words excluding table separators, above the 3,200 ceiling; the lead may want the command table or catalogue shortened",
+   "ARM64 could not be executed in this container (no emulator), and no WebKit build is installed; Bun's JavaScriptCore on x86-64 is the closest available stand-in",
+   "Scratch files from the checks remain under /tmp/claude-0/-home-user-pulsevault/a416cf0e-c7c2-56a3-935d-f4967a8e2aae/scratchpad/spec3 and can be deleted"
+  ],
+  "decisions_for_user": [
+   "Create a new public repository yourself (with a licence), or approve this session trying its repository-creation tool, which has never been invoked",
+   "Which licence the public repository carries",
+   "Accept that the project site shares an origin with the existing PulseVault site (shared storage quota and site-data clearing), or choose a custom domain for a clean origin",
+   "Accept the release-1 cut: bootstrap, probe, two scales, blocks, mechanisms, two phones in one room; liquids, vessels, server, native app and takeover wait behind measured go/no-go",
+   "Accept returning results through a pre-filled GitHub issue link (needs GitHub signed in on the phone), or paste the line into chat instead",
+   "Accept installing the page to the Home Screen from Phase 0b",
+   "Confirm a second phone on iOS 26 or later is available for 1m-a",
+   "A Cloudflare account is needed only if 1m-b (rendezvous worker and takeover) goes ahead"
+  ]
  }
 }

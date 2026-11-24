@@ -15,7 +15,7 @@ Tags: **[M]** measured ("today": run for this spec), **[D]** derived, **[E]** es
 | 1 Mechanisms | Section 8 | Slider joint | 35 |
 | 1m-a Two phones, one room | Section 8 | Late join | 40 |
 
-Release 1 is these six (VF01, F02). Everything else is unscheduled behind a measured go/no-go: 1m-b (rendezvous worker, takeover), 34 bodies and vessels, liquids (single-player first, VF18), environment, bend-yield-break, 6a server, 6b native app (VF17), real terrain, a second awake region, per-region clocks.
+Release 1 is these six (VF01, F02). Unscheduled, each behind a measured go/no-go: 1m-b (rendezvous worker, takeover), 34 bodies and vessels, liquids (single-player first, VF18), environment, bend-yield-break, 6a server, 6b native app (VF17), real terrain, a second awake region, per-region clocks.
 
 **Time box and kill rule.** Device time is scarce: one planned device session per phase, one retry. A phase needing a third applies its cut, then stops for re-planning. Builder effort [E]: 1, 2, 3, 6, 8, 4 sessions. From 0s each page is a toy importing only the public API (F16).
 
@@ -29,11 +29,11 @@ Run today with read-only commands and throwaway files in the scratchpad (`$S`); 
 | `curl` static.rust-lang.org `/dist/rust-std-1.97.0-wasm32-unknown-unknown.tar.xz`; `sha256sum` | 200, 21.9 MB, digest as published. `rustup target add` fetches this file (not run: it writes outside the scratchpad) |
 | `rustc --sysroot $S/sys --target wasm32-unknown-unknown --crate-type cdylib -C opt-level=3 -C strip=symbols`, throwaway f64 kernel, two folders | 18,320 bytes, no imports, identical SHA-256 |
 | Kernel natively; `node run.mjs` (v22.23.5, v24.22.3); `bun run.mjs` (1.4.4: JavaScriptCore, Safari's engine) | One hash everywhere, also in a Chromium page: 7b9a6899fec2896e (10 bodies, 1e6 steps), dee4618cf376e6c5 (34 bodies, 1e5); 5.1-8.4 ns per pair |
-| Playwright 1.63.0 `chromium.launch` (HeadlessChrome 157), local server | Default flags: no adapter. With `--enable-unsafe-webgpu`: a SwiftShader software adapter runs a WGSL compute shader (4,096 values correct; 1,000 dispatches in 116-124 ms), also in a Worker. Timer step 0.1 ms; 0.005 ms with isolation headers |
+| Playwright 1.63.0 `chromium.launch` (HeadlessChrome 157), local server | Default flags: no adapter. With `--enable-unsafe-webgpu`: a SwiftShader software adapter runs a WGSL compute shader (4,096 values correct; 1,000 dispatches in 116-124 ms); a Worker can create a device and pipeline too. Timer step 0.1 ms; 0.005 ms with isolation headers |
 | `cargo build --release --target wasm32-unknown-unknown`, empty library on rapier3d-f64 0.36.1 (`enhanced-determinism`, `serde-serialize`) | Compiles in 46 s, no imports; the feature forces pure-Rust `libm` |
 | `curl -sI` | Reachable: static.rust-lang.org, index.crates.io, registry.npmjs.org, pypi.org. Not: octocat.github.io, cdn.playwright.dev, ssd.jpl.nasa.gov. Only Chromium is installed |
 
-- **Inner loop (VF07).** Node and Bun for bit-exact tests; Chromium with that flag for pages, WGSL and a two-page lockstep harness. The bootstrap script pins rustc, the wasm32 component by digest, Node, Bun, Playwright and a lockfile of crates.io-only dependencies.
+- **Inner loop (VF07).** Node and Bun for bit-exact tests; Chromium with that flag for pages, WGSL and a two-page lockstep harness. The bootstrap script pins rustc, the wasm32 component by digest, Node, Bun, Playwright and a crates.io-only lockfile.
 - **No bindings tool:** it would rewrite the binary. The core exports plain functions over one command and one result buffer; the host is hand-written JavaScript (F17). The compiler's output ships; its SHA-256 is the *build id*, carried in the file name, handshake and world record, where a mismatch is refused (VF14).
 - **Machines.** The deployed site, Safari and ARM64 cannot be seen from here (F07):
 
@@ -58,9 +58,10 @@ A *fingerprint* is 01's 64-bit hash of canonically serialised state. A *transcri
 | T4 | Snapshot bytes at tick 4,800; the restored run at 9,600 | 0a |
 
 **Failure** is any of: one bit differing between two WebAssembly platforms or from the committed file; a transcript edited without an arithmetic-version bump; two clean builds with different digests; a non-finite value reaching the hasher; a cold and a warm run differing on one engine. Failure blocks deploy. A differing native build only obliges servers and native apps to run the .wasm (VP07). A phone mismatch blocks the phase: T0 names the operation, which is replaced by integer arithmetic; 08's fixed-point heavy bodies are the last resort.
+
 ## 4. Phase 0a: the probe
 
-One page, stages in order. Costs are timed over batches of at least 1,000 ticks or 200 ms, so Safari's 1 ms timer [M, R1] costs at most 0.5% [D: 1/200].
+One page whose stages, in order, are the go/no-go ladder. Costs are timed over batches of at least 1,000 ticks or 200 ms, so Safari's 1 ms timer [M, R1] costs at most 0.5% [D: 1/200]. 0a is done when a verified result line has replaced every estimate in 01's budget table.
 
 | Stage | Method | Result fields | Decision; budget re-derived |
 |---|---|---|---|
@@ -87,7 +88,7 @@ One page, stages in order. Costs are timed over batches of at least 1,000 ticks 
 
 | | 0s Two scales | 0b Foundations and blocks |
 |---|---|---|
-| Built | Ten bodies on 02's method; two sites, the equators of Earth and the Moon, each a tangent plane (F12); one surface region; one hand-written steel cube, 0.1 m, 7.85 kg [D: 7,850 x 0.001]; a region ledger with both potentials, ground reservoir, dissipation and numerical loss; tick-stamped input log; snapshot as a copyable string, also the export (VF11); Reality Report | 01 for one region: units; steel, oak, rubber with pair records (P25); vacuum as the ambient value (P14); per-operator numerical loss (P09); ports; world record, journal, checkpoints; the closed input set, governor actions included (P15, VP12); solver constants and clamps in the Reality Report (P08); namespaced origin-private storage, file export (VF11). Boxes through the solver interface: f64 anchor-relative, weld sleep, no speed clamp (VP05). Sites: Earth, Moon, a free-fall region at 400 km; leavers become dormant records |
+| Built | Ten bodies on 02's method; two sites, the equators of Earth and the Moon, each a tangent plane (F12); one surface region; one hand-written steel cube, 0.1 m, 7.85 kg [D: 7,850 x 0.001]; a region ledger with both potentials, ground reservoir, dissipation, numerical loss; tick-stamped input log; snapshot as a copyable string, also the export (VF11); Reality Report | 01 for one region: units; steel, oak, rubber with pair records (P25); vacuum as the ambient value (P14); per-operator numerical loss (P09); ports; world record, journal, checkpoints; the closed input set, governor actions included (P15, VP12); solver constants and clamps in the Reality Report (P08); namespaced origin-private storage, file export (VF11). Boxes through the solver interface: f64 anchor-relative, weld sleep, no speed clamp (VP05). Sites: Earth, Moon, a free-fall region at 400 km; leavers become dormant records |
 | Drawing | Canvas 2D: system view, side view of the site (F22) | One instanced WebGL2 call, Canvas fallback; tests run with drawing off |
 | The user can | Choose the site; Drop; Rest; read derived g, contact force, energy accounts; set warp; copy and paste a snapshot; Run tests | Pick site and material; spawn, throw, stack; warp; kill the app and return; export, import; read the ledger; Run tests |
 | Warp | Above 1x the region is demoted: a falling cube refuses, by name; a resting cube is welded and reported paused (P19, VP03) | Same, for all blocks |
@@ -96,14 +97,14 @@ One page, stages in order. Costs are timed over batches of at least 1,000 ticks 
 
 ## 6. Test catalogue
 
-Runs: N Node and Bun, C Chromium, S Safari runner, P phone, O oracle job. Tolerances other than 0 bits are [E].
+Every test runs on the canonical binary at shipped step, precision and body count (P17). Runs: N Node and Bun, C Chromium, S Safari runner, P phone, O oracle job. Tolerances other than 0 bits are [E].
 
 | Test | Checks | Reference | Tolerance | Runs |
 |---|---|---|---|---|
 | A1 Build identity | Page runs the CI binary | SHA-256 | Equal | C S P |
 | A2 Transcripts | T0, T1; T3 on the candidate solver | Committed file | 0 bits | N C S P |
-| A3 Continue | T4: snapshot, restore elsewhere, run on | Uninterrupted run | 0 bits | N P |
-| A4 Join | Snapshot plus input tail, 10,000 ticks | Uninterrupted run | 0 bits | N |
+| A3 Continue | T4: snapshot, restore elsewhere, run on | Unbroken run | 0 bits | N P |
+| A4 Join | Snapshot plus input tail, 10,000 ticks | Unbroken run | 0 bits | N |
 | A5 Crumbs | Renderer killed mid-stage | Stage marked KILLED; run completes | Exact | C |
 | A6 Kernels | WGSL compiles; GPU against CPU twin, 4,096 particles | Twin | 0 errors; 1e-4 | C S P |
 | S1 Warp invariance | Hash at node 16,384 (11.4 days [D]); three schedules, one through a snapshot copied, reloaded and pasted | Transcript | 0 bits | N P |
@@ -148,28 +149,28 @@ Runs: N Node and Bun, C Chromium, S Safari runner, P phone, O oracle job. Tolera
 |---|---|---|
 | Once | Create a public repository with a licence, or approve this session trying its repository-creation tool (in its catalogue [M]; never invoked) | 3 |
 | Once | Settings, Pages, Source: "GitHub Actions"; attach the repository to the session | 2 |
-| Each phase | Open the URL in Safari, follow the on-page protocol, tap Send result | Section 1 |
+| Each phase | Open the URL in Safari, follow the page, tap Send result | Section 1 |
 | From 0b | Share, Add to Home Screen, open from the icon (wake lock works there [M, R1]) | 1 |
 | 1m-a | Bring a second phone on iOS 26 or later | — |
 | 1m-b only | A Cloudflare account; its token as a repository secret | 15 |
 
-**Sharing an origin (F15, P24).** A project site lives at `<account>.github.io/<repository>/`, the same origin as the existing PulseVault site, which keeps its state in localStorage [M, 07]. Quota, the persistence grant and "clear website data" are shared, so no instruction says to clear site data; the pages offer "Delete engine data" for their own directory. The engine writes no localStorage, registers no service worker and loads no third-party script, since any script there could read the other site's data. Safari may delete script-written data after seven idle days unless persistence is granted [M, R1], and a Home Screen app keeps storage apart from Safari tabs [E]: export and import are the bridge.
+**Sharing an origin (F15, P24).** A project site at `<account>.github.io/<repository>/` shares its origin with the existing PulseVault site, which keeps its state in localStorage [M, 07]. Quota, the persistence grant and "clear website data" are shared, so no instruction ever says to clear site data; the pages offer "Delete engine data" for their own directory. The engine writes no localStorage, registers no service worker and loads no third-party script, since any script there could read the other site's data. Safari may delete script-written data after seven idle days unless persistence is granted [M, R1], and a Home Screen app keeps storage apart from Safari tabs [E]: export and import are the bridge.
 
 ## 8. Phases 1 and 1m, coarsely
 
 | Phase | Exit criteria |
 |---|---|
-| 1 Mechanisms: hinge and slider joints, one motor-battery model, suspend, resume, warp | One 30-part rover blueprint drives from voltages on Earth and the Moon. Motor no-load speed and stall torque within 2% [E]; battery energy equals work plus heat to ledger closure. Foucault precession 10.64 degrees per hour at 45 degrees, within 2% [D, 08]. A rover with spinning wheels and a flywheel, demoted and promoted: identical hash, angular momentum within 1e-12 [E] (VP14). Parked and warped a month: the pre-suspend hash, paused processes listed (VP19). Two rovers pass stage 9's rule; the phone's journal replays on the build server |
-| 1m-a: host-authoritative, offers exchanged as QR codes, no server, no takeover (VF03, VF08) | Two Chromium pages with 5% injected loss first: zero mismatches in 10 minutes. Then two phones, 10 minutes at the shared budget: zero mismatches, ratio 1.000 on both; a build mismatch refused; a late joiner equal after 10,000 ticks (VP11); a guest that loses the host pauses and reports. The lock matrix (lock 3, 10, 60 s; app switch; notification pull-down; Low Power Mode; tab against Home Screen) records what each side sees (VF12) |
+| 1 Mechanisms: hinge and slider joints, one motor-battery model, suspend and resume | One 30-part rover blueprint drives from voltages on Earth and the Moon. Motor no-load speed and stall torque within 2% [E]; battery energy equals work plus heat to ledger closure. Foucault precession 10.64 degrees per hour at 45 degrees, within 2% [D, 08]. A rover with spinning wheels and a flywheel, demoted and promoted: identical hash, angular momentum within 1e-12 [E] (VP14). Parked and warped a month: the pre-suspend hash, paused processes listed (VP19). Two rovers pass stage 9's rule; the phone's journal replays on the build server |
+| 1m-a: host-authoritative, offers exchanged as QR codes, no server, no takeover (VF03, VF08) | Two Chromium pages with 5% injected loss first: zero mismatches in 10 minutes. Then two phones, 10 minutes at the shared budget: zero mismatches, ratio 1.000 on both; a build mismatch refused; a late joiner equal after 10,000 ticks (VP11); a guest that loses the host pauses and reports; battery percentage before and after on both. The lock matrix (lock 3, 10, 60 s; app switch; notification pull-down; Low Power Mode; tab against Home Screen) records what each side sees (VF12) |
 | 1m-b (go/no-go) | Three simulated peers, 1,000 random owner kills: never zero or two owners, ledger change 0 units (VP10); lease expiry from the lock matrix |
 
-**The second phone is needed for** Safari-to-Safari data channels on real radios, fingerprint equality between two devices, the lock matrix, radio battery drain, real jitter for the input delay, and the slowest-phone budget rule. Lockstep logic, joins and fault injection run here without it.
+**The second phone is needed for** Safari-to-Safari data channels on real radios, fingerprint equality between two devices, the lock matrix, radio battery drain, real jitter for the input delay and the slowest-phone budget rule. Lockstep logic, joins and fault injection run here without it.
 
 ## Interfaces
 
 **Assumed from 01.** The fingerprint function and canonical serialisation, before the first commit; record and snapshot formats; closure tolerances; the closed input set; pair table and restitution law; budget lines.
 
-**Assumed from 02.** The integrator and its checkpoint nodes; the DE440 body table; site and gravity-packet definitions (9.7803 and 1.6242 m/s^2); warp admission. One difference: 02 puts the Foucault test in 0b; it needs a joint, so it moves to Phase 1 and B5 stands in.
+**Assumed from 02.** The integrator and its checkpoint nodes; the DE440 body table; site and gravity-packet definitions; warp admission. One difference: 02 puts the Foucault test in 0b; it needs a joint, so it moves to Phase 1 and B5 stands in.
 
 **Provided.** Pinned toolchain, canonical binary and build id; transcripts; the result line; the gates 01 and 02 name.
 
@@ -178,13 +179,11 @@ Runs: N Node and Bun, C Chromium, S Safari runner, P phone, O oracle job. Tolera
 ## Changes to the plan
 
 - The roadmap gains Phase 0; each "Goal" becomes numbered tests (VP06, VF02).
-- Release 1 ends at 1m-a; later rows are unscheduled go/no-go items; Phase 6 splits into 6a and 6b.
-- "1m ... with lease takeover" becomes 1m-a without takeover; takeover is 1m-b.
+- Release 1 ends at 1m-a, which has no lease takeover (that is 1m-b); later rows are unscheduled go/no-go items; Phase 6 splits into 6a and 6b.
 - 0s: any warp above 1x puts the region to sleep; Canvas drawing; no continuous zoom.
 - "This session cannot create one" is untested, tried only on the user's approval; licence, Pages source, Cloudflare account and the second phone's iOS version join the decisions (VF19).
 - "100-300 boxes" and "4 W" are replaced by stages 5 and 9.
-- "Paste back the result" becomes one line per phase.
-- No bindings tool; a hand-written host.
+- Results return as one line per phase; the shipped binary has no bindings tool.
 
 ## Open items
 
